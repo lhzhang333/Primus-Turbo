@@ -296,8 +296,11 @@ def rmsnorm_bwd_kernel_multi_row(
 # ---------------------------------------------------------------------------
 # Backward — persistent grid-stride. dgamma accumulator stays in registers
 # across the row loop; n_parts == num_programs (not B).
+# ROWS_PER_ITER=2 loads rows r and r + num_programs together, so a program has
+# two rows of reads in flight, and folds them into dgamma in the same order:
+# dx and the partials are bit-identical to one row a pass.
 # ---------------------------------------------------------------------------
-@triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs"])
+@triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs", "ROWS_PER_ITER"])
 @triton.jit
 def rmsnorm_bwd_kernel_grid_stride(
     DY_ptr,
@@ -318,6 +321,7 @@ def rmsnorm_bwd_kernel_grid_stride(
     BLOCK_H: tl.constexpr,
     num_programs: tl.constexpr,
     ZERO_CENTERED: tl.constexpr = False,
+    ROWS_PER_ITER: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
     h_offs = tl.arange(0, BLOCK_H)
@@ -330,22 +334,60 @@ def rmsnorm_bwd_kernel_grid_stride(
         g = g + 1.0
     dg_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
-    for row in range(pid, B, num_programs):
-        x_ptrs = X_ptr + row * stride_xb + h_offs * stride_xh
-        dy_ptrs = DY_ptr + row * stride_dyb + h_offs * stride_dyh
-        dx_ptrs = DX_ptr + row * stride_dxb + h_offs * stride_dxh
+    if ROWS_PER_ITER == 2:
+        for row in range(pid, B, 2 * num_programs):
+            row1 = row + num_programs
+            ok1 = row1 < B
+            x = tl.load(X_ptr + row * stride_xb + h_offs * stride_xh, mask=h_mask, other=0.0).to(tl.float32)
+            dy = tl.load(DY_ptr + row * stride_dyb + h_offs * stride_dyh, mask=h_mask, other=0.0).to(
+                tl.float32
+            )
+            rstd = tl.load(RSTD_ptr + row).to(tl.float32)
+            m1_mask = h_mask & ok1
+            x1 = tl.load(X_ptr + row1 * stride_xb + h_offs * stride_xh, mask=m1_mask, other=0.0).to(
+                tl.float32
+            )
+            dy1 = tl.load(DY_ptr + row1 * stride_dyb + h_offs * stride_dyh, mask=m1_mask, other=0.0).to(
+                tl.float32
+            )
+            rstd1 = tl.load(RSTD_ptr + row1, mask=ok1, other=0.0).to(tl.float32)
 
-        x = tl.load(x_ptrs, mask=h_mask, other=0.0).to(tl.float32)
-        dy = tl.load(dy_ptrs, mask=h_mask, other=0.0).to(tl.float32)
-        rstd = tl.load(RSTD_ptr + row).to(tl.float32)
+            x_hat = x * rstd
+            dxhat = dy * g
+            m = tl.sum(dxhat * x_hat, axis=0) / H
+            dx = (dxhat - x_hat * m) * rstd
+            tl.store(
+                DX_ptr + row * stride_dxb + h_offs * stride_dxh, dx.to(DX_ptr.dtype.element_ty), mask=h_mask
+            )
+            dg_acc += dy * x_hat
 
-        x_hat = x * rstd
-        dxhat = dy * g
-        m = tl.sum(dxhat * x_hat, axis=0) / H
-        dx = (dxhat - x_hat * m) * rstd
-        tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=h_mask)
+            x_hat1 = x1 * rstd1
+            dxhat1 = dy1 * g
+            m1 = tl.sum(dxhat1 * x_hat1, axis=0) / H
+            dx1 = (dxhat1 - x_hat1 * m1) * rstd1
+            tl.store(
+                DX_ptr + row1 * stride_dxb + h_offs * stride_dxh,
+                dx1.to(DX_ptr.dtype.element_ty),
+                mask=m1_mask,
+            )
+            dg_acc = tl.where(ok1, dg_acc + dy1 * x_hat1, dg_acc)
+    else:
+        for row in range(pid, B, num_programs):
+            x_ptrs = X_ptr + row * stride_xb + h_offs * stride_xh
+            dy_ptrs = DY_ptr + row * stride_dyb + h_offs * stride_dyh
+            dx_ptrs = DX_ptr + row * stride_dxb + h_offs * stride_dxh
 
-        dg_acc += dy * x_hat
+            x = tl.load(x_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+            dy = tl.load(dy_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+            rstd = tl.load(RSTD_ptr + row).to(tl.float32)
+
+            x_hat = x * rstd
+            dxhat = dy * g
+            m = tl.sum(dxhat * x_hat, axis=0) / H
+            dx = (dxhat - x_hat * m) * rstd
+            tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=h_mask)
+
+            dg_acc += dy * x_hat
 
     dgp_ptrs = DG_PART_ptr + pid * stride_dgp + h_offs
     tl.store(dgp_ptrs, dg_acc, mask=h_mask)

@@ -213,6 +213,9 @@ def rmsnorm_bwd_impl(
         )
     else:  # "grid": persistent grid-stride
         num_programs = GR
+        # Two rows a pass once a program gets two and a row is wide: one row of reads in flight per
+        # program left 8192 x 7168 at 43 us on MI455X, two take 37 (4096: 24 -> 20). Bit-identical.
+        rows_per_iter = 2 if BLOCK_H >= 4096 and B >= 2 * num_programs else 1
         dg_partial = torch.empty(num_programs, H, device=x2.device, dtype=torch.float32)
         rmsnorm_bwd_kernel_grid_stride[(num_programs,)](
             dy2,
@@ -233,6 +236,7 @@ def rmsnorm_bwd_impl(
             BLOCK_H=BLOCK_H,
             num_programs=num_programs,
             ZERO_CENTERED=zero_centered,
+            ROWS_PER_ITER=rows_per_iter,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg

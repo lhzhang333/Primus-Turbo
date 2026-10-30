@@ -55,6 +55,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_variable_k_accum.py",
     # Several rows a pass on the BF16 Mega SwiGLU backward, bit for bit against one row.
     "tests/pytorch/ops/test_mega_bf16_gfx1250_swiglu_rows.py",
+    # Two rows a pass in the Triton RMSNorm backward, bit for bit against one row.
+    "tests/pytorch/ops/test_rmsnorm_bwd_rows.py",
     # The fused Mega dispatch + L1 GEMM, single GPU (EP1).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_dispatch_gemm.py",
     # The fused Mega L2 GEMM + combine, single GPU (EP1).
