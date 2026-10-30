@@ -340,6 +340,48 @@ def dispatch_gemm_nt_gfx1250(
     ``xcd_band`` GEMM tiles to one XCD (``gemm_nt_tile.xcd_band_remap``), ``issue_first`` issues each
     k-tile's prefetch at the top of the previous one, ``lds_cosched`` interleaves the fragment reads
     with the matrix ops (``nt_gemm_tile``) and ``wmma_b2b`` turns the WMMA arbitration stall off."""
+    return prepare_dispatch_gemm_nt_gfx1250(
+        x,
+        w1,
+        handle,
+        num_dispatch_cu=num_dispatch_cu,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        m_warp=m_warp,
+        n_warp=n_warp,
+        group_m=group_m,
+        b_nn=b_nn,
+        num_xcd=num_xcd,
+        xcd_band=xcd_band,
+        issue_first=issue_first,
+        wmma_b2b=wmma_b2b,
+        lds_cosched=lds_cosched,
+    )(handle.pool_row_to_route.numel())
+
+
+def prepare_dispatch_gemm_nt_gfx1250(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    tables,
+    *,
+    num_dispatch_cu: int | None = None,
+    tile_m: int = 256,
+    tile_n: int = 256,
+    tile_k: int = 0,
+    m_warp: int = 4,
+    n_warp: int = 2,
+    group_m: int | None = None,
+    b_nn: bool = False,
+    num_xcd: int | None = None,
+    xcd_band: int | None = None,
+    issue_first: int | None = None,
+    wmma_b2b: int | None = None,
+    lds_cosched: int | None = None,
+):
+    """``dispatch_gemm_nt_gfx1250`` up to the pool row count: ``tables`` may be the prologue's
+    PendingDispatch, whose row count has not reached the host. Returns ``launch(rows) -> out``, so a
+    caller can do this host work while the prologue runs and launch once ``finish`` has the rows."""
     if num_dispatch_cu is None:
         num_dispatch_cu = env_int("PRIMUS_TURBO_MEGA_DISPATCH_CU", 64, nn=b_nn)
     if group_m is None:
@@ -354,10 +396,10 @@ def dispatch_gemm_nt_gfx1250(
         wmma_b2b = env_int("PRIMUS_TURBO_MEGA_WMMA_B2B", 0, nn=b_nn)
     if lds_cosched is None:
         lds_cosched = env_int("PRIMUS_TURBO_MEGA_LDS_COSCHED", 1, nn=b_nn)
-    return _run(
+    return _prepare(
         x,
         w1,
-        handle,
+        tables,
         False,
         b_nn,
         num_dispatch_cu,
@@ -391,10 +433,14 @@ def dispatch_only_gfx1250(
     return symm.dispatch_token_buffer
 
 
-def _run(
+def _run(x, w1, handle, dispatch_only, *knobs):
+    return _prepare(x, w1, handle, dispatch_only, *knobs)(handle.pool_row_to_route.numel())
+
+
+def _prepare(
     x,
     w1,
-    handle,
+    tables,
     dispatch_only,
     b_nn,
     num_dispatch_cu,
@@ -410,6 +456,9 @@ def _run(
     wmma_b2b,
     lds_cosched,
 ):
+    """Everything of a launch but this call's pool row count, which ``tables`` (a DispatchHandle, or a
+    prologue's PendingDispatch) need not know yet: returns ``launch(rows)``, which allocates the output
+    and launches."""
     _require_gfx1250(x.device)
     symm = get_symm_buffer_for_mega_moe()
     G, N, K = w1.shape
@@ -423,35 +472,33 @@ def _run(
     assert tile_m == BLOCK_M, "a GEMM tile is one Mega pool block"
     assert K % tile_k == 0 and K // tile_k >= NUM_BUFFERS, "K must be a whole number of >= 2 k-tiles"
     num_ranks = int(symm.num_ranks)
-    num_comm = handle.expert_send_dst_rank.numel()
+    num_comm = tables.expert_send_dst_rank.numel()
     assert num_comm % num_ranks == 0 and num_dispatch_cu >= num_ranks, "every dst rank needs a comm block"
     assert num_comm // num_ranks == G, "w1 holds this rank's experts"
     a_rows = int(symm.num_max_recv_tokens)
     check_gather_rows(a_rows, K, tile_m, tile_k)
     # the prologue marks padding rows with a_rows, out of range for the A gather
     idx_bits = 16 if a_rows < 0xFFFF else 32
-    out = x.new_empty((0, N) if dispatch_only else (handle.pool_row_to_route.numel(), N))
     n_blocks_n = (N + tile_n - 1) // tile_n
-    args = (
-        _as_ptr(out),
+    head = (
         _as_ptr(x),
         _as_ptr(w1),
         _as_ptr(symm.dispatch_token_buffer),
-        _as_ptr(handle.pool_row_to_recv_token),
-        _as_ptr(handle.tile_to_expert),
-        _as_ptr(handle.num_tile_blocks),
-        _as_ptr(handle.expert_send_dst_rank),
-        _as_ptr(handle.expert_send_count),
-        _as_ptr(handle.expert_send_offset),
-        _as_ptr(handle.dispatched_token_idx),
+        # the same address before and after the handle cuts it to this call's rows
+        _as_ptr(tables.pool_row_to_recv_token),
+        _as_ptr(tables.tile_to_expert),
+        _as_ptr(tables.num_tile_blocks),
+        _as_ptr(tables.expert_send_dst_rank),
+        _as_ptr(tables.expert_send_count),
+        _as_ptr(tables.expert_send_offset),
+        _as_ptr(tables.dispatched_token_idx),
         _as_ptr(symm._dispatch_chunk_counter),
         _as_ptr(symm._dispatch_parity),
         _as_ptr(symm._dispatch_expected),
         symm.get_sym_buffer(),
         torch.cuda.current_stream(),
-        # the comm workgroups, then the GEMM tiles of this call's pool (the prologue's
-        # num_tile_blocks), or dispatch-only's one waiter: masked worst-case tiles would drain last
-        num_dispatch_cu + (1 if dispatch_only else handle.pool_row_to_route.numel() // BLOCK_M * n_blocks_n),
+    )
+    tail = (
         N,
         K,
         n_blocks_n,
@@ -480,12 +527,21 @@ def _run(
         wmma_b2b,
         lds_cosched,
     )
-    key = args[_CONSTEXPR0:]
-    fn = _COMPILED.get(key)
-    if fn is None:
-        fn = flyc.compile(_launch_dispatch_gemm_nt, *args)
+
+    def launch(rows: int) -> torch.Tensor:
+        out = x.new_empty((0, N) if dispatch_only else (rows, N))
+        # the comm workgroups, then the GEMM tiles of this call's pool (the prologue's
+        # num_tile_blocks), or dispatch-only's one waiter: masked worst-case tiles would drain last
+        grid = num_dispatch_cu + (1 if dispatch_only else rows // BLOCK_M * n_blocks_n)
+        args = (_as_ptr(out), *head, grid, *tail)
+        key = args[_CONSTEXPR0:]
+        fn = _COMPILED.get(key)
         if fn is None:
-            return out
-        _COMPILED[key] = fn
-    fn(*args)
-    return out
+            fn = flyc.compile(_launch_dispatch_gemm_nt, *args)
+            if fn is None:
+                return out
+            _COMPILED[key] = fn
+        fn(*args)
+        return out
+
+    return launch

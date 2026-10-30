@@ -19,6 +19,7 @@ import torch
 
 from primus_turbo.flydsl.mega.gfx1250.bf16.dispatch_gemm_kernel import (
     dispatch_gemm_nt_gfx1250,
+    prepare_dispatch_gemm_nt_gfx1250,
 )
 from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import (
     gemm_combine_nt_gfx1250,
@@ -32,7 +33,7 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.variable_k import (
 from primus_turbo.flydsl.mega.gfx1250.bf16.x_redispatch_kernel import get_x_redispatch
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
     DispatchHandle,
-    run_dispatch_prologue,
+    start_dispatch_prologue,
 )
 from primus_turbo.flydsl.mega.gfx1250.swiglu_kernel import (
     swiglu_backward_flydsl_kernel,
@@ -62,8 +63,12 @@ def wgrad_accum_supported(w: torch.Tensor) -> bool:
 
 def stage1_forward(x, w1, group, topk_idx, topk_weights):
     """dispatch + L1 GEMM. Returns ``(l1_out, dispatch_weights, handle)``."""
-    handle, dispatch_weights = run_dispatch_prologue(x, w1, group, topk_idx, topk_weights)
-    return dispatch_gemm_nt_gfx1250(x, w1, handle), dispatch_weights, handle
+    # The GEMM's host-side launch work goes in while the prologue runs, ahead of the prologue's
+    # row-count sync, so that after it the GPU waits only for the output and the launch itself.
+    pending = start_dispatch_prologue(x, w1, group, topk_idx, topk_weights)
+    launch = prepare_dispatch_gemm_nt_gfx1250(x, w1, pending)
+    handle, dispatch_weights = pending.finish()
+    return launch(handle.pool_row_to_route.numel()), dispatch_weights, handle
 
 
 def stage2_forward(
