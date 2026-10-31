@@ -250,3 +250,63 @@ def test_fused_mega_moe_staged_wgrad_accum_ep1(
         assert p.grad_added_to_main_grad is f, f"{name}: grad_added_to_main_grad"
         # compare the accumulated gradient alone; main_grad's starting value would hide its error
         assert (snr := _snr(p.main_grad.float() - s, w - s)) > 40, f"{name} SNR {snr:.1f} dB"
+
+
+def test_fused_mega_moe_staged_wgrad_first_write_ep1(ep1_group):
+    """With a gradient-buffer consumer rotating grad_ownership every iteration, the first micro-batch's
+    dW1 / dW2 replace an uncleared ``main_grad`` and the later ones add into it, giving what accumulating
+    every micro-batch into a cleared one gives. The op's dispatch order varies from run to run, so the
+    two runs agree to bf16 rounding rather than bit for bit (the kernel's overwrite is bit for bit
+    accumulating into zeros: test_mega_bf16_gfx1250_variable_k_accum)."""
+    from primus_turbo.pytorch.core import grad_ownership
+    from primus_turbo.pytorch.ops.moe.fused_mega_moe import (
+        fused_mega_moe_stage1,
+        fused_mega_moe_stage2,
+    )
+
+    num_tokens, hidden, inter, num_experts, num_topk = 1024, 7168, 2048, 32, 8
+    torch.manual_seed(7)
+    w1 = (torch.randn(num_experts, 2 * inter, hidden, device="cuda") * 2 / hidden**0.5).to(torch.bfloat16)
+    w2 = (torch.randn(num_experts, hidden, inter, device="cuda") * 2 / inter**0.5).to(torch.bfloat16)
+    batches = []
+    for _ in range(3):
+        x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        scores = torch.randn(num_tokens, num_experts, device="cuda").softmax(-1)
+        topk_w, topk_idx = scores.topk(num_topk, dim=-1)
+        dy = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        batches.append((x, topk_w, topk_idx, dy))
+
+    def run(start):
+        params = [w.clone().requires_grad_() for w in (w1, w2)]
+        for p in params:
+            p.main_grad = torch.full_like(p, start)
+            p.grad_added_to_main_grad = False
+        for x, topk_w, topk_idx, dy in batches:
+            lw1, lw2 = params
+            l1_out, dwib, handle = fused_mega_moe_stage1(
+                x, topk_idx, topk_w, lw1, ep1_group, fuse_wgrad_accum_pattern="megatron"
+            )
+            y = fused_mega_moe_stage2(
+                l1_out, dwib, handle, topk_idx, topk_w, lw2, ep1_group, fuse_wgrad_accum_pattern="megatron"
+            )
+            y.backward(dy)
+            for p in params:
+                p.grad = None
+        return [p.main_grad for p in params]
+
+    names = ("_written", "_skipped", "_previous", "_ever_recorded", "_first_writes", "_previous_first_writes")
+    saved = {k: getattr(grad_ownership, k) for k in names + ("_stepping",)}
+    try:
+        grad_ownership._stepping = False
+        cleared = run(0.0)  # no consumer: every micro-batch accumulates into zeros
+        grad_ownership.begin_step()
+        stale = run(float("nan"))  # a consumer left the buffer uncleared
+        claimed = grad_ownership.begin_step()
+        assert claimed == {(g.data_ptr(), g.numel(), g.dtype) for g in stale}
+        assert grad_ownership.previous_first_writes() == claimed
+    finally:
+        for k, v in saved.items():
+            setattr(grad_ownership, k, v)
+    for name, a, b in zip(("dW1", "dW2"), cleared, stale):
+        assert not torch.isnan(b).any(), f"{name}: stale main_grad survived the first write"
+        assert (snr := _snr(b, a)) > 60, f"{name} SNR {snr:.1f} dB"
