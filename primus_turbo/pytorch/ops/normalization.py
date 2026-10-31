@@ -152,6 +152,10 @@ class _RMSNormResidualMultiFunction(torch.autograd.Function):
         )
 
         ctx.save_for_backward(x_plus_r, gamma, rstd)
+        # An output nobody consumed (x_plus_r into a final norm, an unused alias) gets None, not a
+        # materialized zero tensor: the kernel skips it, which saves the fill, and adding a zero
+        # residual gradient would turn -0.0 into +0.0.
+        ctx.set_materialize_grads(False)
         ctx.has_extra = x_extra is not None
         ctx.exact = exact
         ctx.orig_shape = orig_shape

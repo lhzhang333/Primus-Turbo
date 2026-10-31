@@ -419,6 +419,7 @@ def rmsnorm_bwd_residual_kernel_grid_stride(
     num_programs: tl.constexpr,
     NUM_DY: tl.constexpr = 1,
     ROUND_GRAD: tl.constexpr = False,
+    HAS_DXPR: tl.constexpr = True,
 ):
     pid = tl.program_id(0)
     h_offs = tl.arange(0, BLOCK_H)
@@ -447,16 +448,16 @@ def rmsnorm_bwd_residual_kernel_grid_stride(
             )
             if ROUND_GRAD:
                 dy = dy.to(DY_ptr.dtype.element_ty).to(tl.float32)
-        dxpr = tl.load(dxpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
         rstd = tl.load(RSTD_ptr + row).to(tl.float32)
 
         x_hat = xpr * rstd
         dxhat = dy * g
         m = tl.sum(dxhat * x_hat, axis=0) / H
-        dx_norm = (dxhat - x_hat * m) * rstd
-        if ROUND_GRAD:
-            dx_norm = dx_norm.to(DX_ptr.dtype.element_ty).to(tl.float32)
-        dx = dx_norm + dxpr
+        dx = (dxhat - x_hat * m) * rstd
+        if HAS_DXPR:
+            if ROUND_GRAD:
+                dx = dx.to(DX_ptr.dtype.element_ty).to(tl.float32)
+            dx = dx + tl.load(dxpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
         tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=h_mask)
 
         dg_acc += dy * x_hat
@@ -524,6 +525,7 @@ def rmsnorm_bwd_residual_kernel_multi_row(
     ROWS_PER_BLOCK: tl.constexpr,
     NUM_DY: tl.constexpr = 1,
     ROUND_GRAD: tl.constexpr = False,
+    HAS_DXPR: tl.constexpr = True,
 ):
     pid = tl.program_id(0)
     row_start = pid * ROWS_PER_BLOCK
@@ -552,17 +554,17 @@ def rmsnorm_bwd_residual_kernel_multi_row(
         dy = dy + tl.load(dy2_ptrs, mask=full_mask, other=0.0).to(tl.float32)
         if ROUND_GRAD:
             dy = dy.to(DY_ptr.dtype.element_ty).to(tl.float32)
-    dxpr = tl.load(dxpr_ptrs, mask=full_mask, other=0.0).to(tl.float32)
     g = tl.load(g_ptrs, mask=h_mask, other=0.0).to(tl.float32)
     rstd = tl.load(RSTD_ptr + row_offs, mask=row_mask, other=0.0).to(tl.float32)
 
     x_hat = xpr * rstd[:, None]
     dxhat = dy * g[None, :]
     m = tl.sum(dxhat * x_hat, axis=1) / H
-    dx_norm = (dxhat - x_hat * m[:, None]) * rstd[:, None]
-    if ROUND_GRAD:
-        dx_norm = dx_norm.to(DX_ptr.dtype.element_ty).to(tl.float32)
-    dx = dx_norm + dxpr
+    dx = (dxhat - x_hat * m[:, None]) * rstd[:, None]
+    if HAS_DXPR:
+        if ROUND_GRAD:
+            dx = dx.to(DX_ptr.dtype.element_ty).to(tl.float32)
+        dx = dx + tl.load(dxpr_ptrs, mask=full_mask, other=0.0).to(tl.float32)
 
     tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=full_mask)
 

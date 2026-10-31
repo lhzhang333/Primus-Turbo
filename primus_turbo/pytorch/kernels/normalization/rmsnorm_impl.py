@@ -362,12 +362,9 @@ def rmsnorm_bwd_residual_impl(
     dye = [_reshape_batch_hidden(d, H) for d in dy_extra]
     dy_1 = dye[0] if len(dye) > 0 else dy2
     dy_2 = dye[1] if len(dye) > 1 else dy2
-    if dxpr is None:
-        # When ``x_plus_r`` is unused downstream, autograd may hand us None.
-        # Substitute zeros so the kernel sees a valid pointer.
-        dxpr2 = torch.zeros_like(x_plus_r)
-    else:
-        dxpr2 = _reshape_batch_hidden(dxpr, H)
+    # When ``x_plus_r`` is unused downstream, autograd hands us None: the kernel skips the add
+    # (any tensor serves as the unread pointer).
+    dxpr2 = dy2 if dxpr is None else _reshape_batch_hidden(dxpr, H)
     dx = torch.empty_like(x_plus_r)
     mode, BLOCK_H, GR, num_warps, num_stages = _pick_bwd_config(H, B)
     if mode == "multi":
@@ -403,6 +400,7 @@ def rmsnorm_bwd_residual_impl(
             ROWS_PER_BLOCK=ROWS,
             NUM_DY=1 + len(dye),
             ROUND_GRAD=round_grad,
+            HAS_DXPR=dxpr is not None,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -438,6 +436,7 @@ def rmsnorm_bwd_residual_impl(
             num_programs=num_programs,
             NUM_DY=1 + len(dye),
             ROUND_GRAD=round_grad,
+            HAS_DXPR=dxpr is not None,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg

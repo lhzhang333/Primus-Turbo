@@ -115,6 +115,28 @@ def test_backward_exact(shape, num_outputs, with_extra, config):
         _assert_bitwise(a, b, name)
 
 
+@pytest.mark.parametrize("shape", [(8192, 7168), (64, 512)])
+@pytest.mark.parametrize("config", BWD_CONFIGS)
+def test_backward_exact_unused_sum(shape, config):
+    """``x_plus_r`` with no consumer (a final norm): no residual gradient, no add, signed zeros kept."""
+    x, e, r, *gys = _inputs(shape, 6, seed=6)
+    gamma = torch.randn(shape[-1], dtype=torch.bfloat16, device="cuda")
+    with _pinned_bwd_config(*config):
+        xr, er, rr, gr = (t.detach().clone().requires_grad_() for t in (x, e, r, gamma))
+        h = (xr + er) + rr
+        y = rmsnorm(h, gr, 1e-6)
+        outs = [None] * 3
+        for i in reversed(range(3)):
+            outs[i] = y * 1
+        torch.autograd.backward(outs, gys)
+        xf, ef, rf, gf = (t.detach().clone().requires_grad_() for t in (x, e, r, gamma))
+        *ys, _ = rmsnorm_residual(xf, rf, gf, 1e-6, x_extra=ef, num_outputs=3, exact=True)
+        torch.autograd.backward(ys, gys)
+    for name, a, b in (("dx", xf.grad, xr.grad), ("dx_extra", ef.grad, er.grad), ("dresidual", rf.grad, rr.grad)):
+        _assert_bitwise(a, b, name)
+    _assert_bitwise(gf.grad, gr.grad, "dgamma")
+
+
 @pytest.mark.parametrize("shape", [(8192, 7168), (4096, 2048)])
 @pytest.mark.parametrize("num_outputs", [1, 3])
 def test_backward_unpinned_close(shape, num_outputs):
