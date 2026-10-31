@@ -63,6 +63,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_gemm_combine.py",
     # The fused_mega_moe op (forward and backward) on the gfx1250 kernels, single GPU (EP1).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe.py",
+    # grad_ownership's first-write claims, which the Mega wgrad makes (host-side only).
+    "tests/pytorch/core/test_grad_ownership_first_write.py",
     # The same op across every visible GPU (EP2+).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe_ep.py",
     # Residual RMSNorm with a second summand, per-consumer gradients and exact rounding: the
