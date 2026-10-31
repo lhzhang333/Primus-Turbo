@@ -437,6 +437,8 @@ def rmsnorm_bwd_residual_impl(
             NUM_DY=1 + len(dye),
             ROUND_GRAD=round_grad,
             HAS_DXPR=dxpr is not None,
+            # two rows of reads in flight per program for wide rows; bit-identical to one row a pass
+            ROWS_PER_ITER=2 if B >= 2 * num_programs and BLOCK_H >= 4096 else 1,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
