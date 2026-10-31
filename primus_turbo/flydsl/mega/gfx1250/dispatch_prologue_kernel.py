@@ -15,7 +15,8 @@
 
 import functools
 import itertools
-from typing import NamedTuple
+from types import SimpleNamespace
+from typing import NamedTuple, Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -675,8 +676,9 @@ def _compiled_dispatch_prologue(
     )
 
 
-def dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weight):
-    """Build the routing tables on ``symm``; returns ``(handle, dispatch_weights)``."""
+def _issue_dispatch_prologue(symm, topk_idx, topk_weight) -> SimpleNamespace:
+    """Launch the prologue on ``symm`` and take this call's copies of its receive tables, all queued
+    on the current stream; ``_finish_dispatch_prologue`` cuts them to the rows dispatched here."""
     if topk_idx.dtype not in (torch.int32, torch.int64):
         raise TypeError(f"topk_idx must be int32 or int64, got {topk_idx.dtype}")
     num_tokens, num_topk = topk_idx.shape
@@ -733,20 +735,10 @@ def dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weight):
         stream=torch.cuda.current_stream(),
     )
     # The receive tables and weights live in the shared heap, which the next prologue overwrites, so
-    # the handle keeps copies. They are taken whole, before the sync below: queued behind the
-    # prologue while the host waits on it, rather than issued one by one after it while the GPU
-    # idles. A few MB at most; the handle keeps the rows of this call.
-    pool_row_to_route = symm.pool_row_to_route.clone()
-    pool_row_to_recv_token = symm.pool_row_to_recv_token.clone()
-    recv_token_to_pool_rows = symm.recv_token_to_pool_rows.clone()
-    dispatch_weights = symm.weight_recv_buf.clone()
-    # One D2H, like DeepEP's notify: the receive tables below, and every row-indexed tensor the
-    # dispatch, SwiGLU and combine allocate for this call, span the block_m-padded rows actually
-    # dispatched to this rank instead of the worst-case pool. The sync keeps the op out of CUDA graphs.
-    rows = int(num_tokens_per_expert_prefix[-1].item())
-    if rows > num_max_pool_tokens:  # only reachable with repeated experts in topk_idx
-        raise RuntimeError(f"mega MoE dispatch: {rows} pool rows exceed the capacity {num_max_pool_tokens}")
-    handle = DispatchHandle(
+    # the handle keeps copies. They are taken whole, before the host waits for the row count: queued
+    # behind the prologue while the host waits on it, rather than issued one by one after it while
+    # the GPU idles. A few MB at most; the handle keeps the rows of this call.
+    return SimpleNamespace(
         expert_send_dst_rank=expert_send_dst_rank,
         expert_send_count=expert_send_count,
         expert_send_offset=expert_send_offset,
@@ -758,18 +750,51 @@ def dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weight):
         combine_recv_dst_rank=combine_recv_dst_rank,
         combine_recv_start_row=combine_recv_start_row,
         combine_recv_fold_count=combine_recv_fold_count,
-        pool_row_to_route=pool_row_to_route[:rows],
-        # BLOCK_M rows past the last real one, which the gather prefetch reads
-        pool_row_to_recv_token=pool_row_to_recv_token[: rows + BLOCK_M],
-        recv_token_to_pool_rows=recv_token_to_pool_rows,
+        pool_row_to_route=symm.pool_row_to_route.clone(),
+        pool_row_to_recv_token=symm.pool_row_to_recv_token.clone(),
+        recv_token_to_pool_rows=symm.recv_token_to_pool_rows.clone(),
+        dispatch_weights=symm.weight_recv_buf.clone(),
+        num_max_pool_tokens=num_max_pool_tokens,
     )
-    return handle, dispatch_weights[:rows]
 
 
-def run_dispatch_prologue(x, w1, group, topk_idx, topk_weights):
-    """Activate the symm buffer for this shape and run the prologue on it."""
+def _finish_dispatch_prologue(t: SimpleNamespace, rows: int):
+    """``(handle, dispatch_weights)`` of an issued prologue that dispatched ``rows`` pool rows here."""
+    if rows > t.num_max_pool_tokens:  # only reachable with repeated experts in topk_idx
+        raise RuntimeError(f"mega MoE dispatch: {rows} pool rows exceed the capacity {t.num_max_pool_tokens}")
+    handle = DispatchHandle(
+        expert_send_dst_rank=t.expert_send_dst_rank,
+        expert_send_count=t.expert_send_count,
+        expert_send_offset=t.expert_send_offset,
+        dispatched_token_idx=t.dispatched_token_idx,
+        tile_to_expert=t.tile_to_expert,
+        num_tokens_per_expert=t.num_tokens_per_expert,
+        num_tokens_per_expert_prefix=t.num_tokens_per_expert_prefix,
+        num_tile_blocks=t.num_tile_blocks,
+        combine_recv_dst_rank=t.combine_recv_dst_rank,
+        combine_recv_start_row=t.combine_recv_start_row,
+        combine_recv_fold_count=t.combine_recv_fold_count,
+        pool_row_to_route=t.pool_row_to_route[:rows],
+        # BLOCK_M rows past the last real one, which the gather prefetch reads
+        pool_row_to_recv_token=t.pool_row_to_recv_token[: rows + BLOCK_M],
+        recv_token_to_pool_rows=t.recv_token_to_pool_rows,
+    )
+    return handle, t.dispatch_weights[:rows]
+
+
+def dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weight):
+    """Build the routing tables on ``symm``; returns ``(handle, dispatch_weights)``."""
+    tables = _issue_dispatch_prologue(symm, topk_idx, topk_weight)
+    # One D2H, like DeepEP's notify: the receive tables, and every row-indexed tensor the dispatch,
+    # SwiGLU and combine allocate for this call, span the block_m-padded rows actually dispatched to
+    # this rank instead of the worst-case pool. The sync keeps the op out of CUDA graphs.
+    return _finish_dispatch_prologue(tables, int(tables.num_tokens_per_expert_prefix[-1].item()))
+
+
+def _symm_for(x, w1, group, topk_idx):
+    """Activate the symm buffer for this shape."""
     num_experts_per_rank = w1.shape[0]
-    symm = get_symm_buffer_for_mega_moe(
+    return get_symm_buffer_for_mega_moe(
         group,
         num_experts=num_experts_per_rank * group.size(),
         num_max_tokens_per_rank=x.shape[0],
@@ -777,4 +802,46 @@ def run_dispatch_prologue(x, w1, group, topk_idx, topk_weights):
         hidden=x.shape[1],
         intermediate_hidden=w1.shape[1] // 2,
     )
-    return dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weights)
+
+
+def _prefetch_key(symm, topk_idx, topk_weights):
+    tensors = (topk_idx,) if topk_weights is None else (topk_idx, topk_weights)
+    return (id(symm),) + tuple((t.data_ptr(), t._version, tuple(t.shape), t.dtype) for t in tensors)
+
+
+# The prologue prefetch_dispatch_prologue issued, until the run_dispatch_prologue it was issued for.
+_prefetched: Optional[SimpleNamespace] = None
+_rows_host: Optional[torch.Tensor] = None  # pinned, where a prefetched prologue's row count lands
+
+
+def prefetch_dispatch_prologue(x, w1, group, topk_idx, topk_weights) -> None:
+    """Issue the prologue of the next ``run_dispatch_prologue`` (same arguments, which must come
+    next) now, and its row count's copy to the host behind it, without waiting for either. Work the
+    caller queues before that call (e.g. the shared expert) then runs while the host waits for the
+    count and launches the dispatch, instead of the GPU idling there."""
+    global _prefetched, _rows_host
+    if _prefetched is not None:
+        raise RuntimeError("mega MoE dispatch: a prefetched prologue was not used by its stage1 forward")
+    symm = _symm_for(x, w1, group, topk_idx)
+    tables = _issue_dispatch_prologue(symm, topk_idx, topk_weights)
+    if _rows_host is None:
+        _rows_host = torch.empty(1, dtype=torch.int64, pin_memory=True)
+    _rows_host.copy_(tables.num_tokens_per_expert_prefix[-1:], non_blocking=True)
+    tables.rows_ready = torch.cuda.Event()
+    tables.rows_ready.record()
+    tables.key = _prefetch_key(symm, topk_idx, topk_weights)
+    _prefetched = tables
+
+
+def run_dispatch_prologue(x, w1, group, topk_idx, topk_weights):
+    """Activate the symm buffer for this shape and run the prologue on it, or finish the one
+    ``prefetch_dispatch_prologue`` issued for these arguments."""
+    global _prefetched
+    symm = _symm_for(x, w1, group, topk_idx)
+    tables, _prefetched = _prefetched, None
+    if tables is None:
+        return dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weights)
+    if tables.key != _prefetch_key(symm, topk_idx, topk_weights):
+        raise RuntimeError("mega MoE dispatch: the prefetched prologue was issued for other arguments")
+    tables.rows_ready.synchronize()
+    return _finish_dispatch_prologue(tables, int(_rows_host[0]))
