@@ -19,6 +19,14 @@ For the residual variant the bwd additionally folds the gradient flowing through
 function returns the same gradient for both ``x`` and ``residual`` since their
 sum has Jacobian ``[I, I]``.
 
+The residual variant also takes a second summand ``x2`` in the forward (``x + x2 +
+residual``) and up to three incoming gradients ``dy`` in the backward (one per consumer
+of ``y``), summed in the kernel. ``ROUND_SUM`` / ``ROUND_GRAD`` round every partial sum
+to the storage dtype, in the order an unfused graph would: ``(x + x2)``, then
+``+ residual``, normalizing the stored sum; ``(dy0 + dy1) + dy2``; ``dx_norm`` before
+adding the residual gradient. The result is then bitwise that of the separate adds
+followed by the plain kernels.
+
 A 2-stage bwd is used. The multi-row variants reduce ``dgamma`` *inside* each
 program over its ``ROWS_PER_BLOCK`` rows, so the partial buffer is
 ``(num_programs, H)`` instead of ``(B, H)``. This is essential at small-H,
@@ -129,6 +137,7 @@ def rmsnorm_fwd_kernel_multi_row(
 @triton.jit
 def rmsnorm_fwd_residual_kernel(
     X_ptr,
+    X2_ptr,
     R_ptr,
     G_ptr,
     Y_ptr,
@@ -136,6 +145,8 @@ def rmsnorm_fwd_residual_kernel(
     RSTD_ptr,
     stride_xb,
     stride_xh,
+    stride_x2b,
+    stride_x2h,
     stride_rb,
     stride_rh,
     stride_yb,
@@ -146,6 +157,8 @@ def rmsnorm_fwd_residual_kernel(
     eps,
     BLOCK_H: tl.constexpr,
     SKIP_Y_STORE: tl.constexpr = False,
+    HAS_X2: tl.constexpr = False,
+    ROUND_SUM: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
@@ -157,9 +170,17 @@ def rmsnorm_fwd_residual_kernel(
     mask = offs < H
 
     x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+    if HAS_X2:
+        x = x + tl.load(X2_ptr + row * stride_x2b + offs * stride_x2h, mask=mask, other=0.0).to(tl.float32)
+        if ROUND_SUM:
+            x = x.to(XPR_ptr.dtype.element_ty).to(tl.float32)
     r = tl.load(r_ptrs, mask=mask, other=0.0).to(tl.float32)
     xpr = x + r
-    tl.store(xpr_ptrs, xpr.to(XPR_ptr.dtype.element_ty), mask=mask)
+    xpr_lp = xpr.to(XPR_ptr.dtype.element_ty)
+    tl.store(xpr_ptrs, xpr_lp, mask=mask)
+    if ROUND_SUM:
+        # normalize the stored sum, as a separate add followed by the plain kernel does
+        xpr = xpr_lp.to(tl.float32)
 
     var = tl.sum(xpr * xpr, axis=0) / H
     rstd = tl.rsqrt(var + eps)
@@ -180,6 +201,7 @@ def rmsnorm_fwd_residual_kernel(
 @triton.jit
 def rmsnorm_fwd_residual_kernel_multi_row(
     X_ptr,
+    X2_ptr,
     R_ptr,
     G_ptr,
     Y_ptr,
@@ -187,6 +209,8 @@ def rmsnorm_fwd_residual_kernel_multi_row(
     RSTD_ptr,
     stride_xb,
     stride_xh,
+    stride_x2b,
+    stride_x2h,
     stride_rb,
     stride_rh,
     stride_yb,
@@ -199,6 +223,8 @@ def rmsnorm_fwd_residual_kernel_multi_row(
     BLOCK_H: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
     SKIP_Y_STORE: tl.constexpr = False,
+    HAS_X2: tl.constexpr = False,
+    ROUND_SUM: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     row_start = pid * ROWS_PER_BLOCK
@@ -216,10 +242,18 @@ def rmsnorm_fwd_residual_kernel_multi_row(
 
     full_mask = row_mask[:, None] & h_mask[None, :]
     x = tl.load(x_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+    if HAS_X2:
+        x2_ptrs = X2_ptr + row_offs[:, None] * stride_x2b + h_offs[None, :] * stride_x2h
+        x = x + tl.load(x2_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+        if ROUND_SUM:
+            x = x.to(XPR_ptr.dtype.element_ty).to(tl.float32)
     r = tl.load(r_ptrs, mask=full_mask, other=0.0).to(tl.float32)
 
     xpr = x + r
-    tl.store(xpr_ptrs, xpr.to(XPR_ptr.dtype.element_ty), mask=full_mask)
+    xpr_lp = xpr.to(XPR_ptr.dtype.element_ty)
+    tl.store(xpr_ptrs, xpr_lp, mask=full_mask)
+    if ROUND_SUM:
+        xpr = xpr_lp.to(tl.float32)
 
     var = tl.sum(xpr * xpr, axis=1) / H
     rstd = tl.rsqrt(var + eps)
@@ -358,6 +392,8 @@ def rmsnorm_bwd_kernel_grid_stride(
 @triton.jit
 def rmsnorm_bwd_residual_kernel_grid_stride(
     DY_ptr,
+    DY1_ptr,
+    DY2_ptr,
     DXPR_ptr,
     XPR_ptr,
     G_ptr,
@@ -368,6 +404,10 @@ def rmsnorm_bwd_residual_kernel_grid_stride(
     stride_xprh,
     stride_dyb,
     stride_dyh,
+    stride_dy1b,
+    stride_dy1h,
+    stride_dy2b,
+    stride_dy2h,
     stride_dxprb,
     stride_dxprh,
     stride_dxb,
@@ -377,6 +417,8 @@ def rmsnorm_bwd_residual_kernel_grid_stride(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     num_programs: tl.constexpr,
+    NUM_DY: tl.constexpr = 1,
+    ROUND_GRAD: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     h_offs = tl.arange(0, BLOCK_H)
@@ -393,6 +435,18 @@ def rmsnorm_bwd_residual_kernel_grid_stride(
 
         xpr = tl.load(xpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
         dy = tl.load(dy_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+        if NUM_DY >= 2:
+            dy = dy + tl.load(DY1_ptr + row * stride_dy1b + h_offs * stride_dy1h, mask=h_mask, other=0.0).to(
+                tl.float32
+            )
+            if ROUND_GRAD:
+                dy = dy.to(DY_ptr.dtype.element_ty).to(tl.float32)
+        if NUM_DY >= 3:
+            dy = dy + tl.load(DY2_ptr + row * stride_dy2b + h_offs * stride_dy2h, mask=h_mask, other=0.0).to(
+                tl.float32
+            )
+            if ROUND_GRAD:
+                dy = dy.to(DY_ptr.dtype.element_ty).to(tl.float32)
         dxpr = tl.load(dxpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
         rstd = tl.load(RSTD_ptr + row).to(tl.float32)
 
@@ -400,6 +454,8 @@ def rmsnorm_bwd_residual_kernel_grid_stride(
         dxhat = dy * g
         m = tl.sum(dxhat * x_hat, axis=0) / H
         dx_norm = (dxhat - x_hat * m) * rstd
+        if ROUND_GRAD:
+            dx_norm = dx_norm.to(DX_ptr.dtype.element_ty).to(tl.float32)
         dx = dx_norm + dxpr
         tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=h_mask)
 
@@ -441,6 +497,8 @@ def rmsnorm_bwd_finalize_kernel(
 @triton.jit
 def rmsnorm_bwd_residual_kernel_multi_row(
     DY_ptr,
+    DY1_ptr,
+    DY2_ptr,
     DXPR_ptr,
     XPR_ptr,
     G_ptr,
@@ -451,6 +509,10 @@ def rmsnorm_bwd_residual_kernel_multi_row(
     stride_xprh,
     stride_dyb,
     stride_dyh,
+    stride_dy1b,
+    stride_dy1h,
+    stride_dy2b,
+    stride_dy2h,
     stride_dxprb,
     stride_dxprh,
     stride_dxb,
@@ -460,6 +522,8 @@ def rmsnorm_bwd_residual_kernel_multi_row(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
+    NUM_DY: tl.constexpr = 1,
+    ROUND_GRAD: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     row_start = pid * ROWS_PER_BLOCK
@@ -478,6 +542,16 @@ def rmsnorm_bwd_residual_kernel_multi_row(
     full_mask = row_mask[:, None] & h_mask[None, :]
     xpr = tl.load(xpr_ptrs, mask=full_mask, other=0.0).to(tl.float32)
     dy = tl.load(dy_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+    if NUM_DY >= 2:
+        dy1_ptrs = DY1_ptr + row_offs[:, None] * stride_dy1b + h_offs[None, :] * stride_dy1h
+        dy = dy + tl.load(dy1_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+        if ROUND_GRAD:
+            dy = dy.to(DY_ptr.dtype.element_ty).to(tl.float32)
+    if NUM_DY >= 3:
+        dy2_ptrs = DY2_ptr + row_offs[:, None] * stride_dy2b + h_offs[None, :] * stride_dy2h
+        dy = dy + tl.load(dy2_ptrs, mask=full_mask, other=0.0).to(tl.float32)
+        if ROUND_GRAD:
+            dy = dy.to(DY_ptr.dtype.element_ty).to(tl.float32)
     dxpr = tl.load(dxpr_ptrs, mask=full_mask, other=0.0).to(tl.float32)
     g = tl.load(g_ptrs, mask=h_mask, other=0.0).to(tl.float32)
     rstd = tl.load(RSTD_ptr + row_offs, mask=row_mask, other=0.0).to(tl.float32)
@@ -486,6 +560,8 @@ def rmsnorm_bwd_residual_kernel_multi_row(
     dxhat = dy * g[None, :]
     m = tl.sum(dxhat * x_hat, axis=1) / H
     dx_norm = (dxhat - x_hat * m[:, None]) * rstd[:, None]
+    if ROUND_GRAD:
+        dx_norm = dx_norm.to(DX_ptr.dtype.element_ty).to(tl.float32)
     dx = dx_norm + dxpr
 
     tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=full_mask)
