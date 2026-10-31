@@ -1182,6 +1182,19 @@ def _pick_variable_k_config(OUT_M: int, OUT_N: int, avg_m: int):
     return (256, 256, 128, 2, 2, 2)
 
 
+def _vk_group_m(OUT_M: int, OUT_N: int, cfg) -> int:
+    """``group_m=-1``: 16, the shipped super-tile height, except on the DeepSeek-V3 ring when 16 does not
+    divide the output's first-axis tile count. There the ragged last super-tile measured slower, and the
+    largest divisor of the count up to 16 is taken: dW2's 28 tiles -> 14, -4% to -6.5% at sustained clocks
+    on one MI455X at 1024 / 2048 / 4096 rows per expert (4 / 2 / 1 / 7 measured the same, 3 and 8 no
+    better than 16). dW1's 16 tiles keep 16; 14 is 5% slower there. The tile order changes no output's
+    k-step sequence, so every value gives the same result."""
+    n = -(-OUT_M // cfg[0])
+    if (OUT_M, OUT_N) not in _VK_DEEP_RING_SHAPES or tuple(cfg) != (256, 256, 64, 2, 2, 3) or n % 16 == 0:
+        return 16
+    return max(d for d in range(1, 17) if n % d == 0)
+
+
 def grouped_gemm_bf16_variable_k_supported(OUT_M: int, OUT_N: int, avg_m: int = 0) -> bool:
     """Whether ``grouped_gemm_bf16_variable_k_flydsl_kernel`` can serve this shape.
 
@@ -1230,8 +1243,9 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     num_buffers: int = 0,
     # Super-tile width in output blocks: co-resident workgroups share a column
     # slice. 16, not the gfx950 default of 4; re-measured after `split_bar` was
-    # wired onto the same resource and it still holds.
-    group_m: int = 16,
+    # wired onto the same resource and it still holds. -1 = `_vk_group_m`: 16,
+    # except DeepSeek-V3's dW2 ring, whose 28 tile rows take 14.
+    group_m: int = -1,
     # XCD band-cyclic remap. Off by default -- the MI455X XCD count is unconfirmed,
     # unlike MI355X's 8. Correctness does not depend on the value.
     num_xcd: int = 1,
@@ -1400,6 +1414,9 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         split_bar = _vk_auto_split_bar(
             (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers), OUT_M, OUT_N, _avg_m
         )
+
+    if group_m == -1:
+        group_m = _vk_group_m(OUT_M, OUT_N, (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers))
 
     # The store walks `g*OUT_M*ldc + blk_n*ldc + blk_k`, so the allocation has to be
     # OUT_M*ldc per expert, not OUT_M*OUT_N. Checked rather than assumed: this is the

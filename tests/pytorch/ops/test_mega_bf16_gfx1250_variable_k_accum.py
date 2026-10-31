@@ -154,8 +154,28 @@ def test_ring3_matches_two_buffers(out_m, out_n, counts, gather):
     assert torch.equal(acc2, acc3)
 
 
+def test_group_m_does_not_change_the_result():
+    """The super-tile height only reorders tiles: dW2's pick (14) against the old 16 and 4, accumulating."""
+    vk = _vk()
+    out_m, out_n, counts, gather = CASES[1]
+    a, b, offs, masked_k, kw, _ = _problem(out_m, out_n, counts, gather)
+    ring3 = {"BLOCK_K": 64, "num_buffers": 3}
+    old = _old_out((len(counts), out_m, out_n))
+    outs = []
+    for gm in (-1, 16, 4):
+        out = old.clone()
+        vk.grouped_gemm_bf16_variable_k_flydsl_kernel(
+            a, b, offs, masked_k=masked_k, out=out, accumulate=1, group_m=gm, **kw, **ring3
+        )
+        outs.append(out)
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2])
+
+
 def test_deepseek_v3_wgrads_pick_the_ring():
     vk = _vk()
+    assert vk._vk_group_m(7168, 2048, (256, 256, 64, 2, 2, 3)) == 14
+    assert vk._vk_group_m(4096, 7168, (256, 256, 64, 2, 2, 3)) == 16
+    assert vk._vk_group_m(7168, 2048, (256, 256, 128, 2, 2, 2)) == 16
     assert vk._pick_variable_k_config(4096, 7168, 2048)[2:] == (64, 2, 2, 3)
     assert vk._pick_variable_k_config(7168, 2048, 1024)[2:] == (64, 2, 2, 3)
     assert vk._pick_variable_k_config(7168, 2048, 512)[2:] == (128, 2, 2, 2)
