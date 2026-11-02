@@ -1,0 +1,20 @@
+pattern                   cycles/rep  (one wave per SIMD, median)
+WMMMMMM*64                    719.09
+WMMMMMMM*64                   784.09
+WMMMMMMMM*64                  848.09
+WW*32                         512.19
+WWMMMMMM*32                   617.10
+WWMMMMMMMMMM*32               754.09
+WWMMMMMMMMMMMM*32             819.09
+WWMMMMMMMMMMMMMM*32           883.09
+WWMMMMMMMMMMMMMMM*32          915.09
+WWWMMMMMMMMMMMMMMMMMMMM*16     675.09
+WXMMMXWXMMMX*32               524.10
+WWXMMMMMMX*32                 617.10
+WXMMMMXWXMMMMX*32             526.09
+WWXMMMMMMMMX*32               688.09
+WXMMMMMXWXMMMMMX*32           654.09
+WWXMMMMMMMMMMX*32             754.09
+WLXMMXWLXMMX*32               517.39
+WWLLXMMMMX*32                 521.37
+[07:49:10 UTC] rc=0 log /home/lihuzhan/projects/2026_1023__v2/Primus-Turbo-hk-ladder/benchmark/hk_attn_ladder/logs/20261102_074907_wmma_mix_p.log

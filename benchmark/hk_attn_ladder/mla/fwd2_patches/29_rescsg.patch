@@ -1,0 +1,26 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 05:55:55.983907288 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 05:56:16.495366703 +0000
+@@ -547,7 +547,7 @@
+                          "valu: v_mov_b32 of a softmax scratch VGPR onto itself; nop: s_nop 0)")
+     ap.add_argument("--bank-tree", action="store_true",
+                     help="sum tree partial sums in the leaf whose VGPR banks differ from the other operands'")
+-    ap.add_argument("--abl", action="append", default=[], choices=("nosoft", "nolds"),
++    ap.add_argument("--abl", action="append", default=[], choices=("nosoft", "nolds", "rescsg"),
+                     help="timing-only ablation (wrong results)")
+     ap.add_argument("-D", dest="defines", action="append", default=[],
+                     help="extra macro of both compiles, e.g. -D HKGEN_PROBE=1 (diagnostic builds: the probe's stamp "
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 05:55:55.983930798 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 05:56:16.495167102 +0000
+@@ -944,7 +944,9 @@
+     for dt in range(NDT):
+         for r in range(0, 8, 2):
+             o = vr(L.O(i, dt) + r, 2)
+-            out.append(f"v_pk_mul_f32 {o}, {o}, {vr(L.corr[i], 2)} op_sel_hi:[1,0]")
++            # --abl rescsg (timing only, wrong results): the multiplier from the SGPR pair S_C, no VGPR bank read
++            src = f"s[{S_C[0][1:]}:{S_C[1][1:]}]" if "rescsg" in ABL else vr(L.corr[i], 2)
++            out.append(f"v_pk_mul_f32 {o}, {o}, {src} op_sel_hi:[1,0]")
+     return out
+ 
+ 

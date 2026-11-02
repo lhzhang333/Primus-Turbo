@@ -1,0 +1,37 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 08:04:55.471089523 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 08:04:55.486507060 +0000
+@@ -552,7 +552,7 @@
+                          "valu: v_mov_b32 of a softmax scratch VGPR onto itself; nop: s_nop 0)")
+     ap.add_argument("--bank-tree", action="store_true",
+                     help="sum tree partial sums in the leaf whose VGPR banks differ from the other operands'")
+-    ap.add_argument("--abl", action="append", default=[], choices=("nosoft", "nolds", "rescsg"),
++    ap.add_argument("--abl", action="append", default=[], choices=("nosoft", "nolds", "rescsg", "mnalt", "corralt"),
+                     help="timing-only ablation (wrong results)")
+     ap.add_argument("-D", dest="defines", action="append", default=[],
+                     help="extra macro of both compiles, e.g. -D HKGEN_PROBE=1 (diagnostic builds: the probe's stamp "
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 08:04:55.471110183 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 08:04:55.486388660 +0000
+@@ -925,8 +925,11 @@
+     cc = f"s[{S_C[0][1:]}:{S_C[1][1:]}]" if c_sgpr else vr(L.cc, 2)
+     for j in range(NKV):
+         for e in range(0, 8, 2):
++            mnx = mn
++            if "mnalt" in ABL and _bank_pair(S[j][e]) & _bank_pair(mn):  # timing only: wrong results
++                mnx = L.mn[i ^ 1]
+             add(
+-                f"v_pk_fma_f32 {vr(S[j][e], 2)}, {vr(S[j][e], 2)}, {cc}, {vr(mn, 2)} "
++                f"v_pk_fma_f32 {vr(S[j][e], 2)}, {vr(S[j][e], 2)}, {cc}, {vr(mnx, 2)} "
+                 f"op_sel_hi:[1,{0 if c_sgpr else 1},0] neg_lo:[0,0,1] neg_hi:[0,0,1]",
+                 "VALU",
+                 f"p{i}",
+@@ -958,6 +961,8 @@
+             o = vr(L.O(i, dt) + r, 2)
+             # --abl rescsg (timing only, wrong results): the multiplier from the SGPR pair S_C, no VGPR bank read
+             src = f"s[{S_C[0][1:]}:{S_C[1][1:]}]" if "rescsg" in ABL else vr(L.corr[i], 2)
++            if "corralt" in ABL and _bank_pair(L.O(i, dt) + r) & _bank_pair(L.corr[i]):  # timing only: wrong results
++                src = vr(L.corr[i ^ 1], 2)
+             out.append(f"v_pk_mul_f32 {o}, {o}, {src} op_sel_hi:[1,0]")
+     return out
+ 

@@ -1,0 +1,27 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 07:52:40.884765668 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 07:52:40.899756447 +0000
+@@ -160,6 +160,11 @@
+ #if HKGEN_TDMGEN && !HKGEN_TDMASM
+ #error "HKGEN_TDMGEN needs HKGEN_TDMASM"
+ #endif
++// HKGEN_FA3FIRST 1 (on HKGEN_SKIPPV): FINAL_A3 is the likely branch, laid out right after TILE_D3, the rare full FINAL_A
++// after it: a block's code runs in one ascending address range (the per-block code exceeds the instruction cache)
++#ifndef HKGEN_FA3FIRST
++#define HKGEN_FA3FIRST 0
++#endif
+ #if HKGEN_FTILE && (HKGEN2 || HKGEN_INCDESC)
+ #error "HKGEN_FTILE needs the shell's tile loop and the per-tile descriptors"
+ #endif
+@@ -926,7 +931,11 @@
+       const unsigned wls = (unsigned)(LSE_SLOT + 4 * lane2);
+ #if HKGEN_FMERGE && !HKGEN_REF
+ #if HKGEN_SKIPPV
++#if HKGEN_FA3FIRST
++      if (__builtin_expect(ncc + 3 < n, 1))  // TILE_D3 ran
++#else
+       if (ncc + 3 < n)  // TILE_D3 ran
++#endif
+         asm volatile("; HKGEN FINAL_A3 wa=%0 wb=%1 la=%2 lb=%3" ::"v"(sga + wl), "v"(sgb + wl), "v"(sga + wls),
+                      "v"(sgb + wls) : HKGEN_CLOBBERS);
+       else

@@ -1,0 +1,26 @@
+pattern                   cycles/rep  (one wave per SIMD, median)
+WMMMM*64                      526.09
+WLMM*64                       517.39
+WLMMM*64                      524.34
+WLMMMM*64                     526.32
+WLLMM*64                     1024.43
+WLLMMM*64                    1024.43
+WLLMMMM*64                   1024.43
+WMMLMM*64                     526.34
+WMMLLMM*64                   1024.45
+WMMMML*64                     527.35
+WMMMMLL*64                   1011.30
+WMLMM*64                      524.35
+WMLLMM*64                    1024.44
+WLMLM*64                     1024.43
+WMLML*64                     1024.44
+WLMMMLMMM*32                  573.06
+WLLMMMWMMMM*32                525.33
+WLMMMWLMMM*32                 524.34
+WLEMM*64                      524.34
+WLLEMM*64                    1024.43
+WLPP*64                       593.27
+WLLPP*64                     1024.43
+WLPPP*64                      647.27
+WTMMM*64                      524.34
+WTTMMM*64                    1024.43

@@ -1,0 +1,115 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 05:50:38.094004855 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 05:50:57.894329928 +0000
+@@ -533,7 +533,7 @@
+                     help="one LDS load issued per N cycles at most in the model1 scheduler (fwdgen.DS_RATE, default 6)")
+     ap.add_argument("--lat", default=None,
+                     help="scheduler latencies KIND=N[,KIND=N...] for LAT and SLOT_LAT (e.g. WMMA=32,DS=330)")
+-    ap.add_argument("--resc", default="always", choices=("always", "branch", "branch2", "ool"),
++    ap.add_argument("--resc", default="always", choices=("always", "branch", "branch2", "ool", "pair"),
+                     help="O *= corr on every tile, under a per-q-tile wave-uniform branch (FlyDSL's _rescale_if), or "
+                          "the whole rescale decision and O *= corr out of line behind a not-taken branch")
+     ap.add_argument("--resc-threshold", type=float, default=None,
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 05:50:38.093981595 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 05:51:52.047736928 +0000
+@@ -342,6 +342,12 @@
+         n.vuses = set(range(o, o + 64)) | {m, int(f[6])} | ({int(f[7][1:])} if f[7].startswith("v") else set())
+         n.suses = {f[5], S_SEL} | ({f[7]} if f[7].startswith("s") else set())
+         return n
++    if kind == "RESC" and text.startswith("HKRESC2"):  # "HKRESC2 a b oa ob corra corrb scc": O(a), O(b) under one branch
++        _, _, _, oa, ob, ca, cb, sany = text.split()
++        n.vdefs = set(range(int(oa), int(oa) + 64)) | set(range(int(ob), int(ob) + 64))
++        n.vuses = n.vdefs | {int(ca), int(cb)}
++        n.suses = {sany}
++        return n
+     if kind == "RESC":  # "HKRESC i o corr sany": the block O(i) *= corr(i) under S_ANY[i]
+         _, _, o, corr, sany = text.split()
+         n.vdefs = set(range(int(o), int(o) + 64))
+@@ -811,7 +817,7 @@
+             add(f"v_cndmask_b32_e64 {s}, {s}, 0x{NEG_INF:x}, {sm}", "VALU", f"mask{i}")
+ 
+ 
+-def softmax_nodes(L, i, add, c_sgpr):
++def softmax_nodes(L, i, add, c_sgpr, resc=True):
+     """The softmax of q tile i up to P and O *= corr: scores in S(i), p into the leaves PR(i). c from the SGPR
+     pair S_C (c_sgpr: the packed fma then has two VGPR sources, not three) or from the VGPR pair L.cc."""
+     if "nosoft" in ABL:  # P = bf16(S): the PV operands only
+@@ -851,7 +857,7 @@
+             f"rare{i}")
+     else:
+         softmax_decision(L, i, add, c_sgpr, lmx, pl, lm, need, rmax, mfull, dm)
+-    _softmax_p(L, i, add, c_sgpr, S, mn, corr)
++    _softmax_p(L, i, add, c_sgpr, S, mn, corr, resc)
+ 
+ 
+ def softmax_decision(L, i, add, c_sgpr, lmx, pl, lm, need, rmax, mfull, dm):
+@@ -900,7 +906,7 @@
+             f"{b}:")
+ 
+ 
+-def _softmax_p(L, i, add, c_sgpr, S, mn, corr):
++def _softmax_p(L, i, add, c_sgpr, S, mn, corr, resc=True):
+     """p = exp2(fma(s, c, -m')) into the leaves, bf16 P, and O *= corr (unless the rare path does it)."""
+     # p = exp2(fma(s, c, -m')): packed fma in place, then exp into the leaves. An SGPR-pair source of a packed
+     # f32 op takes op_sel_hi 0 (the assembler rejects 1): both halves read c from s102
+@@ -920,9 +926,11 @@
+             j, e = 2 * kt + r // 4, 2 * (r % 4)
+             lo, hi = L.PR(i, 8 * j + e), L.PR(i, 8 * j + e + 1)
+             add(f"v_cvt_pk_bf16_f32 {vr(L.P(i, kt) + r)}, {vr(lo)}, {vr(hi)}", "VALU", f"cvt{i}")
++    if not resc:
++        return
+     if RESC == "branch":
+         add(f"HKRESC {i} {L.O(i, 0)} {corr} {S_ANY[i]}", "RESC", f"resc{i}")
+-    elif RESC == "branch2":  # the s_cmp as its own node; the RESC node reads its scc
++    elif RESC in ("branch2", "pair"):  # the s_cmp as its own node; the RESC node reads its scc
+         add(f"s_cmp_lg_u32 {S_ANY[i]}, 0", "SALU", f"resc{i}")
+         add(f"HKRESC {i} {L.O(i, 0)} {corr} scc", "RESC", f"resc{i}")
+     elif RESC == "always":
+@@ -940,9 +948,20 @@
+     return out
+ 
+ 
++def resc_pair_nodes(L, a, b, add):
++    """--resc pair: one branch for q tiles a, b: O(a) *= corr(a) and O(b) *= corr(b) when either needs it (the other's
++    corr is exactly 1 then: x * 1.0 is x, the same bits). S_ANY[a] |= S_ANY[b] sets scc (S_ANY[a] is dead after
++    its v_cndmask)."""
++    add(f"s_or_b32 {S_ANY[a]}, {S_ANY[a]}, {S_ANY[b]}", "SALU", f"resc{a}{b}")
++    add(f"HKRESC2 {a} {b} {L.O(a, 0)} {L.O(b, 0)} {L.corr[a]} {L.corr[b]} scc", "RESC", f"resc{a}{b}")
++
++
+ def resc_block(L, line, label):
+     """The expansion of a RESC pseudo-line: (lines ending the block before it, the conditional block's lines,
+     the label line starting the block after it)."""
++    if line.startswith("HKRESC2"):
++        _, a, b = line.split()[:3]
++        return ([f"s_cbranch_scc0 {label}"], resc_lines(L, int(a)) + resc_lines(L, int(b)), f"{label}:")
+     _, i, _, _, sany = line.split()
+     if sany == "scc":  # --resc branch2: the s_cmp is a scheduled node of its own
+         return ([f"s_cbranch_scc0 {label}"], resc_lines(L, int(i)), f"{label}:")
+@@ -996,8 +1015,10 @@
+ def prefix_nodes(L, add, c_sgpr):
+     """The tail of the previous tile: the softmax of q tiles 2, 3 (masked scores in S(2), S(3)), their sum
+     tree, then the PV WMMAs of all four q tiles (V of the previous tile), tags PV{i}p."""
+-    softmax_nodes(L, 2, add, c_sgpr)
+-    softmax_nodes(L, 3, add, c_sgpr)
++    softmax_nodes(L, 2, add, c_sgpr, resc=RESC != "pair")
++    softmax_nodes(L, 3, add, c_sgpr, resc=RESC != "pair")
++    if RESC == "pair" and "nosoft" not in ABL:
++        resc_pair_nodes(L, 2, 3, add)
+     sum_nodes(L, 2, add, (2, 3))
+     for i in range(QT):
+         for kt in range(2):
+@@ -1089,7 +1110,11 @@
+         if i == k:
+             mask_nodes(L, i, ops["dl"] if i == 0 else L.dl[i], add)
+         if i < 2:  # the rest of q tiles 2, 3 runs in the next region's prefix
+-            softmax_nodes(L, i, add, c_sgpr=True)
++            # --resc pair: q tile 0's RESC waits for q tile 1's (one branch for both); a body that skips q tile 0
++            # (TILE_D1) keeps q tile 1's own
++            softmax_nodes(L, i, add, c_sgpr=True, resc=RESC != "pair" or (i == 1 and first == 1))
++        if i == 1 and RESC == "pair" and first == 0 and "nosoft" not in ABL:
++            resc_pair_nodes(L, 0, 1, add)
+         if i == 1:
+             sum_nodes(L, 0, add, range(first, 2))
+     # the arrive, after every LDS read of the region and one LDS latency after the last (its s_wait_dscnt 0

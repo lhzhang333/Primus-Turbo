@@ -1,0 +1,55 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 06:04:25.526649983 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 06:05:40.230137901 +0000
+@@ -131,6 +131,16 @@
+ #ifndef HKGEN_ROWS64
+ #define HKGEN_ROWS64 0
+ #endif
++// HKGEN_TDMASM 1: the TILE_C loop's ring slots by inline asm (LLVM adds no s_wait_tensorcnt for them: the waits that
++// matter are explicit) from descriptors carried across the tiles: slot t + 3 is the block's tile min(t + 3, n - 1) with
++// all its 64 rows (ROWS64; past tile n - 1 a copy of it into the free stage, never read), so group 1 is the same for
++// every slot and group 0 advances by a constant per tile
++#ifndef HKGEN_TDMASM
++#define HKGEN_TDMASM 0
++#endif
++#if HKGEN_TDMASM && (!HKGEN_ROWS64 || HKGEN_INCDESC || HKGEN2 || HKGEN_FTILE)
++#error "HKGEN_TDMASM needs HKGEN_ROWS64 and the shell's plain TILE_C loop"
++#endif
+ #if HKGEN_FTILE && (HKGEN2 || HKGEN_INCDESC)
+ #error "HKGEN_FTILE needs the shell's tile loop and the per-tile descriptors"
+ #endif
+@@ -714,6 +724,13 @@
+       t = 1;
+     }
+ #endif
++#if HKGEN_TDMASM
++    const i32x8 g1a = tdm_g1(W0_A, (unsigned)NB, 128, NB, krow), g1b = tdm_g1(W0_B, (unsigned)NB, 64, NB, krow),
++                g1v = tdm_g1(W0_V, (unsigned)NB, 128, NB, vrow);
++    unsigned long long xk = gk0 + 2ull * (unsigned long long)(min(3, n - 1) * NB) * krow;
++    unsigned long long xv = gv0 + 2ull * (unsigned long long)(min(3, n - 1) * NB) * vrow;
++    unsigned xs = (unsigned)(((sb + 3) & (NSTG - 1)) * STG_B);
++#endif
+ #if HKGEN_INCDESC
+     // ring slot t + 3: its tile (or, past tile n - 1, a 1-row copy of it), K / V addresses and stage, carried
+     unsigned long long gki = gk0 + 2ull * (unsigned long long)(min(3, n - 1) * NB) * krow;
+@@ -721,7 +738,19 @@
+     unsigned sti = (unsigned)(((sb + 3) & (NSTG - 1)) * STG_B);
+ #endif
+     for (; t < ncc; ++t) {
+-#if HKGEN_INCDESC
++#if HKGEN_TDMASM
++      {
++        const unsigned st = lds0 + xs;
++        // one asm statement per op: a single group-0 quad is live at a time
++        asm volatile("tensor_load_to_lds %0, %1" ::"s"(tdm_g0(st, xk, cnt0)), "s"(g1a) : "memory");
++        asm volatile("tensor_load_to_lds %0, %1" ::"s"(tdm_g0(st + 256, xk + 256, cnt0)), "s"(g1b) : "memory");
++        asm volatile("tensor_load_to_lds %0, %1" ::"s"(tdm_g0(st + K_B, xv, cnt0)), "s"(g1v) : "memory");
++        const bool adv = t + 4 < n;
++        xk += adv ? 2ull * NB * krow : 0ull;
++        xv += adv ? 2ull * NB * vrow : 0ull;
++        xs = xs == (NSTG - 1) * STG_B ? 0u : xs + STG_B;
++      }
++#elif HKGEN_INCDESC
+       {
+         const bool real = t + 3 < n;
+         const unsigned rows = (unsigned)(Skv_ - (real ? t + 3 : n - 1) * NB);

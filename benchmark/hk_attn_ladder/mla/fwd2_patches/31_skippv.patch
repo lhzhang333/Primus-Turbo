@@ -1,0 +1,169 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 07:06:35.426777701 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 07:12:54.394242313 +0000
+@@ -141,6 +141,16 @@
+ #if HKGEN_TDMASM && (!HKGEN_ROWS64 || HKGEN_INCDESC || HKGEN2 || HKGEN_FTILE)
+ #error "HKGEN_TDMASM needs HKGEN_ROWS64 and the shell's plain TILE_C loop"
+ #endif
++// HKGEN_SKIPPV 1: a region's prefix skips the PV WMMAs (and, for q tile 2, the softmax) of the q tiles the previous
++// diagonal tile skipped (their P is 0: the WMMAs add exact zeros): TILE_D2 those of q tile 0, TILE_D3 of q tiles 0, 1,
++// and FINAL_A3 -- FINAL_A after TILE_D3 -- of q tiles 0..2. A block that ends before TILE_D3 (Sq % 256 != 0) ends with
++// the full FINAL_A
++#ifndef HKGEN_SKIPPV
++#define HKGEN_SKIPPV 0
++#endif
++#if HKGEN_SKIPPV && (!HKGEN_FMERGE || HKGEN2)
++#error "HKGEN_SKIPPV needs HKGEN_FMERGE and the shell's diagonal tiles"
++#endif
+ #if HKGEN_FTILE && (HKGEN2 || HKGEN_INCDESC)
+ #error "HKGEN_FTILE needs the shell's tile loop and the per-tile descriptors"
+ #endif
+@@ -892,6 +902,12 @@
+       const unsigned wl = (unsigned)((lane2 & 15) * XO + (lane2 >> 4) * 16);
+       const unsigned wls = (unsigned)(LSE_SLOT + 4 * lane2);
+ #if HKGEN_FMERGE && !HKGEN_REF
++#if HKGEN_SKIPPV
++      if (ncc + 3 < n)  // TILE_D3 ran
++        asm volatile("; HKGEN FINAL_A3 wa=%0 wb=%1 la=%2 lb=%3" ::"v"(sga + wl), "v"(sgb + wl), "v"(sga + wls),
++                     "v"(sgb + wls) : HKGEN_CLOBBERS);
++      else
++#endif
+       asm volatile("; HKGEN FINAL_A wa=%0 wb=%1 la=%2 lb=%3" ::"v"(sga + wl), "v"(sgb + wl), "v"(sga + wls),
+                    "v"(sgb + wls) : HKGEN_CLOBBERS);
+ #else
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 07:06:35.426840861 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 07:18:24.270454596 +0000
+@@ -590,6 +590,7 @@
+         DEFINES.append("HKGEN2=1")
+     G.ABL = set(a.abl)
+     G.BANK_TREE = a.bank_tree
++    G.SKIPPV = "HKGEN_SKIPPV=1" in DEFINES
+     global PAD
+     if a.pad:
+         kd, nn = a.pad.split(":")
+@@ -627,7 +628,7 @@
+     if "HKGEN_FTILE=1" in DEFINES:
+         want = (*want, "TILE_F")
+     if "HKGEN_FMERGE=1" in DEFINES:
+-        want = (*(x for x in want if not x.startswith("FINAL_")), "FINAL_A")
++        want = (*(x for x in want if not x.startswith("FINAL_")), "FINAL_A", *(("FINAL_A3",) if G.SKIPPV else ()))
+     if sorted(names) != sorted(want):
+         raise RuntimeError(f"markers {names}, want {list(want)}")
+     hi, wmma_trans, scalars = scan_shell(ins)
+@@ -697,8 +698,9 @@
+             if name == "TILE_F":
+                 o["qa"], o["qb"] = vfirst(ops["qa"]), vfirst(ops["qb"])
+             texts, cycles[name] = G.region_tile(L, o, k, ftile=name == "TILE_F")
+-        elif name == "FINAL_A":
+-            texts = G.region_final_all(L, {k: vfirst(ops[k]) for k in ("wa", "wb", "la", "lb")})
++        elif name in ("FINAL_A", "FINAL_A3"):
++            texts = G.region_final_all(L, {k: vfirst(ops[k]) for k in ("wa", "wb", "la", "lb")},
++                                       skip=3 if name == "FINAL_A3" else 0)
+             pre = ["\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"] + ["\tv_nop"] * 4
+             # the shell reads the staging back and rewrites the address VGPRs: every LDS op done, sources read
+             post = ["\ts_wait_dscnt 0x0", "\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"]
+@@ -751,9 +753,9 @@
+     if bad:
+         fail.append(f"verify_obj: {bad[:3]}")
+     # SGPR spills go to VGPR lanes (no memory traffic; the --loop shell spills around its LOOP marker): tolerated, as
+-    # by hkl.build and in the shipped dK / dV kernel; VGPR spills and scratch fail
++    # by hkl.build and in the shipped dK / dV kernel, and in a probe build (timing only); VGPR spills and scratch fail
+     if any(meta.get(k, 0) for k in ("vgpr_spill_count", "private_segment_fixed_size")) or (
+-        meta.get("sgpr_spill_count", 0) and not G.LOOP
++        meta.get("sgpr_spill_count", 0) and not (G.LOOP or probe)
+     ):
+         fail.append(f"spills / scratch: {meta}")
+ 
+@@ -925,7 +927,7 @@
+                 ok_base |= {L.kb, L.vb}
+             if name.startswith("TILE"):
+                 ok_base |= {vfirst(ops_of[name]["kb"]), vfirst(ops_of[name]["vb"])}
+-            if name == "FINAL_A":  # the staging stores only
++            if name in ("FINAL_A", "FINAL_A3"):  # the staging stores only
+                 ok_base = {vfirst(ops_of[name][k]) for k in ("wa", "wb", "la", "lb")}
+                 if not x.mn.startswith("ds_store"):
+                     fail.append(f"{name}: an LDS op other than the staging stores: {x.text.strip()}")
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 07:06:35.426857152 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 07:12:54.394880714 +0000
+@@ -112,6 +112,7 @@
+ # x * 1.0 changes no bit). A RESC node stands for the whole block in the schedule; build.py expands it (resc_block).
+ RESC = "always"
+ BANK_TREE = False  # build.py --bank-tree (see _sum_nodes)
++SKIPPV = False  # build.py, from -D HKGEN_SKIPPV=1 (k_mla_fwd.hip): prefixes skip the no-op PVs (prefix_nodes)
+ RESC_COST = 6  # modelled cycles of the s_cmp + s_cbranch of a RESC block that is not taken
+ # --resc branch2: the RESC block's s_cmp is a node of its own (SALU, writes scc), so the scheduler can issue it BR_LAT
+ # cycles ahead of the s_cbranch (ATT: s_cmp -> s_cbranch 9 cycles; a taken branch costs ~25 more)
+@@ -1014,15 +1015,19 @@
+         add(f"v_fma_f32 {vr(L.d[qi])}, {vr(L.corr[qi])}, {vr(L.d[qi])}, {vr(tot)}", "VALU", f"sum{qi}")
+ 
+ 
+-def prefix_nodes(L, add, c_sgpr):
++def prefix_nodes(L, add, c_sgpr, skip=0):
+     """The tail of the previous tile: the softmax of q tiles 2, 3 (masked scores in S(2), S(3)), their sum
+-    tree, then the PV WMMAs of all four q tiles (V of the previous tile), tags PV{i}p."""
+-    softmax_nodes(L, 2, add, c_sgpr, resc=RESC != "pair")
+-    softmax_nodes(L, 3, add, c_sgpr, resc=RESC != "pair")
+-    if RESC == "pair" and "nosoft" not in ABL:
++    tree, then the PV WMMAs of all four q tiles (V of the previous tile), tags PV{i}p. skip (SKIPPV): the previous
++    tile skipped q tiles 0 .. skip - 1 (P 0, S(2) -inf): none of their PVs, no softmax of q tile 2 (q tile 3 then
++    has its own RESC branch; the sum tree's q tile 2 half adds stale leaves into nothing)."""
++    soft = [i for i in (2, 3) if i >= skip]
++    pair = RESC == "pair" and len(soft) == 2
++    for i in soft:
++        softmax_nodes(L, i, add, c_sgpr, resc=RESC != "pair" or not pair)
++    if pair and "nosoft" not in ABL:
+         resc_pair_nodes(L, 2, 3, add)
+-    sum_nodes(L, 2, add, (2, 3))
+-    for i in range(QT):
++    sum_nodes(L, 2, add, tuple(soft))
++    for i in range(skip, QT):
+         for kt in range(2):
+             for dt in range(NDT):
+                 o = vr(L.O(i, dt), 8)
+@@ -1081,9 +1086,13 @@
+             loads += [add(q_load(L, 0, ks, h), "DS", f"Q0.{ks}.{h}") for ks in range(NKS) for h in range(2)]
+     if ftile:  # the resident Q fragments of q tiles 1, 2 (INIT's)
+         loads += [add(q_load(L, i, ks, h), "DS", f"Q{i}.{ks}.{h}") for i in (1, 2) for ks in range(NKS) for h in range(2)]
+-    else:
+-        prefix_nodes(L, add, c_sgpr=True)
+-    for i in range(first):  # the next prefix must be a no-op for the q tiles this body skips
++    else:  # SKIPPV: TILE_Dk's prefix skips the q tiles TILE_D(k - 1) skipped
++        prefix_nodes(L, add, c_sgpr=True, skip=max(first - 1, 0) if SKIPPV else 0)
++    # the next prefix must be a no-op for the q tiles this body skips. SKIPPV: the next diagonal tile's prefix skips
++    # them, only a block's last region FINAL_A (after TILE_D1 / D2) reads the P of q tile first - 1 (the P of the
++    # others are 0 since an earlier diagonal tile), FINAL_A3 (always after TILE_D3) none
++    zero = range(first) if not SKIPPV else ((first - 1,) if first in (1, 2) else ())
++    for i in zero:
+         if i < 2:
+             for kt in range(2):
+                 for e in range(8):
+@@ -1143,7 +1152,7 @@
+     # one VALU class in flight): the V reads go after the last prefix PV WMMA, the Q(3) reads after the last
+     # QK(0) WMMA, so each group waits once instead of once per buffer slice
+     last = {nd.tag: nd.idx for nd in nodes if nd.kind == "WMMA"}
+-    lpv = max(last[f"PV{i}p"] for i in range(QT)) if not ftile else None
++    lpv = max(last[t] for t in (f"PV{i}p" for i in range(QT)) if t in last) if not ftile else None
+     for nd in loads if GROUP_EDGES else ():
+         if nd.tag.startswith("V") and lpv is not None:
+             add_order(nodes, lpv, nd.idx)
+@@ -1214,14 +1223,15 @@
+     return out
+ 
+ 
+-def region_final_all(L, ops):
++def region_final_all(L, ops, skip=0):
+     """FINAL_A (HKGEN_FMERGE; scheduled): the last tile's prefix, then per q tile i: 1 / d (d > 0, else 0), out =
+     bf16(O(i) / d) into the dead K registers (K + 32 i), lse = (m + log2 d) ln 2, and their ds_stores into the
+     staging slot: out rows at (i < 2 ? wa : wb) + (i & 1) 4 SQT + 32 dt, lse at (i < 2 ? la : lb) + (i & 1) 4 SQT.
+-    Per q tile its own scratch (12 VGPRs of the dead Q buffers) and SGPRs, so the four overlap."""
++    Per q tile its own scratch (12 VGPRs of the dead Q buffers) and SGPRs, so the four overlap. skip: FINAL_A3's
++    prefix skips q tiles 0..2 (prefix_nodes)."""
+     nodes, add = node_list()
+     add(f"s_mov_b32 {S_SEL}, 0x{SEL_LO:x}", "SALU", "sel")
+-    prefix_nodes(L, add, c_sgpr=False)
++    prefix_nodes(L, add, c_sgpr=False, skip=skip)
+     for i in range(QT):
+         d, m = L.d[i], L.m[i]
+         a, b, rc, e1, q, e2, sh, sub, x, lg, inv = (L.qbuf[0] + 12 * i + k for k in range(11))  # inv: even (pairs)

@@ -1,0 +1,21 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 05:45:48.836946864 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 05:45:48.851799181 +0000
+@@ -529,6 +529,8 @@
+     ap.add_argument("--pad-start", type=int, default=0, help="diagnostic: N dead s_nop at the kernel start")
+     ap.add_argument("--pad-end", type=int, default=0, help="diagnostic: N dead s_nop at the kernel end")
+     ap.add_argument("--ds-max", type=int, default=None, help="LDS loads in flight at most (fwdgen.DS_MAX, default 56)")
++    ap.add_argument("--ds-rate", type=int, default=None,
++                    help="one LDS load issued per N cycles at most in the model1 scheduler (fwdgen.DS_RATE, default 6)")
+     ap.add_argument("--lat", default=None,
+                     help="scheduler latencies KIND=N[,KIND=N...] for LAT and SLOT_LAT (e.g. WMMA=32,DS=330)")
+     ap.add_argument("--resc", default="always", choices=("always", "branch", "branch2", "ool"),
+@@ -581,6 +583,8 @@
+         if a.issue == "m1ds":
+             G.DS_RATE = hw[1]
+         G.LAT["DS"] = G.DS_LAT
++    if a.ds_rate is not None:
++        G.DS_RATE = a.ds_rate
+     G.PREFETCH = a.kprefetch
+     if a.loop:
+         DEFINES.append("HKGEN2=1")

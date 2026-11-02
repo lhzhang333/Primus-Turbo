@@ -1,0 +1,62 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 07:57:17.193218913 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 07:57:17.209076272 +0000
+@@ -532,6 +532,8 @@
+     ap.add_argument("--pad-start", type=int, default=0, help="diagnostic: N dead s_nop at the kernel start")
+     ap.add_argument("--pad-end", type=int, default=0, help="diagnostic: N dead s_nop at the kernel end")
+     ap.add_argument("--ds-max", type=int, default=None, help="LDS loads in flight at most (fwdgen.DS_MAX, default 56)")
++    ap.add_argument("--ds-pair", type=int, default=0,
++                    help="m1ds: LDS loads in back-to-back pairs (one HW_DS_BLOCK for both), N cycles between pair starts")
+     ap.add_argument("--ds-rate", type=int, default=None,
+                     help="one LDS load issued per N cycles at most in the model1 scheduler (fwdgen.DS_RATE, default 6)")
+     ap.add_argument("--lat", default=None,
+@@ -588,6 +590,7 @@
+         G.LAT["DS"] = G.DS_LAT
+     if a.ds_rate is not None:
+         G.DS_RATE = a.ds_rate
++    G.DS_PAIR = a.ds_pair
+     G.PREFETCH = a.kprefetch
+     if a.loop:
+         DEFINES.append("HKGEN2=1")
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 07:57:17.193195893 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 07:57:17.208911162 +0000
+@@ -101,6 +101,7 @@
+ ISSUE = "model1"  # "m1ds": model1, but an LDS op holds the next non-LDS issue (WMMA included) HW_DS_BLOCK cycles, and
+                   # an LDS op that would push a ready WMMA past its cadence waits
+ HW_DS_BLOCK = 4
++DS_PAIR = 0  # build.py --ds-pair N (m1ds): two LDS loads back to back (one HW_DS_BLOCK for both), pairs N cycles apart
+ HW_DS_GAP = 4
+ HW_RESC = 30
+ HW_WMMA = 8
+@@ -521,6 +522,7 @@
+     out = []
+     t, last_w, wk, trans_at, perm_busy, salu_free, ds_next, done = 0, -100, 0, -100, -1, 0, 0, 0
+     ds_block = 0
++    pair_t = -100  # DS_PAIR: the cycle of the open pair's first load
+     mreq = [msb_req(nd) for nd in nodes] if MSB_BUCKET else None
+     mode = [None, None, None, None]
+ 
+@@ -540,7 +542,8 @@
+             return o >= 8 and t != trans_at + 1 and t > perm_busy
+         if k == "DS":  # loads still in flight: not retired by a consumer and not yet complete in the model
+             inflight = sum(1 for p in issued_ds[retired_ds:] if ds_done[p] > t)
+-            return o != 0 and t >= ds_next and inflight < DS_MAX
++            rate = t >= ds_next or (DS_PAIR and t == pair_t + 1)  # DS_PAIR: a pair's second load, the next cycle
++            return o != 0 and rate and inflight < DS_MAX
+         if k in ("SALU", "RESC", "RARE", "TDM", "BARW"):
+             return o != 0 and t >= salu_free and (k != "RESC" or t > perm_busy)
+         return o != 0
+@@ -588,7 +591,11 @@
+             last_done = max(t + DS_LAT, last_done)
+             ds_done[pick] = last_done
+             issued_ds.append(pick)
+-            ds_next = t + DS_RATE
++            if DS_PAIR and t == pair_t + 1:  # the pair's second load: the rate counts from its first
++                pair_t = -100
++            else:
++                pair_t = t
++                ds_next = t + (DS_PAIR or DS_RATE)
+             ds_block = t + HW_DS_BLOCK
+         elif k == "BAR":
+             retired_ds = len(issued_ds)

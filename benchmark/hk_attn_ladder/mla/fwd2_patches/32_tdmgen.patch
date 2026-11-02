@@ -1,0 +1,184 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 07:33:53.242760074 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 07:38:08.869595948 +0000
+@@ -151,6 +151,15 @@
+ #if HKGEN_SKIPPV && (!HKGEN_FMERGE || HKGEN2)
+ #error "HKGEN_SKIPPV needs HKGEN_FMERGE and the shell's diagonal tiles"
+ #endif
++// HKGEN_TDMGEN 1 (on HKGEN_TDMASM): the TILE_C region issues ring slot t + 3 itself, scheduled into its WMMA stream:
++// the three group-0 descriptors (K columns 0..127 and 128..191, V) are carried across the tiles in SGPR quads that
++// the region issues and then advances (global address += one tile while t < n - 4, LDS address to the next stage)
++#ifndef HKGEN_TDMGEN
++#define HKGEN_TDMGEN 0
++#endif
++#if HKGEN_TDMGEN && !HKGEN_TDMASM
++#error "HKGEN_TDMGEN needs HKGEN_TDMASM"
++#endif
+ #if HKGEN_FTILE && (HKGEN2 || HKGEN_INCDESC)
+ #error "HKGEN_FTILE needs the shell's tile loop and the per-tile descriptors"
+ #endif
+@@ -740,6 +749,12 @@
+     unsigned long long xk = gk0 + 2ull * (unsigned long long)(min(3, n - 1) * NB) * krow;
+     unsigned long long xv = gv0 + 2ull * (unsigned long long)(min(3, n - 1) * NB) * vrow;
+     unsigned xs = (unsigned)(((sb + 3) & (NSTG - 1)) * STG_B);
++#if HKGEN_TDMGEN && !HKGEN_REF
++    i32x4 dqk = tdm_g0(lds0 + xs, xk, cnt0), dqb = tdm_g0(lds0 + xs + 256, xk + 256, cnt0),
++          dqv = tdm_g0(lds0 + xs + K_B, xv, cnt0);
++    const int n4 = n - 4;
++    const unsigned l3 = lds0 + (unsigned)((NSTG - 1) * STG_B);
++#endif
+ #endif
+ #if HKGEN_INCDESC
+     // ring slot t + 3: its tile (or, past tile n - 1, a 1-row copy of it), K / V addresses and stage, carried
+@@ -748,7 +763,7 @@
+     unsigned sti = (unsigned)(((sb + 3) & (NSTG - 1)) * STG_B);
+ #endif
+     for (; t < ncc; ++t) {
+-#if HKGEN_TDMASM
++#if HKGEN_TDMASM && (!HKGEN_TDMGEN || HKGEN_REF)
+       {
+         const unsigned st = lds0 + xs;
+         // one asm statement per op: a single group-0 quad is live at a time
+@@ -760,6 +775,8 @@
+         xv += adv ? 2ull * NB * vrow : 0ull;
+         xs = xs == (NSTG - 1) * STG_B ? 0u : xs + STG_B;
+       }
++#elif HKGEN_TDMASM
++      // HKGEN_TDMGEN: the region issues the slot
+ #elif HKGEN_INCDESC
+       {
+         const bool real = t + 3 < n;
+@@ -783,6 +800,12 @@
+ #endif
+ #if HKGEN_REF
+       tile(st + k_lane, st + K_B + v_lane, 0, -1);
++#elif HKGEN_TDMGEN
++      asm volatile("; HKGEN TILE_C kb=%3 vb=%4 c2=%5 qk=%0 qb=%1 qv=%2 g1a=%6 g1b=%7 g1v=%8 t=%9 n4=%10 l3=%11"
++                   : "+s"(dqk), "+s"(dqb), "+s"(dqv)
++                   : "v"(st + k_lane), "v"(st + K_B + v_lane), "s"(c2), "s"(g1a), "s"(g1b), "s"(g1v), "s"(t), "s"(n4),
++                     "s"(l3)
++                   : HKGEN_CLOBBERS);
+ #else
+       asm volatile("; HKGEN TILE_C kb=%0 vb=%1 c2=%2" ::"v"(st + k_lane), "v"(st + K_B + v_lane), "s"(c2)
+                    : HKGEN_CLOBBERS);
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 07:33:53.242850644 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 07:38:08.870036899 +0000
+@@ -87,6 +87,9 @@
+     "s_mov_b32",
+     "s_cmp_lg_u32",
+     "s_cselect_b32",
++    "s_cselect_b64",  # TILE_C (HKGEN_TDMGEN): the ring slot's address step
++    "s_lshl_b64",
++    "s_cmp_eq_u32",
+     "s_cbranch_scc0",
+     "s_cbranch_scc1",
+     "s_branch",
+@@ -591,6 +594,7 @@
+     G.ABL = set(a.abl)
+     G.BANK_TREE = a.bank_tree
+     G.SKIPPV = "HKGEN_SKIPPV=1" in DEFINES
++    G.TDMGEN = "HKGEN_TDMGEN=1" in DEFINES
+     global PAD
+     if a.pad:
+         kd, nn = a.pad.split(":")
+@@ -697,6 +701,8 @@
+                 k, o["dl"] = int(name[-1]), vfirst(ops["dl"])
+             if name == "TILE_F":
+                 o["qa"], o["qb"] = vfirst(ops["qa"]), vfirst(ops["qb"])
++            if name == "TILE_C" and G.TDMGEN:
++                o.update({x: ops[x] for x in ("qk", "qb", "qv", "g1a", "g1b", "g1v", "t", "n4", "l3")})
+             texts, cycles[name] = G.region_tile(L, o, k, ftile=name == "TILE_F")
+         elif name in ("FINAL_A", "FINAL_A3"):
+             texts = G.region_final_all(L, {k: vfirst(ops[k]) for k in ("wa", "wb", "la", "lb")},
+@@ -915,7 +921,10 @@
+         if set(x.defs) - gen_regs - out_regs.get(name, set()):
+             fail.append(f"{name}: writes VGPRs outside the generated range: {x.text.strip()}")
+         sd, _ = sgpr_defs_uses(x)
+-        if set(sd) - (G.LOOP_CLOBBERED if name == "LOOP" else G.CLOBBERED):
++        s_ok = G.LOOP_CLOBBERED if name == "LOOP" else G.CLOBBERED
++        if name == "TILE_C" and G.TDMGEN:  # and its in-out descriptor quads
++            s_ok = s_ok | {f"s{G._sbase(ops_of[name][q]) + j}" for q in ("qk", "qb", "qv") for j in range(4)}
++        if set(sd) - s_ok:
+             fail.append(f"{name}: writes scalars outside the clobbered set: {sd} {x.text.strip()}")
+         if x.mn.startswith("ds_"):
+             st["ds"] += 1
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 07:33:53.242824514 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 07:38:39.094760870 +0000
+@@ -113,6 +113,8 @@
+ RESC = "always"
+ BANK_TREE = False  # build.py --bank-tree (see _sum_nodes)
+ SKIPPV = False  # build.py, from -D HKGEN_SKIPPV=1 (k_mla_fwd.hip): prefixes skip the no-op PVs (prefix_nodes)
++TDMGEN = False  # build.py, from -D HKGEN_TDMGEN=1: TILE_C issues and advances its ring slot (tdm_nodes)
++TDM_SLAT = 10  # modelled cycles from a SALU write of an SGPR to a TDM op reading it (ATT: ~9)
+ RESC_COST = 6  # modelled cycles of the s_cmp + s_cbranch of a RESC block that is not taken
+ # --resc branch2: the RESC block's s_cmp is a node of its own (SALU, writes scc), so the scheduler can issue it BR_LAT
+ # cycles ahead of the s_cbranch (ATT: s_cmp -> s_cbranch 9 cycles; a taken branch costs ~25 more)
+@@ -364,7 +366,7 @@
+     elif mn.startswith("s_cmp"):
+         n.sdefs, n.suses = {"scc"}, set(_sregs(ops[0])) | set(_sregs(ops[1]))
+     elif mn.startswith("s_cselect"):
+-        n.sdefs, n.suses = set(_sregs(ops[0])), {"scc"}
++        n.sdefs, n.suses = set(_sregs(ops[0])), {"scc"} | {r for o in ops[1:] for r in _sregs(o)}
+     elif mn.startswith("s_mov"):
+         n.sdefs, n.suses = set(_sregs(ops[0])), set(_sregs(ops[1]))
+     elif mn.startswith("tensor_load_to_lds"):
+@@ -415,6 +417,8 @@
+                     lat = SGPR_LAT
+                 if r == "scc" and pk == "SALU" and n.kind == "RESC":
+                     lat = BR_LAT
++                if n.kind == "TDM" and pk == "SALU":
++                    lat = max(lat, TDM_SLAT)
+                 preds[p] = max(preds.get(p, 0), lat)
+         for r in list(n.vdefs) + list(n.sdefs):
+             k = _key(r)
+@@ -1072,6 +1076,8 @@
+             add(f"s_mov_b32 {r}, {ops['c2']}", "SALU", "c2")
+     else:  # LOOP: S_SEL / S_C set once in the prologue; the tile's scalars, TDM ops and fragment bases first
+         pre(add)
++    if TDMGEN and k is None and not ftile and pre is None:
++        tdm_nodes(ops, add)
+     # the K (k-step major: FlyDSL's issue order) and Q(0) reads first; the prefix reads neither K nor qbuf[0]
+     # (--kprefetch: the previous tile, or the LOOP prologue, read them)
+     loads = []
+@@ -1164,6 +1170,39 @@
+     return nodes
+ 
+ 
++def _sbase(t):
++    """First SGPR of an SGPR-tuple operand (s[40:43])."""
++    m = re.fullmatch(r"s\[(\d+):(\d+)\]", t.strip())
++    if not m:
++        raise ValueError(f"not an SGPR tuple: {t}")
++    return int(m.group(1))
++
++
++def tdm_nodes(ops, add):
++    """TDMGEN: TILE_C issues ring slot t + 3 from the carried group-0 quads qk, qb, qv (K columns 0..127, 128..191, V)
++    and the loop-invariant group-1 octets g1a, g1b, g1v, then advances the quads: global address += one tile (64 rows
++    of the row stride in elements that group 1 holds in words 5, 6: stride << 7 bytes) while t < n4 (= n - 4; past it
++    the slot is a copy of the block's last tile), LDS address += one stage, from the last stage (l3) back to the
++    first. Scratch: s99 (the stage step) and s[100:101] (the address step): S_MASK, which TILE_C does not use."""
++    qk, qb, qv = (_sbase(ops[x]) for x in ("qk", "qb", "qv"))
++    for q, g in ((qk, "g1a"), (qb, "g1b"), (qv, "g1v")):
++        add(f"tensor_load_to_lds s[{q}:{q + 3}], {ops[g]}", "TDM", "tdm")
++    for g, qs in (("g1a", (qk, qb)), ("g1v", (qv,))):
++        s5 = _sbase(ops[g]) + 5  # odd: copied to the aligned pair first
++        add(f"s_mov_b32 s100, s{s5}", "SALU", "tdmadv")
++        add(f"s_mov_b32 s101, s{s5 + 1}", "SALU", "tdmadv")
++        add("s_lshl_b64 s[100:101], s[100:101], 7", "SALU", "tdmadv")
++        add(f"s_cmp_lt_i32 {ops['t']}, {ops['n4']}", "SALU", "tdmadv")
++        add("s_cselect_b64 s[100:101], s[100:101], 0", "SALU", "tdmadv")
++        for q in qs:
++            add(f"s_add_nc_u64 s[{q + 2}:{q + 3}], s[{q + 2}:{q + 3}], s[100:101]", "SALU", "tdmadv")
++    add(f"s_mov_b32 s99, 0x{STG_B:x}", "SALU", "tdmadv")
++    add(f"s_cmp_eq_u32 s{qk + 1}, {ops['l3']}", "SALU", "tdmadv")
++    add(f"s_cselect_b32 s99, 0x{(-3 * STG_B) & 0xFFFFFFFF:x}, s99", "SALU", "tdmadv")
++    for q in (qk, qb, qv):
++        add(f"s_add_co_i32 s{q + 1}, s{q + 1}, s99", "SALU", "tdmadv")
++
++
+ def region_tile(L, ops, k=None, ftile=False):
+     """(lines, modelled cycles) of TILE_C (k None), TILE_Dk or TILE_F (ftile)."""
+     order, cycles = schedule(tile_nodes(L, ops, k, ftile=ftile))

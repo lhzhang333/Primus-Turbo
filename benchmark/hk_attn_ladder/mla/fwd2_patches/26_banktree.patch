@@ -1,0 +1,70 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 05:39:58.951631112 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 05:40:35.030377193 +0000
+@@ -543,6 +543,8 @@
+                     help="timing-only probe of marginal issue costs: KIND:N adds N redundant instructions spread over "
+                          "each TILE region (msb: every s_set_vgpr_msb repeated N times; salu: s_mov_b32 s101, s101; "
+                          "valu: v_mov_b32 of a softmax scratch VGPR onto itself; nop: s_nop 0)")
++    ap.add_argument("--bank-tree", action="store_true",
++                    help="sum tree partial sums in the leaf whose VGPR banks differ from the other operands'")
+     ap.add_argument("--abl", action="append", default=[], choices=("nosoft", "nolds"),
+                     help="timing-only ablation (wrong results)")
+     ap.add_argument("-D", dest="defines", action="append", default=[],
+@@ -583,6 +585,7 @@
+     if a.loop:
+         DEFINES.append("HKGEN2=1")
+     G.ABL = set(a.abl)
++    G.BANK_TREE = a.bank_tree
+     global PAD
+     if a.pad:
+         kd, nn = a.pad.split(":")
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 05:39:58.951752622 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 05:40:35.030177853 +0000
+@@ -111,6 +111,7 @@
+ # wave-uniform branch around its 32 v_pk_mul (FlyDSL's _rescale_if: taken only when S_ANY[i] says m moved; skipping
+ # x * 1.0 changes no bit). A RESC node stands for the whole block in the schedule; build.py expands it (resc_block).
+ RESC = "always"
++BANK_TREE = False  # build.py --bank-tree (see _sum_nodes)
+ RESC_COST = 6  # modelled cycles of the s_cmp + s_cbranch of a RESC block that is not taken
+ # --resc branch2: the RESC block's s_cmp is a node of its own (SALU, writes scc), so the scheduler can issue it BR_LAT
+ # cycles ahead of the s_cbranch (ATT: s_cmp -> s_cbranch 9 cycles; a taken branch costs ~25 more)
+@@ -954,16 +955,34 @@
+     _sum_nodes(L, i0, add, upd)
+ 
+ 
++def _bank_pair(r):
++    """The two VGPR banks (register % 4) a 64-bit pair starting at r reads."""
++    return {r % 4, (r + 1) % 4}
++
++
+ def _sum_nodes(L, i0, add, upd):
+     """FlyDSL's sum tree over the 32 leaves of q tiles (i0, i0 + 1), packed (low half i0), in place in the
+-    leaves (the cvts have read them); then d of the q tiles in upd (one outside it has stale leaves here)."""
++    leaves (the cvts have read them); then d of the q tiles in upd (one outside it has stale leaves here).
++    --bank-tree: a group's partial sum goes to the leaf register whose VGPR banks differ from the other members'
++    (a + b computed as b + a into b, then + c: the same additions, IEEE-commutative, so the same bits): an
++    accumulate-form v_pk_add whose other source shares a bank with the accumulated pair costs a cycle."""
+     leaves = [L.pr + 2 * x for x in range(32)]
+     while len(leaves) > 1:  # (a + b) + c per group of 3; a trailing pair a + b, a trailing single passed on
+         groups = [leaves[a : a + 3] for a in range(0, len(leaves), 3)]
++        nxt = []
+         for g in groups:
+-            for y in g[1:]:
+-                add(f"v_pk_add_f32 {vr(g[0], 2)}, {vr(g[0], 2)}, {vr(y, 2)}", "VALU", f"sum{i0}")
+-        leaves = [g[0] for g in groups]
++            acc = g[0]
++            if BANK_TREE and len(g) >= 2:
++                # the accumulator must be one of the first two (the first add is a + b); prefer the one whose banks
++                # differ from every other member, then the second (keeps the partial sums' banks alternating)
++                def clash(c):
++                    return sum(1 for y in g if y != c and _bank_pair(y) & _bank_pair(c))
++                acc = min((g[1], g[0]), key=clash)
++            others = [y for y in g if y != acc]
++            for y in others:
++                add(f"v_pk_add_f32 {vr(acc, 2)}, {vr(acc, 2)}, {vr(y, 2)}", "VALU", f"sum{i0}")
++            nxt.append(acc)
++        leaves = nxt
+     for x in range(2):
+         qi = i0 + x
+         if qi not in upd:
