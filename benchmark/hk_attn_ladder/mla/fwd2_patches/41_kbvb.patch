@@ -1,0 +1,107 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 09:34:29.420882427 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 09:36:02.636676749 +0000
+@@ -176,6 +176,14 @@
+ #ifndef HKGEN_TDMST
+ #define HKGEN_TDMST 0
+ #endif
++// HKGEN_KBVB 1 (on HKGEN_TDMGEN): TILE_C's K / V fragment bases are in-out operands the region advances to the next
++// stage, so the shell runs no VALU between two TILE_C regions (LLVM then drains no WMMA before the next one)
++#ifndef HKGEN_KBVB
++#define HKGEN_KBVB 0
++#endif
++#if HKGEN_KBVB && !HKGEN_TDMGEN
++#error "HKGEN_KBVB needs HKGEN_TDMGEN"
++#endif
+ #if HKGEN_D3F && !HKGEN_SKIPPV
+ #error "HKGEN_D3F needs HKGEN_SKIPPV"
+ #endif
+@@ -778,6 +786,13 @@
+           dqv = tdm_g0(lds0 + xs + K_B, xv, cnt0);
+     const int n4 = n - 4;
+     const unsigned l3 = lds0 + (unsigned)((NSTG - 1) * STG_B);
++#if HKGEN_KBVB
++    unsigned kbv = lds0 + (unsigned)(((sb + t) & (NSTG - 1)) * STG_B) + k_lane;  // tile t's fragment bases
++    unsigned vbv = kbv - k_lane + (unsigned)K_B + v_lane;
++    // an asm def of both: LLVM waits for the VALU above here, once, and not at the loop head (it takes asm outputs as
++    // ready, so the loop's back edge brings no pending VALU write)
++    asm volatile("" : "+v"(kbv), "+v"(vbv));
++#endif
+ #endif
+ #endif
+ #if HKGEN_INCDESC
+@@ -824,6 +839,12 @@
+ #endif
+ #if HKGEN_REF
+       tile(st + k_lane, st + K_B + v_lane, 0, -1);
++#elif HKGEN_TDMGEN && HKGEN_KBVB
++      (void)st;
++      asm volatile("; HKGEN TILE_C kb=%3 vb=%4 c2=%5 qk=%0 qb=%1 qv=%2 g1a=%6 g1b=%7 g1v=%8 t=%9 n4=%10 l3=%11"
++                   : "+s"(dqk), "+s"(dqb), "+s"(dqv), "+v"(kbv), "+v"(vbv)
++                   : "s"(c2), "s"(g1a), "s"(g1b), "s"(g1v), "s"(t), "s"(n4), "s"(l3)
++                   : HKGEN_CLOBBERS);
+ #elif HKGEN_TDMGEN
+       asm volatile("; HKGEN TILE_C kb=%3 vb=%4 c2=%5 qk=%0 qb=%1 qv=%2 g1a=%6 g1b=%7 g1v=%8 t=%9 n4=%10 l3=%11"
+                    : "+s"(dqk), "+s"(dqb), "+s"(dqv)
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 09:34:29.420972347 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 09:35:04.395105929 +0000
+@@ -599,6 +599,7 @@
+     G.BANK_TREE = a.bank_tree
+     G.QRES = a.qres
+     G.D3F = "HKGEN_D3F=1" in DEFINES
++    G.KBVB = "HKGEN_KBVB=1" in DEFINES
+     if a.qres and a.plan != 2:
+         raise SystemExit("--qres needs --plan 2")
+     G.SKIPPV = "HKGEN_SKIPPV=1" in DEFINES
+@@ -934,7 +935,10 @@
+             fail.append(f"{name}: instruction outside the whitelist: {x.text.strip()}")
+         if mn == "s_set_vgpr_msb":
+             msb_mode[name] = int(x.ops[0], 0) & 0xFF
+-        if set(x.defs) - gen_regs - out_regs.get(name, set()):
++        v_ok = set()
++        if name == "TILE_C" and G.KBVB:  # its in-out K / V fragment bases
++            v_ok = {vfirst(ops_of[name]["kb"]), vfirst(ops_of[name]["vb"])}
++        if set(x.defs) - gen_regs - out_regs.get(name, set()) - v_ok:
+             fail.append(f"{name}: writes VGPRs outside the generated range: {x.text.strip()}")
+         sd, _ = sgpr_defs_uses(x)
+         s_ok = G.LOOP_CLOBBERED if name == "LOOP" else G.CLOBBERED
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 09:34:29.420945217 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 09:35:28.971077601 +0000
+@@ -120,6 +120,7 @@
+ # (dead until the q tile's exps), (peer sum, total) in leaves the sum tree has consumed, m / d in the unused high
+ # halves of the (m', unused) / (corr, unused) pairs, the mask bounds dl in block 0
+ QRES = False
++KBVB = False  # build.py, from -D HKGEN_KBVB=1: TILE_C advances its in-out K / V fragment bases (tdm_nodes)
+ D3F = False  # build.py, from -D HKGEN_D3F=1: TILE_D3F = TILE_D3 + FINAL's math (fin_nodes), FINAL_ST its stores
+ TDM_SLAT = 10  # modelled cycles from a SALU write of an SGPR to a TDM op reading it (ATT: ~9)
+ RESC_COST = 6  # modelled cycles of the s_cmp + s_cbranch of a RESC block that is not taken
+@@ -1176,6 +1177,8 @@
+             sum_nodes(L, 0, add, range(first, 2))
+     # the arrive, after every LDS read of the region and one LDS latency after the last (its s_wait_dscnt 0
+     # then does not stall); no LDS read follows it, as the next block's Q may then overwrite the staging area
++    if KBVB and TDMGEN and k is None and not ftile and pre is None:
++        kbvb_nodes(ops, add)
+     bar = add("s_barrier_signal -1", "BAR", "arrive")
+     if fin:  # D3F: the last tile's own prefix (P(3) of this tile's S(3), V) and FINAL's math, no LDS op
+         fin_nodes(L, add)
+@@ -1245,6 +1248,18 @@
+         add(f"s_add_co_i32 s{q + 1}, s{q + 1}, s99", "SALU", "tdmadv")
+ 
+ 
++def kbvb_nodes(ops, add):
++    """KBVB (program order after the tile's last LDS read and tdm_nodes): the next tile's K / V fragment bases, one
++    stage on, three back after the last stage: tile t's stage is the advanced slot's (t + 4 = t mod 4), so the last
++    stage is qk1 == l3 after tdm_nodes' advance."""
++    qk = _sbase(ops["qk"])
++    add(f"s_mov_b32 s100, 0x{STG_B:x}", "SALU", "kbvb")
++    add(f"s_cmp_eq_u32 s{qk + 1}, {ops['l3']}", "SALU", "kbvb")
++    add(f"s_cselect_b32 s100, 0x{(-3 * STG_B) & 0xFFFFFFFF:x}, s100", "SALU", "kbvb")
++    add(f"v_add_nc_u32_e32 {vr(ops['kb'])}, s100, {vr(ops['kb'])}", "VALU", "kbvb")
++    add(f"v_add_nc_u32_e32 {vr(ops['vb'])}, s100, {vr(ops['vb'])}", "VALU", "kbvb")
++
++
+ def fin_nodes(L, add):
+     """D3F: TILE_D3's own tail (prefix_nodes with skip 3, c from the SGPR pair, WMMA tags PV{i}f) and FINAL's math per
+     q tile: out = bf16(O / d) into the dead K registers (K + 32 i), lse into qbuf[0] + 12 i + 9 (FINAL_ST stores both

@@ -5906,6 +5906,220 @@
    },
    "feature": "f37j + O written by TDM stores from the staging slots (no read-back + buffer_store phase)",
    "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f41_null",
+   "parent": "f40_null",
+   "patch": "fwd2_patches/41_kbvb.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=28,VALU=6"
+     ],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "c29ac43ff14eed04d201fb458c0064ce5771ed25678e262524e4a48dfe364553"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 41 (HKGEN_KBVB) off: must equal f37j",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f41a",
+   "parent": "f41_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=28,VALU=6",
+      "-D",
+      "HKGEN_KBVB=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37j + TILE_C advances its in-out K / V fragment bases (no VALU in the shell between TILE_C regions)",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f42_null",
+   "parent": "f41_null",
+   "patch": "fwd2_patches/42_kentry.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=28,VALU=6",
+      "-D",
+      "HKGEN_KBVB=1"
+     ],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "7b5f13c344f5da6a86f3c87fda2557599ead53390a4450d01498e174866b9d2e"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 42 (HKGEN_KENTRY) off: must equal f41a",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f42a",
+   "parent": "f42_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=28,VALU=6",
+      "-D",
+      "HKGEN_KBVB=1",
+      "-D",
+      "HKGEN_KENTRY=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f41a + TILE_C emitted from a known entry state (drain before the tile loop; no full drain at every region entry)",
+   "bitwise_with": "flydsl"
   }
  ]
 }

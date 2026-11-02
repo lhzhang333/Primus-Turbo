@@ -1,0 +1,147 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 09:40:06.401155186 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 09:40:37.835466301 +0000
+@@ -184,6 +184,14 @@
+ #if HKGEN_KBVB && !HKGEN_TDMGEN
+ #error "HKGEN_KBVB needs HKGEN_TDMGEN"
+ #endif
++// HKGEN_KENTRY 1 (on HKGEN_KBVB): the shell drains before the TILE_C loop, so build.py emits TILE_C from a known entry
++// (the drained state joined with TILE_C's own exit) instead of draining every in-flight WMMA at each region entry
++#ifndef HKGEN_KENTRY
++#define HKGEN_KENTRY 0
++#endif
++#if HKGEN_KENTRY && !HKGEN_KBVB
++#error "HKGEN_KENTRY needs HKGEN_KBVB"
++#endif
+ #if HKGEN_D3F && !HKGEN_SKIPPV
+ #error "HKGEN_D3F needs HKGEN_SKIPPV"
+ #endif
+@@ -792,6 +800,9 @@
+     // an asm def of both: LLVM waits for the VALU above here, once, and not at the loop head (it takes asm outputs as
+     // ready, so the loop's back edge brings no pending VALU write)
+     asm volatile("" : "+v"(kbv), "+v"(vbv));
++#if HKGEN_KENTRY
++    asm volatile("s_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)\n\ts_wait_dscnt 0x0\n\ts_wait_xcnt 0x0" ::: "memory");
++#endif
+ #endif
+ #endif
+ #endif
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 09:40:06.401215306 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 09:44:52.399539623 +0000
+@@ -380,7 +380,7 @@
+     return out
+ 
+ 
+-def emit_region(texts, fmap, scalars, L=None):
++def emit_region(texts, fmap, scalars, L=None, entry=None, want_exit=False):
+     """asmkit.emit on one region: (lines, what walk_check finds in them, which must be nothing). Entry state:
+     anything may be in flight (unknown), XCNT as xcnt_entry, no VALU history. Pseudo-lines split the region into
+     blocks (forward edges only; a block entered from two places gets the joined flows):
+@@ -394,7 +394,7 @@
+             cur = []
+         else:
+             cur.append(t)
+-    flow = M.Flow([E.State(unknown=True)], [xcnt_entry(scalars)], [[]])
++    flow = entry.copy() if entry is not None else M.Flow([E.State(unknown=True)], [xcnt_entry(scalars)], [[]])
+ 
+     def emit(tx, fl):
+         items = [M.make_item("\t" + t) for t in tx]
+@@ -427,10 +427,28 @@
+         RESC_LABELS[0] += 1
+         lines, _, f3 = emit(cur + [f"s_branch .LHKE{n}"], flow)
+         return out + lead + lines + ool + [f".LHKE{n}:"], found + f3
+-    lines, _, f3 = emit(cur, flow)
++    lines, ex, f3 = emit(cur, flow)
++    if want_exit:
++        return out + lead + lines, found + f3, ex
+     return out + lead + lines, found + f3
+ 
+ 
++def emit_tile_c_known(texts, fmap, scalars, L):
++    """HKGEN_KENTRY: TILE_C emitted from a known entry: the join of the drained state (the shell drains before the
++    tile loop) and TILE_C's own exit (the back edge runs no VALU / memory op: s_barrier_wait and the loop counter),
++    iterated to a fixed point."""
++    drained = M.Flow([E.State()], [xcnt_entry(scalars)], [[]])
++    ent = drained
++    for _ in range(32):
++        lines, open_, ex = emit_region(texts, fmap, scalars, L, entry=ent, want_exit=True)
++        nxt = M.Flow.join([ent, ex])
++        nxt.sts = [E.join(nxt.sts)]  # one merged state: the join only grows, so the iteration settles
++        if nxt.sig() == ent.sig():
++            return lines, open_
++        ent = nxt
++    raise RuntimeError("TILE_C: the entry state did not converge")
++
++
+ def split_resc(blocks, L):
+     """Blocks with HKRESC pseudo-lines (--resc branch) split at them: the block before ends in s_cmp + s_cbranch over
+     the conditional O *= corr block, which falls through to the block after; that one takes the original
+@@ -600,6 +618,7 @@
+     G.QRES = a.qres
+     G.D3F = "HKGEN_D3F=1" in DEFINES
+     G.KBVB = "HKGEN_KBVB=1" in DEFINES
++    G.KENTRY = "HKGEN_KENTRY=1" in DEFINES
+     if a.qres and a.plan != 2:
+         raise SystemExit("--qres needs --plan 2")
+     G.SKIPPV = "HKGEN_SKIPPV=1" in DEFINES
+@@ -735,7 +754,10 @@
+             # the shell's LDS stores read the outputs, and LLVM puts no va_vdst wait after an inline-asm def
+             post = ["\ts_wait_alu depctr_va_vdst(0)"]
+         msb_defaults(fmap, [t for t in texts if not t.startswith(("HKRESC", "HKRARE"))] + G.resc_lines(L, 0))
+-        lines, open_ = emit_region(texts, fmap, scalars, L)
++        if name == "TILE_C" and G.KENTRY:
++            lines, open_ = emit_tile_c_known(texts, fmap, scalars, L)
++        else:
++            lines, open_ = emit_region(texts, fmap, scalars, L)
+         if open_:
+             fail.append(f"{name}: {len(open_)} hazards / coverage errors after emission, e.g. {open_[:3]}")
+         if PAD and name == "TILE_C":
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 09:40:06.401243016 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 09:43:34.067552940 +0000
+@@ -120,6 +120,7 @@
+ # (dead until the q tile's exps), (peer sum, total) in leaves the sum tree has consumed, m / d in the unused high
+ # halves of the (m', unused) / (corr, unused) pairs, the mask bounds dl in block 0
+ QRES = False
++KENTRY = False  # build.py, from -D HKGEN_KENTRY=1 (emission only: build.emit_tile_c_known)
+ KBVB = False  # build.py, from -D HKGEN_KBVB=1: TILE_C advances its in-out K / V fragment bases (tdm_nodes)
+ D3F = False  # build.py, from -D HKGEN_D3F=1: TILE_D3F = TILE_D3 + FINAL's math (fin_nodes), FINAL_ST its stores
+ TDM_SLAT = 10  # modelled cycles from a SALU write of an SGPR to a TDM op reading it (ATT: ~9)
+@@ -1156,6 +1157,8 @@
+         for kt in range(2)
+         for h in range(2)
+     ]
++    if KBVB and TDMGEN and k is None and not ftile and pre is None and KENTRY:  # after every K / V read (program order)
++        kbvb_nodes(ops, add)
+     for i in range(first, QT):
+         if i == 3 and "noq" not in ABL and not QRES:  # into qbuf[0], after QK(0) has read Q(0)
+             loads += [add(q_load(L, 3, ks, h), "DS", f"Q3.{ks}.{h}") for ks in range(NKS) for h in range(2)]
+@@ -1177,7 +1180,7 @@
+             sum_nodes(L, 0, add, range(first, 2))
+     # the arrive, after every LDS read of the region and one LDS latency after the last (its s_wait_dscnt 0
+     # then does not stall); no LDS read follows it, as the next block's Q may then overwrite the staging area
+-    if KBVB and TDMGEN and k is None and not ftile and pre is None:
++    if KBVB and TDMGEN and k is None and not ftile and pre is None and not KENTRY:
+         kbvb_nodes(ops, add)
+     bar = add("s_barrier_signal -1", "BAR", "arrive")
+     if fin:  # D3F: the last tile's own prefix (P(3) of this tile's S(3), V) and FINAL's math, no LDS op
+@@ -1209,8 +1212,17 @@
+             add_order(nodes, lpv, nd.idx)
+         if nd.tag.startswith("Q3") and "QK0" in last:
+             add_order(nodes, last["QK0"], nd.idx)
++    # KBVB: the base advances before QK(2) (after the last K / V read, long before the region ends), so the next
++    # region's first reads of the bases find them retired instead of draining every in-flight VALU
++    kv = [nd.idx for nd in nodes if nd.tag == "kbvb" and nd.kind == "VALU"]
++    q2 = [nd.idx for nd in nodes if nd.kind == "WMMA" and nd.tag == "QK2"]
++    if kv and q2 and KENTRY:
++        for i in kv:
++            if i < min(q2):
++                add_order(nodes, i, min(q2))
+     # the first read goes before the first WMMA: the va_vdst(0) wait at the region entry then drains no WMMA
+-    if post is None:
++    # (KENTRY TILE_C: the entry is known, the K reads wait only for the previous tile's QK WMMAs that read K)
++    if post is None and not (KENTRY and k is None and not ftile):
+         add_order(nodes, loads[0].idx, min(nd.idx for nd in nodes if nd.kind == "WMMA"))
+     return nodes
+ 
