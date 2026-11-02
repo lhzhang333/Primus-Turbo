@@ -41,7 +41,9 @@ entry's ``extra_flags`` with the flags cc.sh recorded (``<entry>.meta.json`` / `
 refuses a cc.sh build whose meta.json says it failed or names other bytes. ``--record FILE`` (the JSON
 lines the GPU tests append with ``HK_VALIDATION_RECORD``) further refuses any code object without a
 record of its direction's full and production-shape tests passing on those bytes. ``--check`` compiles
-and compares with the pins without writing; ``--status`` only reports.
+and compares with the pins without writing (an entry without a pin passes only when ``--against`` showed
+it byte-identical to the validated build: the manifest's flags reproduce it, ready to pin after its GPU
+validation); ``--status`` only reports.
 Standard library only (runs in a device-less compile container).
 """
 
@@ -332,7 +334,9 @@ def pin(
             out(f"every code object has a passing validation record in {record}")
         if not check and not dirs:
             out("WARNING: --unvalidated: pinned without comparing with a validated build")
-        return _report_and_write(mods, m, built, toolchain, check, copy_bin, Path(tmp), out)
+        return _report_and_write(
+            mods, m, built, toolchain, check, copy_bin, Path(tmp), out, verified=bool(dirs)
+        )
 
 
 def _check_against(hs, built, dirs, out):
@@ -353,17 +357,22 @@ def _check_against(hs, built, dirs, out):
     out("byte-identical to the validated builds: " + ", ".join(refs))
 
 
-def _report_and_write(mods, m, built, toolchain, check, copy_bin, tmp, out):
+def _report_and_write(mods, m, built, toolchain, check, copy_bin, tmp, out, verified=False):
     """Print the pins; unless ``check``, write the manifest, then copy the code objects into bin/ (only
-    once every kernel compiled and passed, so a failed run leaves bin/ and the pins as they were)."""
+    once every kernel compiled and passed, so a failed run leaves bin/ and the pins as they were).
+    ``check``: 0 when every pinned entry matches its pin and every unpinned one was ``verified`` (byte-identical
+    to its ``--against`` build), else 1."""
     hs = mods["hsaco"]
     path, entries = hs.MANIFEST_PATH, m["kernels"]
     out(f"toolchain: {toolchain}")
-    drift = 0
+    drift, unpinned = 0, []
     for name, (sha, fields) in built.items():
         old = entries[name].get("hsaco_sha256")
         mark = "" if old == sha else (" (new pin)" if old is None else f" (was {str(old)[:16]})")
-        drift += old != sha
+        if old is None:
+            unpinned.append(name)
+        else:
+            drift += old != sha
         for sym, f in fields.items():
             out(
                 f"  {name:20s} {sym:22s} sha256 {sha[:16]}{mark} vgpr {f['vgpr']} sgpr {f['sgpr']} "
@@ -375,7 +384,16 @@ def _report_and_write(mods, m, built, toolchain, check, copy_bin, tmp, out):
             if not drift
             else f"check: {drift} code object(s) differ from their pin"
         )
-        return 1 if drift else 0
+        if unpinned and verified:
+            out(
+                f"check: {', '.join(unpinned)} not pinned yet; byte-identical to the validated builds "
+                "(pin after the GPU validation: --against ... --record ...)"
+            )
+        elif unpinned:
+            out(
+                f"check: {', '.join(unpinned)} not pinned yet and not compared (--against the validated builds)"
+            )
+        return 1 if drift or (unpinned and not verified) else 0
     for name, (sha, fields) in built.items():
         e = entries[name]
         e["hsaco_sha256"] = sha

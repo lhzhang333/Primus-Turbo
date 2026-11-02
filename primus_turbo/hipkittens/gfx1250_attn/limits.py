@@ -18,7 +18,10 @@ of ``primus_turbo.flydsl.attention.gfx1250.interface.unsupported_reason``:
   module is asked as well, so these only have to be no wider than the kernel);
 - bwd_v0: G == 4 (compiled into k_hk_bwd_g4), Sq a multiple of 64, Skv of 128 (one kv block of 128
   rows per workgroup) and the int32 offsets of the prep / main / dQ-convert kernels below 2^31
-  (hk/notes/bwd_v0_design.md 11.3).
+  (hk/notes/bwd_v0_design.md 11.3);
+- fwd_v1: fwd_v0's rules with G in (4, 8, 16) (the kernel's kv head is a shift by log2 G), exactly
+  ``fwd_v1.unsupported_reason`` for causal calls (it also refuses causal=False, as these rules do);
+- bwd_v1: bwd_v0's rules (same index formulas and gate, ``bwd_v1.unsupported_reason``).
 
 ``MODULE_RULES`` holds the numbers; ``shape_unsupported_reason`` applies them.
 """
@@ -33,6 +36,8 @@ MODULE_RULES = {
     "fwd_v0": {"g_multiple": 4, "g_values": None, "sq_multiple": 64, "skv_multiple": 64},
     "fwd_pp": {"g_multiple": 4, "g_values": None, "sq_multiple": 64, "skv_multiple": 64},
     "bwd_v0": {"g_multiple": 4, "g_values": (4,), "sq_multiple": 64, "skv_multiple": 128},
+    "fwd_v1": {"g_multiple": 4, "g_values": (4, 8, 16), "sq_multiple": 64, "skv_multiple": 64},
+    "bwd_v1": {"g_multiple": 4, "g_values": (4,), "sq_multiple": 64, "skv_multiple": 128},
 }
 
 
@@ -58,7 +63,13 @@ def _bwd_extents(b, sq, skv, hq, hkv):
     )
 
 
-_EXTENTS = {"fwd_v0": _fwd_extents, "fwd_pp": _fwd_extents, "bwd_v0": _bwd_extents}
+_EXTENTS = {
+    "fwd_v0": _fwd_extents,
+    "fwd_pp": _fwd_extents,
+    "bwd_v0": _bwd_extents,
+    "fwd_v1": _fwd_extents,
+    "bwd_v1": _bwd_extents,
+}
 
 
 def shape_unsupported_reason(module, q_shape, k_shape, v_shape, causal) -> Optional[str]:

@@ -52,6 +52,7 @@ from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
 from primus_turbo.pytorch.kernels.attention.attention_hk_gfx1250_impl import (
     flash_attn_hk_gfx1250_backward_impl,
     flash_attn_hk_gfx1250_forward_impl,
+    hk_gfx1250_operands,
 )
 from primus_turbo.pytorch.kernels.attention.attention_impl import (
     _sbhd_layout,
@@ -119,9 +120,11 @@ class FlashAttnFunc(torch.autograd.Function):
     backward takes the same one. q/k/v arrive ``[b, s, h, d]``-shaped, so the sbhd-native
     kernels -- FlyDSL's gfx950 ones and HipKittens' gfx950 ones -- take their ``[s, b, h, d]``
     permute (the original tensor, since only sbhd storage is eligible) and permute their results
-    back. FlyDSL's gfx1250 kernels (the DeepSeek-V3 MLA head dims, and head dim 128) and
-    HipKittens' gfx1250 kernels (head dim 128; a direction they cannot take runs FlyDSL's) take
-    any byte order, made contiguous BSHD."""
+    back. FlyDSL's gfx1250 kernels (the DeepSeek-V3 MLA head dims, and head dim 128) take any
+    byte order, made contiguous BSHD. HipKittens' gfx1250 kernels (head dim 128; a direction they
+    cannot take runs FlyDSL's) do the same, unless their code objects take strides: then each
+    contiguous-BSHD or sbhd-storage tensor goes to them as it is, and out / dq / dk / dv come back
+    in the layouts of q / q / k / v (hk_gfx1250_operands), so no layout copy is made."""
 
     @staticmethod
     def forward(
@@ -198,7 +201,10 @@ class FlashAttnFunc(torch.autograd.Function):
             reason = flydsl_gfx1250_unsupported_reason(q, k, v, causal)
             if reason is not None:
                 raise ValueError(f"{name}: {reason}")
-            q_c, k_c, v_c = (t.contiguous() for t in (q, k, v))
+            # [b, s, h, d] in any byte order. Kernels that take strides get contiguous-BSHD and
+            # sbhd-storage tensors as they are (out then comes in q's layout); everything else is
+            # made contiguous BSHD. The backward consumes exactly these tensors.
+            q_c, k_c, v_c = hk_gfx1250_operands("fwd", q, k, v)
             out, lse = flash_attn_hk_gfx1250_forward_impl(
                 q_c, k_c, v_c, softmax_scale=softmax_scale, causal=causal
             )
@@ -385,6 +391,8 @@ class FlashAttnFunc(torch.autograd.Function):
             )
 
         if ctx.hk_gfx1250:
+            # dout as autograd hands it (sbhd storage under Megatron); the impl hands it and the saved
+            # tensors over as they are when the backward kernels take strides, else contiguous BSHD.
             q, k, v, out, lse = ctx.saved_tensors
             dq, dk, dv = flash_attn_hk_gfx1250_backward_impl(
                 dout,
@@ -677,7 +685,8 @@ def flash_attn_func(
     FlyDSL takes sbhd only on gfx950 and any layout on gfx1250, where its head-dim-128 kernels
     return contiguous [b, s, h, d] outputs and grads; so does HipKittens on gfx1250
     (``PRIMUS_TURBO_ATTN_BACKEND=HIPKITTENS``), which falls back to those FlyDSL kernels per
-    direction and call.
+    direction and call -- except where its kernels take strides: there sbhd-storage views are read
+    in place and out / dq / dk / dv come back in the layouts of q / q / k / v.
     """
     qkv_format = _infer_qkv_format(q, k, v)
     is_grad_enabled = torch.is_grad_enabled()

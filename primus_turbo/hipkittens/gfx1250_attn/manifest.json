@@ -515,6 +515,487 @@
           "wavefront_size": 32
         }
       }
+    },
+    "k_attn_fwd_v1": {
+      "module": "fwd_v1",
+      "src": "src/k_attn_fwd_v1.hip",
+      "extra_flags": [
+        "-mllvm",
+        "-structurizecfg-skip-uniform-regions",
+        "-mllvm",
+        "-amdgpu-sched-strategy=coexec",
+        "-DFWD1_LSUM=0",
+        "-DFWD1_OPT_RESC=1",
+        "-DFWD1_MDS=3",
+        "-DFWD1_OPT_UNROLL=1"
+      ],
+      "hsaco_sha256": "c7ae5b8e16f556d7744e2998479a7a7c501beb7c610a1df279aed63ea1cc6f55",
+      "block": 128,
+      "args": [
+        {
+          "name": "Q",
+          "kind": "ptr",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "K",
+          "kind": "ptr",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "V",
+          "kind": "ptr",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "O",
+          "kind": "ptr",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "LSE",
+          "kind": "ptr",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "o_bytes",
+          "kind": "i64",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "lse_bytes",
+          "kind": "i64",
+          "offset": 48,
+          "size": 8
+        },
+        {
+          "name": "B",
+          "kind": "i32",
+          "offset": 56,
+          "size": 4
+        },
+        {
+          "name": "Sq",
+          "kind": "i32",
+          "offset": 60,
+          "size": 4
+        },
+        {
+          "name": "Skv",
+          "kind": "i32",
+          "offset": 64,
+          "size": 4
+        },
+        {
+          "name": "Hq",
+          "kind": "i32",
+          "offset": 68,
+          "size": 4
+        },
+        {
+          "name": "Hkv",
+          "kind": "i32",
+          "offset": 72,
+          "size": 4
+        },
+        {
+          "name": "G",
+          "kind": "i32",
+          "offset": 76,
+          "size": 4
+        },
+        {
+          "name": "nqb",
+          "kind": "i32",
+          "offset": 80,
+          "size": 4
+        },
+        {
+          "name": "nhq4",
+          "kind": "i32",
+          "offset": 84,
+          "size": 4
+        },
+        {
+          "name": "nkv_st",
+          "kind": "i32",
+          "offset": 88,
+          "size": 4
+        },
+        {
+          "name": "cst",
+          "kind": "i32",
+          "offset": 92,
+          "size": 4
+        },
+        {
+          "name": "causal",
+          "kind": "i32",
+          "offset": 96,
+          "size": 4
+        },
+        {
+          "name": "c2",
+          "kind": "f32",
+          "offset": 100,
+          "size": 4
+        },
+        {
+          "name": "c2inv",
+          "kind": "f32",
+          "offset": 104,
+          "size": 4
+        },
+        {
+          "name": "W",
+          "kind": "i32",
+          "offset": 108,
+          "size": 4
+        },
+        {
+          "name": "mode",
+          "kind": "i32",
+          "offset": 112,
+          "size": 4
+        },
+        {
+          "name": "mW",
+          "kind": "u32",
+          "offset": 116,
+          "size": 4
+        },
+        {
+          "name": "shW",
+          "kind": "i32",
+          "offset": 120,
+          "size": 4
+        },
+        {
+          "name": "mNP",
+          "kind": "u32",
+          "offset": 124,
+          "size": 4
+        },
+        {
+          "name": "shNP",
+          "kind": "i32",
+          "offset": 128,
+          "size": 4
+        },
+        {
+          "name": "mH4",
+          "kind": "u32",
+          "offset": 132,
+          "size": 4
+        },
+        {
+          "name": "shH4",
+          "kind": "i32",
+          "offset": 136,
+          "size": 4
+        },
+        {
+          "name": "mNH",
+          "kind": "u32",
+          "offset": 140,
+          "size": 4
+        },
+        {
+          "name": "shNH",
+          "kind": "i32",
+          "offset": 144,
+          "size": 4
+        }
+      ],
+      "kernarg_size": 148,
+      "lds": 327680,
+      "vgpr": 898,
+      "sgpr": 101,
+      "wavefront_size": 32
+    },
+    "k_attn_bwd_v1": {
+      "module": "bwd_v1",
+      "src": "src/k_attn_bwd_v1.hip",
+      "extra_flags": [
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode",
+        "-DHK_ATTN_EXPERT_SCHED_BUILD",
+        "-DBWD1_ATOM=2",
+        "-DBWD1_OPT_REGS=15",
+        "-DBWD1_OPT_TDM3=1",
+        "-DBWD1_OPT_MASKED=2"
+      ],
+      "hsaco_sha256": "21b1ceb26ccb3f9267f535ed1ee8f04e6c059b616a6d15ddd5dfbf6b2c69acf7",
+      "symbols": {
+        "k_hk_bwd1_prep": {
+          "block": 256,
+          "args": [
+            {
+              "name": "DO",
+              "kind": "ptr",
+              "offset": 0,
+              "size": 8
+            },
+            {
+              "name": "O",
+              "kind": "ptr",
+              "offset": 8,
+              "size": 8
+            },
+            {
+              "name": "LSE",
+              "kind": "ptr",
+              "offset": 16,
+              "size": 8
+            },
+            {
+              "name": "LD",
+              "kind": "ptr",
+              "offset": 24,
+              "size": 8
+            },
+            {
+              "name": "DQA",
+              "kind": "ptr",
+              "offset": 32,
+              "size": 8
+            },
+            {
+              "name": "Sq",
+              "kind": "i32",
+              "offset": 40,
+              "size": 4
+            },
+            {
+              "name": "Hq",
+              "kind": "i32",
+              "offset": 44,
+              "size": 4
+            },
+            {
+              "name": "B",
+              "kind": "i32",
+              "offset": 48,
+              "size": 4
+            }
+          ],
+          "kernarg_size": 52,
+          "lds": 256,
+          "vgpr": 38,
+          "sgpr": 68,
+          "wavefront_size": 32
+        },
+        "k_hk_bwd1_prep_z": {
+          "block": 256,
+          "args": [
+            {
+              "name": "DO",
+              "kind": "ptr",
+              "offset": 0,
+              "size": 8
+            },
+            {
+              "name": "O",
+              "kind": "ptr",
+              "offset": 8,
+              "size": 8
+            },
+            {
+              "name": "LSE",
+              "kind": "ptr",
+              "offset": 16,
+              "size": 8
+            },
+            {
+              "name": "LD",
+              "kind": "ptr",
+              "offset": 24,
+              "size": 8
+            },
+            {
+              "name": "DQA",
+              "kind": "ptr",
+              "offset": 32,
+              "size": 8
+            },
+            {
+              "name": "Sq",
+              "kind": "i32",
+              "offset": 40,
+              "size": 4
+            },
+            {
+              "name": "Hq",
+              "kind": "i32",
+              "offset": 44,
+              "size": 4
+            },
+            {
+              "name": "B",
+              "kind": "i32",
+              "offset": 48,
+              "size": 4
+            }
+          ],
+          "kernarg_size": 52,
+          "lds": 256,
+          "vgpr": 38,
+          "sgpr": 68,
+          "wavefront_size": 32
+        },
+        "k_hk_bwd1_g4": {
+          "block": 128,
+          "args": [
+            {
+              "name": "Q",
+              "kind": "ptr",
+              "offset": 0,
+              "size": 8
+            },
+            {
+              "name": "K",
+              "kind": "ptr",
+              "offset": 8,
+              "size": 8
+            },
+            {
+              "name": "V",
+              "kind": "ptr",
+              "offset": 16,
+              "size": 8
+            },
+            {
+              "name": "DO",
+              "kind": "ptr",
+              "offset": 24,
+              "size": 8
+            },
+            {
+              "name": "LD",
+              "kind": "ptr",
+              "offset": 32,
+              "size": 8
+            },
+            {
+              "name": "DK",
+              "kind": "ptr",
+              "offset": 40,
+              "size": 8
+            },
+            {
+              "name": "DV",
+              "kind": "ptr",
+              "offset": 48,
+              "size": 8
+            },
+            {
+              "name": "DQA",
+              "kind": "ptr",
+              "offset": 56,
+              "size": 8
+            },
+            {
+              "name": "scale",
+              "kind": "f32",
+              "offset": 64,
+              "size": 4
+            },
+            {
+              "name": "Sq",
+              "kind": "i32",
+              "offset": 68,
+              "size": 4
+            },
+            {
+              "name": "Skv",
+              "kind": "i32",
+              "offset": 72,
+              "size": 4
+            },
+            {
+              "name": "Hq",
+              "kind": "i32",
+              "offset": 76,
+              "size": 4
+            },
+            {
+              "name": "Hkv",
+              "kind": "i32",
+              "offset": 80,
+              "size": 4
+            },
+            {
+              "name": "B",
+              "kind": "i32",
+              "offset": 84,
+              "size": 4
+            },
+            {
+              "name": "causal",
+              "kind": "i32",
+              "offset": 88,
+              "size": 4
+            }
+          ],
+          "kernarg_size": 92,
+          "lds": 266240,
+          "vgpr": 860,
+          "sgpr": 74,
+          "wavefront_size": 32
+        },
+        "k_hk_bwd1_dqcvt": {
+          "block": 256,
+          "args": [
+            {
+              "name": "DQA",
+              "kind": "ptr",
+              "offset": 0,
+              "size": 8
+            },
+            {
+              "name": "DQ",
+              "kind": "ptr",
+              "offset": 8,
+              "size": 8
+            },
+            {
+              "name": "scale",
+              "kind": "f32",
+              "offset": 16,
+              "size": 4
+            },
+            {
+              "name": "Sq",
+              "kind": "i32",
+              "offset": 20,
+              "size": 4
+            },
+            {
+              "name": "Hq",
+              "kind": "i32",
+              "offset": 24,
+              "size": 4
+            },
+            {
+              "name": "B",
+              "kind": "i32",
+              "offset": 28,
+              "size": 4
+            }
+          ],
+          "kernarg_size": 32,
+          "lds": 8704,
+          "vgpr": 24,
+          "sgpr": 68,
+          "wavefront_size": 32
+        }
+      }
     }
   }
 }

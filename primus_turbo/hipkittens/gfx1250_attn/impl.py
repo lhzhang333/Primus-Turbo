@@ -5,15 +5,26 @@
 ###############################################################################
 
 """Production entry points of the gfx1250 HipKittens attention kernels (head dim 128, GQA, bottom-right
-causal, bf16, contiguous BSHD; the Llama-3.1-8B attention).
+causal, bf16, [B, S, H, D] tensors; the Llama-3.1-8B attention).
 
     hk_unsupported_reason(direction, q, k, v, causal, deterministic=False, softmax_scale=None) -> None | str
+    hk_supports_strides(direction)                                 -> bool
     hk_attn_fwd(q, k, v, softmax_scale, causal)                    -> (o [B,Sq,Hq,128] bf16, lse [B,Hq,Sq] fp32)
     hk_attn_bwd(do, q, k, v, o, lse, softmax_scale, causal, deterministic=False) -> (dq, dk, dv)
 
 lse is the natural-log logsumexp [B, Hq, Sq], the FlyDSL gfx1250 kernels' convention, so either family's
 forward feeds either family's backward. ``hk_attn_*`` raise NotImplementedError where
 ``hk_unsupported_reason`` gives a reason; the caller (the HIPKITTENS backend) runs FlyDSL then.
+
+Layouts. A kernel module whose code object was built with -DHK_STRIDES=1 says so with its attribute
+``SUPPORTS_STRIDES`` (it reads that from the code object's kernel metadata); ``hk_supports_strides(direction)``
+is that attribute of the module that runs the direction (False when none can). Such a module takes each of
+q / k / v (forward) and do / q / k / v / o (backward) in either layout, per tensor (``tensor_layout``):
+"bshd", contiguous [B, S, H, D], or "sbhd", a [B, S, H, D] view of contiguous [S, B, H, D] storage
+(``x.permute(1, 0, 2, 3)``, what Megatron hands over), and writes o in q's layout, dq in q's, dk in k's and
+dv in v's; lse stays fp32 [B, Hq, Sq] contiguous. Every other module, and every other layout, takes
+contiguous BSHD only (ValueError otherwise). The tensors are handed over viewed with the exact strides of
+their layout (a tensor with B == 1 or S == 1 is both: "bshd").
 
 Kernel modules of this package, each with the attention lab's contract (``hk/lab/lab.py``):
 ``flash_attn_fwd(q, k, v, softmax_scale, causal)`` / ``flash_attn_bwd(do, q, k, v, o, lse, softmax_scale,
@@ -22,16 +33,25 @@ launch, and optionally a gate asked on top of ``limits``: ``unsupported_reason(q
 dtype, causal)`` or ``unsupported_reason(b, sq, skv, hq, hkv, causal[, d])`` -> None | str (``module_gate``
 tells them apart by their parameter names). Selected once, at import:
 
-    forward   PRIMUS_TURBO_HK_FWD = v0 (DEFAULT_FWD) | pp | flydsl      -> fwd_v0 | fwd_pp | none
-    backward  PRIMUS_TURBO_HK_BWD = v0 (DEFAULT_BWD) | flydsl           -> bwd_v0 | none
+    forward   PRIMUS_TURBO_HK_FWD = v1 (DEFAULT_FWD) | v0 | pp | flydsl   -> fwd_v1 | fwd_v0 | fwd_pp | none
+    backward  PRIMUS_TURBO_HK_BWD = v1 (DEFAULT_BWD) | v0 | flydsl        -> bwd_v1 | bwd_v0 | none
 
+v1: the persistent-grid forward built with -DFWD1_LSUM=0 (v0's numerics, bitwise) and the expert-scheduled
+backward built with -DBWD1_ATOM=2 (manifest ``extra_flags``); v0: the previous defaults, still selectable.
+v1 and v0 take the same shapes (``limits`` and the modules' own gates). An unset or empty variable runs
+the default or, when the default cannot run here (kernel module missing or broken, code objects missing,
+unpinned or stale) and ``DEFAULT_FALLBACK``'s setting can, that one: one RuntimeWarning, and ``describe`` /
+``fallback_reason`` say why. An explicit setting never falls back (it is what a validation or a benchmark
+asked for). When nothing can run, the reason names every setting tried and the direction runs FlyDSL as
+before.
 "flydsl" selects no module: that direction is unsupported here and runs FlyDSL (mixed mode). The
 backward with deterministic=True is unsupported too (dQ is summed with fp32 atomics).
 
 Code objects. Production: ``bin/<kernel>.hsaco`` of this package, only for kernels that
 ``manifest.json`` lists for the module (``module`` field) with a sha256 pin matching the file
-(``hsaco.unavailable_reason``, cached); the module is pointed at ``bin/``, and the files are hashed
-again right before the module's first launch, which is when the module loads them (a mismatch then is
+(``hsaco.unavailable_reason``, cached); the module is pointed at ``bin/`` (its ``set_hsaco_dir``, so its
+own lab ``DEFAULT_HSACO_DIR`` is never used), and the files are hashed again right before the module's
+first launch, which is when the module loads them (a mismatch then is
 a NotImplementedError and the direction stays unavailable). The modules themselves load by path without
 a pin (``hiprt.load_hsaco(path, specs)``), so this re-check is the enforcement; a module that passes
 ``hsaco.code_object``'s sha256 to ``load_hsaco`` would close the remaining gap. Lab: a search path given
@@ -49,6 +69,7 @@ import math
 import os
 import sys
 import threading
+import warnings
 from numbers import Real
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -59,13 +80,16 @@ from . import hsaco, limits
 
 __all__ = [
     "code_object_files",
+    "fallback_reason",
     "hk_attn_bwd",
     "hk_attn_fwd",
+    "hk_supports_strides",
     "hk_unavailable_reason",
     "hk_unsupported_reason",
     "flash_attn_bwd",
     "flash_attn_fwd",
     "set_hsaco_dir",
+    "tensor_layout",
 ]
 
 FWD_ENV = "PRIMUS_TURBO_HK_FWD"
@@ -73,11 +97,14 @@ BWD_ENV = "PRIMUS_TURBO_HK_BWD"
 HSACO_DIR_ENV = "HK_HSACO_DIR"
 
 # The kernel module of each direction when its variable is unset or empty: the one place to change it.
-DEFAULT_FWD = "v0"
-DEFAULT_BWD = "v0"
+DEFAULT_FWD = "v1"
+DEFAULT_BWD = "v1"
+# What an unset or empty variable runs when its default cannot (module, code objects): the previous default.
+# Never used for an explicit setting.
+DEFAULT_FALLBACK = {"fwd": "v0", "bwd": "v0"}
 # setting -> kernel module of this package; None: no HK kernels for that direction (FlyDSL runs it).
-FWD_MODULES = {"pp": "fwd_pp", "v0": "fwd_v0", "flydsl": None}
-BWD_MODULES = {"v0": "bwd_v0", "flydsl": None}
+FWD_MODULES = {"v1": "fwd_v1", "v0": "fwd_v0", "pp": "fwd_pp", "flydsl": None}
+BWD_MODULES = {"v1": "bwd_v1", "v0": "bwd_v0", "flydsl": None}
 HEAD_DIM = limits.HEAD_DIM
 
 # Read once at import, like the FlyDSL kernels' switches: a process uses one configuration.
@@ -90,11 +117,14 @@ HSACO_DIR = None
 # Tensor start alignment the kernels address with (fwd_v0 / fwd_pp raise on less); a misaligned call is
 # a reason (q / k / v) or a NotImplementedError of hk_attn_bwd (do / o / lse), so it runs on FlyDSL.
 ALIGNMENT = 16
+# The layouts a module with SUPPORTS_STRIDES takes, per tensor (tensor_layout); every other module: "bshd".
+LAYOUTS = ("bshd", "sbhd")
 
 _DIRECTIONS = {"fwd": (FWD_ENV, DEFAULT_FWD, FWD_MODULES), "bwd": (BWD_ENV, DEFAULT_BWD, BWD_MODULES)}
 _ENTRY = {"fwd": "flash_attn_fwd", "bwd": "flash_attn_bwd"}
 _MODULES = {}  # kernel module name -> module, or why it cannot be used (str)
 _REASONS = {}  # direction -> None or why it cannot run on HK at all (setting, module, code objects)
+_FALLBACK = {}  # direction -> (DEFAULT_FALLBACK's setting it runs, why its default cannot), once resolved
 _LAB_DIRS = {}  # kernel module name -> the search-path directory holding its code objects (lab)
 _VERIFIED = set()  # kernel modules whose pinned code objects were re-hashed before their first launch
 _LOCK = threading.RLock()
@@ -107,14 +137,37 @@ def _raw_setting(direction):
     return FWD_SETTING if direction == "fwd" else BWD_SETTING
 
 
+def _explicit(direction) -> bool:
+    return bool(_raw_setting(direction).strip())
+
+
+def candidates(direction) -> List[str]:
+    """The settings tried for ``direction``, in order: an explicit setting (lower-cased) alone; for an unset or
+    empty variable the default, then ``DEFAULT_FALLBACK``'s."""
+    if _explicit(direction):
+        return [_raw_setting(direction).strip().lower()]
+    default, fallback = _DIRECTIONS[direction][1], DEFAULT_FALLBACK.get(direction)
+    return [default] if fallback in (None, default) else [default, fallback]
+
+
 def setting(direction) -> str:
-    """The direction's setting, lower-cased: its variable, or the default when unset or empty."""
-    return _raw_setting(direction).strip().lower() or _DIRECTIONS[direction][1]
+    """The direction's setting, lower-cased: its variable or, when unset or empty, the default -- or the
+    default's fallback once ``hk_unavailable_reason`` found that the default cannot run and the fallback can."""
+    fell = _FALLBACK.get(direction)
+    return fell[0] if fell else candidates(direction)[0]
 
 
 def module_name(direction) -> Optional[str]:
-    """The kernel module a direction runs on, or None (flydsl, or an invalid setting)."""
+    """The kernel module a direction runs on (see ``setting``), or None (flydsl, or an invalid setting)."""
     return _DIRECTIONS[direction][2].get(setting(direction))
+
+
+def fallback_reason(direction) -> Optional[str]:
+    """Why ``direction`` runs ``DEFAULT_FALLBACK``'s module instead of the default's (resolved first), or None
+    when it does not: the default runs, the setting is explicit, or HK cannot run the direction at all."""
+    hk_unavailable_reason(direction)
+    fell = _FALLBACK.get(direction)
+    return fell[1] if fell else None
 
 
 def hsaco_dir() -> Optional[str]:
@@ -145,6 +198,7 @@ def set_hsaco_dir(path) -> None:
         dirs = [d for d in str(path).split(os.pathsep) if d] if path else []
         HSACO_DIR = os.pathsep.join(str(Path(d).resolve()) for d in dirs) or None
         _REASONS.clear()
+        _FALLBACK.clear()
         _LAB_DIRS.clear()
         _VERIFIED.clear()
         for modname, mod in _MODULES.items():
@@ -157,6 +211,7 @@ def _reset() -> None:
     with _LOCK:
         _MODULES.clear()
         _REASONS.clear()
+        _FALLBACK.clear()
         _GATES.clear()
         _LAB_DIRS.clear()
         _VERIFIED.clear()
@@ -249,9 +304,10 @@ def _code_objects_reason(modname, mod) -> Optional[str]:
     return hsaco.unavailable_reason(hsaco.BIN_DIR, names)
 
 
-def _unavailable(direction) -> Optional[str]:
+def _setting_unavailable(direction, choice) -> Optional[str]:
+    """Why setting ``choice`` cannot run ``direction`` (setting, kernel module, entry point, code objects), or
+    None after pointing its module at its code objects."""
     env, _, table = _DIRECTIONS[direction]
-    choice = setting(direction)
     if choice not in table:
         return f"{env}={_raw_setting(direction)!r} is not one of {sorted(table)}"
     modname = table[choice]
@@ -266,6 +322,27 @@ def _unavailable(direction) -> Optional[str]:
     if reason is None:
         _point_module(modname, mod)
     return reason
+
+
+def _unavailable(direction) -> Optional[str]:
+    """None when one of ``candidates`` can run (the first one that can; a fallback is recorded in _FALLBACK
+    and warned about once), else the first candidate's reason followed by the fallback's."""
+    tried = []
+    for choice in candidates(direction):
+        reason = _setting_unavailable(direction, choice)
+        if reason is None:
+            if tried:
+                _FALLBACK[direction] = (choice, tried[0][1])
+                warnings.warn(
+                    f"HK gfx1250 attention: {direction} runs {module_name(direction)} ({choice}), not the default "
+                    f"{tried[0][0]}: {tried[0][1]}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            return None
+        tried.append((choice, reason))
+    first = tried[0][1]
+    return first + "".join(f" (default fallback {c}: {r})" for c, r in tried[1:])
 
 
 def hk_unavailable_reason(direction) -> Optional[str]:
@@ -286,14 +363,37 @@ def hk_unavailable_reason(direction) -> Optional[str]:
         return _REASONS[direction]
 
 
+def hk_supports_strides(direction) -> bool:
+    """Whether the kernel module that runs ``direction`` (after the default's fallback, see ``setting``) takes
+    [B, S, H, D] views of SBHD storage as well as contiguous BSHD, per tensor: its ``SUPPORTS_STRIDES``
+    attribute is True (the module reads that from its code object's kernel metadata). False when HK cannot run
+    the direction at all (FlyDSL then: contiguous BSHD). Read on every call, never cached here: a module that
+    only learns it when it loads its code object answers False until then. Never raises."""
+    try:
+        if hk_unavailable_reason(direction) is not None:
+            return False
+        mod = _MODULES.get(module_name(direction))
+        return (
+            mod is not None and not isinstance(mod, str) and getattr(mod, "SUPPORTS_STRIDES", False) is True
+        )
+    except Exception:  # noqa: BLE001 -- a question that cannot be answered is a no
+        return False
+
+
 def describe(direction) -> str:
-    """One line for the log: the module and where its code objects come from."""
+    """One line for the log: the module, why it is not the default's when it fell back, where its code
+    objects come from, and the layouts it takes (``hk_supports_strides``)."""
     modname = module_name(direction)
     if hsaco_dirs():
         source = f"{_LAB_DIRS.get(modname) or hsaco_dir()} (unpinned, lab)"
     else:
         source = f"{hsaco.BIN_DIR} (pinned by {hsaco.MANIFEST_PATH.name})"
-    return f"{direction}: {modname} ({setting(direction)}), code objects {source}"
+    fell = _FALLBACK.get(direction)
+    choice = setting(direction)
+    if fell:
+        choice += f"; the default {_DIRECTIONS[direction][1]} cannot run: {fell[1]}"
+    layouts = "BSHD / SBHD in place (strides)" if hk_supports_strides(direction) else "contiguous BSHD"
+    return f"{direction}: {modname} ({choice}), code objects {source}, layouts {layouts}"
 
 
 # ---------------------------------------------------------------- gate
@@ -368,7 +468,7 @@ def shape_unsupported_reason(
 def hk_unsupported_reason(
     direction, q, k, v, causal, deterministic=False, softmax_scale=None
 ) -> Optional[str]:
-    """Why HK cannot run this direction ("fwd" / "bwd") of this BSHD call, or None. Never raises.
+    """Why HK cannot run this direction ("fwd" / "bwd") of this [B, S, H, D] call, or None. Never raises.
 
     Order: the setting, kernel module and code objects (once per process), then q / k / v on one
     device with one dtype, then ``shape_unsupported_reason``.
@@ -417,16 +517,55 @@ def _verify_before_first_launch(direction) -> None:
         _VERIFIED.add(modname)
 
 
-def _check_tensors(**tensors):
-    """ValueError unless every tensor is contiguous and on q's device (the kernels address BSHD bytes)."""
+def tensor_layout(t) -> Optional[str]:
+    """ "bshd" for a contiguous [B, S, H, D] tensor, "sbhd" for a [B, S, H, D] view of contiguous [S, B, H, D]
+    storage (``x.permute(1, 0, 2, 3)``), None for anything else (also for a tensor that is not 4-D). A tensor
+    that is both (B == 1 or S == 1: the same bytes) is "bshd"."""
+    if t.dim() != 4:
+        return None
+    if t.is_contiguous():
+        return "bshd"
+    if t.permute(1, 0, 2, 3).is_contiguous():
+        return "sbhd"
+    return None
+
+
+def _exact_strides(t, layout):
+    """t viewed with the exact strides of ``layout`` ("bshd": (S*H*D, H*D, D, 1), "sbhd": (H*D, B*H*D, D, 1)).
+    ``tensor_layout`` ignores the stride of a size-1 dimension, which addresses nothing, so only those can
+    differ: the view reads the same elements, and a module's stride checks see one of the two forms."""
+    b, s, h, d = t.shape
+    want = (s * h * d, h * d, d, 1) if layout == "bshd" else (h * d, b * h * d, d, 1)
+    if tuple(t.stride()) == want:
+        return t
+    return t.as_strided(tuple(t.shape), want, t.storage_offset())
+
+
+def _check_tensors(direction, **tensors):
+    """The tensors to hand the direction's module, in the order given: ValueError unless every one is on q's
+    device and contiguous -- or, when the module supports strides (``hk_supports_strides``), q / k / v / do / o
+    each "bshd" or "sbhd" (``tensor_layout``; lse contiguous), viewed with that layout's exact strides."""
     q = tensors["q"]
+    strided = hk_supports_strides(direction)
+    out = []
     for name, t in tensors.items():
         if t.device != q.device:
             raise ValueError(
                 f"all tensors must be on one device, got q on {q.device} and {name} on {t.device}"
             )
+        layout = tensor_layout(t) if strided and name != "lse" else None
+        if layout is not None:
+            out.append(_exact_strides(t, layout))
+            continue
+        if strided and name != "lse":
+            raise ValueError(
+                f"{name} must be contiguous [B, S, H, D] or a [B, S, H, D] view of contiguous [S, B, H, D] "
+                f"storage, got shape {tuple(t.shape)} strides {t.stride()}"
+            )
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+        out.append(t)
+    return out
 
 
 # ---------------------------------------------------------------- entry points
@@ -435,13 +574,14 @@ def _check_tensors(**tensors):
 def hk_attn_fwd(q, k, v, softmax_scale=None, causal=True):
     """Forward on the selected HK module: (o [B, Sq, Hq, 128] bf16, lse [B, Hq, Sq] fp32 natural log).
 
-    NotImplementedError when ``hk_unsupported_reason("fwd", ...)`` gives a reason, ValueError for
-    tensors the kernels cannot address (non-contiguous, on another device)."""
+    q / k / v contiguous BSHD, or, when ``hk_supports_strides("fwd")``, each BSHD or SBHD storage (o then
+    comes in q's layout). NotImplementedError when ``hk_unsupported_reason("fwd", ...)`` gives a reason,
+    ValueError for tensors the kernels cannot address (another layout, on another device)."""
     scale = _scale(softmax_scale)
     reason = hk_unsupported_reason("fwd", q, k, v, causal, softmax_scale=scale)
     if reason is not None:
         raise NotImplementedError(f"hk_attn_fwd: {reason}")
-    _check_tensors(q=q, k=k, v=v)
+    q, k, v = _check_tensors("fwd", q=q, k=k, v=v)
     _verify_before_first_launch("fwd")
     return _MODULES[module_name("fwd")].flash_attn_fwd(q, k, v, scale, bool(causal))
 
@@ -450,14 +590,15 @@ def hk_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, determinis
     """Backward on the selected HK module: (dq, dk, dv) like q / k / v (dk / dv with Hkv heads).
 
     q / k / v / o / lse are what the forward saw and returned (either family's: same lse convention);
-    do must have q's shape. NotImplementedError when ``hk_unsupported_reason("bwd", ...)`` gives a
-    reason (deterministic=True always does) or do / o / lse are not 16-byte aligned, ValueError for
-    mismatched tensors."""
+    do must have q's shape. do / q / k / v / o contiguous BSHD, or, when ``hk_supports_strides("bwd")``,
+    each BSHD or SBHD storage (dq then comes in q's layout, dk in k's, dv in v's); lse contiguous.
+    NotImplementedError when ``hk_unsupported_reason("bwd", ...)`` gives a reason (deterministic=True
+    always does) or do / o / lse are not 16-byte aligned, ValueError for mismatched tensors."""
     scale = _scale(softmax_scale)
     reason = hk_unsupported_reason("bwd", q, k, v, causal, deterministic, softmax_scale=scale)
     if reason is not None:
         raise NotImplementedError(f"hk_attn_bwd: {reason}")
-    _check_tensors(q=q, k=k, v=v, do=do, o=o, lse=lse)
+    q, k, v, do, o, lse = _check_tensors("bwd", q=q, k=k, v=v, do=do, o=o, lse=lse)
     b, sq, hq, _ = q.shape
     for name, t in (("do", do), ("o", o)):
         if t.shape != q.shape or t.dtype != q.dtype:

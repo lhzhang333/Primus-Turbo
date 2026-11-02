@@ -15,8 +15,9 @@ satisfies the FlyDSL kernels' FLYDSL_REQUIREMENT (the backend's gate is FlyDSL's
 amdclang++ with the gfx1250 target. The numeric tests need a gfx1250 card and the HK kernels of the
 direction they test: pinned code objects in bin/, or lab directories in HK_HSACO_DIR (a search path; lab code
 objects also need PRIMUS_TURBO_HK_FWD / PRIMUS_TURBO_HK_BWD set explicitly). A direction named in
-HK_TEST_REQUIRE (fwd,bwd) fails instead of skipping when it is unavailable, and the tests through
-flash_attn_func assert that HK, not the FlyDSL fallback, ran. Run them toy first (``-k toy``); the
+HK_TEST_REQUIRE (fwd,bwd) fails instead of skipping when it is unavailable or when an unset setting runs the
+default's fallback (impl.DEFAULT_FALLBACK) instead of the default, and the tests through flash_attn_func assert
+that HK, not the FlyDSL fallback, ran (and that it did not where the HK gate declines). Run them toy first (``-k toy``); the
 production shape needs PRIMUS_TURBO_TEST_LARGE=1. With HK_VALIDATION_RECORD=<file>, a session in which
 nothing failed appends one JSON line naming the code objects (sha256) and the checks that passed per
 direction (scripts/hk/e2e_mg.sh and the pin tool's --record read it). Their fp32 reference runs on the CPU.
@@ -33,16 +34,19 @@ import inspect
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import types
+import weakref
 from pathlib import Path
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 import primus_turbo.pytorch.ops.attention.flash_attn_interface as flash_attn_interface
 from primus_turbo.pytorch.core.backend import (
@@ -65,8 +69,12 @@ _HK_MODULES_AT_IMPORT = sorted(m for m in sys.modules if m == _PKG or m.startswi
 
 from primus_turbo.hipkittens.gfx1250_attn import hsaco, impl, limits  # noqa: E402
 
-# the forward module the package selects by default (impl.DEFAULT_FWD); the selection tests use it
-_FWD = impl._DIRECTIONS["fwd"][2][impl.DEFAULT_FWD]
+# the modules the package selects by default (impl.DEFAULT_FWD / DEFAULT_BWD); the selection tests use them
+_FWD = impl.FWD_MODULES[impl.DEFAULT_FWD]
+_BWD = impl.BWD_MODULES[impl.DEFAULT_BWD]
+# the modules an unset variable falls back to when the default cannot run (impl.DEFAULT_FALLBACK)
+_FWD_FALLBACK = impl.FWD_MODULES[impl.DEFAULT_FALLBACK["fwd"]]
+_BWD_FALLBACK = impl.BWD_MODULES[impl.DEFAULT_FALLBACK["bwd"]]
 
 _ROOT = Path(__file__).resolve().parents[3]
 D = 128
@@ -127,14 +135,25 @@ def hk(monkeypatch):
     impl._reset()
 
 
-def _fake_module(monkeypatch, name, *, fwd=True, bwd=True, gate=None, kernels=None, setter=True):
-    """A kernel module of the lab contract, put where impl imports ``<package>.<name>`` from."""
+def _fake_module(
+    monkeypatch, name, *, fwd=True, bwd=True, gate=None, kernels=None, setter=True, strides=None
+):
+    """A kernel module of the lab contract, put where impl imports ``<package>.<name>`` from. ``strides``: its
+    ``SUPPORTS_STRIDES`` (unset: None); ``seen`` records (name, data_ptr, strides) of every tensor it got;
+    outputs come in the inputs' layouts (zeros_like keeps the strides of dense tensors)."""
     mod = types.ModuleType(f"{_PKG}.{name}")
-    mod.calls, mod.dirs = [], []
+    mod.calls, mod.dirs, mod.seen = [], [], []
+    if strides is not None:
+        mod.SUPPORTS_STRIDES = strides
+
+    def see(**tensors):
+        mod.seen.append({n: (t.data_ptr(), tuple(t.stride())) for n, t in tensors.items()})
+
     if fwd:
 
         def flash_attn_fwd(q, k, v, softmax_scale, causal):
             mod.calls.append(("fwd", softmax_scale, causal))
+            see(q=q, k=k, v=v)
             b, sq, hq, _ = q.shape
             return torch.zeros_like(q), torch.zeros(b, hq, sq, device=q.device)
 
@@ -143,6 +162,7 @@ def _fake_module(monkeypatch, name, *, fwd=True, bwd=True, gate=None, kernels=No
 
         def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale, causal):
             mod.calls.append(("bwd", softmax_scale, causal))
+            see(do=do, q=q, k=k, v=v, o=o, lse=lse)
             return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
 
         mod.flash_attn_bwd = flash_attn_bwd
@@ -164,7 +184,7 @@ def _lab_dir(tmp_path, names):
     return d
 
 
-def _available(monkeypatch, hk, tmp_path, fwd=_FWD, bwd="bwd_v0", **kwargs):
+def _available(monkeypatch, hk, tmp_path, fwd=_FWD, bwd=_BWD, **kwargs):
     """Fake fwd / bwd modules and a lab directory holding their manifest kernels: both directions run HK."""
     mods = {}
     for name in (fwd, bwd):
@@ -252,24 +272,42 @@ def test_settings_are_read_once_at_import():
     env = _clean_env(PRIMUS_TURBO_HK_FWD="v0", PRIMUS_TURBO_HK_BWD="flydsl", HK_HSACO_DIR="/lab/dir")
     run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, env=env)
     assert run.stdout.split() == ["v0", "flydsl", "/lab/dir", "fwd_v0", "None"], run.stdout + run.stderr
+    env = _clean_env(PRIMUS_TURBO_HK_FWD="V1", PRIMUS_TURBO_HK_BWD="v1")
+    run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True, env=env)
+    assert run.stdout.split() == ["V1", "v1", "None", "fwd_v1", "bwd_v1"], run.stdout + run.stderr
 
 
 def test_default_selection(hk):
-    assert hk.DEFAULT_FWD == "v0" and hk.DEFAULT_BWD == "v0"
-    assert (hk.setting("fwd"), hk.module_name("fwd")) == ("v0", "fwd_v0")
-    assert (hk.setting("bwd"), hk.module_name("bwd")) == ("v0", "bwd_v0")
+    """v1 by default in both directions; v0 is the default's fallback (an unset variable only)."""
+    assert hk.DEFAULT_FWD == "v1" and hk.DEFAULT_BWD == "v1"
+    assert hk.DEFAULT_FALLBACK == {"fwd": "v0", "bwd": "v0"}
+    assert (hk.setting("fwd"), hk.module_name("fwd")) == ("v1", "fwd_v1")
+    assert (hk.setting("bwd"), hk.module_name("bwd")) == ("v1", "bwd_v1")
+    assert hk.candidates("fwd") == ["v1", "v0"] and hk.candidates("bwd") == ["v1", "v0"]
+
+
+@pytest.mark.parametrize(
+    ("direction", "value", "candidates"),
+    [("fwd", "v1", ["v1"]), ("bwd", " V1 ", ["v1"]), ("fwd", "v0", ["v0"]), ("bwd", "", ["v1", "v0"])],
+)
+def test_only_an_unset_setting_falls_back(monkeypatch, hk, direction, value, candidates):
+    monkeypatch.setattr(hk, "FWD_SETTING" if direction == "fwd" else "BWD_SETTING", value)
+    assert hk.candidates(direction) == candidates
 
 
 @pytest.mark.parametrize(
     ("direction", "value", "module"),
     [
+        ("fwd", "v1", "fwd_v1"),
         ("fwd", "v0", "fwd_v0"),
         ("fwd", " PP ", "fwd_pp"),
         ("fwd", "flydsl", None),
-        ("fwd", "  ", "fwd_v0"),
+        ("fwd", "  ", "fwd_v1"),
+        ("bwd", "V1", "bwd_v1"),
         ("bwd", "V0", "bwd_v0"),
         ("bwd", "FlyDSL", None),
-        ("fwd", "v1", None),
+        ("bwd", "", "bwd_v1"),
+        ("fwd", "v2", None),
         ("bwd", "pp", None),
     ],
 )
@@ -283,7 +321,7 @@ def test_setting_parsing(monkeypatch, hk, direction, value, module):
     [
         ("fwd", "flydsl", "PRIMUS_TURBO_HK_FWD=flydsl"),
         ("bwd", "FLYDSL", "PRIMUS_TURBO_HK_BWD=flydsl"),
-        ("fwd", "v1", "PRIMUS_TURBO_HK_FWD='v1' is not one of"),
+        ("fwd", "v2", "PRIMUS_TURBO_HK_FWD='v2' is not one of"),
         ("bwd", "pp", "PRIMUS_TURBO_HK_BWD='pp' is not one of"),
     ],
 )
@@ -303,6 +341,7 @@ def test_unknown_direction_is_a_reason(hk):
 
 
 def test_missing_kernel_module_is_a_reason(monkeypatch, hk):
+    monkeypatch.setattr(hk, "FWD_SETTING", hk.DEFAULT_FWD)  # explicit: no fallback
     monkeypatch.setitem(sys.modules, f"{_PKG}.{_FWD}", None)  # import raises ModuleNotFoundError
     q, k, v = _meta(*PROD)
     reason = hk.hk_unsupported_reason("fwd", q, k, v, True)
@@ -323,7 +362,8 @@ class _BrokenFinder:
 
 
 def test_module_that_fails_to_import_is_a_reason_resolved_once(monkeypatch, hk):
-    finder = _BrokenFinder(f"{_PKG}.bwd_v0")
+    monkeypatch.setattr(hk, "BWD_SETTING", hk.DEFAULT_BWD)  # explicit: no fallback
+    finder = _BrokenFinder(f"{_PKG}.{_BWD}")
     monkeypatch.delitem(sys.modules, finder.name, raising=False)
     monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
     for _ in range(3):
@@ -339,13 +379,13 @@ def test_module_without_its_entry_point_is_a_reason(monkeypatch, hk, tmp_path):
 
 
 def test_lab_directory_needs_the_modules_kernels(monkeypatch, hk, tmp_path):
-    mod = _fake_module(monkeypatch, "bwd_v0")
+    mod = _fake_module(monkeypatch, _BWD)
     empty = tmp_path / "empty"
     empty.mkdir()
     hk.set_hsaco_dir(empty)
     reason = hk.hk_unavailable_reason("bwd")
     assert reason is not None and "not in" in reason and str(empty) in reason, reason
-    hk.set_hsaco_dir(_lab_dir(tmp_path, hsaco.kernel_names("bwd_v0")))
+    hk.set_hsaco_dir(_lab_dir(tmp_path, hsaco.kernel_names(_BWD)))
     assert hk.hk_unavailable_reason("bwd") is None
     assert mod.dirs[-1] == str(tmp_path / "lab")
     hk.set_hsaco_dir(tmp_path / "nowhere")
@@ -389,20 +429,20 @@ def test_set_hsaco_dir_repoints_loaded_modules(monkeypatch, hk, tmp_path):
 def test_lab_search_path_gives_each_module_its_own_directory(monkeypatch, hk, tmp_path):
     """HK_HSACO_DIR may join several cc.sh output directories (one per kernel): each module loads from the
     first one holding all of its code objects; a missing directory of the path is a reason."""
-    mods = {n: _fake_module(monkeypatch, n) for n in (_FWD, "bwd_v0")}
+    mods = {n: _fake_module(monkeypatch, n) for n in (_FWD, _BWD)}
     dirs = {}
     for n in mods:
         dirs[n] = tmp_path / n
         dirs[n].mkdir()
         for k in hsaco.kernel_names(n):
             (dirs[n] / f"{k}.hsaco").write_bytes(b"x")
-    hk.set_hsaco_dir(os.pathsep.join(str(dirs[n]) for n in (_FWD, "bwd_v0")))
-    assert hk.hsaco_dirs() == [str(dirs[_FWD]), str(dirs["bwd_v0"])]
+    hk.set_hsaco_dir(os.pathsep.join(str(dirs[n]) for n in (_FWD, _BWD)))
+    assert hk.hsaco_dirs() == [str(dirs[_FWD]), str(dirs[_BWD])]
     assert hk.hk_unavailable_reason("fwd") is None and hk.hk_unavailable_reason("bwd") is None
-    assert mods[_FWD].dirs[-1] == str(dirs[_FWD]) and mods["bwd_v0"].dirs[-1] == str(dirs["bwd_v0"])
-    assert str(dirs["bwd_v0"]) in hk.describe("bwd") and "unpinned, lab" in hk.describe("bwd")
+    assert mods[_FWD].dirs[-1] == str(dirs[_FWD]) and mods[_BWD].dirs[-1] == str(dirs[_BWD])
+    assert str(dirs[_BWD]) in hk.describe("bwd") and "unpinned, lab" in hk.describe("bwd")
     files = hk.code_object_files("bwd")
-    assert files == {k: dirs["bwd_v0"] / f"{k}.hsaco" for k in hsaco.kernel_names("bwd_v0")}
+    assert files == {k: dirs[_BWD] / f"{k}.hsaco" for k in hsaco.kernel_names(_BWD)}
     hk.set_hsaco_dir([dirs[_FWD]])  # a list works too; bwd's code objects are not on this path
     assert "not in" in hk.hk_unavailable_reason("bwd") and hk.hk_unavailable_reason("fwd") is None
     hk.set_hsaco_dir(os.pathsep.join([str(dirs[_FWD]), str(tmp_path / "typo")]))
@@ -412,21 +452,22 @@ def test_lab_search_path_gives_each_module_its_own_directory(monkeypatch, hk, tm
 def test_pinned_code_objects_are_hashed_again_before_the_first_launch(monkeypatch, hk, tmp_manifest):
     """Production: bytes replaced in bin/ after the (cached) check are refused before the module's first
     launch, and the direction stays unavailable."""
-    mod = _fake_module(monkeypatch, "bwd_v0")
+    mod = _fake_module(monkeypatch, _BWD)
     data = b"validated code object"
-    tmp_manifest({"k_attn_bwd_v0": _entry("bwd_v0", hashlib.sha256(data).hexdigest())})
-    (hsaco.BIN_DIR / "k_attn_bwd_v0.hsaco").write_bytes(data)
+    name = f"k_attn_{_BWD}"
+    tmp_manifest({name: _entry(_BWD, hashlib.sha256(data).hexdigest())})
+    (hsaco.BIN_DIR / f"{name}.hsaco").write_bytes(data)
     q, k, v = (torch.zeros(s, dtype=torch.bfloat16) for s in ((1, 128, 4, D), (1, 128, 1, D), (1, 128, 1, D)))
     lse = torch.zeros(1, 4, 128)
     assert hk.hk_unavailable_reason("bwd") is None
-    (hsaco.BIN_DIR / "k_attn_bwd_v0.hsaco").write_bytes(b"swapped")
+    (hsaco.BIN_DIR / f"{name}.hsaco").write_bytes(b"swapped")
     with pytest.raises(NotImplementedError, match="sha256"):
         hk.hk_attn_bwd(q, q, k, v, q, lse, None, True)
     assert mod.calls == [] and "sha256" in hk.hk_unavailable_reason("bwd")
-    (hsaco.BIN_DIR / "k_attn_bwd_v0.hsaco").write_bytes(data)
+    (hsaco.BIN_DIR / f"{name}.hsaco").write_bytes(data)
     hk._reset()
     hk.hk_attn_bwd(q, q, k, v, q, lse, None, True)
-    (hsaco.BIN_DIR / "k_attn_bwd_v0.hsaco").write_bytes(b"swapped")  # loaded already: not re-read
+    (hsaco.BIN_DIR / f"{name}.hsaco").write_bytes(b"swapped")  # loaded already: not re-read
     hk.hk_attn_bwd(q, q, k, v, q, lse, None, True)
     assert len(mod.calls) == 2
 
@@ -435,19 +476,21 @@ def test_pinned_code_objects_are_hashed_again_before_the_first_launch(monkeypatc
 def test_production_code_objects_must_match_their_pins(monkeypatch, hk, tmp_manifest, state):
     """Without a lab directory, a module runs only when every manifest kernel of it is in bin/ with the
     pinned sha256; the module is then pointed at bin/."""
-    mod = _fake_module(monkeypatch, "bwd_v0")
+    monkeypatch.setattr(hk, "BWD_SETTING", hk.DEFAULT_BWD)  # explicit: no fallback
+    mod = _fake_module(monkeypatch, _BWD)
     data = b"validated code object"
     sha = hashlib.sha256(data).hexdigest()
+    name = f"k_attn_{_BWD}"
     kernels = {
-        "unlisted": {"k_other": _entry("fwd_v0", sha)},
-        "unpinned": {"k_attn_bwd_v0": _entry("bwd_v0")},
-    }.get(state, {"k_attn_bwd_v0": _entry("bwd_v0", sha)})
+        "unlisted": {"k_other": _entry(_FWD, sha)},
+        "unpinned": {name: _entry(_BWD)},
+    }.get(state, {name: _entry(_BWD, sha)})
     tmp_manifest(kernels)
     if state in ("stale", "pinned"):
-        (hsaco.BIN_DIR / "k_attn_bwd_v0.hsaco").write_bytes(data if state == "pinned" else b"rebuilt")
+        (hsaco.BIN_DIR / f"{name}.hsaco").write_bytes(data if state == "pinned" else b"rebuilt")
     reason = hk.hk_unavailable_reason("bwd")
     expected = {
-        "unlisted": "lists no kernels for bwd_v0",
+        "unlisted": f"lists no kernels for {_BWD}",
         "unpinned": "is not pinned",
         "unbuilt": "is not built",
         "stale": "sha256",
@@ -470,6 +513,163 @@ def test_missing_manifest_is_a_reason(monkeypatch, hk, tmp_path):
     finally:
         hsaco.MANIFEST_PATH = old
         hsaco.reload_manifest()
+
+
+# ---------------------------------------------------------------------------
+# The default's fallback (DEFAULT_FALLBACK): an unset variable whose default cannot run
+# ---------------------------------------------------------------------------
+
+
+def _production(monkeypatch, tmp_manifest, pinned, unpinned=(), mods=None):
+    """Fake default and fallback modules of both directions (unless ``mods`` are given); a manifest listing one
+    code object per module, ``pinned`` modules pinned (their bytes in bin/), ``unpinned`` listed without a pin,
+    the others unlisted."""
+    if mods is None:
+        mods = {m: _fake_module(monkeypatch, m) for m in (_FWD, _BWD, _FWD_FALLBACK, _BWD_FALLBACK)}
+    kernels = {}
+    for m in pinned:
+        data = f"validated {m}".encode()
+        kernels[f"k_attn_{m}"] = _entry(m, hashlib.sha256(data).hexdigest())
+    for m in unpinned:
+        kernels[f"k_attn_{m}"] = _entry(m)
+    tmp_manifest(kernels)
+    for m in pinned:
+        (hsaco.BIN_DIR / f"k_attn_{m}.hsaco").write_bytes(f"validated {m}".encode())
+    return mods
+
+
+def test_unpinned_default_falls_back_to_the_pinned_previous_default(monkeypatch, hk, tmp_manifest):
+    """v1 listed but not pinned yet, v0 pinned: an unset variable runs v0 from bin/ (one RuntimeWarning per
+    direction, the reason in describe / fallback_reason), with v0's shape rules; the default's module is never
+    pointed at anything."""
+    mods = _production(monkeypatch, tmp_manifest, [_FWD_FALLBACK, _BWD_FALLBACK], [_FWD, _BWD])
+    with pytest.warns(RuntimeWarning) as caught:
+        assert hk.hk_unavailable_reason("fwd") is None and hk.hk_unavailable_reason("bwd") is None
+        assert hk.hk_unavailable_reason("fwd") is None  # resolved once: no second warning
+    assert [str(w.message) for w in caught] == [
+        f"HK gfx1250 attention: {d} runs {fb} ({hk.DEFAULT_FALLBACK[d]}), not the default {default}: "
+        f"k_attn_{m} is not pinned in manifest.json (validate it, then run {hsaco.PIN_TOOL})"
+        for d, fb, default, m in (
+            ("fwd", _FWD_FALLBACK, hk.DEFAULT_FWD, _FWD),
+            ("bwd", _BWD_FALLBACK, hk.DEFAULT_BWD, _BWD),
+        )
+    ]
+    for d, fb, default in (("fwd", _FWD_FALLBACK, _FWD), ("bwd", _BWD_FALLBACK, _BWD)):
+        assert hk.module_name(d) == fb and hk.setting(d) == hk.DEFAULT_FALLBACK[d]
+        assert f"k_attn_{default} is not pinned" in hk.fallback_reason(d)
+        assert mods[fb].dirs == [str(hsaco.BIN_DIR)] and mods[default].dirs == []
+        line = hk.describe(d)
+        assert line.startswith(
+            f"{d}: {fb} ({hk.DEFAULT_FALLBACK[d]}; the default {hk._DIRECTIONS[d][1]} cannot run: "
+        )
+        assert hk.code_object_files(d) == {f"k_attn_{fb}": hsaco.BIN_DIR / f"k_attn_{fb}.hsaco"}
+    q, k, v = (
+        torch.zeros(s, dtype=torch.bfloat16) for s in ((1, 128, 12, D), (1, 128, 1, D), (1, 128, 1, D))
+    )
+    # G 12: the gate asks the module that runs (fwd_v0's rules take it, fwd_v1's do not)
+    assert hk.hk_unsupported_reason("fwd", q, k, v, True) == limits.shape_unsupported_reason(
+        _FWD_FALLBACK, q.shape, k.shape, v.shape, True
+    )
+    by_module = {
+        m: limits.shape_unsupported_reason(m, q.shape, k.shape, v.shape, True) for m in (_FWD, _FWD_FALLBACK)
+    }
+    assert by_module[_FWD] != by_module[_FWD_FALLBACK]
+    q, k, v = (torch.zeros(s, dtype=torch.bfloat16) for s in ((1, 128, 4, D), (1, 128, 1, D), (1, 128, 1, D)))
+    out, lse = hk.hk_attn_fwd(q, k, v, None, True)
+    hk.hk_attn_bwd(q, q, k, v, out, lse, None, True)
+    assert mods[_FWD_FALLBACK].calls == [("fwd", D**-0.5, True)]
+    assert mods[_BWD_FALLBACK].calls == [("bwd", D**-0.5, True)]
+    assert mods[_FWD].calls == [] and mods[_BWD].calls == []
+
+
+def test_fallback_is_resolved_again_once_the_default_is_pinned(monkeypatch, hk, tmp_manifest):
+    mods = _production(monkeypatch, tmp_manifest, [_FWD_FALLBACK], [_FWD])
+    with pytest.warns(RuntimeWarning):
+        assert hk.hk_unavailable_reason("fwd") is None and hk.module_name("fwd") == _FWD_FALLBACK
+    assert mods[_FWD].dirs == []
+    # the pin tool pinned the default
+    _production(monkeypatch, tmp_manifest, [_FWD, _FWD_FALLBACK], mods=mods)
+    hk.set_hsaco_dir(None)  # forgets every verdict (as a new process would)
+    with warnings_recorded() as caught:
+        assert hk.hk_unavailable_reason("fwd") is None and hk.fallback_reason("fwd") is None
+    assert caught == []
+    assert (hk.setting("fwd"), hk.module_name("fwd")) == (hk.DEFAULT_FWD, _FWD)
+    assert "cannot run" not in hk.describe("fwd") and mods[_FWD].dirs[-1] == str(hsaco.BIN_DIR)
+
+
+@pytest.mark.parametrize("direction", ["fwd", "bwd"])
+def test_an_explicit_setting_never_falls_back(monkeypatch, hk, tmp_manifest, direction):
+    """PRIMUS_TURBO_HK_*=v1 (what a validation or benchmark asks for) runs v1 or nothing: the direction runs
+    FlyDSL with v1's reason, even though v0 could run."""
+    default = _FWD if direction == "fwd" else _BWD
+    variable = "FWD_SETTING" if direction == "fwd" else "BWD_SETTING"
+    monkeypatch.setattr(hk, variable, hk._DIRECTIONS[direction][1])
+    mods = _production(monkeypatch, tmp_manifest, [_FWD_FALLBACK, _BWD_FALLBACK], [_FWD, _BWD])
+    with warnings_recorded() as caught:
+        reason = hk.hk_unavailable_reason(direction)
+    assert (
+        reason == f"k_attn_{default} is not pinned in manifest.json (validate it, then run {hsaco.PIN_TOOL})"
+    )
+    assert caught == [] and hk.fallback_reason(direction) is None and hk.module_name(direction) == default
+    assert all(m.dirs == [] for name, m in mods.items() if name.startswith(direction))
+
+
+def test_nothing_to_fall_back_to_runs_flydsl_with_one_warning_naming_both(monkeypatch, hk, tmp_manifest):
+    """Neither the default nor its fallback can run: the reason names both (the default's first), and the
+    adapter runs FlyDSL with one warning per direction, as before."""
+    _production(monkeypatch, tmp_manifest, [], [_FWD, _BWD, _FWD_FALLBACK])  # bwd v0 not even listed
+    reason = hk.hk_unavailable_reason("fwd")
+    assert reason == (
+        f"k_attn_{_FWD} is not pinned in manifest.json (validate it, then run {hsaco.PIN_TOOL}) (default fallback "
+        f"{hk.DEFAULT_FALLBACK['fwd']}: k_attn_{_FWD_FALLBACK} is not pinned in manifest.json (validate it, then "
+        f"run {hsaco.PIN_TOOL}))"
+    )
+    bwd_fallback = (
+        f"(default fallback {hk.DEFAULT_FALLBACK['bwd']}: manifest.json lists no kernels for {_BWD_FALLBACK})"
+    )
+    assert bwd_fallback in hk.hk_unavailable_reason("bwd")
+    assert hk.module_name("fwd") == _FWD and hk.fallback_reason("fwd") is None
+    calls, log = [], _LogRecorder()
+    monkeypatch.setattr(hk_adapter, "_IMPL", hk)
+    monkeypatch.setattr(hk_adapter, "_flydsl_interface", lambda: _FakeFlydsl(calls))
+    monkeypatch.setattr(hk_adapter, "logger", log)
+    q, k, v = _meta(*PROD)
+    for _ in range(2):
+        hk_adapter._run_forward(q, k, v, 0.1, True)
+        hk_adapter._run_backward(q, q, k, v, q, None, 0.1, True, False)
+    assert [c[0] for c in calls] == ["fly_fwd", "fly_bwd"] * 2
+    assert len({w[1] for w in log.warnings()}) == 2 and all(w[2] for w in log.warnings())
+    assert all("runs on FlyDSL (" in w[1] and "default fallback v0" in w[1] for w in log.warnings())
+
+
+def test_fallback_through_the_adapter_runs_hk_without_a_flydsl_warning(monkeypatch, hk, tmp_manifest):
+    mods = _production(monkeypatch, tmp_manifest, [_FWD_FALLBACK, _BWD_FALLBACK], [_FWD, _BWD])
+    log = _LogRecorder()
+    monkeypatch.setattr(hk_adapter, "_IMPL", hk)
+    monkeypatch.setattr(hk_adapter, "_flydsl_interface", lambda: pytest.fail("FlyDSL reached"))
+    monkeypatch.setattr(hk_adapter, "logger", log)
+    q, k, v = (torch.zeros(s, dtype=torch.bfloat16) for s in ((1, 128, 4, D), (1, 128, 1, D), (1, 128, 1, D)))
+    with pytest.warns(RuntimeWarning):
+        out, lse = hk_adapter._run_forward(q, k, v, 0.1, True)
+        hk_adapter._run_backward(q, q, k, v, out, lse, 0.1, True, False)
+    assert len(mods[_FWD_FALLBACK].calls) == len(mods[_BWD_FALLBACK].calls) == 1
+    assert log.warnings() == []
+    infos = [r[1] for r in log.records if r[0] == "info"]
+    assert [i.split(" (")[0] for i in infos] == [
+        f"HIPKITTENS attention on gfx1250: fwd: {_FWD_FALLBACK}",
+        f"HIPKITTENS attention on gfx1250: bwd: {_BWD_FALLBACK}",
+    ]
+    assert all("cannot run: " in i for i in infos)
+
+
+@contextlib.contextmanager
+def warnings_recorded():
+    """Every warning raised inside, as a list (empty: none)."""
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        yield caught
 
 
 # ---------------------------------------------------------------------------
@@ -501,8 +701,10 @@ def test_gate_accepts(monkeypatch, hk, tmp_path, direction, shape):
         ("fwd", (1, 128, 192, 4, 1), {}, None),  # Skv % 64 suffices forward
         ("bwd", (1, 256, 256, 16, 2), {}, "must be one of (4,)"),
         ("bwd", (1, 128, 192, 4, 1), {}, "seqlen_kv must be a multiple of 128"),
-        ("fwd", (1, 256, 256, 8, 4), {}, "multiple of 4"),
-        ("fwd", (1, 256, 256, 4, 4), {}, "multiple of 4"),
+        ("fwd", (1, 256, 256, 8, 4), {}, "heads_q / heads_kv must be"),  # G 2
+        ("fwd", (1, 256, 256, 4, 4), {}, "heads_q / heads_kv must be"),  # G 1
+        ("fwd", (1, 128, 128, 12, 1), {}, "must be one of (4, 8, 16)"),  # G 12: v1's kv head is a shift
+        ("bwd", (1, 128, 128, 4, 2), {}, "must be one of (4,)"),  # G 2
         ("fwd", (1, 96, 128, 4, 1), {}, "seqlen_q must be a multiple of 64"),
         ("fwd", (1, 128, 160, 4, 1), {}, "seqlen_kv must be a multiple of 64"),
         ("fwd", (1, 256, 128, 4, 1), {}, "seqlen_q <= seqlen_kv"),
@@ -548,7 +750,7 @@ def test_gate_refuses_misaligned_tensors(monkeypatch, hk, tmp_path):
     do = torch.zeros(q.numel() + 1, dtype=torch.bfloat16)[1:].view(q.shape)
     with pytest.raises(NotImplementedError, match="do data_ptr not 16-byte aligned"):
         hk.hk_attn_bwd(do, q, k, v, q, lse, None, True)
-    assert mods["bwd_v0"].calls == []
+    assert mods[_BWD].calls == []
 
 
 def test_module_gate_is_cached_only_once_the_module_is_loaded(monkeypatch, hk, tmp_path):
@@ -560,9 +762,9 @@ def test_module_gate_is_cached_only_once_the_module_is_loaded(monkeypatch, hk, t
 
     q, k, v = _meta(1, 128, 128, 4, 1)
     assert hk.shape_unsupported_reason("bwd", q.shape, k.shape, v.shape, torch.bfloat16, True) is None
-    assert "bwd_v0" not in hk._GATES  # not loaded yet: nothing cached
+    assert _BWD not in hk._GATES  # not loaded yet: nothing cached
     _available(monkeypatch, hk, tmp_path, gate=gate)
-    assert hk.hk_unsupported_reason("bwd", q, k, v, True) == "bwd_v0: the kernel says no" and seen
+    assert hk.hk_unsupported_reason("bwd", q, k, v, True) == f"{_BWD}: the kernel says no" and seen
 
 
 def test_gate_refuses_mismatched_tensors(monkeypatch, hk, tmp_path):
@@ -574,7 +776,7 @@ def test_gate_refuses_mismatched_tensors(monkeypatch, hk, tmp_path):
     assert "must match" in hk.hk_unsupported_reason("fwd", q, k, v[:, :64], True)
 
 
-@pytest.mark.parametrize("module", ["fwd_v0", "fwd_pp"])
+@pytest.mark.parametrize("module", ["fwd_v1", "fwd_v0", "fwd_pp"])
 def test_forward_module_choice_picks_its_rules(monkeypatch, hk, tmp_path, module):
     monkeypatch.setattr(hk, "FWD_SETTING", module.split("_")[1])
     _available(monkeypatch, hk, tmp_path, fwd=module, bwd=None)
@@ -595,7 +797,7 @@ def test_module_gate_is_asked_too(monkeypatch, hk, tmp_path):
     assert hk.hk_unsupported_reason("fwd", q, k, v, True) is None
     assert seen == [((1, 128, 4, D), (1, 256, 1, D), torch.bfloat16, True)]
     q, k, v = _meta(1, 256, 256, 4, 1)
-    assert hk.hk_unsupported_reason("bwd", q, k, v, True) == "bwd_v0: the kernel says no"
+    assert hk.hk_unsupported_reason("bwd", q, k, v, True) == f"{_BWD}: the kernel says no"
 
 
 def test_module_gate_that_raises_declines(monkeypatch, hk, tmp_path):
@@ -638,11 +840,11 @@ def test_entry_points_call_the_selected_modules(monkeypatch, hk, tmp_path):
     assert out.shape == q.shape and lse.shape == (1, 4, 128)
     hk.hk_attn_bwd(q, q, k, v, out, lse, 0.05, True)
     assert mods[_FWD].calls == [("fwd", D**-0.5, True)]
-    assert mods["bwd_v0"].calls == [("bwd", 0.05, True)]
+    assert mods[_BWD].calls == [("bwd", 0.05, True)]
     # the lab arm contract: the production selection under the lab's names
     hk.flash_attn_fwd(q, k, v, 0.1, True)
     hk.flash_attn_bwd(q, q, k, v, out, lse, 0.1, True)
-    assert mods[_FWD].calls[-1] == ("fwd", 0.1, True) and mods["bwd_v0"].calls[-1] == ("bwd", 0.1, True)
+    assert mods[_FWD].calls[-1] == ("fwd", 0.1, True) and mods[_BWD].calls[-1] == ("bwd", 0.1, True)
 
 
 def test_entry_points_raise_when_unsupported(monkeypatch, hk, tmp_path):
@@ -659,6 +861,387 @@ def test_entry_points_raise_when_unsupported(monkeypatch, hk, tmp_path):
         hk.hk_attn_bwd(q, q, k, v, q[:, :64].contiguous(), lse, None, True)
     with pytest.raises(ValueError, match="q must be contiguous"):
         hk.hk_attn_fwd(q.transpose(1, 2).contiguous().transpose(1, 2), k, v, None, True)
+
+
+# ---------------------------------------------------------------------------
+# Strided layouts (-DHK_STRIDES=1 code objects): impl
+# ---------------------------------------------------------------------------
+
+
+def _sbhd(b, s, h, d=D, device="cpu"):
+    """A [b, s, h, d] view of contiguous [s, b, h, d] storage (what Megatron hands over), random bf16."""
+    return torch.randn(s, b, h, d, device=device).to(torch.bfloat16).transpose(0, 1)
+
+
+def _layout_cases():
+    """(name, tensor, layout by the kernel contract) -- also the size-1 cases, where only "bshd" is reported."""
+    t = torch.randn(2, 3, 4, 8)
+    odd = torch.empty(1, 3, 4, 8).as_strided((1, 3, 4, 8), (999, 32, 8, 1))  # b == 1, any batch stride
+    return [
+        ("bshd", t, "bshd"),
+        ("sbhd", t.transpose(0, 1).contiguous().transpose(0, 1), "sbhd"),
+        ("sbhd_b1", torch.randn(3, 1, 4, 8).transpose(0, 1), "bshd"),
+        ("sbhd_s1", torch.randn(1, 2, 4, 8).transpose(0, 1), "bshd"),
+        ("bshd_odd_size1_stride", odd, "bshd"),
+        ("bhsd", torch.randn(2, 4, 3, 8).transpose(1, 2), None),
+        ("head_slice", t[:, :, :2], None),
+        ("d_slice", t[..., :4], None),
+        ("sbhd_head_slice", t.transpose(0, 1).contiguous().transpose(0, 1)[:, :, 1:3], None),
+        ("3d", torch.randn(2, 3, 4), None),
+    ]
+
+
+@pytest.mark.parametrize(("name", "t", "layout"), _layout_cases(), ids=[c[0] for c in _layout_cases()])
+def test_tensor_layout_of_impl_and_adapter(name, t, layout):
+    assert impl.tensor_layout(t) == hk_adapter.tensor_layout(t) == layout
+
+
+def test_hk_supports_strides_is_the_running_modules_attribute(monkeypatch, hk, tmp_path):
+    mods = _available(monkeypatch, hk, tmp_path)
+    assert hk.hk_supports_strides("fwd") is False and hk.hk_supports_strides("bwd") is False  # no attribute
+    mods[_FWD].SUPPORTS_STRIDES = True
+    assert hk.hk_supports_strides("fwd") is True and hk.hk_supports_strides("bwd") is False
+    mods[_BWD].SUPPORTS_STRIDES = 1  # only True counts
+    assert hk.hk_supports_strides("bwd") is False
+    mods[_BWD].SUPPORTS_STRIDES = True
+    assert hk.hk_supports_strides("bwd") is True
+    assert "layouts BSHD / SBHD in place (strides)" in hk.describe("fwd")
+    monkeypatch.setattr(hk, "BWD_SETTING", "flydsl")  # no module runs the backward
+    hk._reset()
+    assert hk.hk_supports_strides("bwd") is False and hk.hk_supports_strides("fwd") is True
+    assert hk.hk_supports_strides("sideways") is False
+
+
+def test_hk_supports_strides_follows_the_default_fallback(monkeypatch, hk, tmp_manifest):
+    """v1 not pinned, v0 pinned: v0 runs, so its attribute counts, not v1's."""
+    mods = _production(monkeypatch, tmp_manifest, [_FWD_FALLBACK, _BWD_FALLBACK], [_FWD, _BWD])
+    mods[_FWD].SUPPORTS_STRIDES = mods[_BWD].SUPPORTS_STRIDES = True
+    with pytest.warns(RuntimeWarning):
+        assert hk.hk_supports_strides("fwd") is False and hk.hk_supports_strides("bwd") is False
+    mods[_FWD_FALLBACK].SUPPORTS_STRIDES = True
+    assert hk.hk_supports_strides("fwd") is True
+    line = hk.describe("fwd")
+    assert line.startswith(f"fwd: {_FWD_FALLBACK} (") and line.endswith(
+        "layouts BSHD / SBHD in place (strides)"
+    )
+    assert hk.describe("bwd").endswith("layouts contiguous BSHD")
+    # e2e_table.py's HK_RAN pattern still finds the module
+    assert re.search(
+        r"HIPKITTENS attention on gfx1250: (fwd|bwd): (\w+) \(", f"HIPKITTENS attention on gfx1250: {line}"
+    )
+
+
+@pytest.mark.parametrize("strided", [True, False])
+def test_impl_entry_points_hand_sbhd_storage_only_to_strided_modules(monkeypatch, hk, tmp_path, strided):
+    """A module with SUPPORTS_STRIDES gets q / k / v / do / o as they are, per tensor BSHD or SBHD storage (the
+    caller's bytes, exact strides of the layout), lse contiguous; a module without it: ValueError, as before."""
+    mods = _available(monkeypatch, hk, tmp_path, strides=strided)
+    b, s, hq, hkv = 2, 128, 4, 1
+    q, k, v = _sbhd(b, s, hq), torch.randn(b, s, hkv, D).to(torch.bfloat16), _sbhd(b, s, hkv)
+    if not strided:
+        with pytest.raises(ValueError, match="q must be contiguous"):
+            hk.hk_attn_fwd(q, k, v, None, True)
+        assert mods[_FWD].calls == []
+        return
+    out, lse = hk.hk_attn_fwd(q, k, v, None, True)
+    assert mods[_FWD].seen == [{n: (t.data_ptr(), t.stride()) for n, t in (("q", q), ("k", k), ("v", v))}]
+    assert out.stride() == q.stride()  # the fake writes q's layout (zeros_like)
+    do = _sbhd(b, s, hq)
+    hk.hk_attn_bwd(do, q, k, v, out, lse, None, True)
+    seen = mods[_BWD].seen[-1]
+    for n, t in (("do", do), ("q", q), ("k", k), ("v", v), ("o", out), ("lse", lse)):
+        assert seen[n] == (t.data_ptr(), t.stride()), n
+    with pytest.raises(ValueError, match="lse must be"):
+        hk.hk_attn_bwd(do, q, k, v, out, lse.transpose(1, 2).contiguous().transpose(1, 2), None, True)
+    bhsd = torch.randn(b, hq, s, D).to(torch.bfloat16).transpose(1, 2)
+    with pytest.raises(ValueError, match=r"q must be contiguous \[B, S, H, D\] or a \[B, S, H, D\] view"):
+        hk.hk_attn_fwd(bhsd, k, v, None, True)
+    with pytest.raises(ValueError, match="do must be contiguous"):
+        hk.hk_attn_bwd(bhsd, q, k, v, out, lse, None, True)
+
+
+def test_impl_hands_exact_layout_strides_to_a_strided_module(monkeypatch, hk, tmp_path):
+    """The stride of a size-1 dimension addresses nothing, so torch calls such a tensor contiguous whatever it
+    is; the module is handed the same elements with the exact strides of the layout."""
+    mods = _available(monkeypatch, hk, tmp_path, strides=True)
+    q = torch.zeros(1, 128, 4, D, dtype=torch.bfloat16)
+    odd = q.as_strided(q.shape, (12345, 4 * D, D, 1))
+    k = torch.zeros(1, 128, 1, D, dtype=torch.bfloat16)
+    hk.hk_attn_fwd(odd, k, k, None, True)
+    assert mods[_FWD].seen[-1]["q"] == (q.data_ptr(), (128 * 4 * D, 4 * D, D, 1))
+
+
+# ---------------------------------------------------------------------------
+# Strided layouts: the adapter's ops and the HIPKITTENS glue
+# ---------------------------------------------------------------------------
+
+_HOST_SHAPE = (2, 128, 256, 8, 2)  # b, sq, skv, hq, hkv: FlyDSL's gate takes it (G 4), b > 1 and s > 1
+
+
+def _bshd(b, s, h, d=D):
+    return torch.randn(b, s, h, d).to(torch.bfloat16)
+
+
+def _make(layout, b, s, h):
+    return _sbhd(b, s, h) if layout == "sbhd" else _bshd(b, s, h)
+
+
+def _expected(q, k, v, do):
+    """The fakes' outputs (out = 2 q, dq = do + q, dk = 3 k, dv = 5 v; the same bf16 ops)."""
+    with torch.no_grad():
+        return 2 * q, do + q, 3 * k, 5 * v
+
+
+@pytest.fixture
+def strided_adapter(monkeypatch):
+    """The real adapter on a fake impl (``fake.strided`` picks the directions whose kernels take strides) and
+    fake FlyDSL kernels, with the custom ops' bodies called directly (no device guard)."""
+    _TAGGED.clear()
+    fake = _FakeImpl(strided=("fwd", "bwd"))
+    log = _LogRecorder()
+    monkeypatch.setattr(hk_adapter, "_IMPL", fake)
+    monkeypatch.setattr(hk_adapter, "_flydsl_interface", lambda: _FakeFlydsl(fake.calls))
+    monkeypatch.setattr(hk_adapter, "logger", log)
+    monkeypatch.setattr(hk_adapter, "_forward", hk_adapter._run_forward)
+    monkeypatch.setattr(hk_adapter, "_backward", hk_adapter._run_backward)
+    return fake, log
+
+
+def test_operands_keep_either_layout_only_for_strided_kernels(strided_adapter):
+    fake, _ = strided_adapter
+    b, sq, skv, hq, hkv = _HOST_SHAPE
+    q, k, v = (
+        _sbhd(b, sq, hq),
+        _bshd(b, skv, hkv),
+        torch.randn(b, hkv, skv, D).to(torch.bfloat16).transpose(1, 2),
+    )
+    got = hk_adapter.hk_gfx1250_operands("fwd", q, k, v)
+    assert (
+        got[0] is q and got[1] is k and got[2] is not v and got[2].is_contiguous() and torch.equal(got[2], v)
+    )
+    got = hk_adapter.hk_gfx1250_operands("fwd", q, k, strided=False)
+    assert got[0] is not q and got[0].is_contiguous() and got[1] is k
+    fake.strided = set()
+    got = hk_adapter.hk_gfx1250_operands("bwd", q, k)
+    assert got[0] is not q and got[0].is_contiguous() and torch.equal(got[0], q) and got[1] is k
+
+
+_COMBOS = {  # layouts of q, k, v, dout (flash_attn_func wants one layout for q / k / v; the ops take any mix)
+    "sbhd": ("sbhd", "sbhd", "sbhd", "sbhd"),
+    "mixed_q": ("sbhd", "bshd", "bshd", "sbhd"),
+    "mixed_kv": ("bshd", "sbhd", "bshd", "bshd"),
+    "bshd": ("bshd", "bshd", "bshd", "bshd"),
+    "sbhd_dout_bshd": ("sbhd", "sbhd", "sbhd", "bshd"),
+    "bshd_dout_sbhd": ("bshd", "bshd", "bshd", "sbhd"),
+}
+_FUNC_COMBOS = ["sbhd", "sbhd_dout_bshd", "bshd_dout_sbhd"]
+
+
+@pytest.mark.parametrize(
+    "runner", ["hk_strided", "hk_without_strides", "fly_gate", "fly_late"], ids=lambda r: r
+)
+@pytest.mark.parametrize("combo", list(_COMBOS))
+def test_ops_return_the_input_layouts_whatever_runs(strided_adapter, runner, combo):
+    """Whatever runs a direction, the op returns out in q's layout and dq / dk / dv in q's / k's / v's (what its
+    fake says): strided HK writes them in place from the caller's bytes; HK without strides (a module re-pointed
+    after the glue asked) and FlyDSL (gate or late decline) get contiguous copies and their results are copied
+    into those layouts. The values are the same."""
+    fake, log = strided_adapter
+    if runner == "hk_without_strides":
+        fake.strided = set()
+    elif runner == "fly_gate":
+        fake.reasons = {"fwd": "a shape reason", "bwd": "a shape reason"}
+    elif runner == "fly_late":
+
+        def late(*args, **kwargs):
+            raise NotImplementedError("hk_attn_*: o data_ptr not 16-byte aligned")
+
+        fake.hk_attn_fwd = fake.hk_attn_bwd = late
+    b, sq, skv, hq, hkv = _HOST_SHAPE
+    lq, lk, lv, ld = _COMBOS[combo]
+    q, k, v, do = _make(lq, b, sq, hq), _make(lk, b, skv, hkv), _make(lv, b, skv, hkv), _make(ld, b, sq, hq)
+    out, lse = hk_adapter._run_forward(q, k, v, 0.1, True)
+    dq, dk, dv = hk_adapter._run_backward(do, q, k, v, out, lse, 0.1, True, False)
+    for t, layout in ((out, lq), (dq, lq), (dk, lk), (dv, lv)):
+        assert _layout_of(t) == layout
+    for got, want in zip((out, dq, dk, dv), _expected(q, k, v, do)):
+        assert torch.equal(got, want)
+    kinds = [c[0] for c in fake.calls]
+    assert kinds == (["hk_fwd", "hk_bwd"] if runner.startswith("hk") else ["fly_fwd", "fly_bwd"])
+    seen_fwd, seen_bwd = fake.calls[0][-1], fake.calls[1][-1]
+    if runner == "hk_strided":
+        assert seen_fwd == {n: (t.data_ptr(), t.stride()) for n, t in (("q", q), ("k", k), ("v", v))}
+        assert seen_bwd["do"] == (do.data_ptr(), do.stride()) and seen_bwd["o"] == (
+            out.data_ptr(),
+            out.stride(),
+        )
+        assert _tag_of((out, dq, dk, dv)) == (
+            "hk out",
+            "hk dq",
+            "hk dk",
+            "hk dv",
+        )  # no copy after the kernels
+    else:  # contiguous BSHD reached the kernels; a copy only where a layout was "sbhd"
+        for name, t in (("q", q), ("k", k), ("v", v)):
+            assert (seen_fwd[name][0] == t.data_ptr()) == (_layout_of(t) == "bshd"), name
+    if runner.startswith("fly"):
+        assert len(log.warnings()) == 2
+
+
+@pytest.mark.parametrize("combo", ["sbhd", "mixed_q", "mixed_kv"])
+def test_fake_impls_follow_the_input_layouts(combo):
+    b, sq, skv, hq, hkv = _HOST_SHAPE
+    lq, lk, lv, ld = _COMBOS[combo]
+
+    def meta(layout, s, h):
+        return _alloc(torch.empty(0, dtype=torch.bfloat16, device="meta"), (b, s, h, D), layout)
+
+    q, k, v, do = meta(lq, sq, hq), meta(lk, skv, hkv), meta(lv, skv, hkv), meta(ld, sq, hq)
+    out, lse = torch.ops.primus_turbo.flash_attn_hk_gfx1250_forward(q, k, v, 0.1, True)
+    assert out.shape == q.shape and out.stride() == q.stride() and lse.is_contiguous()
+    dq, dk, dv = torch.ops.primus_turbo.flash_attn_hk_gfx1250_backward(
+        do, q, k, v, out, lse, 0.1, True, False
+    )
+    assert (dq.stride(), dk.stride(), dv.stride()) == (q.stride(), k.stride(), v.stride())
+
+
+class _AtenOps(TorchDispatchMode):
+    """Every aten op dispatched inside (``copies``: the ones that copy a tensor)."""
+
+    COPY_OPS = {"clone", "copy_", "_to_copy", "contiguous", "copy"}
+
+    def __init__(self):
+        super().__init__()
+        self.ops = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        self.ops.append(func.overloadpacket.__name__)
+        return func(*args, **(kwargs or {}))
+
+    def copies(self):
+        return [op for op in self.ops if op in self.COPY_OPS]
+
+
+def _megatron_like(combo):
+    """Leaf storages (contiguous; [s, b, h, d] for "sbhd") and the [b, s, h, d] views flash_attn_func gets (a
+    transpose of SBHD storage, as Megatron's), and dout in its layout."""
+    b, sq, skv, hq, hkv = _HOST_SHAPE
+    lq, lk, lv, ld = _COMBOS[combo]
+    leaves, views = [], []
+    for layout, s, h in ((lq, sq, hq), (lk, skv, hkv), (lv, skv, hkv)):
+        leaf = (torch.randn(s, b, h, D) if layout == "sbhd" else torch.randn(b, s, h, D)).to(torch.bfloat16)
+        leaves.append(leaf.requires_grad_())
+        views.append(leaf.transpose(0, 1) if layout == "sbhd" else leaf)
+    return leaves, views, _make(ld, b, sq, hq)
+
+
+def _bshd_view(leaf, view):
+    """A leaf's grad seen as [b, s, h, d] (the view's shape)."""
+    return leaf.grad if leaf.grad.shape == view.shape else leaf.grad.transpose(0, 1)
+
+
+def _check_values(out, leaves, views, do):
+    got = (out, *(_bshd_view(leaf, view) for leaf, view in zip(leaves, views)))
+    for g, want in zip(got, _expected(*views, do)):
+        assert torch.equal(g, want)
+
+
+@needs_flydsl
+@pytest.mark.parametrize("combo", _FUNC_COMBOS)
+def test_flash_attn_func_hands_sbhd_storage_to_strided_hk_without_copies(monkeypatch, strided_adapter, combo):
+    """HIPKITTENS on "gfx1250", kernels with strides, Megatron's layouts: not one tensor copy in the forward and
+    backward (no clone / copy_ dispatched at all); the kernels read the caller's bytes (data_ptr), out comes in
+    q's layout (Megatron's permute back is then contiguous), and each grad reaches its leaf in the leaf's own
+    storage order without a copy (AccumulateGrad keeps the kernel's tensor)."""
+    _on_gfx1250(monkeypatch)
+    fake, log = strided_adapter
+    (q_l, k_l, v_l), (q, k, v), do = _megatron_like(combo)
+    ops = _AtenOps()
+    with _pinned(BackendType.HIPKITTENS), ops:
+        out = flash_attn_func(q, k, v, causal=True)
+        out.backward(do)
+    assert ops.copies() == [], ops.ops
+    assert [c[0] for c in fake.calls] == ["hk_fwd", "hk_bwd"] and log.warnings() == []
+    seen_fwd, seen_bwd = fake.calls[0][-1], fake.calls[1][-1]
+    assert seen_fwd == {n: (t.data_ptr(), t.stride()) for n, t in (("q", q), ("k", k), ("v", v))}
+    assert seen_bwd["do"] == (do.data_ptr(), do.stride()) and seen_bwd["o"] == (out.data_ptr(), out.stride())
+    assert _layout_of(out) == _COMBOS[combo][0]
+    for leaf, name in ((q_l, "dq"), (k_l, "dk"), (v_l, "dv")):
+        assert leaf.grad.data_ptr() == _tag_ptr(f"hk {name}") and leaf.grad.is_contiguous(), name
+    _check_values(out, (q_l, k_l, v_l), (q, k, v), do)
+
+
+@needs_flydsl
+@pytest.mark.parametrize("strided", [(), ("bwd",), ("fwd",)], ids=["none", "bwd_only", "fwd_only"])
+def test_flash_attn_func_copies_like_before_where_the_kernels_take_no_strides(
+    monkeypatch, strided_adapter, strided
+):
+    """A direction whose kernels take no strides gets contiguous BSHD copies and returns contiguous BSHD, as
+    before (the forward's three copies of q / k / v; the backward's copy of dout, and of whatever the forward
+    left in SBHD storage); the values are the same."""
+    _on_gfx1250(monkeypatch)
+    fake, _ = strided_adapter
+    fake.strided = set(strided)
+    (q_l, k_l, v_l), (q, k, v), do = _megatron_like("sbhd")
+    fwd_ops, bwd_ops = _AtenOps(), _AtenOps()
+    with _pinned(BackendType.HIPKITTENS):
+        with fwd_ops:
+            out = flash_attn_func(q, k, v, causal=True)
+        with bwd_ops:
+            out.backward(do)
+    seen_fwd, seen_bwd = fake.calls[0][-1], fake.calls[1][-1]
+    if "fwd" in strided:
+        assert fwd_ops.copies() == [] and _layout_of(out) == "sbhd"
+    else:
+        assert fwd_ops.copies() == ["clone"] * 3 and out.is_contiguous()
+        assert all(seen_fwd[n][0] != t.data_ptr() for n, t in (("q", q), ("k", k), ("v", v)))
+    if "bwd" in strided:  # the forward's tensors (copies or not) and dout go in as they are
+        assert seen_bwd["do"][0] == do.data_ptr() and seen_bwd["o"][0] == out.data_ptr()
+    else:  # contiguous BSHD only; dout (SBHD storage) copied
+        contiguous = {n: torch.empty(t.shape, device="meta").stride() for n, t in (("q", q), ("k", k))}
+        for name, (_, stride) in seen_bwd.items():
+            assert stride == contiguous["k" if name in ("k", "v") else "q"], name
+        assert seen_bwd["do"][0] != do.data_ptr()
+    _check_values(out, (q_l, k_l, v_l), (q, k, v), do)
+
+
+@needs_flydsl
+def test_flash_attn_func_keeps_layouts_per_tensor_and_copies_only_the_odd_one(monkeypatch, strided_adapter):
+    """q a head slice of packed SBHD storage (sbhd-ordered for flash_attn_func, but neither layout of the
+    kernels): only q is copied (to contiguous BSHD); k / v in SBHD storage go to the kernels as they are; out
+    follows the q the kernels got (contiguous)."""
+    _on_gfx1250(monkeypatch)
+    fake, _ = strided_adapter
+    b, sq, skv, hq, hkv = _HOST_SHAPE
+    packed = torch.randn(sq, b, hq + 2, D).to(torch.bfloat16)
+    q = packed[:, :, :hq].transpose(0, 1).requires_grad_()
+    assert _layout_of(q) is None
+    k, v = _sbhd(b, skv, hkv).requires_grad_(), _sbhd(b, skv, hkv).requires_grad_()
+    ops = _AtenOps()
+    with _pinned(BackendType.HIPKITTENS), ops:
+        out = flash_attn_func(q, k, v, causal=True)
+    assert ops.copies() == ["clone"]
+    seen = fake.calls[0][-1]
+    assert seen["q"][0] != q.data_ptr() and seen["k"][0] == k.data_ptr() and seen["v"][0] == v.data_ptr()
+    assert out.is_contiguous() and torch.equal(out, _expected(q, k, v, q)[0])
+
+
+@needs_flydsl
+def test_deterministic_backward_runs_flydsl_on_contiguous_copies(monkeypatch, strided_adapter):
+    """deterministic=True: the forward runs strided HK in place; the backward is FlyDSL's (contiguous BSHD in and
+    out, the copies made before its op, none after it)."""
+    _on_gfx1250(monkeypatch)
+    fake, log = strided_adapter
+    (q_l, k_l, v_l), (q, k, v), do = _megatron_like("sbhd")
+    with _pinned(BackendType.HIPKITTENS):
+        out = flash_attn_func(q, k, v, causal=True, deterministic=True)
+        assert _layout_of(out) == "sbhd"
+        out.backward(do)
+    assert [c[0] for c in fake.calls] == ["hk_fwd", "fly_bwd"] and fake.calls[1][3] is True
+    assert all(stride == (stride[1] * t.shape[1], *stride[1:]) for t, (_, stride) in zip(  # contiguous BSHD
+        (do, q, k, v, out), fake.calls[1][-1].values()))  # fmt: skip
+    _check_values(out, (q_l, k_l, v_l), (q, k, v), do)
+    assert len(log.warnings()) == 1 and "deterministic=True" in log.warnings()[0][1]
 
 
 # ---------------------------------------------------------------------------
@@ -887,6 +1470,21 @@ def test_pin_tool_pins_and_checks(tmp_path, capsys):
     capsys.readouterr()
     assert pin.main([*args, "--against", f"{empty}{os.pathsep}{other}"]) == 0
     assert str(other / "k_toy.hsaco") in capsys.readouterr().out
+    # --check of an entry without a pin yet (a new default before its GPU validation): passes only when --against
+    # shows the manifest's flags reproduce the validated build, and writes nothing
+    fresh = _toy_package(tmp_path / "fresh", [["X", "ptr"], ["n", "i32"], ["a", "f32"]])
+    before = (fresh / "manifest.json").read_text()
+    check = ["--package-dir", str(fresh), "--check", "--kernels", "k_toy"]
+    assert pin.main(check) == 1
+    assert "k_toy not pinned yet and not compared" in capsys.readouterr().out
+    assert pin.main([*check, "--against", str(other)]) == 0
+    out = capsys.readouterr().out
+    assert "byte-identical to the validated builds" in out and "k_toy not pinned yet; byte-identical" in out
+    (other / "k_toy.hsaco").write_bytes(b"other bytes")
+    assert pin.main([*check, "--against", str(other)]) == 1
+    assert "not the validated code objects" in capsys.readouterr().err
+    (other / "k_toy.hsaco").write_bytes(data)
+    assert (fresh / "manifest.json").read_text() == before and not (fresh / "bin").exists()
     flags = [
         "amdclang++",
         "-cuid=k_toy",
@@ -1112,9 +1710,11 @@ def test_gfx950_hipkittens_gate_is_unchanged(monkeypatch):
 @needs_flydsl
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_flash_attn_func_routes_hipkittens_to_the_gfx1250_hk_impls(monkeypatch, deterministic):
-    """HIPKITTENS on "gfx1250": the HK impls get contiguous BSHD q/k/v (sbhd bytes in), lse [B, Hq, Sq] and
-    the deterministic flag; neither the gfx950 HipKittens impls nor the FlyDSL impls are reached."""
+    """HIPKITTENS on "gfx1250" with kernels that take no strides: the HK impls get contiguous BSHD q/k/v (sbhd
+    bytes in), lse [B, Hq, Sq] and the deterministic flag; neither the gfx950 HipKittens impls nor the FlyDSL
+    impls are reached."""
     _on_gfx1250(monkeypatch)
+    monkeypatch.setattr(hk_adapter, "_IMPL", _FakeImpl())  # hk_supports_strides: no direction
     b, sq, skv, hq, hkv = 2, 128, 256, 8, 2
     calls = []
 
@@ -1178,11 +1778,83 @@ def test_direct_apply_refuses_what_the_kernels_lack(monkeypatch, kwargs, match):
 # ---------------------------------------------------------------------------
 
 
-class _FakeImpl:
-    """Stands in for the HK package's impl: answers ``reasons[direction]`` and records the HK calls."""
+# Outputs of the fakes below are tagged ("hk out", "fly dq", ...), so a test can tell which one it got back. Weak
+# references: a held reference would make AccumulateGrad copy a grad instead of keeping it.
+_TAGGED = []  # (weakref to the tensor, tag, data_ptr)
 
-    def __init__(self, fwd=None, bwd=None):
+
+def _tagged(tag, t):
+    _TAGGED.append((weakref.ref(t), tag, _ptr(t)))
+    return t
+
+
+def _tag_of(x):
+    if isinstance(x, (tuple, list)):
+        return tuple(_tag_of(y) for y in x)
+    return next((tag for ref, tag, _ in _TAGGED if ref() is x), None)
+
+
+def _tag_ptr(tag):
+    """data_ptr of the last tensor tagged ``tag``."""
+    return [p for _, t, p in _TAGGED if t == tag][-1]
+
+
+def _layout_of(t):
+    """The test's own reading of the two layouts of the kernel contract (None: neither)."""
+    if t.is_contiguous():
+        return "bshd"
+    return "sbhd" if t.transpose(0, 1).is_contiguous() else None
+
+
+def _alloc(like, shape, layout):
+    b, s, h, d = shape
+    if layout == "sbhd":
+        return torch.empty(s, b, h, d, dtype=like.dtype, device=like.device).transpose(0, 1)
+    return torch.empty(b, s, h, d, dtype=like.dtype, device=like.device)
+
+
+def _ptr(t):
+    return None if t.device.type == "meta" else t.data_ptr()
+
+
+def _fake_attention(tag, calls, accepts, out_layouts):
+    """fwd / bwd of a fake attention family: records (kind, ..., {name: (data_ptr, strides)}), refuses (ValueError)
+    tensors whose layout ``accepts(direction, layout)`` refuses, and returns tagged outputs in ``out_layouts(t)``
+    of the matching input, with values the tests can recompute: out = 2 q, dq = do + q, dk = 3 k, dv = 5 v."""
+
+    def check(direction, **tensors):
+        for name, t in tensors.items():
+            if not accepts(direction, _layout_of(t)):
+                raise ValueError(f"{tag} {direction}: {name} layout {_layout_of(t)} strides {t.stride()}")
+        return {name: (_ptr(t), tuple(t.stride())) for name, t in tensors.items()}
+
+    def fwd(q, k, v, softmax_scale, causal):
+        seen = check("fwd", q=q, k=k, v=v)
+        calls.append((f"{tag}_fwd", softmax_scale, causal, seen))
+        b, sq, hq, _ = q.shape
+        out = torch.mul(q, 2, out=_alloc(q, (b, sq, hq, v.shape[-1]), out_layouts("fwd", q)))
+        lse = torch.zeros(b, hq, sq, device=q.device)
+        return _tagged(f"{tag} out", out), _tagged(f"{tag} lse", lse)
+
+    def bwd(do, q, k, v, o, lse, softmax_scale, causal, deterministic):
+        seen = check("bwd", do=do, q=q, k=k, v=v, o=o)
+        calls.append((f"{tag}_bwd", softmax_scale, causal, deterministic, seen))
+        dq = torch.add(do, q, out=_alloc(q, q.shape, out_layouts("bwd", q)))
+        dk = torch.mul(k, 3, out=_alloc(k, k.shape, out_layouts("bwd", k)))
+        dv = torch.mul(v, 5, out=_alloc(v, v.shape, out_layouts("bwd", v)))
+        return tuple(_tagged(f"{tag} {n}", g) for n, g in zip(("dq", "dk", "dv"), (dq, dk, dv)))
+
+    return fwd, bwd
+
+
+class _FakeImpl:
+    """Stands in for the HK package's impl: answers ``reasons[direction]``, records the HK calls. ``strided``: the
+    directions whose kernels take strides (``hk_supports_strides``); they take either layout per tensor and write
+    the inputs' layouts, the others take contiguous BSHD only (ValueError otherwise, like impl) and write it."""
+
+    def __init__(self, fwd=None, bwd=None, strided=()):
         self.reasons = {"fwd": fwd, "bwd": bwd}
+        self.strided = set(strided)
         self.calls = []
 
     def hk_unsupported_reason(self, direction, q, k, v, causal, deterministic=False, softmax_scale=None):
@@ -1190,34 +1862,41 @@ class _FakeImpl:
             return "deterministic=True (the HK backward adds dQ with fp32 atomics)"
         return self.reasons[direction]
 
+    def hk_supports_strides(self, direction):
+        return direction in self.strided
+
     def describe(self, direction):
         return f"{direction}: fake"
 
+    def _family(self):
+        def accepts(direction, layout):
+            return layout == "bshd" or (layout == "sbhd" and direction in self.strided)
+
+        def out_layouts(direction, t):
+            return _layout_of(t) if direction in self.strided else "bshd"
+
+        return _fake_attention("hk", self.calls, accepts, out_layouts)
+
     def hk_attn_fwd(self, q, k, v, softmax_scale, causal):
-        self.calls.append(("hk_fwd", softmax_scale, causal))
-        return "hk out", "hk lse"
+        return self._family()[0](q, k, v, softmax_scale, causal)
 
     def hk_attn_bwd(self, do, q, k, v, o, lse, softmax_scale, causal, deterministic):
-        self.calls.append(("hk_bwd", softmax_scale, causal, deterministic))
-        return "hk grads"
+        return self._family()[1](do, q, k, v, o, lse, softmax_scale, causal, deterministic)
 
 
 class _FakeFlydsl:
+    """FlyDSL's gfx1250 interface: contiguous BSHD in (ValueError otherwise), contiguous BSHD out."""
+
     def __init__(self, calls):
-        self.calls = calls
-
-    def flash_attn_fwd(self, q, k, v, softmax_scale, causal):
-        self.calls.append(("fly_fwd", softmax_scale, causal))
-        return "fly out", "fly lse"
-
-    def flash_attn_bwd(self, do, q, k, v, o, lse, softmax_scale, causal, deterministic):
-        self.calls.append(("fly_bwd", softmax_scale, causal, deterministic))
-        return "fly grads"
+        self.flash_attn_fwd, self.flash_attn_bwd = _fake_attention(
+            "fly", calls, lambda direction, layout: layout == "bshd", lambda direction, t: "bshd"
+        )
 
 
 @pytest.fixture
 def adapter(monkeypatch):
     """The adapter with a fake HK impl, a fake FlyDSL interface and a recording logger."""
+    _TAGGED.clear()
     fake = _FakeImpl()
     log = _LogRecorder()
     monkeypatch.setattr(hk_adapter, "_IMPL", fake)
@@ -1235,8 +1914,8 @@ def _run_both(q, k, v, deterministic=False):
 def test_supported_calls_run_hk(adapter):
     fake, log = adapter
     q, k, v = _meta(*PROD)
-    assert _run_both(q, k, v) == (("hk out", "hk lse"), "hk grads")
-    assert fake.calls == [("hk_fwd", 0.088, True), ("hk_bwd", 0.088, True, False)]
+    assert _tag_of(_run_both(q, k, v)) == (("hk out", "hk lse"), ("hk dq", "hk dk", "hk dv"))
+    assert [c[:-1] for c in fake.calls] == [("hk_fwd", 0.088, True), ("hk_bwd", 0.088, True, False)]
     assert log.warnings() == [] and [r[2] for r in log.records] == [True, True]
 
 
@@ -1244,7 +1923,7 @@ def test_supported_calls_run_hk(adapter):
     ("fwd", "bwd", "deterministic", "expected"),
     [
         ("seqlen_q must be a multiple of 64", "seqlen_q must be a multiple of 64", False, ("fly", "fly")),
-        (None, "k_attn_bwd_v0 is not pinned in manifest.json", False, ("hk", "fly")),
+        (None, "k_attn_bwd_v1 is not pinned in manifest.json", False, ("hk", "fly")),
         ("PRIMUS_TURBO_HK_FWD=flydsl", None, False, ("fly", "hk")),
         (None, None, True, ("hk", "fly")),
     ],
@@ -1261,7 +1940,7 @@ def test_unsupported_directions_run_flydsl_with_one_warning_per_reason(
     kinds = [c[0].split("_")[0] for c in fake.calls[:2]]
     assert tuple(kinds) == expected
     bwd_call = fake.calls[1]
-    assert bwd_call[-1] == (deterministic if expected[1] == "fly" else False)
+    assert bwd_call[-2] == (deterministic if expected[1] == "fly" else False)
     warnings = log.warnings()
     assert all(once for _, _, once in warnings)
     reasons = {w[1] for w in warnings}  # the real logger emits each (level, message) once
@@ -1280,7 +1959,7 @@ def test_hk_entry_point_that_declines_late_runs_flydsl(adapter):
 
     fake.hk_attn_bwd = declines
     q, k, v = _meta(*PROD)
-    assert _run_both(q, k, v) == (("hk out", "hk lse"), "fly grads")
+    assert _tag_of(_run_both(q, k, v)) == (("hk out", "hk lse"), ("fly dq", "fly dk", "fly dv"))
     assert [w[1] for w in log.warnings()] == [
         "HIPKITTENS attention on gfx1250: backward runs on FlyDSL (hk_attn_bwd: do data_ptr not 16-byte aligned)"
     ]
@@ -1298,7 +1977,7 @@ def test_hk_package_that_fails_to_import_runs_flydsl(monkeypatch):
     monkeypatch.setattr(hk_adapter, "_flydsl_interface", lambda: _FakeFlydsl(calls))
     monkeypatch.setattr(hk_adapter, "logger", log)
     q, k, v = _meta(*PROD)
-    assert hk_adapter._run_forward(q, k, v, 0.1, True) == ("fly out", "fly lse")
+    assert _tag_of(hk_adapter._run_forward(q, k, v, 0.1, True)) == ("fly out", "fly lse")
     reason = hk_adapter.hk_gfx1250_unsupported_reason("bwd", q, k, v, True)
     assert "failed to import: ImportError: no module named hiprt" in reason
     assert len(log.warnings()) == 1 and "no module named hiprt" in log.warnings()[0][1]
@@ -1314,11 +1993,11 @@ def test_mixed_mode_through_the_real_impl(monkeypatch, hk, tmp_path):
     monkeypatch.setattr(hk_adapter, "logger", _LogRecorder())
     q, k, v = (torch.zeros(s, dtype=torch.bfloat16) for s in ((1, 128, 4, D), (1, 128, 1, D), (1, 128, 1, D)))
     lse = torch.zeros(1, 4, 128)
-    assert hk_adapter._run_forward(q, k, v, 0.1, True) == ("fly out", "fly lse")
+    assert _tag_of(hk_adapter._run_forward(q, k, v, 0.1, True)) == ("fly out", "fly lse")
     hk_adapter._run_backward(q, q, k, v, q, lse, 0.1, True, False)
-    assert calls == [("fly_fwd", 0.1, True)] and mods["bwd_v0"].calls == [("bwd", 0.1, True)]
+    assert [c[:-1] for c in calls] == [("fly_fwd", 0.1, True)] and mods[_BWD].calls == [("bwd", 0.1, True)]
     hk_adapter._run_backward(q, q, k, v, q, lse, 0.1, True, True)
-    assert calls[-1] == ("fly_bwd", 0.1, True, True) and len(mods["bwd_v0"].calls) == 1
+    assert calls[-1][:-1] == ("fly_bwd", 0.1, True, True) and len(mods[_BWD].calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1382,6 +2061,78 @@ def test_torch_compile_traces_the_hk_custom_ops(monkeypatch, dynamic):
     assert k.grad.shape == k.shape and q.grad.shape == q.shape
 
 
+@needs_flydsl
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("strided", [True, False], ids=["strided", "no_strides"])
+def test_torch_compile_keeps_sbhd_storage_for_strided_hk(monkeypatch, dynamic, strided):
+    """torch.compile(fullgraph) with Megatron's layout (views of SBHD storage) on meta tensors: with kernels that
+    take strides (asked once, at trace time: hk_gfx1250_supports_strides is a constant to Dynamo) neither graph
+    copies a tensor and out comes in SBHD storage (the op's fake follows q); without strides the forward graph
+    holds the three contiguous copies and out is contiguous BSHD, as before."""
+    from functorch.compile import make_boxed_func
+    from torch._dynamo.backends.common import aot_autograd
+
+    _on_gfx1250(monkeypatch)
+    monkeypatch.setattr(hk_adapter, "_IMPL", _FakeImpl(strided=("fwd", "bwd") if strided else ()))
+    b, sq, skv, hq, hkv = _HOST_SHAPE
+    seen = {"fw": [], "bw": []}
+    tangent_clones = {"fw": 0, "bw": 0}
+
+    def record(kind):
+        def compiler(gm, example_inputs):
+            nodes = [n for n in gm.graph.nodes if n.op == "call_function"]
+            seen[kind] += [str(n.target) for n in nodes]
+            # AOTAutograd's own coercion of an incoming gradient (static shapes: tangents_1 -> contiguous clone);
+            # not a copy of the attention path
+            tangent_clones[kind] += sum(
+                str(n.target) == "aten.clone.default"
+                and getattr(n.args[0], "op", None) == "placeholder"
+                and str(n.args[0].target).startswith("tangents")
+                for n in nodes
+            )
+            return make_boxed_func(gm.forward)
+
+        return compiler
+
+    leaves = [
+        torch.empty(s, b, h, D, dtype=torch.bfloat16, device="meta", requires_grad=True)
+        for s, h in ((sq, hq), (skv, hkv), (skv, hkv))
+    ]
+
+    @torch.compile(
+        fullgraph=True,
+        dynamic=dynamic,
+        backend=aot_autograd(fw_compiler=record("fw"), bw_compiler=record("bw")),
+    )
+    def fn(q, k, v):
+        out, lse = flash_attn_func(
+            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), causal=True, return_lse=True
+        )
+        return out, lse
+
+    torch._dynamo.reset()
+    try:
+        with _pinned(BackendType.HIPKITTENS):
+            out, lse = fn(*leaves)
+            (out.float().sum() + lse.sum()).backward()
+    finally:
+        torch._dynamo.reset()
+    hk_ops = {kind: [t for t in targets if t.startswith("primus_turbo.")] for kind, targets in seen.items()}
+    assert hk_ops == {
+        "fw": ["primus_turbo.flash_attn_hk_gfx1250_forward.default"],
+        "bw": ["primus_turbo.flash_attn_hk_gfx1250_backward.default"],
+    }
+    copies = {
+        kind: [t for t in targets if re.match(r"aten\.(\w+)\.", t) and t.split(".")[1] in _AtenOps.COPY_OPS]
+        for kind, targets in seen.items()
+    }
+    assert copies["fw"] == ([] if strided else ["aten.clone.default"] * 3), seen["fw"]
+    if strided:
+        assert copies["bw"] == ["aten.clone.default"] * tangent_clones["bw"], seen["bw"]
+    assert out.shape == (b, sq, hq, D) and _layout_of(out) == ("sbhd" if strided else "bshd")
+    assert all(leaf.grad.shape == leaf.shape for leaf in leaves)
+
+
 # ---------------------------------------------------------------------------
 # Launch plans of the real kernel modules (when present)
 # ---------------------------------------------------------------------------
@@ -1414,7 +2165,10 @@ def _module_specs(mod):
     return specs
 
 
-@pytest.mark.parametrize("module", [_FWD, "fwd_v0", "bwd_v0"])
+_REAL_MODULES = sorted({m for t in (impl.FWD_MODULES, impl.BWD_MODULES) for m in t.values() if m})
+
+
+@pytest.mark.parametrize("module", _REAL_MODULES)
 def test_kernel_module_meets_the_contract(module):
     """The lab / impl contract of a kernel module, its gate in a form impl understands, and its kernel specs
     equal to the manifest's: the pin tool records the arguments the module packs."""
@@ -1460,7 +2214,7 @@ def _plan_launches(mod, b, sq, skv, hq, hkv):
     return [(n, g, blk, len(a)) for n, g, blk, a in launches if g is not None]  # grid None: a torch memset
 
 
-@pytest.mark.parametrize("module", [_FWD, "fwd_v0", "bwd_v0"])
+@pytest.mark.parametrize("module", _REAL_MODULES)
 def test_kernel_module_launch_plan(module):
     """A kernel module's ``plan`` for the production shape (no GPU): every kernel it launches is one the
     manifest lists for it, with the manifest's block and argument count, every grid is positive; a shape
@@ -1478,6 +2232,62 @@ def test_kernel_module_launch_plan(module):
     b, sq, skv, hq, hkv = PROD
     with pytest.raises((ValueError, NotImplementedError)):
         _plan_launches(mod, b, sq + 32, skv, hq, hkv)  # Sq % 64
+
+
+def _resolved_code_object(mod):
+    """Where a real kernel module would load its code object from now (nothing is loaded)."""
+    if callable(getattr(mod, "hsaco_path", None)):
+        return Path(mod.hsaco_path())
+    return Path(mod._hsaco_dir()) / f"{mod.KERNEL}.hsaco"
+
+
+@pytest.mark.parametrize("runs", ["default", "fallback"])
+@pytest.mark.parametrize("direction", ["fwd", "bwd"])
+def test_real_modules_load_from_the_pinned_bin_in_production(
+    monkeypatch, hk, tmp_manifest, tmp_path, direction, runs
+):
+    """Production with the real kernel modules: impl points the module that runs (the default, or its fallback
+    when the default is not pinned) at bin/ through its set_hsaco_dir before any launch, so its DEFAULT_HSACO_DIR
+    (a lab path) and HK_HSACO_DIR are never what it loads from."""
+    default, fallback = (_FWD, _FWD_FALLBACK) if direction == "fwd" else (_BWD, _BWD_FALLBACK)
+    real = json.loads(Path(hsaco.__file__).with_name("manifest.json").read_text())["kernels"]
+    monkeypatch.delenv("HK_HSACO_DIR", raising=False)  # read by the modules themselves at their first launch
+    monkeypatch.delattr(sys.modules[_PKG], "HSACO_DIR", raising=False)
+    kernels = {}
+    for name in (default, fallback):
+        mod = _real_module(name)
+        monkeypatch.setattr(mod, "HSACO_DIR", None)
+        monkeypatch.setattr(mod, "DEFAULT_HSACO_DIR", str(tmp_path / "lab-default-never-used"))
+        if hasattr(mod, "_KERNEL"):
+            monkeypatch.setattr(mod, "_KERNEL", None)
+        entry = dict(real[f"k_attn_{name}"])
+        data = f"validated {name}".encode()
+        pinned = name == fallback or runs == "default"
+        entry["hsaco_sha256"] = hashlib.sha256(data).hexdigest() if pinned else None
+        kernels[f"k_attn_{name}"] = entry
+        if pinned:
+            (hsaco.BIN_DIR / f"k_attn_{name}.hsaco").write_bytes(data)  # tmp_manifest's bin/
+    tmp_manifest(kernels)
+    with warnings_recorded() as caught:
+        assert hk.hk_unavailable_reason(direction) is None
+    running = default if runs == "default" else fallback
+    assert hk.module_name(direction) == running and len(caught) == (runs == "fallback")
+    mod = sys.modules[f"{_PKG}.{running}"]
+    assert _resolved_code_object(mod) == hsaco.BIN_DIR / f"k_attn_{running}.hsaco"
+    assert hk.code_object_files(direction) == {f"k_attn_{running}": hsaco.BIN_DIR / f"k_attn_{running}.hsaco"}
+
+
+def test_fwd_v1_ignores_a_launch_json_in_the_pinned_bin(tmp_manifest, tmp_path):
+    """A lab variant directory's k_attn_fwd_v1.launch.json picks its schedule; one in bin/ (not covered by the pin)
+    is ignored: production launches the host default schedule."""
+    v1 = _real_module("fwd_v1")
+    cfg = {"mode": "items", "W": 3}
+    lab = tmp_path / "lab"
+    lab.mkdir()
+    for d in (lab, hsaco.BIN_DIR):
+        (Path(d) / v1.LAUNCH_JSON).write_text(json.dumps(cfg))
+    assert v1.launch_cfg(lab) == cfg and v1.launch_cfg(hsaco.BIN_DIR) == {}
+    assert v1.launch_cfg(str(hsaco.BIN_DIR) + "/.") == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1527,6 +2337,8 @@ MIN_DB = 50.0  # vs the fp32 reference
 FLYDSL_MARGIN_DB = 0.5  # HK may trail FlyDSL by at most this
 
 # (b, sq, skv, hq, hkv); toy first: run it alone before anything else on a new build.
+# Every selectable module takes every one of them (test_reference_shapes_are_taken_by_every_module), so each
+# module can reach the validation record's full stage.
 _FWD_SHAPES = {
     "toy": (1, 128, 128, 4, 1),
     "gqa4": (2, 256, 256, 8, 2),
@@ -1536,8 +2348,84 @@ _FWD_SHAPES = {
     "gqa8": (1, 256, 256, 16, 2),
     "gqa16": (1, 128, 256, 32, 2),
     "skv_x64": (1, 128, 192, 4, 1),
+    # 320 zig-zag pairs (odd Sq / 64, Sq < Skv): fwd_v1's persistent pairs schedule on a <= 256-CU device, with
+    # more units than workgroups; the backward: more workgroups (Hkv x Skv / 128 x B = 320) than CUs
+    "persistent": (16, 576, 640, 16, 4),
 }
-_BWD_SHAPES = {k: _FWD_SHAPES[k] for k in ("toy", "gqa4", "sq_lt_skv", "odd", "sq64")}
+_BWD_SHAPES = {k: _FWD_SHAPES[k] for k in ("toy", "gqa4", "sq_lt_skv", "odd", "sq64", "persistent")}
+
+# Calls the HK gate declines in one or both directions (every selectable module agrees, see
+# test_reference_shapes_are_taken_by_every_module); the FlyDSL gate takes all of them:
+# name -> ((b, sq, skv, hq, hkv), causal, the directions HK takes).
+_GATE_CASES = {
+    "noncausal": ((1, 128, 128, 4, 1), False, ()),  # limits: causal only (fwd_v1's own gate too)
+    "gqa2": ((1, 128, 128, 4, 2), True, ()),  # G 2
+    "skv_not_x64": ((1, 128, 160, 4, 1), True, ()),  # Skv % 64
+    "gqa8": ((1, 256, 256, 16, 2), True, ("fwd",)),  # the backward needs G == 4
+    "skv_not_x128": ((1, 128, 192, 4, 1), True, ("fwd",)),  # the backward needs Skv % 128
+}
+# FlyDSL's own suite's floor (test_attention_flydsl_gfx1250), for the directions FlyDSL runs here
+FLYDSL_MIN_DB = 40.0
+_OUTPUTS = {"fwd": ("out", "lse"), "bwd": ("dq", "dk", "dv")}
+
+
+@pytest.mark.parametrize("direction", ["fwd", "bwd"])
+def test_reference_shapes_are_taken_by_every_module(direction):
+    """Host only. Every reference shape of the GPU tests (and the production shape) passes limits and the module's
+    own gate for every selectable module of the direction, so each module can reach the validation record's full
+    stage; the gate cases are declined in exactly the directions they name, by every module."""
+    table = impl.FWD_MODULES if direction == "fwd" else impl.BWD_MODULES
+    shapes = dict(_FWD_SHAPES if direction == "fwd" else _BWD_SHAPES, large=PROD)
+    for module in sorted(m for m in table.values() if m):
+        gate = impl.module_gate(_real_module(module))
+        for name, shape in shapes.items():
+            q, k, v = _meta(*shape)
+            assert limits.shape_unsupported_reason(module, q.shape, k.shape, v.shape, True) is None, (
+                module,
+                name,
+            )
+            assert gate is None or gate(q.shape, k.shape, v.shape, torch.bfloat16, True) is None, (
+                module,
+                name,
+            )
+        for name, (shape, causal, takes) in _GATE_CASES.items():
+            q, k, v = _meta(*shape)
+            assert _flydsl_gate_takes(q, k, v, causal), name
+            reason = limits.shape_unsupported_reason(module, q.shape, k.shape, v.shape, causal)
+            if reason is None and gate is not None:
+                reason = gate(q.shape, k.shape, v.shape, torch.bfloat16, causal)
+            assert (reason is None) == (direction in takes), (module, name, reason)
+
+
+def _flydsl_gate_takes(q, k, v, causal):
+    """The FlyDSL gfx1250 head-dim-128 shape gate (loaded lazily: importing it early breaks the FlyDSL suite's
+    lazy-import check), or True when flydsl is not installed here (the GPU tests need it anyway)."""
+    if _FLYDSL_REASON is not None:
+        return True
+    from primus_turbo.flydsl.attention.gfx1250 import interface
+
+    return interface.unsupported_reason(q.shape, k.shape, v.shape, q.dtype, causal) is None
+
+
+def test_fwd_v1_gate_and_schedules():
+    """Host only. fwd_v1 refuses causal=False itself (fwd_v0's own gate takes it; limits refuse it for both);
+    the "persistent" reference shape plans fwd_v1's persistent pairs schedule (odd Sq / 64, Sq < Skv, more units
+    than workgroups) on a 256-CU device, the toy shape the items schedule."""
+    v1, v0 = _real_module("fwd_v1"), _real_module("fwd_v0")
+    q, k, v = _meta(1, 128, 128, 4, 1)
+    assert "full attention" in v1.unsupported_reason(1, 128, 128, 4, 1, False)
+    assert v0.unsupported_reason(1, 128, 128, 4, 1, False) is None
+    with pytest.raises(NotImplementedError, match="full attention"):
+        v1.plan(q, k, v, None, False)
+    for module in ("fwd_v1", "fwd_v0"):
+        assert "causal attention only" in limits.shape_unsupported_reason(
+            module, q.shape, k.shape, v.shape, False
+        )
+    derived = v1.plan(*_meta(*_FWD_SHAPES["persistent"]), None, True, num_cus=256)["derived"]
+    assert derived["mode"] == "pairs" and derived["nqb"] % 2 == 1 and derived["cst"] > 0, derived
+    assert derived["W"] == 256 < derived["units"], derived
+    assert v1.plan(*_meta(*_FWD_SHAPES["toy"]), None, True, num_cus=256)["derived"]["mode"] == "items"
+
 
 # Checks that passed in this session, per direction; the validation record's stages are derived from them:
 # toy = the toy reference check, full = every reference shape and the repeat check, large = the production
@@ -1639,6 +2527,10 @@ def test_required_hk_directions_are_available():
     assert set(_REQUIRED) <= {"fwd", "bwd"}, f"{REQUIRE_ENV}={_REQUIRED}: use fwd and / or bwd"
     for d in _REQUIRED:
         assert _hk_gpu_reason(d) is None, _hk_gpu_reason(d)
+        fell = impl.fallback_reason(d)  # an unset setting must run the default itself, not its fallback
+        assert fell is None, (
+            f"{d} runs {impl.module_name(d)}, not the default {impl._DIRECTIONS[d][1]}: {fell}"
+        )
 
 
 def test_validation_records_are_what_the_readers_expect(monkeypatch):
@@ -1679,12 +2571,13 @@ def _inputs(b, sq, skv, hq, hkv, seed=0):
     return make(sq, hq), make(skv, hkv), make(skv, hkv), make(sq, hq)
 
 
-def _reference(q, k, v, dout):
-    """fp32 bottom-right causal attention and its gradients on the CPU: out, lse, dq, dk, dv."""
+def _reference(q, k, v, dout, causal=True):
+    """fp32 attention (bottom-right causal unless causal=False) and its gradients on the CPU: out, lse, dq, dk, dv."""
     q, k, v = (t.detach().float().requires_grad_() for t in (q, k, v))
     sq, skv, g = q.shape[1], k.shape[1], q.shape[2] // k.shape[2]
     s = torch.einsum("bqhd,bkhd->bhqk", q, k.repeat_interleave(g, 2)) / math.sqrt(D)
-    s = s.masked_fill(torch.ones(sq, skv, dtype=torch.bool).triu(skv - sq + 1), float("-inf"))
+    if causal:
+        s = s.masked_fill(torch.ones(sq, skv, dtype=torch.bool).triu(skv - sq + 1), float("-inf"))
     lse = torch.logsumexp(s, -1)
     out = torch.einsum("bhqk,bkhd->bqhd", s.softmax(-1), v.repeat_interleave(g, 2))
     out.backward(dout.float())
@@ -1722,6 +2615,15 @@ def test_hk_forward_matches_reference(name):
     hk_out = impl.hk_attn_fwd(q, k, v, None, True)
     fly_out = _flydsl().flash_attn_flydsl_gfx1250_forward_impl(q, k, v, None, True)
     _compare(("out", "lse"), hk_out, fly_out, ref[:2])
+    mod = impl._MODULES.get(impl.module_name("fwd"))
+    # fwd_v1: the persistent schedule is what this shape is here for
+    if name == "persistent" and hasattr(mod, "choose_schedule"):
+        b, sq, _, hq, _ = _FWD_SHAPES[name]
+        cfg = mod._kernel()[1]
+        mode, w = mod.choose_schedule(
+            b, hq // mod.NH, sq // mod.QB, mod._device_cus(q.device), cfg.get("mode", "auto"), cfg.get("W")
+        )
+        assert mode == "pairs", (mode, w, cfg)
     _passed("fwd", f"ref:{name}")
 
 
@@ -1779,6 +2681,54 @@ def test_flash_attn_func_hipkittens_end_to_end(name, deterministic, hk_runs):
         assert _snr(r, x) >= MIN_DB, check
     for d in _assert_hk_ran(hk_runs, deterministic):
         _passed(d, f"e2e:{name}{':det' if deterministic else ''}")
+
+
+@needs_hk_any
+@pytest.mark.parametrize("name", list(_GATE_CASES))
+def test_flash_attn_func_runs_flydsl_where_the_hk_gate_declines(name, hk_runs):
+    """Calls the HK gate declines in a direction (non-causal, G 2, Skv % 64; backward only: G 8, Skv % 128)
+    through flash_attn_func with HIPKITTENS: those directions run FlyDSL (a FlyDSL backward on an HK forward's
+    o / lse included), HK runs the rest, and everything matches the fp32 reference."""
+    shape, causal, takes = _GATE_CASES[name]
+    q, k, v, dout = _inputs(*shape)
+    ref = dict(zip(("out", "lse", "dq", "dk", "dv"), _reference(q, k, v, dout, causal)))
+    qc, kc, vc = (t.cuda().requires_grad_() for t in (q, k, v))
+    hk_dirs = [d for d in _HK_DIRECTIONS if d in takes]
+    for d in _HK_DIRECTIONS:
+        reason = impl.hk_unsupported_reason(d, qc, kc, vc, causal)
+        assert (reason is None) == (d in takes), (d, reason)
+    with _pinned(BackendType.HIPKITTENS):
+        out, lse = flash_attn_func(qc, kc, vc, causal=causal, return_lse=True)
+    out.backward(dout.cuda())
+    got = dict(zip(("out", "lse", "dq", "dk", "dv"), (out, lse, qc.grad, kc.grad, vc.grad)))
+    for d, names in _OUTPUTS.items():
+        floor = MIN_DB if d in hk_dirs else FLYDSL_MIN_DB
+        for n in names:
+            assert got[n].shape == ref[n].shape and _snr(ref[n], got[n]) >= floor, (n, d, floor)
+    assert {d: hk_runs[d] > 0 for d in hk_runs} == {d: d in hk_dirs for d in ("fwd", "bwd")}, hk_runs
+    for d in _HK_DIRECTIONS:
+        _passed(d, f"gate:{name}")
+
+
+@needs_hk_fwd
+def test_hk_forward_module_refuses_non_causal_before_launch(monkeypatch):
+    """causal=False: impl refuses it for every module (limits), and a module whose own gate refuses it too
+    (fwd_v1) raises NotImplementedError from its entry point before any launch."""
+    q, k, v, _ = (t.cuda() for t in _inputs(1, 128, 128, 4, 1))
+    with pytest.raises(NotImplementedError, match="causal attention only"):
+        impl.hk_attn_fwd(q, k, v, None, False)
+    mod = impl._MODULES[impl.module_name("fwd")]
+    gate = impl.module_gate(mod)
+    if gate is None or gate(q.shape, k.shape, v.shape, q.dtype, False) is None:
+        pytest.skip(f"{impl.module_name('fwd')} takes causal=False itself (only limits refuse it)")
+
+    def launched(*args):
+        raise AssertionError("a non-causal forward was launched")
+
+    monkeypatch.setattr(mod, "_launch", launched)
+    with pytest.raises(NotImplementedError):
+        mod.flash_attn_fwd(q, k, v, None, False)
+    _passed("fwd", "gate:noncausal_module")
 
 
 @needs_hk_any
