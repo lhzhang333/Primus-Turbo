@@ -1,0 +1,75 @@
+diff -ruN a/include/bwd1/idx.h b/include/bwd1/idx.h
+--- a/include/bwd1/idx.h	2026-11-02 11:35:50.019733179 +0000
++++ b/include/bwd1/idx.h	2026-11-02 11:35:50.027537690 +0000
+@@ -51,6 +51,9 @@
+ #ifndef BWD1_OPT_DQSPLIT // 1: dQ split by (q half, d half) over the 4 waves (wave w: q rows 16 (w >> 1) .., d columns
+ #define BWD1_OPT_DQSPLIT 0 //  64 (w & 1) ..) instead of 4 d quarters: each wave reads half of dS^T (8 tr16 / step instead
+ #endif                     //  of 16) and holds K^T for 64 d (+64 VGPR); same WMMAs, atomics and dQ_acc layout
++#ifndef BWD1_OPT_QTC     // 1: the 16 QT(s) tr16 of an interleaved step are issued in C (2 per WMMA gap, gaps 0..7)
++#define BWD1_OPT_QTC 0   //   instead of E1: ~300 cycles before the signal's s_wait_dscnt (LDS latency under load)
++#endif
+ #ifndef BWD1_OPT_REGS    // bit mask of llvm.fake.use register holds (kernel-scope steps), see v1_step.inc:
+ #define BWD1_OPT_REGS 0  //   1 X.qA / X.dA to the end of G1, 2 dSa to the end of C, 4 E operands to the end of E2,
+ #endif                   //   8 dQ(s - 1) atomic data + voffset through G0 of step s + 1, 16 E2 operands likewise
+@@ -65,7 +68,7 @@
+ static_assert(NWIN >= 8 && NWIN <= 16 && NWIN % 2 == 0, "BWD1_NWIN: 8..16, even (QT loads in the first 8 E1 gaps)");
+ static_assert(HROT == 0 || HROT == 1, "BWD1_HROT");
+ constexpr int OPT_MASKED = BWD1_OPT_MASKED, OPT_TDM3 = BWD1_OPT_TDM3, OPT_REGS = BWD1_OPT_REGS, OPT_REUSE = BWD1_OPT_REUSE,
+-              OPT_DQSPLIT = BWD1_OPT_DQSPLIT;
++              OPT_DQSPLIT = BWD1_OPT_DQSPLIT, OPT_QTC = BWD1_OPT_QTC;
+ // BWD1_OPT_DQSPLIT: dQ operand counts per wave and the dQ_acc address of wave w's fragment (qh16 = w >> 1, d columns
+ // 64 (w & 1) + 16 jj + l % 16 = b0's (w' = 2 (w & 1) + jj / 2, j' = jj % 2)): the block layout (and dqcvt) unchanged
+ constexpr int DQ_NQH = OPT_DQSPLIT ? 1 : 2, DQ_NJ = OPT_DQSPLIT ? 4 : 2;
+diff -ruN a/include/bwd1/v1_step.inc b/include/bwd1/v1_step.inc
+--- a/include/bwd1/v1_step.inc	2026-11-02 11:35:50.019770219 +0000
++++ b/include/bwd1/v1_step.inc	2026-11-02 11:35:50.027595590 +0000
+@@ -140,7 +140,21 @@
+ #else
+         const int avo = voff_nonneg(voff_lane + b0::dqa_voff(0, 0, b1::atom_gh(s, n, G, rot), b1::atom_qt(s, n, G, nqp), nqp));
+ #endif
+-#if BWD1_OPT_MASKED
++#if BWD1_OPT_QTC
++        // BWD1_OPT_QTC: QT(s) (ring slot s, published since the step began) under the dQ WMMAs, 2 per gap in gaps 0..7
++        if constexpr (IL) {
++            load_qt();
++            constexpr int XV = 56 + (MASKED ? b1::MASK_VALU : 0);
++            static_for<16>([&](auto g) {
++                sched_group_barrier<sg::WMMA, 1, 0>();
++                if constexpr ((int) g >= 2) {
++                    constexpr int nv = b1::share(XV, 14, (int) g - 2);
++                    if constexpr (nv > 0) sched_group_barrier<sg::VALU | sg::TRANS, nv, 0>();
++                }
++                if constexpr ((int) g < 8) sched_group_barrier<sg::DS_READ, 2, 0>();
++            });
++        }
++#elif BWD1_OPT_MASKED
+         if constexpr (IL) pattern<16, 56 + (MASKED ? b1::MASK_VALU : 0), 0, 0, 2>();
+ #else
+         if constexpr (!MASKED) pattern<16, 56, 0, 0, 2>();
+@@ -158,7 +172,7 @@
+ #endif
+         // all DS loads issued so far (dSa, dOT: G0, ~300 cycles ago) are complete here: one explicit wait instead of
+         // LLVM's per-WMMA s_wait_dscnt in E1 (its dV WMMAs read dOT while the QT loads are in flight)
+-        if constexpr (IL) wait_dscnt<0>();
++        if constexpr (IL) wait_dscnt<b1::OPT_QTC ? 16 : 0>(); // QTC: the 16 QT loads (the youngest) may stay in flight
+         // ST: dS^T(s) -> buffer P
+         static_for<2>([&](auto kh) {
+             static_for<2>([&](auto hh) { ds_store_b128(ds_st, P * b0::DS_B + b0::ct_imm(SP, 16 * kh, 16 * hh), du[hh][kh]); });
+@@ -182,7 +196,7 @@
+             // source order == issue order per gap (atomics are ordered memory ops: the DS loads cannot pass them)
+             static_for<b1::NE1>([&](auto g) {
+                 e_wmma(g, std::integral_constant<int, g + 1>{});
+-                if constexpr (g < 8) QT[g] = load_tr<XP>(q_tr + P4 * b0::QT_B, 0, 16 * g);
++                if constexpr (g < 8 && !b1::OPT_QTC) QT[g] = load_tr<XP>(q_tr + P4 * b0::QT_B, 0, 16 * g);
+                 constexpr int a0 = b1::ATOM == 0 ? (g == 0 ? 0 : AT1) : (AT1 * g) / b1::NE1;
+                 constexpr int a1 = b1::ATOM == 0 ? AT1 : (AT1 * (g + 1)) / b1::NE1;
+                 atomics(std::integral_constant<int, a0>{}, std::integral_constant<int, a1>{}, dq, avo);
+@@ -193,7 +207,7 @@
+             });
+             static_for<b1::NE1>([&](auto g) {
+                 sched_group_barrier<sg::WMMA, 1, 0>();
+-                if constexpr (g < 8) sched_group_barrier<sg::DS_READ, 2, 0>();
++                if constexpr (g < 8 && !b1::OPT_QTC) sched_group_barrier<sg::DS_READ, 2, 0>();
+                 constexpr int na = b1::ATOM == 0 ? (g == 0 ? AT1 : 0) : (AT1 * (g + 1)) / b1::NE1 - (AT1 * g) / b1::NE1;
+                 if constexpr (na > 0) sched_group_barrier<sg::VMEM, na, 0>();
+                 if constexpr (g >= 8) {

@@ -1,0 +1,888 @@
+{
+ "name": "llama_bwd2",
+ "title": "Llama-3.1-8B attention backward, optimization campaign 2026-11-02 (GPU2): from Primus-Turbo dev/lhz/llama31_8b_hk_opt f2e7829d (v1.1)",
+ "tree": "hip",
+ "flags": [
+  "-x",
+  "hip",
+  "--offload-arch=gfx1250",
+  "--cuda-device-only",
+  "--no-gpu-bundle-output",
+  "-O3",
+  "-std=c++20",
+  "-DNDEBUG",
+  "-DKITTENS_CDNA5",
+  "-Iinclude",
+  "-I.",
+  "-save-temps=obj"
+ ],
+ "notes": [
+  "b0 rebuilds the v1.1 backward of dev/lhz/llama31_8b_hk_opt f2e7829d (= llama_bwd v11_best, sha 21b1ceb2) byte for byte; later rungs are -D knobs and/or patches in bwd2_patches/ (paths relative to llama/hip).",
+  "Baseline flydsl: Primus-Turbo's FlyDSL gfx1250 d128 fused backward of $HKL_TURBO_DIR (run with HKL_TURBO_DIR=Primus-Turbo-v3 = main ff4898e4).",
+  "Every rung keeps dK / dV bitwise equal to b0 (bitwise_with); dQ (fp32 atomics) is checked by SNR."
+ ],
+ "rungs": [
+  {
+   "id": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2"
+     ],
+     "sha256": "21b1ceb26ccb3f9267f535ed1ee8f04e6c059b616a6d15ddd5dfbf6b2c69acf7"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "v1.1 (llama_bwd v11_best): the pinned backward of dev/lhz/llama31_8b_hk_opt"
+  },
+  {
+   "id": "n14",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_NWIN=14"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "barrier window 14 dV/dK WMMAs: the signal 2 WMMAs later (2 readback loads may stay in flight past it)",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "n12",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_NWIN=12"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "barrier window 12: the signal 4 WMMAs later",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "n10",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_NWIN=10"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "barrier window 10",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "n8",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_NWIN=8"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "barrier window 8",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "r1_null",
+   "parent": "b0",
+   "patch": "bwd2_patches/01_reuse.patch",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2"
+     ],
+     "sha256": "21b1ceb26ccb3f9267f535ed1ee8f04e6c059b616a6d15ddd5dfbf6b2c69acf7"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "patch 01 (BWD1_OPT_REUSE knob) at its default 0: b0 byte for byte",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r1a",
+   "parent": "r1_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_REUSE=7"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "WMMA operand-reuse hints everywhere: S/dP reuse_b (hh 1), dQ reuse_a (j 1), dV/dK reuse_b (dt > 0)",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "r1b",
+   "parent": "r1_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_REUSE=4"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "reuse hints on dV/dK only",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r1c",
+   "parent": "r1_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_REUSE=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "reuse hints on S/dP only",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r1d",
+   "parent": "r1_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_REUSE=2"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "reuse hints on dQ only",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r1e",
+   "parent": "r1_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_REUSE=6"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "reuse hints on dQ (reuse_a) and dV/dK (reuse_b): every hinted WMMA follows one with the same operand register",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "abl_null",
+   "parent": "b0",
+   "patch": "bwd2_patches/90_ablate.patch",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2"
+     ],
+     "sha256": "21b1ceb26ccb3f9267f535ed1ee8f04e6c059b616a6d15ddd5dfbf6b2c69acf7"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "patch 90 (BWD1_ABL measurement knob) at 0: b0 byte for byte",
+   "side": true
+  },
+  {
+   "id": "abl1",
+   "parent": "abl_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_ABL=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "MEASUREMENT (wrong results): odd steps skip the readback (20 b128 / step on average)",
+   "side": true
+  },
+  {
+   "id": "abl2",
+   "parent": "abl_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_ABL=2"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "MEASUREMENT: odd steps skip the dOT + QT tr16 (16 tr16 / step on average)",
+   "side": true
+  },
+  {
+   "id": "abl4",
+   "parent": "abl_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_ABL=4"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "MEASUREMENT: odd steps skip the dSa tr16 (8 tr16 / step on average)",
+   "side": true
+  },
+  {
+   "id": "abl8",
+   "parent": "abl_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_ABL=8"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "MEASUREMENT: odd steps skip the dQ atomics (16 / step on average)",
+   "side": true
+  },
+  {
+   "id": "abl15",
+   "parent": "abl_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_ABL=15"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "MEASUREMENT: all four",
+   "side": true
+  },
+  {
+   "id": "r2_null",
+   "parent": "r1_null",
+   "patch": "bwd2_patches/02_dqsplit.patch",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2"
+     ],
+     "sha256": "21b1ceb26ccb3f9267f535ed1ee8f04e6c059b616a6d15ddd5dfbf6b2c69acf7"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "patch 02 (BWD1_OPT_DQSPLIT knob) at 0: b0 byte for byte",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r2a",
+   "parent": "r2_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "dQ split by (q half, d half): each wave reads half of dS^T (8 tr16 / step instead of 16), K^T for 64 d resident",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "r2b",
+   "parent": "r2_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_REUSE=6"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r2a + reuse hints on dQ / dV / dK",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r3_null",
+   "parent": "r2_null",
+   "patch": "bwd2_patches/03_qtc.patch",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2"
+     ],
+     "sha256": "21b1ceb26ccb3f9267f535ed1ee8f04e6c059b616a6d15ddd5dfbf6b2c69acf7"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "patch 03 (BWD1_OPT_QTC knob) at 0: b0 byte for byte",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r3a",
+   "parent": "r3_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_QTC=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r2a + QT(s) tr16 issued in C (gaps 0..7) instead of E1: no LDS-latency wait at the signal",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "r3b",
+   "parent": "r3_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=31",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_QTC=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r3a + REGS bit 16 (QT / du loop-carried: QT's registers stay reserved, no WAR drain on the QT loads in C)",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r3c",
+   "parent": "r3_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=31",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r2a + REGS bit 16",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r4_null",
+   "parent": "r3_null",
+   "patch": "bwd2_patches/04_rb1_e2salu.patch",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2"
+     ],
+     "sha256": "21b1ceb26ccb3f9267f535ed1ee8f04e6c059b616a6d15ddd5dfbf6b2c69acf7"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "patch 04 (BWD1_RB1, BWD1_OPT_E2SALU) at defaults: b0 byte for byte",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r4s",
+   "parent": "r4_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=31",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_QTC=1",
+      "-DBWD1_OPT_E2SALU=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r3b + 2 SALU per E2 gap",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r4r4",
+   "parent": "r4_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=31",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_QTC=1",
+      "-DBWD1_RB1=4"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r3b + readback items 0..3 (8 b128) in E1",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r4r8",
+   "parent": "r4_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=31",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_QTC=1",
+      "-DBWD1_RB1=8"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r3b + readback items 0..7 (16 b128) in E1",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r4r12",
+   "parent": "r4_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=31",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_QTC=1",
+      "-DBWD1_RB1=12"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r3b + readback items 0..11 (24 b128) in E1",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r4r8s",
+   "parent": "r4_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=31",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_QTC=1",
+      "-DBWD1_RB1=8",
+      "-DBWD1_OPT_E2SALU=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r4r8 + E2 SALU",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r4r16",
+   "parent": "r4_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=31",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_QTC=1",
+      "-DBWD1_RB1=16"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r3b + readback items 0..15 in E1",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r4r20",
+   "parent": "r4_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=31",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_QTC=1",
+      "-DBWD1_RB1=20"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r3b + readback items 0..19 in E1",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r4r24",
+   "parent": "r4_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=31",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_QTC=1",
+      "-DBWD1_RB1=24"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r3b + readback items 0..23 in E1",
+   "bitwise_with": "b0",
+   "side": true
+  }
+ ],
+ "baselines": [
+  {
+   "id": "flydsl",
+   "module": "primus_turbo.flydsl.attention.gfx1250.interface",
+   "bwd": "flash_attn_bwd",
+   "note": "Primus-Turbo's FlyDSL gfx1250 d128 fused backward (main since #580)"
+  }
+ ],
+ "problem": {
+  "kind": "gqa",
+  "b": 4,
+  "sq": 8192,
+  "skv": 8192,
+  "hq": 32,
+  "hkv": 8,
+  "d": 128,
+  "dv": 128,
+  "causal": true,
+  "layout": "bshd"
+ },
+ "direction": "bwd",
+ "fwd_for_bwd": {
+  "ladder": "ladder_fwd.json",
+  "rung": "p1"
+ },
+ "exact_outputs": [
+  "dk",
+  "dv"
+ ]
+}

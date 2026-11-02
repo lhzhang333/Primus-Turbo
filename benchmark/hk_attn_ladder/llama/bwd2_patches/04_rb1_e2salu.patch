@@ -1,0 +1,38 @@
+diff -ruN a/include/bwd1/idx.h b/include/bwd1/idx.h
+--- a/include/bwd1/idx.h	2026-11-02 11:41:23.966700900 +0000
++++ b/include/bwd1/idx.h	2026-11-02 11:41:49.575295345 +0000
+@@ -54,6 +54,12 @@
+ #ifndef BWD1_OPT_QTC     // 1: the 16 QT(s) tr16 of an interleaved step are issued in C (2 per WMMA gap, gaps 0..7)
+ #define BWD1_OPT_QTC 0   //   instead of E1: ~300 cycles before the signal's s_wait_dscnt (LDS latency under load)
+ #endif
++#ifndef BWD1_RB1         // readback items issued in E1 (before the signal, uncovered: slot s + 1 is readable all of step
++#define BWD1_RB1 -1      //   s); -1 = derived from BWD1_NWIN (none at NWIN 16)
++#endif
++#ifndef BWD1_OPT_E2SALU  // 1: E2's sched groups also take 2 SALU per WMMA gap (the next ring op's descriptor math runs
++#define BWD1_OPT_E2SALU 0 //   under the dK WMMAs instead of as one SALU run after the first of them)
++#endif
+ #ifndef BWD1_OPT_REGS    // bit mask of llvm.fake.use register holds (kernel-scope steps), see v1_step.inc:
+ #define BWD1_OPT_REGS 0  //   1 X.qA / X.dA to the end of G1, 2 dSa to the end of C, 4 E operands to the end of E2,
+ #endif                   //   8 dQ(s - 1) atomic data + voffset through G0 of step s + 1, 16 E2 operands likewise
+@@ -115,7 +121,9 @@
+     if (RB_LOADS - rb_loads(it) <= RB_E2_LOADS) return it;
+   return RB_ITEMS;
+ }
+-constexpr int RB1 = rb_split_items();          // items 0..RB1-1 before the signal (uncovered)
++constexpr int RB1 = BWD1_RB1 >= 0 ? BWD1_RB1 : rb_split_items(); // items 0..RB1-1 before the signal (uncovered)
++static_assert(RB1 >= 0 && RB1 <= RB_ITEMS, "BWD1_RB1");
++constexpr int OPT_E2SALU = BWD1_OPT_E2SALU;
+ constexpr int NUNC = rb_loads(RB1);            // DS loads in flight past a FULL step's signal (s_wait_dscnt)
+ static_assert(NUNC >= 0 && NUNC < 64, "dscnt is a 6-bit field");
+ // item decode: kind 0 qA, 1 dA (hh, dt), 2 ld (hh, k)
+diff -ruN a/include/bwd1/v1_step.inc b/include/bwd1/v1_step.inc
+--- a/include/bwd1/v1_step.inc	2026-11-02 11:41:23.966737010 +0000
++++ b/include/bwd1/v1_step.inc	2026-11-02 11:41:49.575330565 +0000
+@@ -246,6 +246,7 @@
+                 if constexpr (nr > 0) sched_group_barrier<sg::DS_READ, nr, 0>();
+                 constexpr int na = (AT2 * (g + 1)) / b1::NWIN - (AT2 * g) / b1::NWIN;
+                 if constexpr (na > 0) sched_group_barrier<sg::VMEM, na, 0>();
++                if constexpr (b1::OPT_E2SALU && (int) g + 1 < b1::NWIN) sched_group_barrier<sg::SALU, 2, 0>();
+             });
+         }
+ #if (BWD1_OPT_REGS & 4) && BWD1_KS

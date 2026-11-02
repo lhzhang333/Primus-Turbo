@@ -1,0 +1,157 @@
+diff -ruN a/include/bwd1/idx.h b/include/bwd1/idx.h
+--- a/include/bwd1/idx.h	2026-11-02 11:27:00.649272659 +0000
++++ b/include/bwd1/idx.h	2026-11-02 11:27:00.658734873 +0000
+@@ -45,6 +45,9 @@
+ #ifndef BWD1_OPT_TDM3    // 1: wave 3 issues a real 16-B dummy TDM op per step (b0opt::DUMMY_OFF): no role branch
+ #define BWD1_OPT_TDM3 0
+ #endif
++#ifndef BWD1_ABL         // MEASUREMENT ONLY (wrong results): skip a class of memory op in odd steps (s & 1), the
++#define BWD1_ABL 0       //   registers keep the previous step's data: 1 readback (X), 2 dOT + QT tr16, 4 dSa tr16,
++#endif                   //   8 dQ atomics; the WMMA / VALU work is unchanged
+ #ifndef BWD1_OPT_REGS    // bit mask of llvm.fake.use register holds (kernel-scope steps), see v1_step.inc:
+ #define BWD1_OPT_REGS 0  //   1 X.qA / X.dA to the end of G1, 2 dSa to the end of C, 4 E operands to the end of E2,
+ #endif                   //   8 dQ(s - 1) atomic data + voffset through G0 of step s + 1, 16 E2 operands likewise
+@@ -58,7 +61,7 @@
+ static_assert(ATOM >= 0 && ATOM <= 2, "BWD1_ATOM");
+ static_assert(NWIN >= 8 && NWIN <= 16 && NWIN % 2 == 0, "BWD1_NWIN: 8..16, even (QT loads in the first 8 E1 gaps)");
+ static_assert(HROT == 0 || HROT == 1, "BWD1_HROT");
+-constexpr int OPT_MASKED = BWD1_OPT_MASKED, OPT_TDM3 = BWD1_OPT_TDM3, OPT_REGS = BWD1_OPT_REGS;
++constexpr int OPT_MASKED = BWD1_OPT_MASKED, OPT_TDM3 = BWD1_OPT_TDM3, OPT_REGS = BWD1_OPT_REGS, ABL = BWD1_ABL;
+ static_assert(OPT_MASKED >= 0 && OPT_MASKED <= 2, "BWD1_OPT_MASKED");
+ static_assert(OPT_MASKED != 2 || BWD1_SKIP_DEAD, "BWD1_OPT_MASKED=2 is the DEAD-skipping split");
+ static_assert(OPT_TDM3 == 0 || OPT_TDM3 == 1, "BWD1_OPT_TDM3");
+diff -ruN a/include/bwd1/v1_step.inc b/include/bwd1/v1_step.inc
+--- a/include/bwd1/v1_step.inc	2026-11-02 11:27:00.649287679 +0000
++++ b/include/bwd1/v1_step.inc	2026-11-02 11:27:16.060061801 +0000
+@@ -14,6 +14,11 @@
+         constexpr bool IL = b1::SCHED == 1 && !MASKED; // interleave patterns (FULL steps only)
+ #endif
+         using Z0  = std::integral_constant<int, 0>;
++        // BWD1_ABL (measurement only): odd steps skip the selected memory ops
++        using SKDOT = std::integral_constant<bool, (b1::ABL & 2) && (P4 & 1)>;
++        using SKDSA = std::integral_constant<bool, (b1::ABL & 4) && (P4 & 1)>;
++        using SKAT  = std::integral_constant<bool, (b1::ABL & 8) && (P4 & 1)>;
++        constexpr bool SKRB = (b1::ABL & 1) && (P4 & 1);
+         using SLN = std::integral_constant<int, NX>;
+         const int qt = b0::tile_qt(s, n, G, nqp);
+ #if BWD1_OPT_MASKED == 1
+@@ -63,8 +68,8 @@
+                 });
+             });
+         };
+-        auto load_dot = [&] { static_for<8>([&](auto dt) { dOT[dt] = load_tr<XP>(do_tr + P4 * b0::QT_B, 0, 16 * dt); }); };
+-        auto load_qt  = [&] { static_for<8>([&](auto dt) { QT[dt] = load_tr<XP>(q_tr + P4 * b0::QT_B, 0, 16 * dt); }); };
++        auto load_dot = [&] { if constexpr (!SKDOT::value) static_for<8>([&](auto dt) { dOT[dt] = load_tr<XP>(do_tr + P4 * b0::QT_B, 0, 16 * dt); }); };
++        auto load_qt  = [&] { if constexpr (!SKDOT::value) static_for<8>([&](auto dt) { QT[dt] = load_tr<XP>(q_tr + P4 * b0::QT_B, 0, 16 * dt); }); };
+         // E WMMAs [LO, HI), kh-major (an A operand dies only in the second kv-tile pass): e < 16 dV^T[dt][kh] +=
+         // dOT[dt] P[kh] with kh = e / 8, dt = e % 8; e >= 16 dK^T[dt][kh] += QT[dt] dS[kh] likewise
+         auto e_wmma = [&](auto lo_c, auto hi_c) __attribute__((always_inline)) {
+@@ -87,13 +92,13 @@
+         sched_barrier<0>();
+         // G0: S/dP kv tile 0 (its A operands do not die here) || dSa(s - 1) (buffer P ^ 1), dOT(s)
+         if constexpr (!IL) {
+-            load_dsa(std::integral_constant<int, P ^ 1>{});
++            load_dsa(std::integral_constant<int, P ^ 1>{}, SKDSA{});
+             if (live) load_dot();
+             sched_barrier<0>();
+             if (live) sdp(I0);
+         } else {
+             sdp(I0);
+-            load_dsa(std::integral_constant<int, P ^ 1>{});
++            load_dsa(std::integral_constant<int, P ^ 1>{}, SKDSA{});
+             load_dot();
+             pattern<16, 0, 0, 32>();
+         }
+@@ -164,21 +169,21 @@
+ #endif
+         if constexpr (!IL) {
+             if (live) load_qt();
+-            atomics(Z0{}, std::integral_constant<int, AT1>{}, dq, avo);
++            atomics(Z0{}, std::integral_constant<int, AT1>{}, dq, avo, SKAT{});
+             sched_barrier<0>();
+             if (live) e_wmma(Z0{}, std::integral_constant<int, b1::NE1>{});
+-            readback(Z0{}, std::integral_constant<int, RB1>{}, SLN{}, X);
++            if constexpr (!SKRB) readback(Z0{}, std::integral_constant<int, RB1>{}, SLN{}, X);
+         } else {
+             // source order == issue order per gap (atomics are ordered memory ops: the DS loads cannot pass them)
+             static_for<b1::NE1>([&](auto g) {
+                 e_wmma(g, std::integral_constant<int, g + 1>{});
+-                if constexpr (g < 8) QT[g] = load_tr<XP>(q_tr + P4 * b0::QT_B, 0, 16 * g);
++                if constexpr (g < 8 && !SKDOT::value) QT[g] = load_tr<XP>(q_tr + P4 * b0::QT_B, 0, 16 * g);
+                 constexpr int a0 = b1::ATOM == 0 ? (g == 0 ? 0 : AT1) : (AT1 * g) / b1::NE1;
+                 constexpr int a1 = b1::ATOM == 0 ? AT1 : (AT1 * (g + 1)) / b1::NE1;
+-                atomics(std::integral_constant<int, a0>{}, std::integral_constant<int, a1>{}, dq, avo);
++                atomics(std::integral_constant<int, a0>{}, std::integral_constant<int, a1>{}, dq, avo, SKAT{});
+                 if constexpr (g >= 8) {
+                     constexpr int r0 = (RB1 * (g - 8)) / (b1::NE1 - 8), r1 = (RB1 * (g - 7)) / (b1::NE1 - 8);
+-                    readback(std::integral_constant<int, r0>{}, std::integral_constant<int, r1>{}, SLN{}, X);
++                    if constexpr (!SKRB) readback(std::integral_constant<int, r0>{}, std::integral_constant<int, r1>{}, SLN{}, X);
+                 }
+             });
+             static_for<b1::NE1>([&](auto g) {
+@@ -204,7 +209,7 @@
+         g0n = ring_g0(s + 1 + b1::LEAD);
+         asm volatile("" ::"s"(g0n)); // materialize under E2 (IR sinking would move it behind the wait)
+         if constexpr (!IL) {
+-            readback(std::integral_constant<int, RB1>{}, std::integral_constant<int, b1::RB_ITEMS>{}, SLN{}, X);
++            if constexpr (!SKRB) readback(std::integral_constant<int, RB1>{}, std::integral_constant<int, b1::RB_ITEMS>{}, SLN{}, X);
+             sched_barrier<0>();
+             if (live) e_wmma(std::integral_constant<int, b1::NE1>{}, std::integral_constant<int, b1::NE>{});
+         } else {
+@@ -212,9 +217,9 @@
+             static_for<b1::NWIN>([&](auto g) {
+                 e_wmma(std::integral_constant<int, b1::NE1 + g>{}, std::integral_constant<int, b1::NE1 + g + 1>{});
+                 constexpr int r0 = RB1 + (NR * g) / b1::NWIN, r1 = RB1 + (NR * (g + 1)) / b1::NWIN;
+-                readback(std::integral_constant<int, r0>{}, std::integral_constant<int, r1>{}, SLN{}, X);
++                if constexpr (!SKRB) readback(std::integral_constant<int, r0>{}, std::integral_constant<int, r1>{}, SLN{}, X);
+                 constexpr int a0 = AT1 + (AT2 * g) / b1::NWIN, a1 = AT1 + (AT2 * (g + 1)) / b1::NWIN;
+-                atomics(std::integral_constant<int, a0>{}, std::integral_constant<int, a1>{}, dq, avo);
++                atomics(std::integral_constant<int, a0>{}, std::integral_constant<int, a1>{}, dq, avo, SKAT{});
+             });
+             static_for<b1::NWIN>([&](auto g) {
+                 sched_group_barrier<sg::WMMA, 1, 0>();
+@@ -225,7 +230,7 @@
+             });
+         }
+ #if (BWD1_OPT_REGS & 4) && BWD1_KS
+-        // E1 / E2's WMMA operands stay allocated to the end of E2: the readback(s + 1) targets cannot be the
++        // E1 / E2's WMMA operands stay allocated to the end of E2: the if constexpr (!SKRB) readback(s + 1) targets cannot be the
+         // registers the last E WMMAs read (expert-mode WAR va_vdst(0) drains in E2)
+         sched_barrier<0>();
+ #if BWD1_OPT_MASKED == 2
+diff -ruN a/src/k_attn_bwd_v1.hip b/src/k_attn_bwd_v1.hip
+--- a/src/k_attn_bwd_v1.hip	2026-11-02 11:27:00.649410850 +0000
++++ b/src/k_attn_bwd_v1.hip	2026-11-02 11:27:16.056764397 +0000
+@@ -433,8 +433,9 @@
+         });
+     };
+     opnd_t dSa[2][4]; // A operands of dQ(s - 1), read at the start of step s
+-    auto   load_dsa = [&](auto buf_c) {
++    auto   load_dsa = [&](auto buf_c, auto skip_c) {
+         constexpr int BUF = decltype(buf_c)::value;
++        if constexpr (decltype(skip_c)::value) return;
+         static_for<2>([&](auto qh) {
+             static_for<4>([&](auto c) { dSa[qh][c] = load_tr<SP>(ds_tr + BUF * b0::DS_B, 32 * c, 16 * qh); });
+         });
+@@ -451,10 +452,10 @@
+         });
+     };
+     // atomics [LO, HI) of the 32 (order qh, j, i), vo = their step voffset; each its own instruction
+-    auto atomics = [&](auto lo_c, auto hi_c, const acc_t (&dq)[2][2], int vo) __attribute__((always_inline)) {
++    auto atomics = [&](auto lo_c, auto hi_c, const acc_t (&dq)[2][2], int vo, auto skip_c) __attribute__((always_inline)) {
+         constexpr int LO = decltype(lo_c)::value, HI = decltype(hi_c)::value;
+         static_for<b1::NATOM>([&](auto a) {
+-            if constexpr ((int) a >= LO && (int) a < HI) {
++            if constexpr ((int) a >= LO && (int) a < HI && !decltype(skip_c)::value) {
+                 constexpr int qh = a / 16, j = (a / 8) % 2, i = a % 8;
+                 buf_atomic_add_f32(r_dqa, vo + b0::dqa_imm(qh, j, i), 0, dq[qh][j][i]);
+             }
+@@ -586,7 +587,7 @@
+ 
+     // ---- drain: dQ(n - 1) (dSa from buffer (n - 1) & 1 = 1) and its atomics; epilogue; TDM drain + barrier -------
+     {
+-        load_dsa(std::integral_constant<int, 1>{});
++        load_dsa(std::integral_constant<int, 1>{}, std::false_type{});
+         acc_t dq[2][2];
+         dq_wmma(dq);
+         const int vo = voff_nonneg(voff_lane + b0::dqa_voff(0, 0, b1::atom_gh(n, n, G, rot), b1::atom_qt(n, n, G, nqp), nqp));

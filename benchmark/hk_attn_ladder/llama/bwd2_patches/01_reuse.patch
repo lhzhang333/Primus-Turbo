@@ -1,0 +1,71 @@
+diff -ruN a/include/bwd1/idx.h b/include/bwd1/idx.h
+--- a/include/bwd1/idx.h	2026-11-02 11:14:05.397040318 +0000
++++ b/include/bwd1/idx.h	2026-11-02 11:14:05.413645821 +0000
+@@ -45,6 +45,9 @@
+ #ifndef BWD1_OPT_TDM3    // 1: wave 3 issues a real 16-B dummy TDM op per step (b0opt::DUMMY_OFF): no role branch
+ #define BWD1_OPT_TDM3 0
+ #endif
++#ifndef BWD1_OPT_REUSE   // bit mask of WMMA operand-reuse hints (matrix_a_reuse / matrix_b_reuse) on WMMAs whose A / B
++#define BWD1_OPT_REUSE 0 //   operand is the previous WMMA's: 1 S / dP (hh 1 after hh 0: B = kf / vf), 2 dQ (j 1 after
++#endif                   //   j 0: A = dSa), 4 dV / dK (dt > 0 of a kv-tile run: B = P / dS); no instruction change
+ #ifndef BWD1_OPT_REGS    // bit mask of llvm.fake.use register holds (kernel-scope steps), see v1_step.inc:
+ #define BWD1_OPT_REGS 0  //   1 X.qA / X.dA to the end of G1, 2 dSa to the end of C, 4 E operands to the end of E2,
+ #endif                   //   8 dQ(s - 1) atomic data + voffset through G0 of step s + 1, 16 E2 operands likewise
+@@ -58,7 +61,7 @@
+ static_assert(ATOM >= 0 && ATOM <= 2, "BWD1_ATOM");
+ static_assert(NWIN >= 8 && NWIN <= 16 && NWIN % 2 == 0, "BWD1_NWIN: 8..16, even (QT loads in the first 8 E1 gaps)");
+ static_assert(HROT == 0 || HROT == 1, "BWD1_HROT");
+-constexpr int OPT_MASKED = BWD1_OPT_MASKED, OPT_TDM3 = BWD1_OPT_TDM3, OPT_REGS = BWD1_OPT_REGS;
++constexpr int OPT_MASKED = BWD1_OPT_MASKED, OPT_TDM3 = BWD1_OPT_TDM3, OPT_REGS = BWD1_OPT_REGS, OPT_REUSE = BWD1_OPT_REUSE;
+ static_assert(OPT_MASKED >= 0 && OPT_MASKED <= 2, "BWD1_OPT_MASKED");
+ static_assert(OPT_MASKED != 2 || BWD1_SKIP_DEAD, "BWD1_OPT_MASKED=2 is the DEAD-skipping split");
+ static_assert(OPT_TDM3 == 0 || OPT_TDM3 == 1, "BWD1_OPT_TDM3");
+diff -ruN a/include/bwd1/v1_step.inc b/include/bwd1/v1_step.inc
+--- a/include/bwd1/v1_step.inc	2026-11-02 11:14:05.397056408 +0000
++++ b/include/bwd1/v1_step.inc	2026-11-02 11:14:05.413730092 +0000
+@@ -54,12 +54,14 @@
+         auto sdp = [&](auto kh) { // S / dP of kv tile kh: 4 independent chains over dt
+             static_for<4>([&](auto dt) {
+                 static_for<2>([&](auto hh) {
+-                    if constexpr (dt == 0) S[hh][kh] = wmma0(X.qA[hh][dt], kf[kh][dt]);
+-                    else S[hh][kh] = wmma(X.qA[hh][dt], kf[kh][dt], S[hh][kh]);
++                    constexpr bool RB = (b1::OPT_REUSE & 1) && hh == 1; // B = kf[kh][dt], as the hh 0 WMMA before it
++                    if constexpr (dt == 0) S[hh][kh] = wmma0<false, RB>(X.qA[hh][dt], kf[kh][dt]);
++                    else S[hh][kh] = wmma<false, RB>(X.qA[hh][dt], kf[kh][dt], S[hh][kh]);
+                 });
+                 static_for<2>([&](auto hh) {
+-                    if constexpr (dt == 0) dP[hh][kh] = wmma0(X.dA[hh][dt], vf[kh][dt]);
+-                    else dP[hh][kh] = wmma(X.dA[hh][dt], vf[kh][dt], dP[hh][kh]);
++                    constexpr bool RB = (b1::OPT_REUSE & 1) && hh == 1; // B = vf[kh][dt]
++                    if constexpr (dt == 0) dP[hh][kh] = wmma0<false, RB>(X.dA[hh][dt], vf[kh][dt]);
++                    else dP[hh][kh] = wmma<false, RB>(X.dA[hh][dt], vf[kh][dt], dP[hh][kh]);
+                 });
+             });
+         };
+@@ -72,8 +74,9 @@
+             static_for<b1::NE>([&](auto e) {
+                 if constexpr ((int) e >= LO && (int) e < HI) {
+                     constexpr int kh = (e % 16) / 8, dt = e % 8;
+-                    if constexpr (e < 16) dVt[dt][kh] = wmma(dOT[dt], cat_u32(pu[0][kh], pu[1][kh]), dVt[dt][kh]);
+-                    else dKt[dt][kh] = wmma(QT[dt], cat_u32(du[0][kh], du[1][kh]), dKt[dt][kh]);
++                    constexpr bool RB = (b1::OPT_REUSE & 4) && dt > 0; // B = P / dS of kv tile kh, as the dt - 1 WMMA
++                    if constexpr (e < 16) dVt[dt][kh] = wmma<false, RB>(dOT[dt], cat_u32(pu[0][kh], pu[1][kh]), dVt[dt][kh]);
++                    else dKt[dt][kh] = wmma<false, RB>(QT[dt], cat_u32(du[0][kh], du[1][kh]), dKt[dt][kh]);
+                 }
+             });
+         };
+diff -ruN a/src/k_attn_bwd_v1.hip b/src/k_attn_bwd_v1.hip
+--- a/src/k_attn_bwd_v1.hip	2026-11-02 11:14:05.397453569 +0000
++++ b/src/k_attn_bwd_v1.hip	2026-11-02 11:14:05.413699082 +0000
+@@ -444,8 +444,9 @@
+         static_for<4>([&](auto c) {
+             static_for<2>([&](auto qh) {
+                 static_for<2>([&](auto j) {
+-                    if constexpr (c == 0) dq[qh][j] = wmma0(dSa[qh][c], kt[j][c]);
+-                    else dq[qh][j] = wmma(dSa[qh][c], kt[j][c], dq[qh][j]);
++                    constexpr bool RA = (b1::OPT_REUSE & 2) && j == 1; // A = dSa[qh][c], as the j = 0 WMMA before it
++                    if constexpr (c == 0) dq[qh][j] = wmma0<RA, false>(dSa[qh][c], kt[j][c]);
++                    else dq[qh][j] = wmma<RA, false>(dSa[qh][c], kt[j][c], dq[qh][j]);
+                 });
+             });
+         });
