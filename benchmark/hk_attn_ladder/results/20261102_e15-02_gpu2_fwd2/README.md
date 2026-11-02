@@ -39,6 +39,10 @@ f32a without `--qres` are flat or worse, f37m / f37n).
 | f35r8 | DS_RATE 8 on f32a | 0.987-0.991x |
 | f36x | Q(0) / Q(3) not re-read per tile (timing only, wrong results) | 1.048x cold, 1.025x burst: the bound for Q residency |
 | f37a-i | `--qres` with the default knobs (f37a) and single-knob variants | f37a cold 1.004-1.007x, burst 0.996-0.999x |
+| f38a | TILE_D3F: TILE_D3 + FINAL_A3's math in one region, FINAL_ST stores after the barrier (patch 38) | 0.995-0.997x |
+| f39x | no O / lse global stores (timing only) | cold 1.017x, burst 1.008x (cycles 1.008x): the bound for the write-back |
+| f40a | O by `tensor_store_from_lds` from the staging slots (patch 40; micro/tdmst.cpp: a store reads LDS linearly, no padding, so the 272-B rows go out as 136-column tiles with dim 0 bounded at 128) | 1.000x (20 rounds): the next block's tensor_wait<0> waits for the stores |
+| r12s (bwd) | dS^T stores after the stage's last LDS reads (--st-late) | 0.998-1.003x |
 | r12t4/8/16 (bwd) | dK/dV: the entry ticket only for the last 1/4, 1/8, 1/16 of the workgroups (bitwise == r10x) | 1.00x, 1.002-1.005x, 0.989x: the entry atomic is not on the critical path |
 
 ## What the traces say (f31a / f32a ATT, one wave, `tools/att_*.py`)

@@ -1,0 +1,44 @@
+diff -ruN a/r8gen/gen/build.py b/r8gen/gen/build.py
+--- a/r8gen/gen/build.py	2026-11-02 09:14:18.957172467 +0000
++++ b/r8gen/gen/build.py	2026-11-02 09:14:18.969246884 +0000
+@@ -109,6 +109,7 @@
+     ap.add_argument("--final-pipe", action="store_true", help="r8gen.FINAL_PIPE (pipelined epilogue)")
+     ap.add_argument("--tdm-lim-sc7", action="store_true", help="r8gen.TDM_LIM_SC7 (shell -DHKGEN_W4)")
+     ap.add_argument("--dv-interleave", action="store_true", help="r8gen.DV_INTERLEAVE (dV of kh after hh1's kh + 1)")
++    ap.add_argument("--st-late", action="store_true", help="r8gen.ST_LATE (dS^T stores after the stage's last reads)")
+     ap.add_argument("--bar-gap", type=int, default=None, help="bwdgen.SLOT['bar_gap']: WMMAs between ring signal / wait")
+     ap.add_argument("--slot", default="", help="bwdgen.SLOT overrides for the slot scheduler: KEY=INT,KEY=INT")
+     ap.add_argument("--asmkit-root", default=None, help="ignored: the package carries its own asmkit")
+@@ -127,6 +128,7 @@
+     G.SCAL_IN_BODY, G.TDM_DUMMY, G.FINAL_PIPE = a.scal_in_body, a.tdm_dummy, a.final_pipe
+     G.TDM_LIM_SC7 = a.tdm_lim_sc7
+     G.DV_INTERLEAVE = a.dv_interleave
++    G.ST_LATE = a.st_late
+     import bwdgen as BG
+     if a.bar_gap is not None:
+         BG.SLOT["bar_gap"] = a.bar_gap
+diff -ruN a/r8gen/gen/r8gen.py b/r8gen/gen/r8gen.py
+--- a/r8gen/gen/r8gen.py	2026-11-02 09:14:18.957133867 +0000
++++ b/r8gen/gen/r8gen.py	2026-11-02 09:14:18.969103513 +0000
+@@ -296,6 +296,8 @@
+ #                     moves 16-B dummies (shell -DHKGEN_W4: waves 2, 3 share waves 0, 1's ring)
+ SCAL_XCNT_GAP = 160  # cycles between a VMEM / TDM op and the next tile's redefinition of an SGPR it reads
+ HH1_SPLIT = 0  # hh1's S / dP order: dt < HH1_SPLIT dt outer (every kh), the rest kh-major (6: all dt outer)
++ST_LATE = False  # --st-late: the dS^T stores after the stage's last LDS reads (Q^T 10, 11): their data transfer
++#                (~32 cycles a store) overlaps the barrier signal's s_wait_dscnt 0 instead of a WMMA window
+ BDO_AFTER_HH1 = False  # the dO^T loads issue only after every hh1 operand load (they do not crowd the LDS queue)
+ DV_INTERLEAVE = False  # the WMMA stream runs dV of kh right after hh1's S / dP of kh + 1 (dV of the last kh after
+ #                       hh1's run): each kh's softmax spreads over the next kh's WMMAs instead of bunching before dV
+@@ -465,6 +467,12 @@
+         if nodes[i].kind in ("VM_ST", "VM_LD"):
+             for j in sm:
+                 add_order(nodes, j, i)
++    if ST_LATE:
++        for i in ex:
++            if nodes[i].kind == "VM_ST":
++                for d in (10, 11):
++                    for j in bq_loads.get(d, []):
++                        add_order(nodes, j, i)
+     for i in nxt_reads:
+         add_order(nodes, bw, i)
+     if BDO_AFTER_HH1:

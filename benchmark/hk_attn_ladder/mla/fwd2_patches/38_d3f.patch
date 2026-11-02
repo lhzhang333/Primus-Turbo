@@ -1,0 +1,252 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 09:03:30.250589709 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 09:04:22.209568266 +0000
+@@ -160,6 +160,14 @@
+ #if HKGEN_TDMGEN && !HKGEN_TDMASM
+ #error "HKGEN_TDMGEN needs HKGEN_TDMASM"
+ #endif
++// HKGEN_D3F 1 (on HKGEN_SKIPPV): TILE_D3F = TILE_D3 + FINAL_A3's math (the last tile's own prefix, 1 / d, bf16(O / d),
++// lse) in one region; after the block's last barrier FINAL_ST only stores the outputs into the staging slots
++#ifndef HKGEN_D3F
++#define HKGEN_D3F 0
++#endif
++#if HKGEN_D3F && !HKGEN_SKIPPV
++#error "HKGEN_D3F needs HKGEN_SKIPPV"
++#endif
+ // HKGEN_FA3FIRST 1 (on HKGEN_SKIPPV): FINAL_A3 is the likely branch, laid out right after TILE_D3, the rare full FINAL_A
+ // after it: a block's code runs in one ascending address range (the per-block code exceeds the instruction cache)
+ #ifndef HKGEN_FA3FIRST
+@@ -876,6 +884,12 @@
+ #if HKGEN_REF
+         tile(st + k_lane, st + K_B + v_lane, dl0 - NB * t2, k);
+ #else
++#if HKGEN_D3F
++        if constexpr (k == 3)
++          asm volatile("; HKGEN TILE_D3F kb=%0 vb=%1 dl=%2 c2=%3" ::"v"(st + k_lane), "v"(st + K_B + v_lane),
++                       "v"(dl0 - NB * t2), "s"(c2) : HKGEN_CLOBBERS);
++        else
++#endif
+         asm volatile("; HKGEN TILE_D%c4 kb=%0 vb=%1 dl=%2 c2=%3" ::"v"(st + k_lane), "v"(st + K_B + v_lane),
+                      "v"(dl0 - NB * t2), "s"(c2), "n"((int)k) : HKGEN_CLOBBERS);
+ #endif
+@@ -936,8 +950,13 @@
+ #else
+       if (ncc + 3 < n)  // TILE_D3 ran
+ #endif
++#if HKGEN_D3F
++        asm volatile("; HKGEN FINAL_ST wa=%0 wb=%1 la=%2 lb=%3" ::"v"(sga + wl), "v"(sgb + wl), "v"(sga + wls),
++                     "v"(sgb + wls) : HKGEN_CLOBBERS);
++#else
+         asm volatile("; HKGEN FINAL_A3 wa=%0 wb=%1 la=%2 lb=%3" ::"v"(sga + wl), "v"(sgb + wl), "v"(sga + wls),
+                      "v"(sgb + wls) : HKGEN_CLOBBERS);
++#endif
+       else
+ #endif
+       asm volatile("; HKGEN FINAL_A wa=%0 wb=%1 la=%2 lb=%3" ::"v"(sga + wl), "v"(sgb + wl), "v"(sga + wls),
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 09:03:30.250655389 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 09:04:11.101087323 +0000
+@@ -598,6 +598,7 @@
+     G.ABL = set(a.abl)
+     G.BANK_TREE = a.bank_tree
+     G.QRES = a.qres
++    G.D3F = "HKGEN_D3F=1" in DEFINES
+     if a.qres and a.plan != 2:
+         raise SystemExit("--qres needs --plan 2")
+     G.SKIPPV = "HKGEN_SKIPPV=1" in DEFINES
+@@ -640,6 +641,8 @@
+         want = (*want, "TILE_F")
+     if "HKGEN_FMERGE=1" in DEFINES:
+         want = (*(x for x in want if not x.startswith("FINAL_")), "FINAL_A", *(("FINAL_A3",) if G.SKIPPV else ()))
++    if G.D3F:  # TILE_D3 + FINAL_A3's math in one region, FINAL_A3's stores in FINAL_ST
++        want = tuple({"TILE_D3": "TILE_D3F", "FINAL_A3": "FINAL_ST"}.get(x, x) for x in want)
+     if sorted(names) != sorted(want):
+         raise RuntimeError(f"markers {names}, want {list(want)}")
+     hi, wmma_trans, scalars = scan_shell(ins)
+@@ -705,12 +708,16 @@
+             o = {"kb": vfirst(ops["kb"]), "vb": vfirst(ops["vb"]), "c2": c2}
+             k = None
+             if name.startswith("TILE_D"):
+-                k, o["dl"] = int(name[-1]), vfirst(ops["dl"])
++                k, o["dl"] = int(name[6]), vfirst(ops["dl"])
+             if name == "TILE_F":
+                 o["qa"], o["qb"] = vfirst(ops["qa"]), vfirst(ops["qb"])
+             if name == "TILE_C" and G.TDMGEN:
+                 o.update({x: ops[x] for x in ("qk", "qb", "qv", "g1a", "g1b", "g1v", "t", "n4", "l3")})
+-            texts, cycles[name] = G.region_tile(L, o, k, ftile=name == "TILE_F")
++            texts, cycles[name] = G.region_tile(L, o, k, ftile=name == "TILE_F", d3f=name == "TILE_D3F")
++        elif name == "FINAL_ST":
++            texts = G.region_final_st(L, {k: vfirst(ops[k]) for k in ("wa", "wb", "la", "lb")})
++            pre = ["\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"]
++            post = ["\ts_wait_dscnt 0x0", "\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"]
+         elif name in ("FINAL_A", "FINAL_A3"):
+             texts = G.region_final_all(L, {k: vfirst(ops[k]) for k in ("wa", "wb", "la", "lb")},
+                                        skip=3 if name == "FINAL_A3" else 0)
+@@ -943,7 +950,7 @@
+                 ok_base |= {L.kb, L.vb}
+             if name.startswith("TILE"):
+                 ok_base |= {vfirst(ops_of[name]["kb"]), vfirst(ops_of[name]["vb"])}
+-            if name in ("FINAL_A", "FINAL_A3"):  # the staging stores only
++            if name in ("FINAL_A", "FINAL_A3", "FINAL_ST"):  # the staging stores only
+                 ok_base = {vfirst(ops_of[name][k]) for k in ("wa", "wb", "la", "lb")}
+                 if not x.mn.startswith("ds_store"):
+                     fail.append(f"{name}: an LDS op other than the staging stores: {x.text.strip()}")
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 09:03:30.250676659 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 09:04:11.100516062 +0000
+@@ -120,6 +120,7 @@
+ # (dead until the q tile's exps), (peer sum, total) in leaves the sum tree has consumed, m / d in the unused high
+ # halves of the (m', unused) / (corr, unused) pairs, the mask bounds dl in block 0
+ QRES = False
++D3F = False  # build.py, from -D HKGEN_D3F=1: TILE_D3F = TILE_D3 + FINAL's math (fin_nodes), FINAL_ST its stores
+ TDM_SLAT = 10  # modelled cycles from a SALU write of an SGPR to a TDM op reading it (ATT: ~9)
+ RESC_COST = 6  # modelled cycles of the s_cmp + s_cbranch of a RESC block that is not taken
+ # --resc branch2: the RESC block's s_cmp is a node of its own (SALU, writes scc), so the scheduler can issue it BR_LAT
+@@ -502,7 +503,7 @@
+     return out
+ 
+ 
+-def schedule(nodes):
++def schedule(nodes, worder=None):
+     """(ordered nodes, modelled cycles): a cycle-stepped list scheduler on an issue model of one wave.
+ 
+     WMMAs issue in WORDER (program order within a tag), one per 8 cycles at most (XDL occupancy). Within 8
+@@ -517,13 +518,14 @@
+     order. An s_wait_dscnt goes in where a load would exceed DS_MAX. --issue hw: schedule_hw."""
+     if ISSUE == "hw":
+         return schedule_hw(nodes)
++    worder = worder or WORDER
+     n = len(nodes)
+     succ = [[] for _ in range(n)]
+     for i, nd in enumerate(nodes):
+         for p, lat in nd.preds:
+             succ[p].append((i, lat))
+     wmmas = [i for i in range(n) if nodes[i].kind == "WMMA"]
+-    wseq = [i for tag in WORDER for i in wmmas if nodes[i].tag == tag]
++    wseq = [i for tag in worder for i in wmmas if nodes[i].tag == tag]
+     if sorted(wseq) != wmmas:
+         raise ValueError("WORDER does not cover the WMMAs")
+     wpos = {i: k for k, i in enumerate(wseq)}
+@@ -1057,7 +1059,7 @@
+         add(f"v_fma_f32 {vr(L.d[qi])}, {vr(L.corr[qi])}, {vr(L.d[qi])}, {vr(tot)}", "VALU", f"sum{qi}")
+ 
+ 
+-def prefix_nodes(L, add, c_sgpr, skip=0):
++def prefix_nodes(L, add, c_sgpr, skip=0, ptag="p"):
+     """The tail of the previous tile: the softmax of q tiles 2, 3 (masked scores in S(2), S(3)), their sum
+     tree, then the PV WMMAs of all four q tiles (V of the previous tile), tags PV{i}p. skip (SKIPPV): the previous
+     tile skipped q tiles 0 .. skip - 1 (P 0, S(2) -inf): none of their PVs, no softmax of q tile 2 (q tile 3 then
+@@ -1076,12 +1078,12 @@
+                 add(
+                     f"v_wmma_f32_16x16x32_bf16 {o}, {vr(L.V(dt, kt), 8)}, {vr(L.P(i, kt), 8)}, {o}",
+                     "WMMA",
+-                    f"PV{i}p",
++                    f"PV{i}{ptag}",
+                 )
+ 
+ 
+-def tile_nodes(L, ops, k=None, pre=None, post=None, ftile=False):
+-    nodes = _tile_nodes(L, ops, k, pre, post, ftile)
++def tile_nodes(L, ops, k=None, pre=None, post=None, ftile=False, fin=False):
++    nodes = _tile_nodes(L, ops, k, pre, post, ftile, fin)
+     if "nolds" not in ABL:
+         return nodes
+     keep = [nd for nd in nodes if nd.kind != "DS"]
+@@ -1090,7 +1092,7 @@
+     return build_dag(keep)
+ 
+ 
+-def _tile_nodes(L, ops, k=None, pre=None, post=None, ftile=False):
++def _tile_nodes(L, ops, k=None, pre=None, post=None, ftile=False, fin=False):
+     """The nodes of a TILE region in program order. ops: kb / vb (VGPRs: the K / V fragment bases of the
+     stage), c2 (SGPR: c), and for a diagonal tile dl (VGPR: q + Skv - Sq - kv0 - 8 (lane / 16) of q tile 0).
+     k: None for TILE_C, else the diagonal tile k (q tiles below k skipped, the mask on q tile k only).
+@@ -1175,6 +1177,8 @@
+     # the arrive, after every LDS read of the region and one LDS latency after the last (its s_wait_dscnt 0
+     # then does not stall); no LDS read follows it, as the next block's Q may then overwrite the staging area
+     bar = add("s_barrier_signal -1", "BAR", "arrive")
++    if fin:  # D3F: the last tile's own prefix (P(3) of this tile's S(3), V) and FINAL's math, no LDS op
++        fin_nodes(L, add)
+     tail = []
+     if post is not None:  # the barrier wait and the next tile's reads
+         n0 = len(nodes)
+@@ -1241,9 +1245,77 @@
+         add(f"s_add_co_i32 s{q + 1}, s{q + 1}, s99", "SALU", "tdmadv")
+ 
+ 
+-def region_tile(L, ops, k=None, ftile=False):
++def fin_nodes(L, add):
++    """D3F: TILE_D3's own tail (prefix_nodes with skip 3, c from the SGPR pair, WMMA tags PV{i}f) and FINAL's math per
++    q tile: out = bf16(O / d) into the dead K registers (K + 32 i), lse into qbuf[0] + 12 i + 9 (FINAL_ST stores both
++    after the barrier)."""
++    prefix_nodes(L, add, c_sgpr=True, skip=3, ptag="f")
++    for i in range(QT):
++        for t, kind in _fin_math(L, i):
++            add(t, kind, f"fin{i}")
++
++
++def _fin_math(L, i):
++    """[(text, kind)] of q tile i's FINAL math without its stores (region_final_all's order)."""
++    d, m = L.d[i], L.m[i]
++    a, b, rc, e1, q, e2, sh, sub, x, lg, inv = (L.qbuf[0] + 12 * i + k for k in range(11))
++    sv = lg
++    s1, s2 = S_NEED[i], S_ANY[i]
++    out = []
++    for t in (
++        f"v_div_scale_f32 {vr(a)}, null, {vr(d)}, {vr(d)}, 1.0",
++        f"v_div_scale_f32 {vr(b)}, vcc_lo, 1.0, {vr(d)}, 1.0",
++        f"v_rcp_f32_e32 {vr(rc)}, {vr(a)}",
++        f"v_fma_f32 {vr(e1)}, -{vr(a)}, {vr(rc)}, 1.0",
++        f"v_fmac_f32_e32 {vr(rc)}, {vr(e1)}, {vr(rc)}",
++        f"v_mul_f32_e32 {vr(q)}, {vr(b)}, {vr(rc)}",
++        f"v_fma_f32 {vr(e2)}, -{vr(a)}, {vr(q)}, {vr(b)}",
++        f"v_fmac_f32_e32 {vr(q)}, {vr(e2)}, {vr(rc)}",
++        f"v_fma_f32 {vr(a)}, -{vr(a)}, {vr(q)}, {vr(b)}",
++        f"v_div_fmas_f32 {vr(a)}, {vr(a)}, {vr(rc)}, {vr(q)}",
++        f"v_div_fixup_f32 {vr(a)}, {vr(a)}, {vr(d)}, 1.0",
++        f"v_cmp_lt_f32_e64 {s1}, 0, {vr(d)}",
++        f"v_cndmask_b32_e64 {vr(inv)}, 0, {vr(a)}, {s1}",
++    ):
++        out.append((t, "TRANS" if t.startswith("v_rcp") else "VALU"))
++    o32 = L.k + 32 * i
++    for dt in range(NDT):
++        for r in range(0, 8, 2):
++            o = vr(L.O(i, dt) + r, 2)
++            out.append((f"v_pk_mul_f32 {o}, {o}, {vr(inv, 2)} op_sel_hi:[1,0]", "VALU"))
++            out.append((f"v_cvt_pk_bf16_f32 {vr(o32 + 4 * dt + r // 2)}, {vr(L.O(i, dt) + r)}, "
++                        f"{vr(L.O(i, dt) + r + 1)}", "VALU"))
++    for t in (
++        f"v_cmp_gt_f32_e64 {s2}, 0x800000, {vr(d)}",
++        f"v_cndmask_b32_e64 {vr(sh)}, 0, 32, {s2}",
++        f"v_cndmask_b32_e64 {vr(sub)}, 0, 0x42000000, {s2}",
++        f"v_ldexp_f32 {vr(x)}, {vr(d)}, {vr(sh)}",
++        f"v_log_f32_e32 {vr(x)}, {vr(x)}",
++        f"v_sub_f32_e32 {vr(lg)}, {vr(x)}, {vr(sub)}",
++        f"v_add_f32_e32 {vr(sv)}, {vr(m)}, {vr(lg)}",
++        f"v_mul_f32_e32 {vr(sv)}, 0x{LN2:x}, {vr(sv)}",
++    ):
++        out.append((t, "TRANS" if t.startswith("v_log") else "VALU"))
++    return out
++
++
++def region_final_st(L, ops):
++    """FINAL_ST (D3F, program order): the staging stores of TILE_D3F's outputs, as region_final_all's."""
++    out = []
++    for i in range(QT):
++        o32 = L.k + 32 * i
++        base = ops["wa"] if i < 2 else ops["wb"]
++        for dt in range(NDT):
++            out.append(f"ds_store_b128 {vr(base)}, {vr(o32 + 4 * dt, 4)} offset:{(i & 1) * 4 * SQT_B + 32 * dt}")
++        lbase = ops["la"] if i < 2 else ops["lb"]
++        out.append(f"ds_store_b32 {vr(lbase)}, {vr(L.qbuf[0] + 12 * i + 9)} offset:{(i & 1) * 4 * SQT_B}")
++    return out
++
++
++def region_tile(L, ops, k=None, ftile=False, d3f=False):
+     """(lines, modelled cycles) of TILE_C (k None), TILE_Dk or TILE_F (ftile)."""
+-    order, cycles = schedule(tile_nodes(L, ops, k, ftile=ftile))
++    worder = WORDER + tuple(f"PV{i}f" for i in range(QT)) if d3f else None
++    order, cycles = schedule(tile_nodes(L, ops, k, ftile=ftile, fin=d3f), worder)
+     out = []
+     for nd in order:
+         if nd.kind == "BAR":  # this wave's LDS reads done, wave 0's TDM ops of the next stage landed

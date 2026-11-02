@@ -1,0 +1,42 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 09:18:36.526693460 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 09:18:36.545102408 +0000
+@@ -165,6 +165,10 @@
+ #ifndef HKGEN_D3F
+ #define HKGEN_D3F 0
+ #endif
++// HKGEN_ABL_NOWB 1 (timing only, no output): the epilogue's read-back and global stores of O / lse dropped
++#ifndef HKGEN_ABL_NOWB
++#define HKGEN_ABL_NOWB 0
++#endif
+ #if HKGEN_D3F && !HKGEN_SKIPPV
+ #error "HKGEN_D3F needs HKGEN_SKIPPV"
+ #endif
+@@ -1037,11 +1041,11 @@
+         static_for<NDT>([&](auto j) {
+           const u32x4 w = i < 2 ? lds_load_u32x4(rda, (i & 1) * 4 * SQT + 2 * j * XO)
+                                 : lds_load_u32x4(rdb, (i & 1) * 4 * SQT + 2 * j * XO);
+-          buf_store_b128(w, r_o[i], (int)vo_l, (int)((unsigned)(2 * j) * rsb));
++          if constexpr (!HKGEN_ABL_NOWB) buf_store_b128(w, r_o[i], (int)vo_l, (int)((unsigned)(2 * j) * rsb));
+         });
+         sched_barrier<0>();
+       });
+-      buf_store_b64(lsev, r_l, (int)lo, 0);
++      if constexpr (!HKGEN_ABL_NOWB) buf_store_b64(lsev, r_l, (int)lo, 0);
+       sched_barrier<0>();
+     }
+ 
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 09:18:36.526763420 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 09:19:06.373233263 +0000
+@@ -783,7 +783,9 @@
+     rec["checks"]["contract"] = contract_checks(spl, objdump, markers, L, fail)
+     # the writeback check guards the static schedule's hand-arranged store phase (E1/E2); the probe's stamps and the
+     # ticket code (atomics, a per-lane branch, the slot read) put LLVM's own control flow into it: report only
+-    relaxed = probe or any(d.startswith("HKGEN_TICKET=") and d != "HKGEN_TICKET=0" for d in DEFINES)
++    relaxed = probe or any(d.startswith("HKGEN_TICKET=") and d != "HKGEN_TICKET=0" for d in DEFINES) or (
++        "HKGEN_ABL_NOWB=1" in DEFINES  # timing ablation: no store phase at all
++    )
+     rec["checks"]["writeback"] = writeback_check(objdump, fail if not relaxed else [])
+ 
+     for f in fail:

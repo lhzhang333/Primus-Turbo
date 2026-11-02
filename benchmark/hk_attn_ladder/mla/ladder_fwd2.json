@@ -5591,6 +5591,321 @@
    "feature": "f32a (no --qres) with --lat WMMA=32,VALU=6",
    "bitwise_with": "flydsl",
    "side": true
+  },
+  {
+   "id": "f38_null",
+   "parent": "f37_null",
+   "patch": "fwd2_patches/38_d3f.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=28,VALU=6"
+     ],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "c29ac43ff14eed04d201fb458c0064ce5771ed25678e262524e4a48dfe364553"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 38 (HKGEN_D3F) off: must equal f37j",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f38a",
+   "parent": "f38_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=28,VALU=6",
+      "-D",
+      "HKGEN_D3F=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37j + TILE_D3F: TILE_D3 and FINAL_A3's math (the last tile's own prefix, 1/d, out, lse) in one region, FINAL_ST stores after the barrier",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f39_null",
+   "parent": "f38_null",
+   "patch": "fwd2_patches/39_abl_nowb.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=28,VALU=6"
+     ],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "c29ac43ff14eed04d201fb458c0064ce5771ed25678e262524e4a48dfe364553"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 39 (HKGEN_ABL_NOWB) off: must equal f37j",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f39x",
+   "parent": "f39_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=28,VALU=6",
+      "-D",
+      "HKGEN_ABL_NOWB=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "timing ablation (no output): f37j without the epilogue's global stores",
+   "side": true
+  },
+  {
+   "id": "f40_null",
+   "parent": "f39_null",
+   "patch": "fwd2_patches/40_tdmst.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=28,VALU=6"
+     ],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "c29ac43ff14eed04d201fb458c0064ce5771ed25678e262524e4a48dfe364553"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 40 (HKGEN_TDMST) off: must equal f37j",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f40a",
+   "parent": "f40_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=28,VALU=6",
+      "-D",
+      "HKGEN_TDMST=1"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37j + O written by TDM stores from the staging slots (no read-back + buffer_store phase)",
+   "bitwise_with": "flydsl"
   }
  ]
 }

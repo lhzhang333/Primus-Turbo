@@ -1,0 +1,53 @@
+diff -ru a/gfx1250_mla/hip/src/k_mla_fwd.hip b/gfx1250_mla/hip/src/k_mla_fwd.hip
+--- a/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 09:24:33.472029026 +0000
++++ b/gfx1250_mla/hip/src/k_mla_fwd.hip	2026-11-02 09:25:34.182244826 +0000
+@@ -169,6 +169,13 @@
+ #ifndef HKGEN_ABL_NOWB
+ #define HKGEN_ABL_NOWB 0
+ #endif
++// HKGEN_TDMST 1: O leaves the staging slots by TDM (tensor_store_from_lds, one op per wave and q tile: its 16 rows of
++// 272 B read as a 136-column tile whose dim 0 is bounded at 128 columns, so the pad is dropped; rows past Sq dropped by
++// dim 1) instead of the read-back + buffer_store_b128 phase; lse keeps its buffer store. The next block's
++// tensor_wait<0> before B_0 covers the stores, so no TDM load reuses a staging slot before they read it
++#ifndef HKGEN_TDMST
++#define HKGEN_TDMST 0
++#endif
+ #if HKGEN_D3F && !HKGEN_SKIPPV
+ #error "HKGEN_D3F needs HKGEN_SKIPPV"
+ #endif
+@@ -997,6 +1004,27 @@
+       });
+ #endif
+       wave_lds_order();
++#if HKGEN_TDMST && !HKGEN_REF
++      {
++        // group 1 shared by the four ops but for the row bound (words 2, 3); dim 0: D_V columns (the tile's 8 pad
++        // columns are outside it)
++        i32x8 g1 = tdm_g1(0x00010000u, 0u, D_V + 8, 16, (unsigned long long)H_ * D_V);
++        g1[1] = (int)((unsigned)D_V << 16);
++        static_for<QT>([&](auto i) {
++          const int r0 = q0 + 64 * (int)i + 16 * wv;
++          const int nrow = Sq_ - r0;
++          const unsigned tdim1 = nrow > 0 ? (unsigned)nrow : 0u;
++          const unsigned long long ga =
++              (unsigned long long)(uintptr_t)ka.O +
++              2ull * ((((unsigned long long)bb * Sq_ + (unsigned long long)(nrow > 0 ? r0 : 0)) * H_ + hh) * D_V);
++          g1[2] = (int)((tdim1 & 0xFFFFu) << 16);
++          g1[3] = (int)(((tdim1 >> 16) & 0xFFFFu) | ((unsigned)(D_V + 8) << 16));
++          const unsigned tb = (i < 2 ? sga : sgb) + (unsigned)((i & 1) * 4 * SQT);
++          asm volatile("tensor_store_from_lds %0, %1" ::"s"(tdm_g0(tb, ga, nrow > 0 ? 1 : 0)), "s"(g1) : "memory");
++          sched_barrier<0>();
++        });
++      }
++#endif
+ 
+       // Phase 2 addresses (all before the first global store):
+       //   O, q tile i: buffer resource r_o[i] based at its first row q0 + 64 i, soffset 2 j * row bytes (store j:
+@@ -1038,6 +1066,7 @@
+       const unsigned lo = q0 + 64 * lt < Sq_ ? la : OOB;
+       sched_barrier<0>();
+       static_for<QT>([&](auto i) {
++        if constexpr (HKGEN_TDMST && !HKGEN_REF) return;
+         static_for<NDT>([&](auto j) {
+           const u32x4 w = i < 2 ? lds_load_u32x4(rda, (i & 1) * 4 * SQT + 2 * j * XO)
+                                 : lds_load_u32x4(rdb, (i & 1) * 4 * SQT + 2 * j * XO);
