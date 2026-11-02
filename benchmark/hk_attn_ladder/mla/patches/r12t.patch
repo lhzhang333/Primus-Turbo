@@ -1,0 +1,43 @@
+diff -ruN a/r8gen/hip/src/k_dkdv96ds.hip b/r8gen/hip/src/k_dkdv96ds.hip
+--- a/r8gen/hip/src/k_dkdv96ds.hip	2026-11-02 08:29:34.325738693 +0000
++++ b/r8gen/hip/src/k_dkdv96ds.hip	2026-11-02 08:29:34.337838448 +0000
+@@ -103,6 +103,9 @@
+ #ifndef HKGEN_TICKET_ORDER
+ #define HKGEN_TICKET_ORDER 0  // HKGEN_TICKET: the item order (0 the grid's, 1 head-major, 2 y-major)
+ #endif
++#ifndef HKGEN_TICKET_TAIL
++#define HKGEN_TICKET_TAIL 0  // HKGEN_TICKET: only the last ceil(items / TAIL) workgroups take a ticket (0: all)
++#endif
+ #ifndef HKGEN_TICKET
+ #define HKGEN_TICKET 0  // HKGEN: the work item from a ticket counter instead of the block id (the int 64 B in front of
+ #endif                  // DS, zeroed before the launch): items go to workgroups in the order they start
+@@ -164,11 +167,29 @@
+   // order they start. The dispatcher deals the blocks to the 8 XCDs round robin, a fixed number each; on a slower
+   // XCD they start later and take the later, shorter items, instead of that XCD finishing last
+   __shared__ int s_item[1];
++#if HKGEN_TICKET_TAIL
++  // HKGEN_TICKET_TAIL: the first k3_nst workgroups (dispatch order) run the item of their own linear id, no atomic
++  // (~1.5K cycles at the entry); the rest take items k3_nst.. by ticket, so a slower XCD still ends with the later,
++  // shorter items. Grid (HG, K3_NBY, B * Hkv / HG): the linear id and the item count from the arguments (no gridDim)
++  const int k3_lid = ((int)blockIdx.z * K3_NBY + (int)blockIdx.y) * HG + (int)blockIdx.x;
++  const int k3_tot = K3_NBY * B * Hkv;
++  const int k3_nst = k3_tot - (k3_tot + HKGEN_TICKET_TAIL - 1) / HKGEN_TICKET_TAIL;
++  int k3_item = k3_lid;
++  if (k3_lid >= k3_nst) {  // wave-uniform
++    if (tid == 0)
++      s_item[0] = k3_nst + __hip_atomic_fetch_add(reinterpret_cast<int*>(reinterpret_cast<unsigned char*>(DS) - 64), 1,
++                                                  __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
++    lds_barrier();
++    k3_item = __builtin_amdgcn_readfirstlane(s_item[0]);
++  }
++  k3_item = __builtin_amdgcn_readfirstlane(k3_item);
++#else
+   if (tid == 0)
+     s_item[0] = __hip_atomic_fetch_add(reinterpret_cast<int*>(reinterpret_cast<unsigned char*>(DS) - 64), 1,
+                                        __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+   lds_barrier();
+   const int k3_item = __builtin_amdgcn_readfirstlane(s_item[0]);
++#endif
+ #if HKGEN_TICKET_ORDER == 1  // head-major: every kv block of a (head group lane, z) in a row, longest first
+ #define K3_BY (k3_item % K3_NBY)
+ #define K3_BX (k3_item / K3_NBY % HG)

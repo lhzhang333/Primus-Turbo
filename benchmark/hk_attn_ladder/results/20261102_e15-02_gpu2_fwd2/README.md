@@ -15,8 +15,13 @@ prod_b4 with out / lse bitwise equal to FlyDSL.
 | f30a | f28a + TILE_C ring slots by inline asm from carried descriptors | 0.738 | 0.644 | f28a ~1.003x |
 | f31a | f30a + diagonal prefixes skip the no-op PVs (D2: q tile 0, D3: 0-1, FINAL_A3 after D3: 0-2 and q tile 2's softmax) | 0.733 | 0.643 | 1.004x / 1.004x |
 | f32a | f31a + TILE_C issues and advances its ring slot in generated code (descriptor quads in SGPRs) | 0.729 | 0.637 | 1.005-1.013x / 1.006-1.007x |
+| f37j | f32a + all four Q fragments resident (patch 37 `--qres`: Q(3) in block 2, softmax scratch in the parity's sum-tree leaves, m / d in the high halves of the (m', -) / (corr, -) pairs, (peer, total) in consumed leaves) + `--lat WMMA=28,VALU=6` | 0.720-0.723 | 0.631-0.636 | cold 1.010-1.015x (clock +1%), burst 1.003-1.004x |
 
-FlyDSL main in the same runs: 0.834-0.840 cold, 0.750-0.763 burst. f32a: 1.15x cold, 1.19x burst.
+FlyDSL main in the same runs: 0.834-0.846 cold, 0.750-0.764 burst. f32a: 1.15x cold, 1.19x burst; f37j: 1.16-1.17x cold,
+1.20x burst. The Q residency removes 24 of the 104 LDS reads per tile: f36x (timing ablation, the reads dropped on
+f32a's registers) bounds it at -4.6% cold / -2.5% burst; with the re-planned registers the schedule lost most of the
+cycle gain (f37a +1.2% cycles cold), the latency knobs recover it (f37b-k: WMMA 28 / VALU 6 best; the same knobs on
+f32a without `--qres` are flat or worse, f37m / f37n).
 
 ## Side rungs and dead ends
 
@@ -32,6 +37,9 @@ FlyDSL main in the same runs: 0.834-0.840 cold, 0.750-0.763 burst. f32a: 1.15x c
 | f34a-c | m1ds with LDS loads in back-to-back pairs, 10-16 cycles apart | 0.980-0.985x |
 | f35x | no VGPR bank conflicts in the packed fma (m') and the RESC multiply (timing only, wrong results) | 1.00x |
 | f35r8 | DS_RATE 8 on f32a | 0.987-0.991x |
+| f36x | Q(0) / Q(3) not re-read per tile (timing only, wrong results) | 1.048x cold, 1.025x burst: the bound for Q residency |
+| f37a-i | `--qres` with the default knobs (f37a) and single-knob variants | f37a cold 1.004-1.007x, burst 0.996-0.999x |
+| r12t4/8/16 (bwd) | dK/dV: the entry ticket only for the last 1/4, 1/8, 1/16 of the workgroups (bitwise == r10x) | 1.00x, 1.002-1.005x, 0.989x: the entry atomic is not on the critical path |
 
 ## What the traces say (f31a / f32a ATT, one wave, `tools/att_*.py`)
 

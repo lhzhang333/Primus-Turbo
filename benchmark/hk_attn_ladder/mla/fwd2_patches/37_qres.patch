@@ -1,0 +1,138 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 08:40:04.012872778 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 08:40:04.028775911 +0000
+@@ -550,6 +550,7 @@
+                     help="timing-only probe of marginal issue costs: KIND:N adds N redundant instructions spread over "
+                          "each TILE region (msb: every s_set_vgpr_msb repeated N times; salu: s_mov_b32 s101, s101; "
+                          "valu: v_mov_b32 of a softmax scratch VGPR onto itself; nop: s_nop 0)")
++    ap.add_argument("--qres", action="store_true", help="plan 2: all four Q fragments resident (fwdgen.QRES)")
+     ap.add_argument("--bank-tree", action="store_true",
+                     help="sum tree partial sums in the leaf whose VGPR banks differ from the other operands'")
+     ap.add_argument("--abl", action="append", default=[], choices=("nosoft", "nolds", "rescsg", "mnalt", "corralt", "noq"),
+@@ -596,6 +597,9 @@
+         DEFINES.append("HKGEN2=1")
+     G.ABL = set(a.abl)
+     G.BANK_TREE = a.bank_tree
++    G.QRES = a.qres
++    if a.qres and a.plan != 2:
++        raise SystemExit("--qres needs --plan 2")
+     G.SKIPPV = "HKGEN_SKIPPV=1" in DEFINES
+     G.TDMGEN = "HKGEN_TDMGEN=1" in DEFINES
+     global PAD
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 08:40:04.012848767 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 08:40:04.028571461 +0000
+@@ -115,6 +115,11 @@
+ BANK_TREE = False  # build.py --bank-tree (see _sum_nodes)
+ SKIPPV = False  # build.py, from -D HKGEN_SKIPPV=1 (k_mla_fwd.hip): prefixes skip the no-op PVs (prefix_nodes)
+ TDMGEN = False  # build.py, from -D HKGEN_TDMGEN=1: TILE_C issues and advances its ring slot (tdm_nodes)
++# build.py --qres (plan 2): all four Q fragments resident (Q(3) in its own buffer qbuf[3], block 2), INIT reads them
++# once per block and the tiles read no Q. The 48 VGPRs: the softmax scratch lives in the parity's sum-tree leaves
++# (dead until the q tile's exps), (peer sum, total) in leaves the sum tree has consumed, m / d in the unused high
++# halves of the (m', unused) / (corr, unused) pairs, the mask bounds dl in block 0
++QRES = False
+ TDM_SLAT = 10  # modelled cycles from a SALU write of an SGPR to a TDM op reading it (ATT: ~9)
+ RESC_COST = 6  # modelled cycles of the s_cmp + s_cbranch of a RESC block that is not taken
+ # --resc branch2: the RESC block's s_cmp is a node of its own (SALU, writes scc), so the scheduler can issue it BR_LAT
+@@ -215,20 +220,35 @@
+         self.base = base
+         self.cc = take(2)
+         self.qa, self.qb = take(1, 1), take(1, 1)
+-        self.tot = [take(1, 1) for _ in range(4)]
++        if QRES:
++            if RESC == "ool":
++                raise ValueError("--qres does not support --resc ool")
++            self.dl = [None] + [take(1, 1) for _ in range(3)]
++        else:
++            self.tot = [take(1, 1) for _ in range(4)]
+         self.qbuf = [take(48, 8) for _ in range(3)]
+         self.vhi = take(64, 8)  # V[dt][kt] of d tiles 4..7
+         self.end0 = nxt[0]
+         self.s = 512  # block 2: S[i][j] = 512 + 32 i + 8 j
+         self.pr = 640  #          PR leaves
+-        self.sm = [[take2(1) for _ in range(18)] for _ in range(2)]
+-        self.mn = [take2(2, 2) for _ in range(QT)]
+-        self.corr = [take2(2, 2) for _ in range(QT)]
+-        self.m = [take2(1) for _ in range(QT)]
+-        if RESC == "ool":
+-            self.m = list(self.mn)
+-        self.d = [take2(1) for _ in range(QT)]
+-        self.dl = [None] + [take2(1) for _ in range(3)]
++        if QRES:
++            # scratch of q tile parity p: leaves 0..17 of parity p; (m', d) and (corr, m) pairs; Q(3) after them
++            self.sm = [[self.pr + 2 * k + p for k in range(18)] for p in range(2)]
++            self.mn = [take2(2, 2) for _ in range(QT)]
++            self.corr = [take2(2, 2) for _ in range(QT)]
++            self.d = [self.mn[i] + 1 for i in range(QT)]
++            self.m = [self.corr[i] + 1 for i in range(QT)]
++            self.qbuf.append(take2(48, 8))
++            self.tot = None  # sum_nodes: leaves the tree consumed
++        else:
++            self.sm = [[take2(1) for _ in range(18)] for _ in range(2)]
++            self.mn = [take2(2, 2) for _ in range(QT)]
++            self.corr = [take2(2, 2) for _ in range(QT)]
++            self.m = [take2(1) for _ in range(QT)]
++            if RESC == "ool":
++                self.m = list(self.mn)
++            self.d = [take2(1) for _ in range(QT)]
++            self.dl = [None] + [take2(1) for _ in range(3)]
+         self.fin = [self.qbuf[0] + k for k in range(11)]
+         self.inv = self.qbuf[0] + 14
+         self.o = 256  # block 1
+@@ -252,7 +272,7 @@
+ 
+     def Q(self, i, ks):
+         """Q fragments of q tile i: 1 and 2 resident in qbuf[1], qbuf[2]; 0 and 3 share qbuf[0]."""
+-        return self.qbuf[(0, 1, 2, 0)[i]] + 8 * ks
++        return self.qbuf[(0, 1, 2, 3 if QRES else 0)[i]] + 8 * ks
+ 
+     def PR(self, i, leaf):
+         """p of q tile i, leaf 8 j + e; a pair's two q tiles interleave, the sum tree adds both at once."""
+@@ -809,8 +829,9 @@
+         out.append(f"v_mov_b32_e32 {vr(L.qa)}, {vr(ops['qa'])}")
+         out.append(f"v_mov_b32_e32 {vr(L.qb)}, {vr(ops['qb'])}")
+     out += [f"v_mov_b32_e32 {vr(r)}, 0" for r in range(L.o, L.o + 256)]
+-    # the resident Q fragments of q tiles 1, 2: the Q staging area does not change until the block's last tile
+-    out += [q_load(L, i, ks, h) for i in (1, 2) for ks in range(NKS) for h in range(2)]
++    # the resident Q fragments of q tiles 1, 2 (QRES: all four): the Q staging area does not change until the block's
++    # last tile
++    out += [q_load(L, i, ks, h) for i in ((0, 1, 2, 3) if QRES else (1, 2)) for ks in range(NKS) for h in range(2)]
+     # the first prefix is a no-op: S(2), S(3) = -inf; P(0), P(1) = 0; V = 0
+     out += [f"v_mov_b32_e32 {vr(r)}, 0x{NEG_INF:x}" for i in (2, 3) for r in range(L.S(i, 0), L.S(i, 0) + 32)]
+     out += [f"v_mov_b32_e32 {vr(L.P(i, kt) + e)}, 0" for i in (0, 1) for kt in range(2) for e in range(8)]
+@@ -1021,11 +1042,16 @@
+                 add(f"v_pk_add_f32 {vr(acc, 2)}, {vr(acc, 2)}, {vr(y, 2)}", "VALU", f"sum{i0}")
+             nxt.append(acc)
+         leaves = nxt
++    if L.tot is None:  # QRES: (peer sum, total) in two leaf pairs the tree consumed (not its result pair)
++        spare = [y for y in reversed([L.pr + 2 * x for x in range(32)]) if y != leaves[0]][:2]
++        tots = [spare[0], spare[1], spare[0] + 1, spare[1] + 1]
++    else:
++        tots = L.tot
+     for x in range(2):
+         qi = i0 + x
+         if qi not in upd:
+             continue
+-        pl, tot = L.tot[2 * x], L.tot[2 * x + 1]
++        pl, tot = tots[2 * x], tots[2 * x + 1]
+         add(f"v_permlanex16_b32 {vr(pl)}, {vr(leaves[0] + x)}, {S_SEL}, 0x{SEL_HI:x}", "PERM", f"sum{qi}")
+         add(f"v_add_f32_e32 {vr(tot)}, {vr(leaves[0] + x)}, {vr(pl)}", "VALU", f"sum{qi}")
+         add(f"v_fma_f32 {vr(L.d[qi])}, {vr(L.corr[qi])}, {vr(L.d[qi])}, {vr(tot)}", "VALU", f"sum{qi}")
+@@ -1100,7 +1126,7 @@
+             for j in range(NKV)
+             for h in range(2)
+         ]
+-        if first == 0 and "noq" not in ABL:  # --abl noq (timing only): Q(0) / Q(3) as if resident
++        if first == 0 and "noq" not in ABL and not QRES:  # --abl noq (timing only): Q(0) / Q(3) as if resident
+             loads += [add(q_load(L, 0, ks, h), "DS", f"Q0.{ks}.{h}") for ks in range(NKS) for h in range(2)]
+     if ftile:  # the resident Q fragments of q tiles 1, 2 (INIT's)
+         loads += [add(q_load(L, i, ks, h), "DS", f"Q{i}.{ks}.{h}") for i in (1, 2) for ks in range(NKS) for h in range(2)]
+@@ -1128,7 +1154,7 @@
+         for h in range(2)
+     ]
+     for i in range(first, QT):
+-        if i == 3 and "noq" not in ABL:  # into qbuf[0], after QK(0) has read Q(0)
++        if i == 3 and "noq" not in ABL and not QRES:  # into qbuf[0], after QK(0) has read Q(0)
+             loads += [add(q_load(L, 3, ks, h), "DS", f"Q3.{ks}.{h}") for ks in range(NKS) for h in range(2)]
+         for ks in range(NKS):  # QK(i): S[i][j] = sum_ks K[j][ks] Q[i][ks], chains from +0
+             for j in range(NKV):

@@ -1,0 +1,33 @@
+diff -ru a/gfx1250_mla/tools/fwdgen/build.py b/gfx1250_mla/tools/fwdgen/build.py
+--- a/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 08:24:18.064214245 +0000
++++ b/gfx1250_mla/tools/fwdgen/build.py	2026-11-02 08:24:18.079267156 +0000
+@@ -552,7 +552,7 @@
+                          "valu: v_mov_b32 of a softmax scratch VGPR onto itself; nop: s_nop 0)")
+     ap.add_argument("--bank-tree", action="store_true",
+                     help="sum tree partial sums in the leaf whose VGPR banks differ from the other operands'")
+-    ap.add_argument("--abl", action="append", default=[], choices=("nosoft", "nolds", "rescsg", "mnalt", "corralt"),
++    ap.add_argument("--abl", action="append", default=[], choices=("nosoft", "nolds", "rescsg", "mnalt", "corralt", "noq"),
+                     help="timing-only ablation (wrong results)")
+     ap.add_argument("-D", dest="defines", action="append", default=[],
+                     help="extra macro of both compiles, e.g. -D HKGEN_PROBE=1 (diagnostic builds: the probe's stamp "
+diff -ru a/gfx1250_mla/tools/fwdgen/fwdgen.py b/gfx1250_mla/tools/fwdgen/fwdgen.py
+--- a/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 08:24:18.064190185 +0000
++++ b/gfx1250_mla/tools/fwdgen/fwdgen.py	2026-11-02 08:24:18.079150486 +0000
+@@ -1100,7 +1100,7 @@
+             for j in range(NKV)
+             for h in range(2)
+         ]
+-        if first == 0:
++        if first == 0 and "noq" not in ABL:  # --abl noq (timing only): Q(0) / Q(3) as if resident
+             loads += [add(q_load(L, 0, ks, h), "DS", f"Q0.{ks}.{h}") for ks in range(NKS) for h in range(2)]
+     if ftile:  # the resident Q fragments of q tiles 1, 2 (INIT's)
+         loads += [add(q_load(L, i, ks, h), "DS", f"Q{i}.{ks}.{h}") for i in (1, 2) for ks in range(NKS) for h in range(2)]
+@@ -1128,7 +1128,7 @@
+         for h in range(2)
+     ]
+     for i in range(first, QT):
+-        if i == 3:  # into qbuf[0], after QK(0) has read Q(0)
++        if i == 3 and "noq" not in ABL:  # into qbuf[0], after QK(0) has read Q(0)
+             loads += [add(q_load(L, 3, ks, h), "DS", f"Q3.{ks}.{h}") for ks in range(NKS) for h in range(2)]
+         for ks in range(NKS):  # QK(i): S[i][j] = sum_ks K[j][ks] Q[i][ks], chains from +0
+             for j in range(NKV):

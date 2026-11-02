@@ -4784,6 +4784,813 @@
    },
    "feature": "f32a with at most one LDS load per 8 modelled cycles",
    "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f36_null",
+   "parent": "f35_null",
+   "patch": "fwd2_patches/36_abl_noq.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1"
+     ],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "0c795a7d48b9c578c7ecaed8b2341088f1125732395981a6b8c0842a4c5b8f5f"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 36 (--abl noq) off: must equal f32a",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f36x",
+   "parent": "f36_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--abl",
+      "noq"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "timing ablation (wrong results): f32a without the per-tile Q(0) / Q(3) LDS reads (Q resident)",
+   "side": true
+  },
+  {
+   "id": "f37_null",
+   "parent": "f36_null",
+   "patch": "fwd2_patches/37_qres.patch",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1"
+     ],
+     "gen_pkg": "gfx1250_mla",
+     "sha256": "0c795a7d48b9c578c7ecaed8b2341088f1125732395981a6b8c0842a4c5b8f5f"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "patch 37 (--qres) off: must equal f32a",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f37a",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f32a with all four Q fragments resident (Q(3) in block 2: softmax scratch in the leaves, m / d in the pairs' high halves): no Q LDS reads in the tiles",
+   "bitwise_with": "flydsl"
+  },
+  {
+   "id": "f37b",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=28,VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37a with --lat WMMA=28,VALU=8",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f37c",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=36,VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37a with --lat WMMA=36,VALU=8",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f37d",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=32,VALU=6"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37a with --lat WMMA=32,VALU=6",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f37e",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=32,VALU=10"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37a with --lat WMMA=32,VALU=10",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f37f",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--sgpr-lat",
+      "16"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37a with --sgpr-lat 16",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f37g",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--sgpr-lat",
+      "24"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37a with --sgpr-lat 24",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f37h",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--ds-max",
+      "56"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37a with --ds-max 56",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f37i",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--resc-cost",
+      "12"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37a with --resc-cost 12",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f37j",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=28,VALU=6"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37a with --lat WMMA=28,VALU=6",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f37k",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--qres",
+      "--lat",
+      "WMMA=24,VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f37a with --lat WMMA=24,VALU=8",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f37m",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--lat",
+      "WMMA=28,VALU=8"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f32a (no --qres) with --lat WMMA=28,VALU=8",
+   "bitwise_with": "flydsl",
+   "side": true
+  },
+  {
+   "id": "f37n",
+   "parent": "f37_null",
+   "kernels": {
+    "k_mla_fwd": {
+     "gen": [
+      "--va-rule",
+      "llvm_war_xdl",
+      "--resc",
+      "pair",
+      "--plan",
+      "2",
+      "-D",
+      "HKGEN_XBLK=1",
+      "--sgpr-lat",
+      "20",
+      "--ds-max",
+      "63",
+      "-D",
+      "HKGEN_ORES=1",
+      "--lat",
+      "WMMA=32,VALU=8",
+      "-D",
+      "HKGEN_ROWS64=1",
+      "-D",
+      "HKGEN_FMERGE=1",
+      "--bank-tree",
+      "-D",
+      "HKGEN_TDMASM=1",
+      "-D",
+      "HKGEN_SKIPPV=1",
+      "-D",
+      "HKGEN_TDMGEN=1",
+      "--lat",
+      "WMMA=32,VALU=6"
+     ],
+     "gen_pkg": "gfx1250_mla"
+    }
+   },
+   "launch": {
+    "module": "fwd_hk",
+    "opts": {
+     "nargs": 12,
+     "persistent": true
+    }
+   },
+   "feature": "f32a (no --qres) with --lat WMMA=32,VALU=6",
+   "bitwise_with": "flydsl",
+   "side": true
   }
  ]
 }

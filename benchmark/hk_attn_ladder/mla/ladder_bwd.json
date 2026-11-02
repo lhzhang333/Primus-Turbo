@@ -6923,6 +6923,199 @@
    "feature": "timing probe of r8b (r8a_pr's source, the msrc asm patch regenerated for its .s)",
    "bitwise_with": "hk_v0",
    "side": true
+  },
+  {
+   "id": "r12t_null",
+   "parent": "r10x",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds",
+     "sha256": "abeea38ec402459872df2c8640f5249e817d9df31d5b40326903426d20bbffbe"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "patch r12t (HKGEN_TICKET_TAIL) off: must equal r10x",
+   "bitwise_with": "r10x",
+   "patch": "patches/r12t.patch",
+   "side": true
+  },
+  {
+   "id": "r12t4",
+   "parent": "r12t_null",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "-D",
+      "HKGEN_TICKET_TAIL=4"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10x with a ticket only for the last 1/4 of the dK/dV workgroups (the rest run their own linear id: no entry atomic)",
+   "bitwise_with": "r10x"
+  },
+  {
+   "id": "r12t8",
+   "parent": "r12t_null",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "-D",
+      "HKGEN_TICKET_TAIL=8"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10x with a ticket only for the last 1/8 of the dK/dV workgroups (the rest run their own linear id: no entry atomic)",
+   "bitwise_with": "r10x"
+  },
+  {
+   "id": "r12t16",
+   "parent": "r12t_null",
+   "kernels": {
+    "k_dkdv96ds": {
+     "gen": [
+      "--rule",
+      "warv",
+      "--nd-fold",
+      "--scal-in-body",
+      "--tdm-dummy",
+      "--final-pipe",
+      "-D",
+      "HKGEN_EARLY_TDM=1",
+      "-D",
+      "HKGEN_TICKET=1",
+      "-D",
+      "HKGEN_KV_TDM=1",
+      "-D",
+      "HKGEN_TICKET_TAIL=16"
+     ],
+     "gen_pkg": "r8gen",
+     "gen_kernel": "k_dkdv96ds"
+    },
+    "k_dqds_c": {
+     "src": "src/k_dqds_c.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode"
+     ]
+    },
+    "k_delta": {
+     "src": "r8gen/hip/src/k_delta.hip",
+     "extra_flags": [
+      "-DHK_ND_FOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_hk",
+    "opts": {
+     "nd_fold": true,
+     "ticket": true
+    }
+   },
+   "feature": "r10x with a ticket only for the last 1/16 of the dK/dV workgroups (the rest run their own linear id: no entry atomic)",
+   "bitwise_with": "r10x"
   }
  ],
  "baselines": [
