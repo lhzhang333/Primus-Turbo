@@ -211,6 +211,26 @@ LAT = {
     "BR": 1,
 }
 WMMA_CHAIN = 16
+# RAW latencies beyond LAT that tools/fwd1gen turns on (ATT of the generated forward, 2026-11-03; None: off, the
+# backward's model): a packed-f32 VALU result (v_pk_*) is read PK_LAT cycles after its issue at the earliest; an SGPR /
+# vcc a VALU writes (v_cmp_*_e64 s, ...) reaches a SALU / branch / memory reader SDST_LAT cycles after it
+PK_LAT = None
+SDST_LAT = None
+# the TRANS unit completes one instruction per TRANS_RATE cycles (wave32 v_exp: quarter rate), each LAT["TRANS"] after
+# its issue at the earliest (ATT fit of the forward: about 18 and 4); 0: no throughput model
+TRANS_RATE = 0
+
+
+def raw_lat(p, c):
+    """Cycles from the issue of producer p to the issue of c that reads p's result (register dependence)."""
+    if p.kind == "WMMA" and c.kind == "WMMA":
+        return WMMA_CHAIN
+    if p.kind == "VALU":
+        if SDST_LAT and (c.suses & p.sdefs) and c.kind not in ("VALU", "TRANS", "WMMA"):
+            return SDST_LAT
+        if PK_LAT and p.text.startswith("v_pk_"):
+            return max(PK_LAT, LAT["VALU"])
+    return LAT[p.kind]
 WAR_XDL, MIN_XDL_AFTER = 24, 14  # va_vdst(14) on a WAR against a WMMA: free whatever VALU is in flight
 DS_MAX = 48
 # issue model (one wave per SIMD; issue-to-issue medians of the generated g3 step, ATT 2026-11-03): one instruction per
@@ -258,7 +278,7 @@ def build_dag(nodes):
         for r in uses:
             if r in last_w:
                 p = last_w[r]
-                lat = WMMA_CHAIN if (nodes[p].kind == "WMMA" and n.kind == "WMMA") else LAT[nodes[p].kind]
+                lat = raw_lat(nodes[p], n)
                 preds[p] = max(preds.get(p, 0), lat)
         for r in defs:
             if r in last_w:
@@ -311,6 +331,7 @@ def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
     ready = set(i for i in range(n) if npred[i] == 0)
     out, wmma_at, done = [], {}, {}
     t, last_w, wk, trans_at, ds_last_done = 0, -100, 0, -100, 0
+    trans_done = -100
     mem_t, mem_c, ds_next = -100, None, 0
     vm_run, vm_last = 0, -100
     ds_issued, ds_retired, ds_seq = 0, -1, {}
@@ -360,6 +381,8 @@ def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
         if i == fence:
             return all(j in done and done[j] <= t for j in bar_deps)
         if k == "BAR_W":  # BAR_GAP WMMAs after the signal, unless its deadline WMMA comes first
+            if not any(nodes[j].kind == "BAR_S" for j in range(n)):  # its signal is in an earlier block
+                return True
             return wk >= bs_wk + BAR_GAP or wk >= len(wseq) or (bs_wk < 10**6 and wk >= WAIT_BEFORE)
         return True
 
@@ -411,13 +434,17 @@ def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
             wk += 1
         if k == "TRANS":
             trans_at = t
+            if TRANS_RATE:
+                trans_done = max(t + LAT["TRANS"], trans_done + TRANS_RATE)
         for s_, l in succ[pick]:
             if k == "DS_LD" and nodes[s_].vuses & nd.vdefs:
                 lat = done_at - t
+            elif k == "TRANS" and TRANS_RATE and nodes[s_].vuses & nd.vdefs:
+                lat = trans_done - t
             elif k == "WMMA":
                 lat = WMMA_CHAIN if nodes[s_].kind == "WMMA" and (nodes[s_].vuses & nd.vdefs) else max(l, 1)
             else:
-                lat = max(l, LAT[k]) if (nodes[s_].vuses & nd.vdefs or nodes[s_].suses & nd.sdefs) else l
+                lat = max(l, raw_lat(nd, nodes[s_])) if (nodes[s_].vuses & nd.vdefs or nodes[s_].suses & nd.sdefs) else l
             earliest[s_] = max(earliest[s_], t + lat)
             npred[s_] -= 1
             if npred[s_] == 0:

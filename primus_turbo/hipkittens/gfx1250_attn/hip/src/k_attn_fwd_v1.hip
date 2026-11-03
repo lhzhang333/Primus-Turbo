@@ -96,6 +96,14 @@
 #include "hk_attn/ext_fwd.h"
 #include "hk_attn/prims.h"
 
+#ifndef HKGEN
+#define HKGEN 0 // 1: the marker shell of the generated item body (tools/fwd1gen), 0: the HIP kernel
+#endif
+// SGPRs the generated regions use as temporaries (and vcc / scc): declared clobbered at every marker
+#define HKGEN_CLOBBERS "memory", "vcc", "scc", "s96", "s97", "s98", "s99", "s100", "s101", "s102", "s103"
+// STAGE_LOOP saves and restores s96..s103 itself (VGPR lanes): only vcc / scc are clobbered
+#define HKGEN_CLOBBERS_LOOP "memory", "vcc", "scc"
+
 #pragma clang fp contract(off)
 
 #ifndef FWD1_LSUM
@@ -891,7 +899,117 @@ extern "C" __global__ __launch_bounds__(f1::BLOCK) void k_attn_fwd_v1(
     kb1 = kbase(1);
     vb0 = vbase(0);
     vb1 = vbase(1);
-#if FWD1_EPI == 0
+#if HKGEN
+    typedef int32_t i32x2 __attribute__((ext_vector_type(2)));
+    // ---- marker shell (HKGEN=1): the item loop, the schedule decode, the TDM descriptors and the burst bases stay
+    // here; every item's front (Q^T, K(0), K(1), V(0), QK(0), SM1(0)), every stage (two chunks: QK, softmax, the
+    // barrier point and the TDM ops, the LDS bursts, PV, SM1, the lazy rescale) and the epilogue (normalize, O image,
+    // O / LSE stores) are generated (tools/fwd1gen). The generated code keeps its state (Q^T, K / V operands, S, P,
+    // O^T, row sums, running max) in VGPRs above every VGPR this shell references and writes only HKGEN_CLOBBERS'
+    // SGPRs; tools/fwd1gen/build.py checks it.
+    static_assert(HK_STRIDES == 1 && FWD1_MDS == 3 && !FWD1_LSUM && FWD1_SM1L && FWD1_OPT_RESC && !FWD1_OPT_NM2,
+                  "HKGEN: the generated body is the production variant (strides, MDS 3, LSUM 0, SM1L + RESC)");
+    {
+        const int dl = f1::thr_rgc(l, 0); // the causal mask's lane part: element i masked iff i > dl + off
+        auto mk = [&](int c1) FWD_INL { // SM1(c1)'s mask offsets (MASK_NONE masks nothing) and the softmax scalars
+            return i32x4{f1::mask_off(w, c1, n, 0, causal), f1::mask_off(w, c1, n, 1, causal),
+                         __builtin_bit_cast(int, c2), __builtin_bit_cast(int, c2inv)};
+        };
+        for (int j = 0; j < J; ++j) {
+            set_cur(j);
+            {
+                const i32x4 sv = mk(0);
+                asm volatile("; HKGEN FRONT qp=%0 kb=%1 vb=%2 dl=%3 sc=%4"
+                             ::"v"(lds0 + (uint32_t) f1::q_lane(w, l)), "v"(kb0), "v"(vb0), "v"(dl), "s"(sv)
+                             : HKGEN_CLOBBERS);
+            }
+            set_ahead(j);
+            const int nmain = f1::imax(n - 2, 0);
+            // stages 0 .. n - 5 (own ops of local stages 3 .. n - 2: whole, the descriptor affine in the stage): one
+            // generated loop; it computes its own descriptors, burst bases and trip count. The rest as before.
+            const int nbulk = f1::imax(n - 4, 0);
+            if (nbulk > 0) {
+                // g0 and lp = {T_end, T} are rewritten by the loop (in / out): group 0 advances, T counts the stages.
+                // Group 1 of a whole op is built by the loop (role W0, the row stride); the other scalars are values
+                // the shell holds anyway (no new SGPR tuples: the item loop's SGPRs are tight)
+                Tdm            d3 = op_desc(f1::own_c(Skv, el0, sst, w, 3), T0 + 3);
+                i32x2          lp = {T0 + nbulk, T0};
+                const uint32_t b0 = lds0 + (uint32_t) f1::kv_op_lds(w, 0);
+                const uint32_t sb = (uint32_t) (f1::op_role_v(w) ? f1::V_SLOT_B : f1::K_SLOT_B);
+                asm volatile("; HKGEN STAGE_LOOP g0=%0 lp=%1 kb1=%2 vb0=%3 vb1=%4 kl=%5 vl=%6 ss=%7 b0=%8 sb=%9 c2=%10 ci=%11"
+                             : "+s"(d3.g0), "+s"(lp)
+                             : "v"(kb1), "v"(vb0), "v"(vb1), "v"(lds0 + (uint32_t) (f1::K_OFF + f1::k_lane(l))),
+                               "v"(lds0 + (uint32_t) (f1::V_OFF + f1::v_lane(l))), "s"(kv_ss), "s"(b0), "s"(sb),
+                               "s"(__builtin_bit_cast(int, c2)), "s"(__builtin_bit_cast(int, c2inv))
+                             : HKGEN_CLOBBERS_LOOP);
+                kb0 = kbase(T0 + nbulk);
+                kb1 = kbase(T0 + nbulk + 1);
+                vb0 = vbase(T0 + nbulk);
+                vb1 = vbase(T0 + nbulk + 1);
+            }
+            for (int t = nbulk; t < nmain; ++t) {
+                int tk = t; // fenced: the descriptor is computed here, right before the stage
+                sgpr_fence(tk);
+                __builtin_assume(tk >= 0);
+                const f1::OpC own = f1::own_c(Skv, el0, sst, w, tk + 3);
+                const Tdm     dn  = op_desc(tk + 3 < n ? own : nx[0], T0 + tk + 3);
+                kb2 = kbase(T0 + tk + 2);
+                vb2 = vbase(T0 + tk + 2);
+                const i32x4 sv = mk(2 * tk + 1);
+                asm volatile("; HKGEN STAGE_MAIN kb0=%0 kb1=%1 vb0=%2 vb1=%3 dl=%4 g0=%5 g1=%6 sc=%7"
+                             ::"v"(kb0), "v"(kb1), "v"(vb0), "v"(vb1), "v"(dl), "s"(dn.g0), "s"(dn.g1), "s"(sv)
+                             : HKGEN_CLOBBERS);
+                kb0 = kb1;
+                kb1 = kb2;
+                vb0 = vb1;
+                vb1 = vb2;
+            }
+            if (f1::has_pen_stage(n)) { // stage n-2: op = stream stage 1; SM1(2n-2) (its odd chunk's) masked
+                const int t  = n - 2;
+                const Tdm dn = op_desc(nx[1], T0 + t + 3);
+                kb2 = kbase(T0 + t + 2);
+                vb2 = vbase(T0 + t + 2);
+                const i32x4 sv = mk(2 * t + 2);
+                asm volatile("; HKGEN STAGE_PEN kb0=%0 kb1=%1 vb0=%2 vb1=%3 dl=%4 g0=%5 g1=%6 sc=%7"
+                             ::"v"(kb0), "v"(kb1), "v"(vb0), "v"(vb1), "v"(dl), "s"(dn.g0), "s"(dn.g1), "s"(sv)
+                             : HKGEN_CLOBBERS);
+                kb0 = kb1;
+                kb1 = kb2;
+                vb0 = vb1;
+                vb1 = vb2;
+            }
+            { // stage n-1: Q(j+1) and op = stream stage 2 at its even point; SM1(2n-1) masked; no QK(2n)
+                const int t  = n - 1;
+                const Tdm dn = op_desc(nx[2], T0 + t + 3), dq = q_desc(qn);
+                kb2 = kbase(T0 + t + 2);
+                vb2 = vbase(T0 + t + 2);
+                const i32x4 sv = mk(2 * t + 1);
+                asm volatile("; HKGEN STAGE_LAST kb0=%0 vb0=%1 dl=%2 g0=%3 g1=%4 q0=%5 q1=%6 sc=%7"
+                             ::"v"(kb0), "v"(vb0), "v"(dl), "s"(dn.g0), "s"(dn.g1), "s"(dq.g0), "s"(dq.g1), "s"(sv)
+                             : HKGEN_CLOBBERS);
+                kb0 = kb1;
+                kb1 = kb2;
+                vb0 = vb1;
+                vb1 = vb2;
+            }
+            { // epilogue: O image (wave's O region), read-back, whole-row O stores; LSE stores
+                const kargs_p  ka = kargs();
+                const f1::Work x  = item_of(j);
+                const f1::Lay  lo = lay_o(ka);
+                const int      ob = (int) f1::o_store_b_s(lo, x.b, x.hq4, x.qb, w, 0, l); // s = 0; + (s / 2) 2 sOs
+                const int      lse0 = (int) f1::lse_store_b(x.b, ka->Hq, ka->Sq, x.hq4, x.qb, w, 0, l);
+                const int      lse1 = (int) f1::lse_store_b(x.b, ka->Hq, ka->Sq, x.hq4, x.qb, w, 1, l);
+                const i32x4    ev = {(int) (2 * ka->sOs), 0, 0, 0};
+                const rsrc_t   ro = make_rsrc(ka->O, ka->o_bytes), rl = make_rsrc(ka->LSE, ka->lse_bytes);
+                asm volatile("; HKGEN EPI ow=%0 or=%1 ob=%2 l0=%3 l1=%4 ev=%5 ro=%6 rl=%7"
+                             ::"v"(lds0 + (uint32_t) f1::ow_lane(w, l)), "v"(lds0 + (uint32_t) f1::or_lane(w, l)),
+                             "v"(ob), "v"(lse0), "v"(lse1), "s"(ev), "s"(ro), "s"(rl)
+                             : HKGEN_CLOBBERS);
+            }
+            T0 += n;
+        }
+    }
+#elif FWD1_EPI == 0
     for (int j = 0; j < J; ++j) {
         set_cur(j);
         front_loads();

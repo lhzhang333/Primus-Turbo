@@ -521,6 +521,8 @@
       "src": "src/k_attn_fwd_v1.hip",
       "extra_flags": [
         "-mllvm",
+        "-amdgpu-expert-scheduling-mode",
+        "-mllvm",
         "-structurizecfg-skip-uniform-regions",
         "-mllvm",
         "-amdgpu-sched-strategy=coexec",
@@ -528,9 +530,10 @@
         "-DFWD1_OPT_RESC=1",
         "-DFWD1_MDS=3",
         "-DFWD1_OPT_UNROLL=1",
-        "-DHK_STRIDES=1"
+        "-DHK_STRIDES=1",
+        "-DHKGEN=1"
       ],
-      "hsaco_sha256": "2a8fca7b85a98f205beec66f667a15c01e245b6f8d423c278b78a02233541ab0",
+      "hsaco_sha256": "34e99a24fd3ab8263196f6fd19cba5b2353df4311e7c3b7ce2c01f0e6d350343",
       "block": 128,
       "args": [
         {
@@ -764,9 +767,11 @@
       ],
       "kernarg_size": 216,
       "lds": 327680,
-      "vgpr": 898,
+      "vgpr": 1024,
       "sgpr": 106,
-      "wavefront_size": 32
+      "wavefront_size": 32,
+      "asm_patch": "asm/k_attn_fwd_v1.s.patch",
+      "asm_input_sha256": "a1ba8afd3fa17c0bbf3b594a5aa6a2da9fcf0cc723a7b0f34e8a22ea1762fdb6"
     },
     "k_attn_bwd_v1": {
       "module": "bwd_v1",

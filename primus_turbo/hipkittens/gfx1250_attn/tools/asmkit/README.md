@@ -1,9 +1,11 @@
 # asmkit: gfx1250 assembly toolkit of the kernel generators
 
-`asmkit` is the backend of the two generators in `tools/`: `fwdgen` (`k_mla_fwd`) and `bwdgen` (`k_dkdv96ds`). A
-generator compiles its HIP marker shell and generates the real instructions of every marked region in their final
-order. asmkit adds the lines that this order implies (`s_set_vgpr_msb`, expert scheduling mode waits, hazard
-`v_nop`s), re-checks the result, and assembles and verifies the spliced kernel. Standard library only.
+`asmkit` is the backend of the two generators in `tools/`: `bwd1gen` (the `k_hk_bwd1_g4` body of `k_attn_bwd_v1`) and
+`fwd1gen` (the item body of `k_attn_fwd_v1`, scheduled by `bwd1gen`'s slot scheduler); copied from the gfx1250_mla
+package (generators `fwdgen` / `bwdgen` there). A generator compiles its HIP marker shell and generates the real
+instructions of every marked region in their final order. asmkit adds the lines that this order implies
+(`s_set_vgpr_msb`, expert scheduling mode waits, hazard `v_nop`s), re-checks the result, and assembles and verifies
+the spliced kernel. Standard library only.
 
 | module | contents |
 |---|---|
@@ -18,14 +20,16 @@ order. asmkit adds the lines that this order implies (`s_set_vgpr_msb`, expert s
 - `s_wait_alu depctr_va_vdst(N)`, N <= 14: before a memory instruction that reads or writes a register an in-flight
   VALU writes, or writes one it reads. WMMA, TRANS and core VALU complete in order within their class, so N may be
   the number of counted same-class instructions issued since (the per-class bound). Rules (`expert.va_need`):
-  `"llvm"` (fwdgen) is LLVM's, N = 0 once more than one class is pending; `"llvm_war_xdl"` (bwdgen) is LLVM's except
-  that a write-after-read against an in-flight WMMA keeps the per-class bound; `"class"`, the per-class bound itself,
-  is what `walk_block` checks.
+  `"llvm"` is LLVM's, N = 0 once more than one class is pending; `"llvm_war_xdl"` is LLVM's except that a
+  write-after-read against an in-flight WMMA keeps the per-class bound; `"class"`, the per-class bound itself (what
+  both generators here use), is what `walk_block` checks.
 - `s_wait_alu depctr_vm_vsrc(N)`, N <= 6 (7 means no wait): before an instruction that writes a register an
   in-flight memory instruction still reads.
 - `s_wait_dscnt` / `loadcnt` / `storecnt N`: before an instruction that touches a register an in-flight load
   writes; `s_wait_dscnt 0` before `s_barrier_signal` while LDS instructions are in flight.
-- `s_wait_xcnt 0`: before a write of a scalar register that an in-flight VMEM / FLAT / TDM instruction still reads.
+- `s_wait_xcnt 0`: before a write of a scalar register that an in-flight VMEM / FLAT / TDM instruction still reads
+  (`emit.XCNT_CLASSES`; `fwd1gen` drops TDM, as LLVM does: a `tensor_load_to_lds` reads its descriptor SGPRs at
+  issue, the compiler rewrites them for the next op with no wait).
   `s_set_vgpr_msb` does not wait for XCNT.
 - `v_nop`, counted in VALU-class instructions: WMMA D -> WMMA A / B: 5; WMMA -> VALU that reads its D or writes its
   D / A / B: 4; TRANS -> an immediately following non-TRANS VALU that reads its result or writes its source: 1.
