@@ -39,6 +39,7 @@ from gencore import (  # noqa: F401
     wmma,
 )
 import gencore as GC
+import re
 
 KP, VP = 272, 288  # K / V ring pitches (bytes)
 NH, NDK, NDT = 4, 4, 8
@@ -47,7 +48,14 @@ TH2 = "0x4138aa3b"  # 8 log2(e): the lazy-rescale threshold (log2 domain)
 LN2 = "0x3f317218"
 SEL_LO, SEL_HI = "0x76543210", "0xfedcba98"  # v_permlanex16_b32: lane l reads lane l of the other half
 S_SEL, S_NEED, S_B, S_ANY, S_HI = "s96", "s97", "s98", "s99", "s100"
-CLOBBERED = {f"s{i}" for i in range(96, 104)} | {"vcc", "scc"}
+CLOBBERED = {f"s{i}" for i in range(96, 104)} | {"vcc", "vcc_lo", "vcc_hi", "scc"}
+# the stage blocks keep their scalars in vcc (s96..s103 hold STAGE_LOOP's descriptor group 1): the rescale decision
+# (vcc_lo, the branch tests it with s_cmp), the rescale's ballot / select (vcc_lo) and permlane select (vcc_hi)
+V_NEED, V_B, V_SEL = "vcc_lo", "vcc_lo", "vcc_hi"
+G1_LOOP = "s[96:103]"
+K_SLOT_B, V_SLOT_B = 0x4400, 0x4800
+K_W0, V_W0 = 0x07510000, 0x0F510000  # tdm_w0(2 D, K_PITCH / V_PITCH) (fwd1/idx.h)
+INOUT = {"STAGE_LOOP": ("g0", "lp")}  # marker operands a region rewrites (in / out asm operands)
 
 
 def k_imm(hc, kt, k, half):
@@ -101,6 +109,8 @@ class Layout:
         self.dv = [take(1, 1) for _ in range(NH)]
         self.thr = [take(1, 1) for _ in range(2)]
         self.t = [take(2, 2) for _ in range(8)]  # scratch pairs (SM1 FIRST, rescale)
+        self.lb = [take(1, 1) for _ in range(4)]  # STAGE_LOOP's burst bases kb1, vb0, vb1 and a temporary
+        self.ssave = take(1, 1)  # STAGE_LOOP: s96..s103 of the shell in lanes 0..7
         self.top = max(a + m for blk in used for a, m in blk)
 
 
@@ -220,26 +230,27 @@ def need_texts(L):
     return [
         f"v_max3_num_f32 {vr(d[0])}, {vr(d[0])}, {vr(d[1])}, {vr(d[2])}",
         f"v_max_num_f32 {vr(d[0])}, {vr(d[0])}, {vr(d[3])}",
-        f"v_cmp_gt_f32_e64 {S_NEED}, {vr(d[0])}, 0",
+        f"v_cmp_gt_f32_e64 {V_NEED}, {vr(d[0])}, 0",
     ]
 
 
 def rescale_texts(L, ops):
     """The out-of-line block: per q-tile b = ballot(mxh > m2th); mn = b ? max(m2, max(mxh, xhalf(mxh)) c2) : m2;
     corr = exp2(m2 - mn); O^T, lsum *= corr; m2 = mn; m2th = (mn + TH2) c2inv. Serial per q-tile (rare)."""
-    sc = ops["sc"]
-    out = [f"s_mov_b32 {S_SEL}, {SEL_LO}"]
+    sc = ops.get("sc")
+    c2, ci = ops.get("c2") or sreg(sc, 2), ops.get("ci") or sreg(sc, 3)
+    out = [f"s_mov_b32 {V_SEL}, {SEL_LO}"]
     for h in range(NH):
         t0, t1 = L.t[0], L.t[1]
         out += [
-            f"v_cmp_gt_f32_e64 {S_B}, {vr(L.mxh[h])}, {vr(L.m2th[h])}",
-            f"s_cmp_lg_u32 {S_B}, 0",
-            f"s_cselect_b32 {S_ANY}, -1, 0",
-            f"v_permlanex16_b32 {vr(t0)}, {vr(L.mxh[h])}, {S_SEL}, {SEL_HI}",
+            f"v_cmp_gt_f32_e64 {V_B}, {vr(L.mxh[h])}, {vr(L.m2th[h])}",
+            f"s_cmp_lg_u32 {V_B}, 0",
+            f"s_cselect_b32 {V_B}, -1, 0",
+            f"v_permlanex16_b32 {vr(t0)}, {vr(L.mxh[h])}, {V_SEL}, {SEL_HI}",
             f"v_max_num_f32 {vr(t0)}, {vr(L.mxh[h])}, {vr(t0)}",
-            f"v_mul_f32 {vr(t0)}, {sreg(sc, 2)}, {vr(t0)}",
+            f"v_mul_f32 {vr(t0)}, {c2}, {vr(t0)}",
             f"v_max_num_f32 {vr(t0)}, {vr(L.m2[h])}, {vr(t0)}",
-            f"v_cndmask_b32_e64 {vr(t0 + 1)}, {vr(L.m2[h])}, {vr(t0)}, {S_ANY}",
+            f"v_cndmask_b32_e64 {vr(t0 + 1)}, {vr(L.m2[h])}, {vr(t0)}, {V_B}",
             f"v_sub_f32 {vr(t1)}, {vr(L.m2[h])}, {vr(t0 + 1)}",
             f"v_exp_f32 {vr(t1)}, {vr(t1)}",
         ]
@@ -251,7 +262,7 @@ def rescale_texts(L, ops):
         out += [
             f"v_mov_b32 {vr(L.m2[h])}, {vr(t0 + 1)}",
             f"v_add_f32 {vr(t1 + 1)}, {TH2}, {vr(t0 + 1)}",
-            f"v_mul_f32 {vr(L.m2th[h])}, {sreg(sc, 3)}, {vr(t1 + 1)}",
+            f"v_mul_f32 {vr(L.m2th[h])}, {ci}, {vr(t1 + 1)}",
         ]
     return out
 
@@ -307,9 +318,11 @@ SIG_AT, WAIT_AT = 16, 24  # the odd chunk's signal by its WMMA SIG_AT; the even 
 V2_AFTER = 13  # V(c+2) -> V[0] after this WMMA of the odd chunk (PV(c-1) released V[0])
 
 
-def chunk_nodes(L, ops, par, kind):
+def chunk_nodes(L, ops, par, kind, extra=None):
     """(nodes, WMMA order, protocol DS loads, fence) of one chunk block. kind: MAIN / PEN / LAST. The barrier point
-    and the loads stand at fixed WMMA positions of the list (hooks), so every order edge points forward."""
+    and the loads stand at fixed WMMA positions of the list (hooks), so every order edge points forward. extra:
+    {"after_td": texts behind the TDM op (program order), "end": texts at the end of the list} (STAGE_LOOP)."""
+    extra = extra or {}
     last = kind == "LAST"
     qkn = not (last and par == 1)
     sm = 0 if (last and par == 1) else (2 if (kind == "PEN" and par == 1) or (last and par == 0) else 1)
@@ -338,6 +351,8 @@ def chunk_nodes(L, ops, par, kind):
         if last:
             marks["tq"] = add(f"tensor_load_to_lds {ops['q0']}, {ops['q1']}")
         marks["td"] = add(f"tensor_load_to_lds {ops['g0']}, {ops['g1']}")
+        for t in extra.get("after_td", []):
+            add(t)
         proto.extend(add(t) for t in ld_v(L, 1, ops["vb0"], 1))  # V(c+1): stage T, half 1
         marks["kn"] = []
         if not last:  # K(c+2) -> kab[0]: stage T + 1 (published by the wait); kab[0] is not read in this chunk
@@ -377,6 +392,8 @@ def chunk_nodes(L, ops, par, kind):
                 add(t)
         for t in need_texts(L):
             add(t)
+    for t in extra.get("end", []):
+        add(t)
     build_dag(nodes)
     if par == 0:
         add_order(nodes, marks["bw"], W[WAIT_AT])
@@ -393,12 +410,13 @@ def chunk_nodes(L, ops, par, kind):
     return nodes, W, proto, fence
 
 
-def region_stage(L, ops, kind):
-    """Blocks C0, C1 (+ the rescale blocks R0, R1, out of line behind a jump to the end)."""
+def stage_blocks(L, ops, kind, extra=(None, None), latch=None):
+    """Blocks C0, C1 and the rescale blocks R0, R1 (names R*: placed out of line by build.py, after the kernel's
+    s_endpgm). C1 falls through to the region exit, or to the latch block (STAGE_LOOP)."""
     blocks, cyc = [], {}
     orders = []
     for par in range(2):
-        nodes, W, proto, fence = chunk_nodes(L, ops, par, kind)
+        nodes, W, proto, fence = chunk_nodes(L, ops, par, kind, extra[par])
         order, cycles = schedule_slot(nodes, W)
         orders.append((nodes, order, proto, fence))
         cyc[f"{kind}{par}"] = cycles
@@ -411,20 +429,94 @@ def region_stage(L, ops, kind):
     before = sum(1 for x in o1[:pos] if x.kind in ("DS_LD", "DS_ST"))
     n1[f1].text = f"s_wait_dscnt 0x{min(after + before, 63):x}"
     has_r = [not (kind == "LAST" and par == 1) for par in range(2)]
+    after_c1 = latch[0] if latch else "X"
     for par in range(2):
         t = [n.text for n in orders[par][1]]
-        nxt = "C1" if par == 0 else "J"
+        nxt = "C1" if par == 0 else after_c1
         if has_r[par]:
-            t += [f"s_cmp_lg_u32 {S_NEED}, 0", f"s_cbranch_scc1 @R{par}"]
+            t += [f"s_cmp_lg_u32 {V_NEED}, 0", f"s_cbranch_scc1 @R{par}"]
             blocks.append((f"C{par}", t, [nxt, f"R{par}"]))
         else:
             blocks.append((f"C{par}", t, [nxt]))
-    blocks.append(("J", ["s_branch @X"], ["X"]))
+    if latch:
+        blocks.append(latch)
     for par in range(2):
         if has_r[par]:
-            back = "C1" if par == 0 else "X"
+            back = "C1" if par == 0 else after_c1
             blocks.append((f"R{par}", rescale_texts(L, ops) + [f"s_branch @{back}"], [back]))
     return blocks, cyc
+
+
+def region_stage(L, ops, kind):
+    return stage_blocks(L, ops, kind)
+
+
+SAVED = {}  # region kind -> the shell SGPRs it saves in VGPR lanes, uses, and restores (build.py allows them)
+
+
+def sgprs_of(op):
+    m = re.fullmatch(r"s\[(\d+):(\d+)\]|s(\d+)", op)
+    if not m:
+        return set()
+    a = int(m.group(1) or m.group(3))
+    return set(range(a, (int(m.group(2)) if m.group(1) else a) + 1))
+
+
+def region_loop(L, ops):
+    """STAGE_LOOP: stages T = T0 .. T_end - 1 of an item (MAIN stages whose TDM op is the item's own whole op of local
+    stage T - T0 + 3). The marker clobbers no SGPR: the loop takes an 8-aligned block G of SGPRs no operand uses, saves
+    it in VGPR lanes (entry block E) and restores it (exit block Z). E: descriptor group 1 of a whole K / V op into G
+    (fwd1 g1_2d(W0, D, 32, D, 32, ss)), the burst bases into the layout's lb; the stage blocks; the latch L (T <
+    T_end: back to C0). In / out operands: g0 (the op's group 0, advanced behind each TDM op: address + 128 ss bytes
+    (G[6:7] are its temporaries, zero again before the next op), LDS address = b0 + slot(T + 4) sb) and lp = {T_end,
+    T} (T + 1 at the end of the odd chunk). At the end of the odd chunk: kb1 = kbase(T + 2), vb0 = vb1, vb1 =
+    vbase(T + 2). ss: the op's row stride (elements); b0: the LDS address of its slot 0; sb: the role's slot bytes;
+    c2, ci: the softmax scale and its inverse (log2 domain)."""
+    lp, g0 = ops["lp"], ops["g0"]
+    used = set().union(*(sgprs_of(v) for v in ops.values()))
+    gb = next(b for b in range(96, -1, -8) if not used & set(range(b, b + 8)))
+    SAVED["STAGE_LOOP"] = {f"s{gb + i}" for i in range(8)}
+    KB1, VB0, VB1, VT = (vr(r) for r in L.lb)
+    T = sreg(lp, 1)
+    lops = dict(ops, kb1=KB1, vb0=VB0, vb1=VB1, g1=f"s[{gb}:{gb + 7}]")
+    g = lambda i: f"s{gb + i}"  # noqa: E731
+    entry = [f"v_writelane_b32 {vr(L.ssave)}, {g(i)}, {i}" for i in range(8)] + [
+        f"s_mov_b32 {g(0)}, {hex(K_W0)}",
+        f"s_cmp_eq_u32 {ops['sb']}, {hex(V_SLOT_B)}",
+        f"s_cselect_b32 {g(0)}, {hex(V_W0)}, {g(0)}",
+        f"s_mov_b32 {g(1)}, 0x800000",
+        f"s_mov_b32 {g(2)}, 0x200000",
+        f"s_mov_b32 {g(3)}, 0x800000",
+        f"s_mov_b32 {g(4)}, 32",
+        f"s_mov_b32 {g(5)}, {ops['ss']}",
+        f"s_mov_b64 s[{gb + 6}:{gb + 7}], 0",
+        f"v_mov_b32 {KB1}, {ops['kb1']}",
+        f"v_mov_b32 {VB0}, {ops['vb0']}",
+        f"v_mov_b32 {VB1}, {ops['vb1']}",
+    ]
+    after_td = [
+        f"s_mov_b32 {g(6)}, {ops['ss']}",
+        f"s_lshl_b64 s[{gb + 6}:{gb + 7}], s[{gb + 6}:{gb + 7}], 7",
+        f"s_add_nc_u64 {spair(g0, 2)}, {spair(g0, 2)}, s[{gb + 6}:{gb + 7}]",
+        f"s_mov_b64 s[{gb + 6}:{gb + 7}], 0",
+        f"s_and_b32 {sreg(g0, 1)}, {T}, 3",
+        f"s_mul_i32 {sreg(g0, 1)}, {sreg(g0, 1)}, {ops['sb']}",
+        f"s_add_co_i32 {sreg(g0, 1)}, {sreg(g0, 1)}, {ops['b0']}",
+    ]
+    end = [
+        f"v_add_nc_u32 {VT}, {T}, 2",
+        f"v_and_b32 {VT}, 3, {VT}",
+        f"v_mad_u32 {KB1}, {hex(K_SLOT_B)}, {VT}, {ops['kl']}",
+        f"v_mov_b32 {VB0}, {VB1}",
+        f"v_mad_u32 {VB1}, {hex(V_SLOT_B)}, {VT}, {ops['vl']}",
+        f"s_add_co_i32 {T}, {T}, 1",
+    ]
+    latch = ("L", [f"s_cmp_lt_i32 {T}, {sreg(lp, 0)}", "s_cbranch_scc1 @C0"], ["C0", "Z"])
+    restore = ("Z", [f"v_readlane_b32 {g(i)}, {vr(L.ssave)}, {i}" for i in range(8)], ["X"])
+    blocks, cyc = stage_blocks(L, lops, "MAIN", ({"after_td": after_td}, {"end": end}), latch)
+    cyc = {k.replace("MAIN", "LOOP"): v for k, v in cyc.items()}
+    k = next(i for i, b in enumerate(blocks) if b[0] == "L")
+    return [("E", entry, ["C0"])] + blocks[: k + 1] + [restore] + blocks[k + 1 :], cyc
 
 
 def region_epi(L, ops):

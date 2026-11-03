@@ -106,7 +106,7 @@
    "launch": {
     "module": "fwd_v1"
    },
-   "feature": "generated item body v1 (model MAIN 512 cycles/chunk)",
+   "feature": "generated item body v1 (model MAIN 512 cycles/chunk) (tree of ladder commit 4559290c)",
    "bitwise_with": "f0"
   },
   {
@@ -128,7 +128,29 @@
    "launch": {
     "module": "fwd_v1"
    },
-   "feature": "g1 + region-entry va_vdst(0), no stage s_wait_xcnt, ATT latencies (TRANS 15, VALU 5, v_pk 9, VALU->SGPR->SALU 10)",
+   "feature": "g1 + region-entry va_vdst(0), no stage s_wait_xcnt, ATT latencies (TRANS 15, VALU 5, v_pk 9, VALU->SGPR->SALU 10) (tree of ladder commit 4559290c)",
+   "bitwise_with": "f0"
+  },
+  {
+   "id": "g4",
+   "parent": "f0",
+   "tree": "fwd3",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "gen": [
+      "--trans-lat",
+      "15",
+      "--valu-lat",
+      "5"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_fwd_v1"
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "g2 + STAGE_LOOP: stages 0..n-5 of an item in one generated loop (descriptors, burst bases, trip count in the loop; s88..s95 saved in VGPR lanes), rescale blocks out of line, stage scalars in vcc",
    "bitwise_with": "f0"
   }
  ]

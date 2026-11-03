@@ -35,6 +35,7 @@ VALU_HISTORY = 12  # VALU-class instructions kept per path (the v_nop rules look
 VA_VDST_MAX = 14  # depctr_va_vdst: 15 means "no wait"
 VM_VSRC_MAX = 6  # depctr_vm_vsrc is a 3-bit field whose 7 means "no wait": a need >= 7 is emitted as 6
 CNT_MAX = 63  # largest emitted s_wait_*cnt value; the model applies the needed one (conservative)
+XCNT_CLASSES = ("VMEM", "FLAT", "TDM")  # instruction classes whose scalar sources an s_wait_xcnt 0 guards
 MAX_STATES = 8  # more distinct wait (or XCNT) states than this at one program point are merged into one
 MAX_HISTORIES = 64  # more distinct VALU histories than this at one program point are an error
 _NOP = parse_line(-1, "\tv_nop")
@@ -390,7 +391,7 @@ def emit_block(items, flow, fmap, va_rule, bar_dscnt=True):
                 E.apply_cnt(st, cnt_fields(x))
             else:
                 E.issue(st, x)
-        if x.cls in ("VMEM", "FLAT", "TDM"):
+        if x.cls in XCNT_CLASSES:
             for s in xs:
                 s.regs |= set(n.suses)
         if x.cls in VALU_CLS:
@@ -418,7 +419,7 @@ def walk_block(ins, flow, on_need):
         if x.cls == "WAIT_CNT" and cnt_fields(x).get("xcnt") == 0:
             for s in flow.xs:
                 s.unknown, s.regs = False, set()
-        elif x.cls in ("VMEM", "FLAT", "TDM"):
+        elif x.cls in XCNT_CLASSES:
             for s in flow.xs:
                 s.regs |= set(su)
         if x.cls in VALU_CLS:

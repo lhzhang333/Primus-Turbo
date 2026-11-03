@@ -101,6 +101,8 @@
 #endif
 // SGPRs the generated regions use as temporaries (and vcc / scc): declared clobbered at every marker
 #define HKGEN_CLOBBERS "memory", "vcc", "scc", "s96", "s97", "s98", "s99", "s100", "s101", "s102", "s103"
+// STAGE_LOOP saves and restores s96..s103 itself (VGPR lanes): only vcc / scc are clobbered
+#define HKGEN_CLOBBERS_LOOP "memory", "vcc", "scc"
 
 #pragma clang fp contract(off)
 
@@ -898,6 +900,7 @@ extern "C" __global__ __launch_bounds__(f1::BLOCK) void k_attn_fwd_v1(
     vb0 = vbase(0);
     vb1 = vbase(1);
 #if HKGEN
+    typedef int32_t i32x2 __attribute__((ext_vector_type(2)));
     // ---- marker shell (HKGEN=1): the item loop, the schedule decode, the TDM descriptors and the burst bases stay
     // here; every item's front (Q^T, K(0), K(1), V(0), QK(0), SM1(0)), every stage (two chunks: QK, softmax, the
     // barrier point and the TDM ops, the LDS bursts, PV, SM1, the lazy rescale) and the epilogue (normalize, O image,
@@ -922,7 +925,29 @@ extern "C" __global__ __launch_bounds__(f1::BLOCK) void k_attn_fwd_v1(
             }
             set_ahead(j);
             const int nmain = f1::imax(n - 2, 0);
-            for (int t = 0; t < nmain; ++t) {
+            // stages 0 .. n - 5 (own ops of local stages 3 .. n - 2: whole, the descriptor affine in the stage): one
+            // generated loop; it computes its own descriptors, burst bases and trip count. The rest as before.
+            const int nbulk = f1::imax(n - 4, 0);
+            if (nbulk > 0) {
+                // g0 and lp = {T_end, T} are rewritten by the loop (in / out): group 0 advances, T counts the stages.
+                // Group 1 of a whole op is built by the loop (role W0, the row stride); the other scalars are values
+                // the shell holds anyway (no new SGPR tuples: the item loop's SGPRs are tight)
+                Tdm            d3 = op_desc(f1::own_c(Skv, el0, sst, w, 3), T0 + 3);
+                i32x2          lp = {T0 + nbulk, T0};
+                const uint32_t b0 = lds0 + (uint32_t) f1::kv_op_lds(w, 0);
+                const uint32_t sb = (uint32_t) (f1::op_role_v(w) ? f1::V_SLOT_B : f1::K_SLOT_B);
+                asm volatile("; HKGEN STAGE_LOOP g0=%0 lp=%1 kb1=%2 vb0=%3 vb1=%4 kl=%5 vl=%6 ss=%7 b0=%8 sb=%9 c2=%10 ci=%11"
+                             : "+s"(d3.g0), "+s"(lp)
+                             : "v"(kb1), "v"(vb0), "v"(vb1), "v"(lds0 + (uint32_t) (f1::K_OFF + f1::k_lane(l))),
+                               "v"(lds0 + (uint32_t) (f1::V_OFF + f1::v_lane(l))), "s"(kv_ss), "s"(b0), "s"(sb),
+                               "s"(__builtin_bit_cast(int, c2)), "s"(__builtin_bit_cast(int, c2inv))
+                             : HKGEN_CLOBBERS_LOOP);
+                kb0 = kbase(T0 + nbulk);
+                kb1 = kbase(T0 + nbulk + 1);
+                vb0 = vbase(T0 + nbulk);
+                vb1 = vbase(T0 + nbulk + 1);
+            }
+            for (int t = nbulk; t < nmain; ++t) {
                 int tk = t; // fenced: the descriptor is computed here, right before the stage
                 sgpr_fence(tk);
                 __builtin_assume(tk >= 0);

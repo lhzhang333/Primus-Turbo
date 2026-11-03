@@ -173,10 +173,11 @@ def verify_func(s_lines, objdump_path, out_dir):
 
 
 
-REGION_KINDS = ("FRONT", "STAGE_MAIN", "STAGE_PEN", "STAGE_LAST", "EPI")
+REGION_KINDS = ("FRONT", "STAGE_LOOP", "STAGE_MAIN", "STAGE_PEN", "STAGE_LAST", "EPI")
 # region graph: the regions that can run right after each one (shell code in between)
-NEXT = {"FRONT": ["STAGE_MAIN", "STAGE_PEN", "STAGE_LAST"], "STAGE_MAIN": ["STAGE_MAIN", "STAGE_PEN", "STAGE_LAST"],
-        "STAGE_PEN": ["STAGE_LAST"], "STAGE_LAST": ["EPI"], "EPI": ["FRONT"]}  # fmt: skip
+NEXT = {"FRONT": ["STAGE_LOOP", "STAGE_MAIN", "STAGE_PEN", "STAGE_LAST"], "STAGE_LOOP": ["STAGE_MAIN"],
+        "STAGE_MAIN": ["STAGE_MAIN", "STAGE_PEN", "STAGE_LAST"], "STAGE_PEN": ["STAGE_LAST"], "STAGE_LAST": ["EPI"],
+        "EPI": ["FRONT"]}  # fmt: skip
 
 
 def parse_markers(lines, lo, hi):
@@ -195,6 +196,16 @@ def parse_markers(lines, lo, hi):
     if sorted(found) != sorted(REGION_KINDS):
         raise ValueError(f"markers {sorted(found)}, want {sorted(REGION_KINDS)}")
     return found
+
+
+def sbase_of(op):
+    m = re.fullmatch(r"s\[(\d+):(\d+)\]|s(\d+)", op)
+    return int(m.group(1) or m.group(3))
+
+
+def nsg_of(op):
+    m = re.fullmatch(r"s\[(\d+):(\d+)\]|s(\d+)", op)
+    return int(m.group(2)) - int(m.group(1)) + 1 if m.group(1) else 1
 
 
 def with_unknown(fl, regs):
@@ -234,6 +245,8 @@ def generate(lines, lo, hi, markers, fmap, rec, va_rule):
             bl, c = G.region_front(L, ops)
         elif kind == "EPI":
             bl, c = G.region_epi(L, ops)
+        elif kind == "STAGE_LOOP":
+            bl, c = G.region_loop(L, ops)
         else:
             bl, c = G.region_stage(L, ops, kind.split("_")[1])
         regions[kind] = bl
@@ -306,27 +319,37 @@ def generate(lines, lo, hi, markers, fmap, rec, va_rule):
     rec["checks"]["fixed_point_iterations"] = it + 1
     spliced = {}
     stats = {}
+    cold = []  # the rescale blocks (R*), out of line after the kernel's s_endpgm
+    cold_of = {}
     for kind, bl in regions.items():
         lines_out = []
         for name, texts, sc in bl:
             if (kind, name) not in out:
                 fail.append(f"{kind} block {name} never reached")
                 continue
-            lines_out += [f"{lab(kind, name)}:"] + out[(kind, name)]
+            blk = [f"{lab(kind, name)}:"] + out[(kind, name)]
+            if name.startswith("R"):
+                cold += blk
+                cold_of.setdefault(kind, []).extend(blk)
+            else:
+                lines_out += blk
         lines_out += [f"{lab(kind, 'X')}:"] + post_of(kind)
         spliced[markers[kind][1]] = lines_out
         o = lines_out
         stats[kind] = {"lines": len(o), "wmma": sum("v_wmma" in l for l in o), "va_vdst0": sum("va_vdst(0)" in l for l in o),
                        "s_wait_alu": sum("s_wait_alu" in l for l in o), "v_nop": sum(l.strip() == "v_nop" for l in o),
                        "dscnt": sum("s_wait_dscnt" in l for l in o), "xcnt": sum("s_wait_xcnt" in l for l in o)}  # fmt: skip
-        for l in o:
+        for l in o + [l for l in cold_of.get(kind, [])]:
             x = parse_line(0, l)
             if not x.mn:
                 continue
             low = [r for r in x.defs if r < base]
             if low:
                 fail.append(f"{kind} writes shell VGPRs {low}: {l.strip()}")
-            bad = [r for r in sgpr_defs_uses(x)[0] if r not in G.CLOBBERED]
+            clob = {"vcc", "vcc_lo", "vcc_hi", "scc"} if kind in G.SAVED else set(G.CLOBBERED)
+            ok = clob | G.SAVED.get(kind, set()) | {f"s{sbase_of(markers[kind][0][o]) + i}" for o in G.INOUT.get(kind, ())
+                                         for i in range(nsg_of(markers[kind][0][o]))}
+            bad = [r for r in sgpr_defs_uses(x)[0] if r not in ok]
             if bad and not x.mn.startswith("s_wait") and x.cls != "MSB":
                 fail.append(f"{kind} writes SGPRs {bad}: {l.strip()}")
     for k in keys:
@@ -336,6 +359,11 @@ def generate(lines, lo, hi, markers, fmap, rec, va_rule):
                 fail.append(f"{k}: {len(found)} open hazards, {len(cov)} coverage errors, e.g. {(found + cov)[:3]}")
     rec["blocks"] = stats
     log(f"regions: {json.dumps(stats)}")
+    ends = [i for i in range(lo, hi + 1) if lines[i].strip() == "s_endpgm"]
+    if not ends:
+        fail.append("no s_endpgm in the kernel")
+    elif cold:
+        spliced[ends[-1]] = cold
     return spliced
 
 
@@ -351,6 +379,9 @@ def main():
         ap.add_argument(f"--{k}", type=int, default=None)
     a = ap.parse_args()
     OPT["entry_va"], OPT["stage_xcnt"] = not a.no_entry_va, a.stage_xcnt
+    # LLVM's semantics: a tensor_load_to_lds reads its descriptor SGPRs at issue (the compiler rewrites them for the
+    # next stage with no s_wait_xcnt); only VMEM / FLAT sources wait for XCNT
+    M.XCNT_CLASSES = ("VMEM", "FLAT")
     GC.set_model(LDS_LAT=a.lds_lat, LDS_RATE=a.lds_rate, PK_LAT=a.pk_lat, SDST_LAT=a.sdst_lat, DS_MAX=a.ds_max)
     if a.trans_lat is not None:
         GC.LAT["TRANS"] = a.trans_lat
