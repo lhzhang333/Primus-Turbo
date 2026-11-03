@@ -11,12 +11,15 @@ descriptors and the LDS burst bases; it marks per item
 
   FRONT       s_wait_tensorcnt 1 (own Q landed), the Q^T B operands, K(0), K(1), V(0); O^T = 0, row sums = 0; QK(0);
               SM1(0) (masked when n = 1): m2 = max(own half, other half) c2, m2th = (m2 + TH2) / c2
+  STAGE_LOOP  stages t = 0 .. n - 5 in one generated loop (their TDM ops are the item's own whole ops of local stage
+              t + 3: the loop advances the descriptor, the burst bases and its count itself)
   STAGE_MAIN  one ring stage t < n - 2 (chunks c = 2t, 2t + 1), STAGE_PEN stage n - 2 (SM1 of its odd chunk masked),
   STAGE_LAST  stage n - 1 (Q(j+1) before its op, SM1 of its even chunk masked, no QK / SM1 in its odd chunk)
   EPI         l = sum, O^T / l to bf16 into the wave's O image, whole-row read-back and O stores; LSE = (m2 + log2 l) ln 2
 
-A stage is two blocks, one per chunk, each ending in the lazy-rescale branch (out-of-line block R: the rescale of
-chunk c + 1, taken when some q-tile's own-half max of chunk c + 1 exceeds its threshold). Chunk c (par = c & 1):
+A stage is two blocks, one per chunk, each ending in the lazy-rescale branch (out-of-line block R, placed behind the
+kernel's s_endpgm: the rescale of chunk c + 1, taken when some q-tile's own-half max of chunk c + 1 exceeds its
+threshold). Chunk c (par = c & 1):
   QK(c+1) -> S[1 - par] (K operands kab[1 - par]) || exp / P^T pack / row sums of S[par] (the scores of chunk c)
   even: s_barrier_wait (WAIT(P_{T+1})), [LAST: Q(j+1)], the TDM op of stage T + 3; V(c+1) -> V[1] (stage T),
         K(c+2) -> kab[0], K(c+3) -> kab[1] (stage T + 1)
@@ -24,9 +27,11 @@ chunk c + 1, taken when some q-tile's own-half max of chunk c + 1 exceeds its th
         V(c+2) -> V[0] (stage T + 1, after PV(c - 1) released V[0])
   PV(c): O^T[h] += V[par] P^T[h] (8 d tiles x 4 q-tiles) || SM1(c+1): [mask], own-half max, the rescale decision
 Every operation is the HIP kernel's (FWD1_LSUM 0, SM1L 1, OPT_RESC 1): o / lse are bitwise those of the production
-build. The node lists are in program order; gencore.schedule_slot reorders them along the dependence graph."""
+build. The node lists are in program order; bwd1gen.schedule_slot reorders them along the dependence graph."""
 
-from gencore import (  # noqa: F401
+import re
+
+from bwd1gen import (  # noqa: F401
     add_order,
     build_dag,
     fix_fence,
@@ -38,8 +43,6 @@ from gencore import (  # noqa: F401
     vr,
     wmma,
 )
-import gencore as GC
-import re
 
 KP, VP = 272, 288  # K / V ring pitches (bytes)
 NH, NDK, NDT = 4, 4, 8
@@ -47,12 +50,12 @@ NEG_INF = "0xff800000"
 TH2 = "0x4138aa3b"  # 8 log2(e): the lazy-rescale threshold (log2 domain)
 LN2 = "0x3f317218"
 SEL_LO, SEL_HI = "0x76543210", "0xfedcba98"  # v_permlanex16_b32: lane l reads lane l of the other half
-S_SEL, S_NEED, S_B, S_ANY, S_HI = "s96", "s97", "s98", "s99", "s100"
+S_SEL, S_B, S_HI = "s96", "s98", "s100"  # FRONT / EPI scalars
 CLOBBERED = {f"s{i}" for i in range(96, 104)} | {"vcc", "vcc_lo", "vcc_hi", "scc"}
-# the stage blocks keep their scalars in vcc (s96..s103 hold STAGE_LOOP's descriptor group 1): the rescale decision
-# (vcc_lo, the branch tests it with s_cmp), the rescale's ballot / select (vcc_lo) and permlane select (vcc_hi)
+# the stage blocks keep their scalars in vcc (STAGE_LOOP clobbers no SGPR: its descriptor group 1 lives in an SGPR
+# block it saves and restores): the rescale decision (vcc_lo, the branch tests it with s_cmp), the rescale's ballot /
+# select (vcc_lo) and permlane select (vcc_hi)
 V_NEED, V_B, V_SEL = "vcc_lo", "vcc_lo", "vcc_hi"
-G1_LOOP = "s[96:103]"
 K_SLOT_B, V_SLOT_B = 0x4400, 0x4800
 K_W0, V_W0 = 0x07510000, 0x0F510000  # tdm_w0(2 D, K_PITCH / V_PITCH) (fwd1/idx.h)
 INOUT = {"STAGE_LOOP": ("g0", "lp")}  # marker operands a region rewrites (in / out asm operands)
@@ -110,7 +113,7 @@ class Layout:
         self.thr = [take(1, 1) for _ in range(2)]
         self.t = [take(2, 2) for _ in range(8)]  # scratch pairs (SM1 FIRST, rescale)
         self.lb = [take(1, 1) for _ in range(4)]  # STAGE_LOOP's burst bases kb1, vb0, vb1 and a temporary
-        self.ssave = take(1, 1)  # STAGE_LOOP: s96..s103 of the shell in lanes 0..7
+        self.ssave = take(1, 1)  # STAGE_LOOP: the shell's SGPR block it borrows, in lanes 0..7
         self.top = max(a + m for blk in used for a, m in blk)
 
 

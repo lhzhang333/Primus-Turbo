@@ -6,21 +6,23 @@
 
 """build.py -- build k_attn_fwd_v1 with its item body generated (fwd1gen).
 
-    python3 build.py --out DIR [--cxx CXX] [--va-rule RULE]
+    python3 build.py --out DIR [--cxx CXX] [--va-rule RULE] [model / schedule options]
 
- 1. compile the marker shell (the manifest's command for k_attn_bwd_v1, -DHKGEN=1): DIR/shell.s; and the reference
-    (the same command with -DHKGEN=0: the HIP kernel, DIR/ref/k_attn_bwd_v1.hsaco), whose operands in high VGPR
-    blocks teach, with the shell's, the s_set_vgpr_msb operand-field map;
- 2. read the BODY marker of k_hk_bwd1_g4 and the registers LLVM gave its operands; base = 1 + the highest VGPR the
-    shell's k_hk_bwd1_g4 references;
- 3. generate the region's blocks (bwd1gen); asmkit.emit derives s_set_vgpr_msb, the expert-mode waits and the hazard
-    v_nops (the loop blocks to a fixed point of their entry states); the region ends with s_wait_xcnt 0 + vm_vsrc 0;
-    a re-walk of every block from its entry state must find no open hazard;
- 4. splice the region behind the marker, k_hk_bwd1_g4's VGPR allocation 1024: DIR/k_attn_bwd_v1.s;
- 5. assemble with the driver's own cc1as / lld (asmkit.build): DIR/k_attn_bwd_v1.hsaco; asmkit.verify_obj on
-    k_hk_bwd1_g4;
- 6. contract: the generated code writes VGPRs only at or above base and SGPRs only in the marker's clobber list; no
-    spills.
+ 1. compile the marker shell (the manifest's command for k_attn_fwd_v1, -DHKGEN=1): DIR/shell.s; and the reference
+    (the same command with -DHKGEN=0: the HIP kernel in expert scheduling mode, DIR/ref/k_attn_fwd_v1.hsaco), whose
+    operands in high VGPR blocks teach, with the shell's, the s_set_vgpr_msb operand-field map;
+ 2. read the markers (FRONT, STAGE_LOOP, STAGE_MAIN, STAGE_PEN, STAGE_LAST, EPI) and the registers LLVM gave their
+    operands; base = 1 + the highest VGPR the shell references;
+ 3. generate every region's blocks (fwd1gen, scheduled by bwd1gen's slot scheduler); asmkit.emit derives
+    s_set_vgpr_msb, the expert-mode waits and the hazard v_nops over the region graph (shell code between regions:
+    unknown VALU / memory state, every region starts with va_vdst 0) to a fixed point of the block entry states; a
+    stage region ends with vm_vsrc 0 (EPI also s_wait_xcnt 0: a tensor_load_to_lds reads its descriptor SGPRs at
+    issue, as LLVM assumes); a re-walk of every block from its entry state must find no open hazard;
+ 4. splice each region behind its marker, the out-of-line rescale blocks behind the kernel's s_endpgm, the kernel's
+    VGPR allocation 1024: DIR/k_attn_fwd_v1.s;
+ 5. assemble with the driver's own cc1as / lld (asmkit.build): DIR/k_attn_fwd_v1.hsaco; asmkit.verify_obj;
+ 6. contract: the generated code writes VGPRs only at or above base and SGPRs only in its marker's clobber list, its
+    in / out operands or the SGPRs it saves and restores (STAGE_LOOP); no spills.
 Writes DIR/build.json; exit status 1 on any failed check. CPU only."""
 
 import argparse
@@ -36,9 +38,9 @@ HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent
 PKG = TOOLS.parent
 HIP = PKG / "hip"
-sys.path[:0] = [str(HERE), str(TOOLS)]
-import fwd1gen as G
-import gencore as GC  # noqa: E402
+sys.path[:0] = [str(HERE), str(TOOLS / "bwd1gen"), str(TOOLS)]
+import bwd1gen as GC  # noqa: E402
+import fwd1gen as G  # noqa: E402
 from asmkit import build as B  # noqa: E402
 from asmkit import emit as M  # noqa: E402
 from asmkit import expert as E  # noqa: E402
@@ -49,9 +51,8 @@ ENTRY = "k_attn_fwd_v1"
 FUNC = "k_attn_fwd_v1"
 MARK = re.compile(r";\s*HKGEN\s+(\w+)\s*(.*)$")
 POST = ["\ts_wait_xcnt 0x0", "\ts_wait_alu depctr_vm_vsrc(0)"]
-# options (main): ENTRY_VA: every region starts with s_wait_alu depctr_va_vdst(0) (the shell's VALU writes retire
-# while the WMMA pipe is empty anyway); STAGE_XCNT: the stage regions end with s_wait_xcnt 0 too (LLVM never waits
-# for XCNT before rewriting a tensor_load_to_lds's descriptor SGPRs; only EPI has VMEM)
+# ENTRY_VA: every region starts with s_wait_alu depctr_va_vdst(0) (the shell's VALU writes retire while the WMMA pipe
+# is empty anyway); STAGE_XCNT: the stage regions end with s_wait_xcnt 0 too (only EPI has VMEM)
 OPT = {"entry_va": True, "stage_xcnt": False}
 ENTRY_VA = "\ts_wait_alu depctr_va_vdst(0)"
 
@@ -90,13 +91,6 @@ def compile_variant(hsaco, cxx, out_dir, reference):
     if r.returncode != 0:
         raise RuntimeError(f"compile failed:\n{r.stderr[-4000:]}")
     return cmd, next(tmp.glob("*-gfx1250.s")), obj
-
-
-def func_range(lines, name):
-    """(first, last) line index of function `name` in a compiler .s: its label to its .Lfunc_end line."""
-    lo = next(i for i, l in enumerate(lines) if l.startswith(f"{name}:"))
-    hi = next(i for i in range(lo, len(lines)) if lines[i].startswith(".Lfunc_end"))
-    return lo, hi
 
 
 def func_range(lines, name):
@@ -374,22 +368,21 @@ def main():
     ap.add_argument("--va-rule", default="class", choices=E.VA_RULES)
     ap.add_argument("--no-entry-va", action="store_true", help="no s_wait_alu depctr_va_vdst(0) at the region starts")
     ap.add_argument("--stage-xcnt", action="store_true", help="end the stage regions with s_wait_xcnt 0 too")
-    ap.add_argument("--dscnt-grain", type=int, default=1, help="derived s_wait_dscnt N rounded down to this grain")
-    ap.add_argument("--pair-costs", action="store_true", help="the scheduler's measured issue-cost pairs and wait cost")
-    ap.add_argument("--wait-cost", type=int, default=None)
     ap.add_argument("--wmma-reuse", default="", help="a / b / ab: WMMA operand-reuse hints (QK: K tile, PV: P tile)")
-    for k, d in (("lds-lat", "LDS_LAT"), ("lds-rate", "LDS_RATE"), ("trans-lat", None), ("valu-lat", None),
-                 ("pk-lat", "PK_LAT"), ("sdst-lat", "SDST_LAT"), ("ds-max", "DS_MAX"), ("trans-rate", "TRANS_RATE")):
-        ap.add_argument(f"--{k}", type=int, default=None)
+    # the scheduler's issue model (bwd1gen): RAW latencies (cycles from issue), the TRANS rate, the LDS model
+    for k, d, h in (("trans-lat", None, "v_exp result latency"), ("trans-rate", 0, "v_exp completions: one per N cycles"),
+                    ("valu-lat", None, "VALU result latency"), ("pk-lat", 9, "v_pk_* result latency"),
+                    ("sdst-lat", 10, "VALU-written SGPR -> SALU / memory reader"), ("lds-lat", None, "LDS latency"),
+                    ("lds-rate", None, "LDS completions: one per N cycles"), ("ds-max", None, "LDS loads in flight")):
+        ap.add_argument(f"--{k}", type=int, default=d, help=h)
     a = ap.parse_args()
     OPT["entry_va"], OPT["stage_xcnt"] = not a.no_entry_va, a.stage_xcnt
     # LLVM's semantics: a tensor_load_to_lds reads its descriptor SGPRs at issue (the compiler rewrites them for the
     # next stage with no s_wait_xcnt); only VMEM / FLAT sources wait for XCNT
     M.XCNT_CLASSES = ("VMEM", "FLAT")
-    M.DSCNT_GRAIN = a.dscnt_grain
     G.REUSE["a"], G.REUSE["b"] = "a" in a.wmma_reuse, "b" in a.wmma_reuse
     GC.set_model(LDS_LAT=a.lds_lat, LDS_RATE=a.lds_rate, PK_LAT=a.pk_lat, SDST_LAT=a.sdst_lat, DS_MAX=a.ds_max,
-                 TRANS_RATE=a.trans_rate, PAIR_COSTS=a.pair_costs or None, WAIT_COST=a.wait_cost)
+                 TRANS_RATE=a.trans_rate)
     if a.trans_lat is not None:
         GC.LAT["TRANS"] = a.trans_lat
     if a.valu_lat is not None:
@@ -410,7 +403,6 @@ def main():
     shutil.copy2(ref_obj, out / "ref" / f"{ENTRY}.hsaco")
     shutil.copy2(ref_s, out / "ref" / f"{ENTRY}.s")
     fmap = M.merge_msb_maps(M.learn_msb_map(parse(shell)), M.learn_msb_map(parse(ref_s.read_text().split("\n"))))
-    prod = HIP.parent / "bin" / f"{ENTRY}.hsaco"
     for mn in ("ds_load_b128", "ds_load_tr16_b128"):
         fmap[(mn, 0)], fmap[(mn, 1)] = {"dst"}, {"src0"}
     fmap[("ds_store_b128", 0)], fmap[("ds_store_b128", 1)] = {"src0"}, {"src1"}
@@ -440,7 +432,7 @@ def main():
     rec["checks"]["verify_obj"] = "ok" if not bad else [str(b) for b in bad]
     if bad:
         fail.append(f"verify_obj: {bad[:3]}")
-    if meta.get("vgpr_spill_count", 0) or meta.get("private_segment_fixed_size", 0):
+    if meta.get("vgpr_spill_count", 0) or meta.get("sgpr_spill_count", 0) or meta.get("private_segment_fixed_size", 0):
         fail.append(f"spills / scratch: {meta}")
     for f in fail:
         log("FAIL:", f)
