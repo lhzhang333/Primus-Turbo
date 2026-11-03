@@ -527,9 +527,10 @@
         "-DFWD1_LSUM=0",
         "-DFWD1_OPT_RESC=1",
         "-DFWD1_MDS=3",
-        "-DFWD1_OPT_UNROLL=1"
+        "-DFWD1_OPT_UNROLL=1",
+        "-DHK_STRIDES=1"
       ],
-      "hsaco_sha256": "c7ae5b8e16f556d7744e2998479a7a7c501beb7c610a1df279aed63ea1cc6f55",
+      "hsaco_sha256": "2a8fca7b85a98f205beec66f667a15c01e245b6f8d423c278b78a02233541ab0",
       "block": 128,
       "args": [
         {
@@ -711,12 +712,60 @@
           "kind": "i32",
           "offset": 144,
           "size": 4
+        },
+        {
+          "name": "sQb",
+          "kind": "i64",
+          "offset": 152,
+          "size": 8
+        },
+        {
+          "name": "sQs",
+          "kind": "i64",
+          "offset": 160,
+          "size": 8
+        },
+        {
+          "name": "sKb",
+          "kind": "i64",
+          "offset": 168,
+          "size": 8
+        },
+        {
+          "name": "sKs",
+          "kind": "i64",
+          "offset": 176,
+          "size": 8
+        },
+        {
+          "name": "sVb",
+          "kind": "i64",
+          "offset": 184,
+          "size": 8
+        },
+        {
+          "name": "sVs",
+          "kind": "i64",
+          "offset": 192,
+          "size": 8
+        },
+        {
+          "name": "sOb",
+          "kind": "i64",
+          "offset": 200,
+          "size": 8
+        },
+        {
+          "name": "sOs",
+          "kind": "i64",
+          "offset": 208,
+          "size": 8
         }
       ],
-      "kernarg_size": 148,
+      "kernarg_size": 216,
       "lds": 327680,
       "vgpr": 898,
-      "sgpr": 101,
+      "sgpr": 106,
       "wavefront_size": 32
     },
     "k_attn_bwd_v1": {
@@ -732,9 +781,10 @@
         "-DBWD1_OPT_MASKED=2",
         "-DBWD1_OPT_DQSPLIT=1",
         "-DBWD1_OPT_QTC=1",
-        "-DBWD1_RB1=8"
+        "-DBWD1_RB1=8",
+        "-DHK_STRIDES=1"
       ],
-      "hsaco_sha256": "9b7cf1f1ee72f961c6c42f44d784c3222db94f48faca585df0975304d67330ed",
+      "hsaco_sha256": "52344febff30bb2a53ca533cd17cd8d03b0d343f88424d70a4d5abda709a57cf",
       "symbols": {
         "k_hk_bwd1_prep": {
           "block": 256,
@@ -786,11 +836,35 @@
               "kind": "i32",
               "offset": 48,
               "size": 4
+            },
+            {
+              "name": "do_sb",
+              "kind": "i64",
+              "offset": 56,
+              "size": 8
+            },
+            {
+              "name": "do_ss",
+              "kind": "i64",
+              "offset": 64,
+              "size": 8
+            },
+            {
+              "name": "o_sb",
+              "kind": "i64",
+              "offset": 72,
+              "size": 8
+            },
+            {
+              "name": "o_ss",
+              "kind": "i64",
+              "offset": 80,
+              "size": 8
             }
           ],
-          "kernarg_size": 52,
+          "kernarg_size": 88,
           "lds": 256,
-          "vgpr": 38,
+          "vgpr": 41,
           "sgpr": 68,
           "wavefront_size": 32
         },
@@ -844,11 +918,35 @@
               "kind": "i32",
               "offset": 48,
               "size": 4
+            },
+            {
+              "name": "do_sb",
+              "kind": "i64",
+              "offset": 56,
+              "size": 8
+            },
+            {
+              "name": "do_ss",
+              "kind": "i64",
+              "offset": 64,
+              "size": 8
+            },
+            {
+              "name": "o_sb",
+              "kind": "i64",
+              "offset": 72,
+              "size": 8
+            },
+            {
+              "name": "o_ss",
+              "kind": "i64",
+              "offset": 80,
+              "size": 8
             }
           ],
-          "kernarg_size": 52,
+          "kernarg_size": 88,
           "lds": 256,
-          "vgpr": 38,
+          "vgpr": 41,
           "sgpr": 68,
           "wavefront_size": 32
         },
@@ -944,12 +1042,84 @@
               "kind": "i32",
               "offset": 88,
               "size": 4
+            },
+            {
+              "name": "q_sb",
+              "kind": "i64",
+              "offset": 96,
+              "size": 8
+            },
+            {
+              "name": "q_ss",
+              "kind": "i64",
+              "offset": 104,
+              "size": 8
+            },
+            {
+              "name": "k_sb",
+              "kind": "i64",
+              "offset": 112,
+              "size": 8
+            },
+            {
+              "name": "k_ss",
+              "kind": "i64",
+              "offset": 120,
+              "size": 8
+            },
+            {
+              "name": "v_sb",
+              "kind": "i64",
+              "offset": 128,
+              "size": 8
+            },
+            {
+              "name": "v_ss",
+              "kind": "i64",
+              "offset": 136,
+              "size": 8
+            },
+            {
+              "name": "do_sb",
+              "kind": "i64",
+              "offset": 144,
+              "size": 8
+            },
+            {
+              "name": "do_ss",
+              "kind": "i64",
+              "offset": 152,
+              "size": 8
+            },
+            {
+              "name": "dk_sb",
+              "kind": "i64",
+              "offset": 160,
+              "size": 8
+            },
+            {
+              "name": "dk_ss",
+              "kind": "i64",
+              "offset": 168,
+              "size": 8
+            },
+            {
+              "name": "dv_sb",
+              "kind": "i64",
+              "offset": 176,
+              "size": 8
+            },
+            {
+              "name": "dv_ss",
+              "kind": "i64",
+              "offset": 184,
+              "size": 8
             }
           ],
-          "kernarg_size": 92,
+          "kernarg_size": 192,
           "lds": 266240,
           "vgpr": 948,
-          "sgpr": 74,
+          "sgpr": 82,
           "wavefront_size": 32
         },
         "k_hk_bwd1_dqcvt": {
@@ -990,9 +1160,21 @@
               "kind": "i32",
               "offset": 28,
               "size": 4
+            },
+            {
+              "name": "dq_sb",
+              "kind": "i64",
+              "offset": 32,
+              "size": 8
+            },
+            {
+              "name": "dq_ss",
+              "kind": "i64",
+              "offset": 40,
+              "size": 8
             }
           ],
-          "kernarg_size": 32,
+          "kernarg_size": 48,
           "lds": 8704,
           "vgpr": 24,
           "sgpr": 68,

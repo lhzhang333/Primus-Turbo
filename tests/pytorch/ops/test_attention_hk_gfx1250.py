@@ -2191,7 +2191,23 @@ def test_kernel_module_meets_the_contract(module):
         m = manifest[sym]
         assert spec["block"] == m["block"], sym
         got = [(a["name"], a["kind"]) if isinstance(a, dict) else tuple(a) for a in m["args"]]
-        assert got == [tuple(a) for a in spec["args"]], sym
+        want = [tuple(a) for a in spec["args"]]
+        if _manifest_strided(module):  # a -DHK_STRIDES=1 pin: the default arguments, then the strides
+            want += _module_stride_args(mod, sym)
+        assert got == want, sym
+
+
+def _manifest_strided(module):
+    """Whether the module's manifest entry is a -DHK_STRIDES=1 build (its kernels then take stride arguments)."""
+    e = hsaco.load_manifest()["kernels"].get(f"k_attn_{module}", {})
+    return "-DHK_STRIDES=1" in e.get("extra_flags", [])
+
+
+def _module_stride_args(mod, sym):
+    """The (name, kind) stride arguments a -DHK_STRIDES=1 build of kernel ``sym`` takes after its default ones."""
+    if callable(getattr(mod, "stride_args", None)):
+        return [tuple(a) for a in mod.stride_args(sym)]
+    return [tuple(a) for a in getattr(mod, "STRIDE_ARGS", ())]
 
 
 def _plan_launches(mod, b, sq, skv, hq, hkv):
@@ -2228,7 +2244,8 @@ def test_kernel_module_launch_plan(module):
     for name, grid, block, nargs in launches:
         assert name in symbols, f"{name} is not a manifest kernel of {module} ({sorted(symbols)})"
         assert block == symbols[name]["block"] and all(int(x) >= 1 for x in grid), (name, grid, block)
-        assert nargs == len(symbols[name]["args"]), name
+        n_strides = len(_module_stride_args(mod, name)) if _manifest_strided(module) else 0
+        assert nargs == len(symbols[name]["args"]) - n_strides, name  # the default (non-strided) plan
     b, sq, skv, hq, hkv = PROD
     with pytest.raises((ValueError, NotImplementedError)):
         _plan_launches(mod, b, sq + 32, skv, hq, hkv)  # Sq % 64
