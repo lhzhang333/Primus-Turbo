@@ -1,0 +1,267 @@
+{
+ "name": "llama_fwd2",
+ "title": "Llama-3.1-8B attention forward, optimization campaign 2026-11-03 (GPU0): from Primus-Turbo dev/lhz/llama31_8b_hk_opt 544d0136",
+ "tree": "hip",
+ "flags": [
+  "-x",
+  "hip",
+  "--offload-arch=gfx1250",
+  "--cuda-device-only",
+  "--no-gpu-bundle-output",
+  "-O3",
+  "-std=c++20",
+  "-DNDEBUG",
+  "-DKITTENS_CDNA5",
+  "-Iinclude",
+  "-I.",
+  "-save-temps=obj"
+ ],
+ "notes": [
+  "f0 rebuilds the pinned forward of dev/lhz/llama31_8b_hk_opt 544d0136 (= llama_fwd v11_strides: v11_best + -DHK_STRIDES=1, sha 2a8fca7b) byte for byte; later rungs are -D knobs and/or patches in fwd2_patches/ (paths relative to llama/hip).",
+  "Baseline flydsl: Primus-Turbo's FlyDSL gfx1250 d128 forward of $HKL_TURBO_DIR.",
+  "Every rung keeps o / lse bitwise equal to f0 (bitwise_with)."
+ ],
+ "rungs": [
+  {
+   "id": "f0",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DFWD1_LSUM=0",
+      "-DFWD1_OPT_RESC=1",
+      "-DFWD1_MDS=3",
+      "-DFWD1_OPT_UNROLL=1",
+      "-DHK_STRIDES=1"
+     ],
+     "sha256": "2a8fca7b85a98f205beec66f667a15c01e245b6f8d423c278b78a02233541ab0"
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "v1.1 + strides (llama_fwd v11_strides): the pinned forward of dev/lhz/llama31_8b_hk_opt"
+  },
+  {
+   "id": "o1_null",
+   "parent": "f0",
+   "patch": "fwd2_patches/01_osoff.patch",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DFWD1_LSUM=0",
+      "-DFWD1_OPT_RESC=1",
+      "-DFWD1_MDS=3",
+      "-DFWD1_OPT_UNROLL=1",
+      "-DHK_STRIDES=1"
+     ],
+     "sha256": "2a8fca7b85a98f205beec66f667a15c01e245b6f8d423c278b78a02233541ab0"
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "patch 01 (FWD1_OPT_OSOFF knob) at 0: f0 byte for byte",
+   "bitwise_with": "f0",
+   "side": true
+  },
+  {
+   "id": "o1a",
+   "parent": "o1_null",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DFWD1_LSUM=0",
+      "-DFWD1_OPT_RESC=1",
+      "-DFWD1_MDS=3",
+      "-DFWD1_OPT_UNROLL=1",
+      "-DHK_STRIDES=1",
+      "-DFWD1_OPT_OSOFF=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "O write-back: position offsets in the SGPR soffset (no s_wait_xcnt between the 32 stores of a wave)",
+   "bitwise_with": "f0"
+  },
+  {
+   "id": "x1",
+   "parent": "f0",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DFWD1_LSUM=0",
+      "-DFWD1_OPT_RESC=1",
+      "-DFWD1_MDS=3",
+      "-DFWD1_OPT_UNROLL=1",
+      "-DHK_STRIDES=1",
+      "-mllvm",
+      "-amdgpu-wmma-vnop-hoisting"
+     ]
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "f0 + -amdgpu-wmma-vnop-hoisting",
+   "bitwise_with": "f0",
+   "side": true
+  },
+  {
+   "id": "x2",
+   "parent": "f0",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DFWD1_LSUM=0",
+      "-DFWD1_OPT_RESC=1",
+      "-DFWD1_MDS=3",
+      "-DFWD1_OPT_UNROLL=1",
+      "-DHK_STRIDES=1",
+      "-mllvm",
+      "-amdgpu-disable-unclustered-high-rp-reschedule"
+     ]
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "f0 + -amdgpu-disable-unclustered-high-rp-reschedule",
+   "bitwise_with": "f0",
+   "side": true
+  },
+  {
+   "id": "x3",
+   "parent": "f0",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DFWD1_LSUM=0",
+      "-DFWD1_OPT_RESC=1",
+      "-DFWD1_MDS=3",
+      "-DFWD1_OPT_UNROLL=1",
+      "-DHK_STRIDES=1",
+      "-mllvm",
+      "-amdgpu-use-amdgpu-trackers"
+     ]
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "f0 + -amdgpu-use-amdgpu-trackers",
+   "bitwise_with": "f0",
+   "side": true
+  },
+  {
+   "id": "x4",
+   "parent": "f0",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DFWD1_LSUM=0",
+      "-DFWD1_OPT_RESC=1",
+      "-DFWD1_MDS=3",
+      "-DFWD1_OPT_UNROLL=1",
+      "-DHK_STRIDES=1",
+      "-mllvm",
+      "-amdgpu-schedule-metric-bias=0"
+     ]
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "f0 + -amdgpu-schedule-metric-bias=0",
+   "bitwise_with": "f0",
+   "side": true
+  },
+  {
+   "id": "x5",
+   "parent": "f0",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=max-ilp",
+      "-DFWD1_LSUM=0",
+      "-DFWD1_OPT_RESC=1",
+      "-DFWD1_MDS=3",
+      "-DFWD1_OPT_UNROLL=1",
+      "-DHK_STRIDES=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "f0 with -amdgpu-sched-strategy=max-ilp instead of coexec",
+   "bitwise_with": "f0",
+   "side": true
+  }
+ ],
+ "baselines": [
+  {
+   "id": "flydsl",
+   "module": "primus_turbo.flydsl.attention.gfx1250.interface",
+   "fwd": "flash_attn_fwd",
+   "note": "Primus-Turbo's FlyDSL gfx1250 d128 forward (main since #580)"
+  }
+ ],
+ "problem": {
+  "kind": "gqa",
+  "b": 4,
+  "sq": 8192,
+  "skv": 8192,
+  "hq": 32,
+  "hkv": 8,
+  "d": 128,
+  "dv": 128,
+  "causal": true,
+  "layout": "bshd"
+ },
+ "direction": "fwd",
+ "exact_outputs": [
+  "o",
+  "lse"
+ ]
+}

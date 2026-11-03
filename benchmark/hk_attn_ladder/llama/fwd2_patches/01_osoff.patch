@@ -1,0 +1,46 @@
+diff -ruN a/src/k_attn_fwd_v1.hip b/src/k_attn_fwd_v1.hip
+--- a/src/k_attn_fwd_v1.hip	2026-11-03 04:12:54.632056260 +0000
++++ b/src/k_attn_fwd_v1.hip	2026-11-03 04:12:54.645073584 +0000
+@@ -122,6 +122,9 @@
+ #ifndef FWD1_OPT_UNROLL
+ #define FWD1_OPT_UNROLL 0
+ #endif
++#ifndef FWD1_OPT_OSOFF // 1: O write-back with each store's position offset in the buffer instruction's SGPR soffset
++#define FWD1_OPT_OSOFF 0 //   (two lane bases in VGPRs, no address VALU between the 32 stores of a wave)
++#endif
+ #ifndef HK_STRIDES
+ #define HK_STRIDES 0
+ #endif
+@@ -841,6 +844,24 @@
+ #if HK_STRIDES
+         const f1::Lay lo = lay_o(ka);
+ #endif
++#if FWD1_OPT_OSOFF
++        // store s = lane base of s % 2 (VGPR) + s / 2 position strides (SGPR soffset): the same byte offsets as
++        // o_store_b(_s), but no VALU address math between the stores, so a just-stored data register is never the next
++        // store's address (which cost an s_wait_xcnt of ~55 cycles per store pair)
++#if HK_STRIDES
++        const int row_b = (int) (2 * lo.ss);
++        const int vb0   = (int) f1::o_store_b_s(lo, x.b, x.hq4, x.qb, w, 0, l);
++        const int vb1   = (int) f1::o_store_b_s(lo, x.b, x.hq4, x.qb, w, 1, l);
++#else
++        const int row_b = 2 * Hq * f1::D;
++        const int vb0   = (int) f1::o_store_b(x.b, Sq, Hq, x.hq4, x.qb, w, 0, l);
++        const int vb1   = (int) f1::o_store_b(x.b, Sq, Hq, x.hq4, x.qb, w, 1, l);
++#endif
++        static_for<2 * f1::QW>([&](auto s) {
++            const u32x4 v = ds_load_b128_u32(rp, f1::or_imm(s));
++            buf_store_b128(ro, (s % 2) ? vb1 : vb0, (s / 2) * row_b, v);
++        });
++#else
+         static_for<2 * f1::QW>([&](auto s) {
+             const u32x4 v = ds_load_b128_u32(rp, f1::or_imm(s));
+ #if HK_STRIDES
+@@ -849,6 +870,7 @@
+             buf_store_b128(ro, (int) f1::o_store_b(x.b, Sq, Hq, x.hq4, x.qb, w, s, l), 0, v);
+ #endif
+         });
++#endif
+         const rsrc_t rl = make_rsrc(ka->LSE, ka->lse_bytes);
+         float        lse[NH];
+         static_for<NH>([&](auto h) { lse[h] = (M2(h) + log2_hw(lt[h])) * f1::LN2; });
