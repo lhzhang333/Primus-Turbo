@@ -36,6 +36,9 @@ VA_VDST_MAX = 14  # depctr_va_vdst: 15 means "no wait"
 VM_VSRC_MAX = 6  # depctr_vm_vsrc is a 3-bit field whose 7 means "no wait": a need >= 7 is emitted as 6
 CNT_MAX = 63  # largest emitted s_wait_*cnt value; the model applies the needed one (conservative)
 XCNT_CLASSES = ("VMEM", "FLAT", "TDM")  # instruction classes whose scalar sources an s_wait_xcnt 0 guards
+# a derived s_wait_dscnt N waits down to a multiple of DSCNT_GRAIN (1: exactly N): one wait then covers the next
+# loads too, fewer waits (each costs ~4 issue cycles on gfx1250) for a longer one
+DSCNT_GRAIN = 1
 MAX_STATES = 8  # more distinct wait (or XCNT) states than this at one program point are merged into one
 MAX_HISTORIES = 64  # more distinct VALU histories than this at one program point are an error
 _NOP = parse_line(-1, "\tv_nop")
@@ -270,6 +273,8 @@ def wait_needs(sts, xs, x, sx, release, va_rule, bar_dscnt=True):
             put("dscnt", 0)
     if sx and any(s.unknown or set(sx) & s.regs for s in xs):
         put("xcnt", 0)
+    if DSCNT_GRAIN > 1 and "dscnt" in need:
+        need["dscnt"] -= need["dscnt"] % DSCNT_GRAIN
     return need
 
 

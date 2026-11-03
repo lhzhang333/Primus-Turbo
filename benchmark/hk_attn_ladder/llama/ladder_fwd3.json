@@ -152,6 +152,56 @@
    },
    "feature": "g2 + STAGE_LOOP: stages 0..n-5 of an item in one generated loop (descriptors, burst bases, trip count in the loop; s88..s95 saved in VGPR lanes), rescale blocks out of line, stage scalars in vcc",
    "bitwise_with": "f0"
+  },
+  {
+   "id": "g5a",
+   "parent": "f0",
+   "tree": "fwd3",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "gen": [
+      "--trans-lat",
+      "18",
+      "--trans-rate",
+      "4",
+      "--valu-lat",
+      "5"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_fwd_v1"
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "g4 + TRANS throughput model (v_exp done = max(issue + 18, previous + 4))",
+   "bitwise_with": "f0"
+  },
+  {
+   "id": "g8c",
+   "parent": "f0",
+   "tree": "fwd3",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "gen": [
+      "--trans-lat",
+      "18",
+      "--trans-rate",
+      "4",
+      "--valu-lat",
+      "5",
+      "--wmma-reuse",
+      "ab"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_fwd_v1"
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "g5a + WMMA operand-reuse hints (QK: matrix_a_reuse across a K tile's 4 heads; PV: matrix_b_reuse across a P tile's 8 dt)",
+   "bitwise_with": "f0"
   }
  ]
 }

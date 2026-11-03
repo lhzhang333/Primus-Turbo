@@ -216,6 +216,35 @@ WMMA_CHAIN = 16
 # branch / memory reader ~10 cycles after it
 PK_LAT = 9
 SDST_LAT = 10
+# the TRANS unit completes one v_exp per TRANS_RATE cycles (wave32: quarter rate), each LAT["TRANS"] after its issue at
+# the earliest (ATT fit 2026-11-03: L 15..28, R 3..4); 0: no throughput model
+TRANS_RATE = 0
+# issue cost pairs (ATT 2026-11-03, generated g5a: own issue cycles of an instruction by the next one's class) and the
+# s_wait_dscnt the emitter puts before the first reader of not yet waited LDS loads (~WAIT_COST issue cycles); off by
+# default (PAIR_COSTS = False)
+PAIR_COSTS = False
+WAIT_COST = 3
+PAIR = {("WMMA", "TRANS"): 2, ("WMMA", "VMAX"): 2, ("VPK", "VCVT"): 4, ("VCVT", "VMAX"): 2, ("VCVT", "VPK"): 2,
+        ("TRANS", "DS_LD"): 2, ("VALU", "WMMA"): 2, ("VMAX", "WMMA"): 1}
+
+
+def sub(n):
+    """The finer class of a node for PAIR (v_pk_*, v_cvt_pk_*, v_max* among the VALU)."""
+    if n.kind == "VALU":
+        if n.text.startswith("v_pk_"):
+            return "VPK"
+        if n.text.startswith("v_cvt_pk"):
+            return "VCVT"
+        if n.text.startswith("v_max"):
+            return "VMAX"
+    return n.kind
+
+
+def pair_cost(a, b):
+    if a is None:
+        return 1
+    sa, sb = sub(a), sub(b)
+    return PAIR.get((sa, sb)) or PAIR.get((a.kind, sb)) or PAIR.get((sa, b.kind)) or PAIR.get((a.kind, b.kind)) or 1
 
 
 def raw_lat(p, c):
@@ -328,11 +357,31 @@ def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
     ready = set(i for i in range(n) if npred[i] == 0)
     out, wmma_at, done = [], {}, {}
     t, last_w, wk, trans_at, ds_last_done = 0, -100, 0, -100, 0
+    trans_done = -100
     mem_t, mem_c, ds_next = -100, None, 0
     vm_run, vm_last = 0, -100
     ds_issued, ds_retired, ds_seq = 0, -1, {}
     bs_wk = 10**6
     bar_deps = set(bar_deps)
+    last_t, last_nd, waited = -100, None, -1
+
+    def wait_seq(i):
+        """the newest not yet waited LDS load i reads (its ds sequence number), -1 if none"""
+        if not PAIR_COSTS:
+            return -1
+        m = -1
+        for p, _ in nodes[i].preds:
+            if nodes[p].kind == "DS_LD" and p in ds_seq and ds_seq[p] > waited and nodes[i].vuses & nodes[p].vdefs:
+                m = max(m, ds_seq[p])
+        return m
+
+    def cost_ok(i):
+        if not PAIR_COSTS:
+            return True
+        c = pair_cost(last_nd, nodes[i])
+        if wait_seq(i) >= 0:
+            c = max(c, WAIT_COST + 1)
+        return t >= last_t + c
 
     def xdl_ok(i):
         rs = nodes[i].war_xdl
@@ -359,7 +408,7 @@ def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
 
     def avail(i):
         k = nodes[i].kind
-        if earliest[i] > t or not port_ok(k):
+        if earliest[i] > t or not port_ok(k) or not cost_ok(i):
             return False
         if k == "TRANS" and t == trans_at + 1:
             return False
@@ -385,7 +434,8 @@ def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
     while len(out) < n:
         pick = None
         nw = wseq[wk] if wk < len(wseq) else None
-        if nw is not None and nw in ready and earliest[nw] <= t and t >= last_w + WMMA_CYC and port_ok("WMMA"):
+        if (nw is not None and nw in ready and earliest[nw] <= t and t >= last_w + WMMA_CYC and port_ok("WMMA")
+                and cost_ok(nw)):
             pick = nw
         else:
             cand = [i for i in ready if nodes[i].kind != "WMMA" and avail(i)]
@@ -405,6 +455,10 @@ def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
         ready.discard(pick)
         k = nd.kind
         done_at = None
+        ws = wait_seq(pick)
+        if ws >= 0:
+            waited = ws
+        last_t, last_nd = t, nd
         if k in ("DS_LD", "DS_ST"):
             done_at = max(t + LDS_LAT, ds_last_done + LDS_RATE)
             ds_last_done = done_at
@@ -430,9 +484,13 @@ def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
             wk += 1
         if k == "TRANS":
             trans_at = t
+            if TRANS_RATE:
+                trans_done = max(t + LAT["TRANS"], trans_done + TRANS_RATE)
         for s_, l in succ[pick]:
             if k == "DS_LD" and nodes[s_].vuses & nd.vdefs:
                 lat = done_at - t
+            elif k == "TRANS" and TRANS_RATE and nodes[s_].vuses & nd.vdefs:
+                lat = trans_done - t
             elif k == "WMMA":
                 lat = WMMA_CHAIN if nodes[s_].kind == "WMMA" and (nodes[s_].vuses & nd.vdefs) else max(l, 1)
             else:

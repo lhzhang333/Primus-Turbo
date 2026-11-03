@@ -134,10 +134,15 @@ def ld_v(L, par, base, hc):
     ]
 
 
+REUSE = {"a": False, "b": False}  # WMMA operand-reuse hints (build.py --wmma-reuse)
+
+
 def qk_wmmas(L, s, kpar):
-    """S^T(s) = K Q^T: k outer, kt, h inner, chains from +0 (the HIP qk)."""
+    """S^T(s) = K Q^T: k outer, kt, h inner, chains from +0 (the HIP qk). Reuse a: the 4 WMMAs of a (k, kt) group read
+    one K tile (the scheduler keeps the WMMA order: the next WMMA of a hinted one is the group's next)."""
     return [
         wmma(L.S[s][h][kt], L.kab[kpar][kt][k], L.qb[h][k], None if k == 0 else L.S[s][h][kt])
+        + (" matrix_a_reuse" if REUSE["a"] and h < NH - 1 else "")
         for k in range(NDK)
         for kt in range(2)
         for h in range(NH)
@@ -145,7 +150,9 @@ def qk_wmmas(L, s, kpar):
 
 
 def pv_wmmas(L, vpar, h):
-    return [wmma(L.O[h][dt], L.V[vpar][dt], L.P[h], L.O[h][dt]) for dt in range(NDT)]
+    """O^T(h) += V^T P^T(h), dt inner. Reuse b: the 8 WMMAs read one P tile."""
+    return [wmma(L.O[h][dt], L.V[vpar][dt], L.P[h], L.O[h][dt]) + (" matrix_b_reuse" if REUSE["b"] and dt < NDT - 1 else "")
+            for dt in range(NDT)]
 
 
 def tail_texts(L, s, h):

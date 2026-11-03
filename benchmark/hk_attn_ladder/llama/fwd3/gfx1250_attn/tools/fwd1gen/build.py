@@ -374,15 +374,22 @@ def main():
     ap.add_argument("--va-rule", default="class", choices=E.VA_RULES)
     ap.add_argument("--no-entry-va", action="store_true", help="no s_wait_alu depctr_va_vdst(0) at the region starts")
     ap.add_argument("--stage-xcnt", action="store_true", help="end the stage regions with s_wait_xcnt 0 too")
+    ap.add_argument("--dscnt-grain", type=int, default=1, help="derived s_wait_dscnt N rounded down to this grain")
+    ap.add_argument("--pair-costs", action="store_true", help="the scheduler's measured issue-cost pairs and wait cost")
+    ap.add_argument("--wait-cost", type=int, default=None)
+    ap.add_argument("--wmma-reuse", default="", help="a / b / ab: WMMA operand-reuse hints (QK: K tile, PV: P tile)")
     for k, d in (("lds-lat", "LDS_LAT"), ("lds-rate", "LDS_RATE"), ("trans-lat", None), ("valu-lat", None),
-                 ("pk-lat", "PK_LAT"), ("sdst-lat", "SDST_LAT"), ("ds-max", "DS_MAX")):
+                 ("pk-lat", "PK_LAT"), ("sdst-lat", "SDST_LAT"), ("ds-max", "DS_MAX"), ("trans-rate", "TRANS_RATE")):
         ap.add_argument(f"--{k}", type=int, default=None)
     a = ap.parse_args()
     OPT["entry_va"], OPT["stage_xcnt"] = not a.no_entry_va, a.stage_xcnt
     # LLVM's semantics: a tensor_load_to_lds reads its descriptor SGPRs at issue (the compiler rewrites them for the
     # next stage with no s_wait_xcnt); only VMEM / FLAT sources wait for XCNT
     M.XCNT_CLASSES = ("VMEM", "FLAT")
-    GC.set_model(LDS_LAT=a.lds_lat, LDS_RATE=a.lds_rate, PK_LAT=a.pk_lat, SDST_LAT=a.sdst_lat, DS_MAX=a.ds_max)
+    M.DSCNT_GRAIN = a.dscnt_grain
+    G.REUSE["a"], G.REUSE["b"] = "a" in a.wmma_reuse, "b" in a.wmma_reuse
+    GC.set_model(LDS_LAT=a.lds_lat, LDS_RATE=a.lds_rate, PK_LAT=a.pk_lat, SDST_LAT=a.sdst_lat, DS_MAX=a.ds_max,
+                 TRANS_RATE=a.trans_rate, PAIR_COSTS=a.pair_costs or None, WAIT_COST=a.wait_cost)
     if a.trans_lat is not None:
         GC.LAT["TRANS"] = a.trans_lat
     if a.valu_lat is not None:
@@ -391,7 +398,8 @@ def main():
     out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     rec = {"recipe": {"va_rule": a.va_rule, "args": sys.argv[1:], "opt": dict(OPT),
-                      "model": {k: getattr(GC, k) for k in ("LDS_LAT", "LDS_RATE", "PK_LAT", "SDST_LAT", "DS_MAX")}
+                      "model": {k: getattr(GC, k) for k in ("LDS_LAT", "LDS_RATE", "PK_LAT", "SDST_LAT", "DS_MAX",
+                                                             "TRANS_RATE")}
                       | {"LAT": dict(GC.LAT)}}, "checks": {}, "fail": []}
     fail = rec["fail"]
     cmd, s_path, _ = compile_variant(hsaco, a.cxx, out / "shell", reference=False)
