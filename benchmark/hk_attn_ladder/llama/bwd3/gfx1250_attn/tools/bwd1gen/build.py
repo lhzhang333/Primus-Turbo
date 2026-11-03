@@ -255,11 +255,20 @@ def main():
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--cxx", default="amdclang++", help="compiler (the manifest's toolchain)")
     ap.add_argument("--va-rule", default="llvm_war_xdl", choices=E.VA_RULES)
+    ap.add_argument("--ds-lat", type=int, help="model: LDS latency (cycles)")
+    ap.add_argument("--ds-rate", type=int, help="model: LDS cycles per operation of the wave")
+    ap.add_argument("--ds-block", type=int, help="model: issue cycles an LDS instruction holds")
+    ap.add_argument("--sig-before", type=int, help="the barrier signal before this WMMA of the step")
+    ap.add_argument("--wait-before", type=int, help="the barrier wait before this WMMA of the step")
+    ap.add_argument("--tw-after", type=int, help="the signal's tensorcnt wait after this WMMA")
     a = ap.parse_args()
     hsaco = load_hsaco()
     out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    rec = {"recipe": {"va_rule": a.va_rule}, "checks": {}, "fail": []}
+    G.set_model(LDS_LAT=a.ds_lat, LDS_RATE=a.ds_rate, DS_BLOCK=a.ds_block, SIG_BEFORE=a.sig_before,
+                WAIT_BEFORE=a.wait_before, TW_AFTER=a.tw_after)
+    rec = {"recipe": {"va_rule": a.va_rule, "model": {k: getattr(G, k) for k in ("LDS_LAT", "LDS_RATE", "DS_BLOCK", "SIG_BEFORE", "WAIT_BEFORE", "TW_AFTER")}},
+           "checks": {}, "fail": []}  # fmt: skip
     fail = rec["fail"]
     cmd, s_path, _ = compile_variant(hsaco, a.cxx, out / "shell", reference=False)
     rec["recipe"]["compile"] = cmd

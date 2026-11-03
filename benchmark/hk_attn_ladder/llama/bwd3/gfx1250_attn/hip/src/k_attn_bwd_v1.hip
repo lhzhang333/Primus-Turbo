@@ -404,20 +404,20 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd1_g4(
     static_assert(b1::OPT_DQSPLIT != 0 && b1::OPT_TDM3 != 0, "HKGEN: the generated step is BWD1_OPT_DQSPLIT=1, BWD1_OPT_TDM3=1");
     {
         typedef int32_t i32x16 __attribute__((ext_vector_type(16)));
-        // TDM: step s = 4 i + P4 issues op(s + 3). Per P4: the global address of op(P4 + 3)'s tile with the
-        // UNCLAMPED q pair (the generator adds -(one q pair) per iteration and selects tile n - 1's address once
-        // op >= n), bit 63 set (tdm_g0's word 3 bit 31; addresses < 2^57); minus the q-pair step; tile n - 1's
-        // address; the LDS address of the op's slot (P4 + 3) & 3
+        // TDM: INIT issues op 3, step s = 4 i + P4 issues op(s + 4) (behind its barrier wait). Per P4: the global
+        // address of op(P4 + 4)'s tile with the UNCLAMPED q pair (the generator adds -(one q pair) per iteration and
+        // selects tile n - 1's address once op >= n), bit 63 set (tdm_g0's word 3 bit 31; addresses < 2^57); minus the
+        // q-pair step; tile n - 1's address; the LDS address of slot P4 (op k lands in slot k & 3)
         auto gaddr = [&](int qt, int gh) {
             return (uint64_t) (rbase + (uint64_t) b0::role_step_byte(0, rqstep, rhstep, qt, gh)) | (1ull << 63);
         };
         i32x16 tdmv;
         static_for<4>([&](auto p4) {
-            constexpr int k = (int) p4 + b1::LEAD;
+            constexpr int k = (int) p4 + G;
             const uint64_t a = gaddr(nqp - 1 - k / G, (k % G + rot) % G);
             tdmv[2 * p4] = (int) (uint32_t) a;
             tdmv[2 * p4 + 1] = (int) (uint32_t) (a >> 32);
-            tdmv[12 + p4] = (int) (lds0 + (uint32_t) b0::role_lds_at(rlds0, rlstep, k & 3));
+            tdmv[12 + p4] = (int) (lds0 + (uint32_t) b0::role_lds_at(rlds0, rlstep, (int) p4));
         });
         const uint64_t alast = gaddr(b0::tile_qt(n - 1, n, G, nqp), b1::tile_gh(n - 1, n, G, rot));
         const uint64_t nqstep = (uint64_t) (-(int64_t) rqstep); // added once per iteration (s_add_nc_u64)
@@ -427,8 +427,9 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd1_g4(
         tdmv[11] = (int) (uint32_t) (alast >> 32);
         // sc: n, nf; the dQ_acc tile scalars ((gh nqp + qt) << 14) of tiles 0..3 (step s's atomics add tile s - 1's
         // dQ; step 0 adds dQ(-1) = 0 into tile 0); the causal mask base of the first diagonal step (mask_off(qt, hh,
-        // kvw0, w, kh, cshift) = M + 16 hh - 16 kh, M = 32 qt + cshift - kvw0 - 32 w); c1 = scale log2(e)
-        i32x8 scv;
+        // kvw0, w, kh, cshift) = M + 16 hh - 16 kh, M = 32 qt + cshift - kvw0 - 32 w); c1 = scale log2(e); op 3's
+        // global address (tile 3: n >= 4, never clamped)
+        i32x16 scv;
         scv[0] = n;
         scv[1] = nf;
         static_for<4>([&](auto p4) {
@@ -436,6 +437,10 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd1_g4(
         });
         scv[6] = b0::QS * b0::tile_qt(nf, n, G, nqp) + cshift - kvw0 - b0::KVW * w;
         scv[7] = __builtin_bit_cast(int, c1);
+        const uint64_t a3 = gaddr(b0::tile_qt(b1::LEAD, n, G, nqp), b1::tile_gh(b1::LEAD, n, G, rot));
+        scv[8] = (int) (uint32_t) a3;
+        scv[9] = (int) (uint32_t) (a3 >> 32);
+        static_for<6>([&](auto i) { scv[10 + i] = 0; });
         // lane bases (LDS byte addresses; every per-step slot / buffer offset is an instruction immediate)
         const uint32_t q_rows = lds0 + b0::OFF_Q + (uint32_t) b0::rows_lane(l, XP);
         const uint32_t do_rows = lds0 + b0::OFF_DO + (uint32_t) b0::rows_lane(l, XP);

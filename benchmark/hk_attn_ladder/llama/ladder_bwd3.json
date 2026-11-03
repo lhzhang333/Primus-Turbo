@@ -83,6 +83,123 @@
    },
    "feature": "generated g4 body v1: FULL / diagonal steps by the slot scheduler (model ~670 cycles/step), stores before WMMA 50, signal before 60",
    "bitwise_with": "b0"
+  },
+  {
+   "id": "g3",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g2 + barrier wait at W72 with the next op and dS^T(s) behind it, issue-port model (DS holds 4 cycles)",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "g4",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g3 + issue model with same-class memory bursts, WMMA latency 36, RB_GAP 14",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "g5",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g4 + every WAR-on-WMMA load >= 14 WMMAs behind its reader, Q^T loads after W8 / W14, tensorcnt wait late",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "g5c",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [
+      "--va-rule",
+      "class"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g5 with the per-class va_vdst rule (hardware semantics) for every hazard",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "g6a",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [
+      "--va-rule",
+      "class",
+      "--sig-before",
+      "68",
+      "--wait-before",
+      "76",
+      "--tw-after",
+      "60"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g5c with the signal before W68 (tensorcnt after W60), the wait before W76: more TDM lead",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "g6b",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [
+      "--va-rule",
+      "class",
+      "--sig-before",
+      "72",
+      "--wait-before",
+      "78",
+      "--tw-after",
+      "64"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g5c with the signal before W72 (tensorcnt after W64), the wait before W78",
+   "bitwise_with": "b0"
   }
  ]
 }

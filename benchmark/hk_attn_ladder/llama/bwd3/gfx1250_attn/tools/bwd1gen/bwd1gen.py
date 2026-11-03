@@ -169,7 +169,7 @@ class Layout:
 # dependence graph and slot scheduler (tools/bwdgen's, with the split barrier and a VMEM issue rate)
 # --------------------------------------------------------------------------------------------------------------
 LAT = {
-    "WMMA": 20,
+    "WMMA": 36,
     "VALU": 4,
     "TRANS": 8,
     "DS_LD": 90,
@@ -185,13 +185,25 @@ LAT = {
     "BR": 1,
 }
 WMMA_CHAIN = 16
-WAR_XDL, MIN_XDL_AFTER = 24, 3
+WAR_XDL, MIN_XDL_AFTER = 24, 14  # va_vdst(14) on a WAR against a WMMA: free whatever VALU is in flight
 DS_MAX = 48
-VALU_SLOTS, MEM_SLOTS = (2, 3, 6, 7), (1, 4, 5)
-LDS_LAT, LDS_RATE = 70, 8
-VM_RATE = 4
+# issue model (one wave per SIMD; issue-to-issue medians of the generated g3 step, ATT 2026-11-03): one instruction per
+# cycle; a WMMA every WMMA_CYC cycles at most; behind a memory instruction (LDS or VMEM) the next one of the same class
+# (or an s_wait) issues the next cycle, anything else DS_BLOCK cycles after it (L->L 1, A->A 1, L->W / L->V / L->A /
+# A->L / A->W 4); the LDS completes the wave's operations in order, one per LDS_RATE cycles, each at least LDS_LAT
+# after its issue
+WMMA_CYC = 8
+DS_BLOCK = 4
+LDS_LAT, LDS_RATE = 120, 8
 BAR_GAP = 12
 MEM = ("DS_LD", "DS_ST", "VM_LD", "VM_ST", "TDM")
+
+
+def set_model(**kw):
+    """Override model parameters (build.py options)."""
+    for k, v in kw.items():
+        if v is not None:
+            globals()[k] = v
 
 
 class Node:
@@ -247,14 +259,13 @@ def add_order(nodes, a, b, lat=1):
     nodes[b].preds = sorted(d.items())
 
 
-def schedule_slot(nodes, wseq, bar_deps=()):
-    """(ordered nodes, modelled cycles): a cycle-stepped list scheduler around the in-order WMMA stream wseq, one
-    instruction per cycle. A WMMA issues once the previous one left the XDL pipe (8 cycles); inside its window a VALU /
-    TRANS issues only at VALU_SLOTS, a memory op only at MEM_SLOTS; one LDS op per LDS_RATE cycles, completing in order
-    LDS_LAT after issue; one VMEM op per VM_RATE cycles; a TRANS blocks VALU / TRANS the next cycle; s_barrier_signal
-    waits until the LDS ops bar_deps completed (its s_wait_dscnt fence), s_barrier_wait BAR_GAP WMMAs after it; at most
-    DS_MAX LDS loads in flight. Ties: barrier and wait nodes first, then the earliest deadline (the first WMMA that needs
-    the node, transitively), the longest critical path, program order."""
+def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
+    """(ordered nodes, modelled cycles): a cycle-stepped list scheduler around the in-order WMMA stream wseq on the issue
+    model above. An LDS instruction issues only if its DS_BLOCK fits before the next WMMA's cycle (unless that WMMA is
+    not ready anyway); the fence node (the barrier signal's s_wait_dscnt) issues once the LDS ops bar_deps completed;
+    s_barrier_wait BAR_GAP WMMAs after the signal; at most DS_MAX LDS loads in flight. Ties: barrier and wait nodes
+    first, then the earliest deadline (the first WMMA that needs the node, transitively), the longest critical path,
+    program order."""
     n = len(nodes)
     succ = [[] for _ in range(n)]
     for i, nd in enumerate(nodes):
@@ -267,12 +278,13 @@ def schedule_slot(nodes, wseq, bar_deps=()):
             dl[i] = min(dl[i], wpos[s_] if s_ in wpos else dl[s_])
     cp = [0] * n
     for i in range(n - 1, -1, -1):
-        cp[i] = (8 if nodes[i].kind == "WMMA" else 1) + max((l + cp[s] for s, l in succ[i]), default=0)
+        cp[i] = (WMMA_CYC if nodes[i].kind == "WMMA" else 1) + max((l + cp[s] for s, l in succ[i]), default=0)
     npred = [len(nd.preds) for nd in nodes]
     earliest = [0] * n
     ready = set(i for i in range(n) if npred[i] == 0)
     out, wmma_at, done = [], {}, {}
-    t, last_w, wk, trans_at, ds_next, ds_last_done, vm_next = 0, -100, 0, -100, 0, 0, 0
+    t, last_w, wk, trans_at, ds_last_done = 0, -100, 0, -100, 0
+    mem_t, mem_c, ds_next = -100, None, 0
     ds_issued, ds_retired, ds_seq = 0, -1, {}
     bs_wk = 10**6
     bar_deps = set(bar_deps)
@@ -285,38 +297,50 @@ def schedule_slot(nodes, wseq, bar_deps=()):
             return False
         return wk - 1 - max(wmma_at[r] for r in rs) >= MIN_XDL_AFTER or wk >= len(wseq)
 
+    def next_wmma_ready():
+        nw = wseq[wk] if wk < len(wseq) else None
+        return nw is not None and nw in ready
+
+    def mclass(k):
+        return "DS" if k in ("DS_LD", "DS_ST") else "VM" if k in ("VM_LD", "VM_ST") else k
+
+    def port_ok(k):
+        """the issue port behind the last memory instruction (at mem_t, class mem_c)"""
+        if mem_c is None:
+            return True
+        if mclass(k) == mem_c or k == "WAIT_CNT":
+            return t >= mem_t + 1
+        return t >= mem_t + DS_BLOCK
+
     def avail(i):
         k = nodes[i].kind
-        if earliest[i] > t:
+        if earliest[i] > t or not port_ok(k):
             return False
-        o = t - last_w
-        inwin = 0 <= o < 8
-        if k in ("VALU", "TRANS"):
-            return (not inwin or o in VALU_SLOTS) and t != trans_at + 1
+        if k == "TRANS" and t == trans_at + 1:
+            return False
         if k in MEM:
             if not xdl_ok(i):
                 return False
-            if k in ("DS_LD", "DS_ST") and (t < ds_next or ds_issued - 1 - ds_retired >= DS_MAX):
+            if k in ("DS_LD", "DS_ST") and sum(1 for x in done.values() if x > t) >= DS_MAX:
                 return False
-            if k in ("VM_LD", "VM_ST") and t < vm_next:
+            # the WMMA after it waits DS_BLOCK: only if it fits before the WMMA's cycle (or the WMMA is not ready)
+            if t + DS_BLOCK > last_w + WMMA_CYC and next_wmma_ready() and wk < len(wseq):
                 return False
-            return not inwin or o in MEM_SLOTS
-        if k == "BAR_S":
-            return o != 0 and all(j in done and done[j] <= t for j in bar_deps)
+            return True
+        if i == fence:
+            return all(j in done and done[j] <= t for j in bar_deps)
         if k == "BAR_W":
-            return o != 0 and (wk >= bs_wk + BAR_GAP or wk >= len(wseq))
-        return o != 0
+            return wk >= bs_wk + BAR_GAP or wk >= len(wseq)
+        return True
 
     while len(out) < n:
         pick = None
         nw = wseq[wk] if wk < len(wseq) else None
-        if nw is not None and nw in ready and earliest[nw] <= t and t >= last_w + 8:
+        if nw is not None and nw in ready and earliest[nw] <= t and t >= last_w + WMMA_CYC and port_ok("WMMA"):
             pick = nw
         else:
             cand = [i for i in ready if nodes[i].kind != "WMMA" and avail(i)]
             if cand:
-                if 0 <= t - last_w < 8 and t - last_w in VALU_SLOTS:
-                    cand = [i for i in cand if nodes[i].kind in ("VALU", "TRANS")] or cand
                 pick = max(
                     cand, key=lambda i: (nodes[i].kind in ("BAR_S", "BAR_W", "WAIT_CNT"), -dl[i], cp[i], -i)
                 )
@@ -330,19 +354,19 @@ def schedule_slot(nodes, wseq, bar_deps=()):
         k = nd.kind
         done_at = None
         if k in ("DS_LD", "DS_ST"):
-            ds_next = max(t, ds_next) + LDS_RATE
             done_at = max(t + LDS_LAT, ds_last_done + LDS_RATE)
             ds_last_done = done_at
             ds_seq[pick] = ds_issued
             ds_issued += 1
             done[pick] = done_at
-        if k in ("VM_LD", "VM_ST"):
-            vm_next = t + VM_RATE
+        if k in MEM:
+            mem_t, mem_c = t, mclass(k)
         for p, _ in nd.preds:
             if nodes[p].kind == "DS_LD" and p in ds_seq and nd.vuses & nodes[p].vdefs:
                 ds_retired = max(ds_retired, ds_seq[p])
-        if k == "BAR_S":
+        if pick == fence:
             ds_retired = max([ds_retired] + [ds_seq[j] for j in bar_deps if j in ds_seq])
+        if k == "BAR_S":
             bs_wk = wk
         out.append(nd)
         if k == "WMMA":
@@ -363,7 +387,7 @@ def schedule_slot(nodes, wseq, bar_deps=()):
             if npred[s_] == 0:
                 ready.add(s_)
         t += 1
-    return out, max(t, last_w + 8)
+    return out, max(t, last_w + WMMA_CYC)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -467,18 +491,25 @@ def atomic_texts(L, ops, vo):
 # --------------------------------------------------------------------------------------------------------------
 # one step
 # --------------------------------------------------------------------------------------------------------------
-# readback deadlines: k-step dt of the next step's S / dP operands before WMMA RB_BEFORE[dt] of this step, the LD
-# records before LD_BEFORE; the dQ atomic a before WMMA 49 + a (one per window in D and E)
+# deadlines (WMMA indices of the step): Q^T 0..3 by QA_BEFORE, Q^T 4..7 and dO^T 4..7 by QB_BEFORE (the signal's
+# fence then waits for the stores only); readback(s + 1) k-step dt by RB_BEFORE[dt], its LD records by LD_BEFORE; the
+# dS^T stores by ST_BEFORE; the dQ atomic a by WMMA 49 + a; the signal by SIG_BEFORE, the barrier wait by WAIT_BEFORE.
+# A load that overwrites a WMMA operand register stands RB_GAP WMMAs after the WMMA's last reader.
+QA_BEFORE, QB_BEFORE = 24, 40
+QA_AFTER, QB_AFTER = 8, 14
 RB_BEFORE = (44, 52, 60, 68)
-LD_BEFORE = 76
-SIG_BEFORE = 60  # within D (48..63): the signal is listed among the dV WMMAs
-ST_BEFORE = 50  # the dS^T stores early in D: the signal's fence then waits for little more than them
-QA_BEFORE, QB_BEFORE = 16, 40  # Q^T 0..3 in A, Q^T 4..7 and dO^T 4..7 by WMMA 40
-RB_GAP = 8  # WMMAs between a register's last WMMA reader and the load that overwrites it
+LD_BEFORE = 64
+ST_BEFORE = 52
+SIG_BEFORE = 60
+WAIT_BEFORE = 72
+TW_AFTER = 50  # the signal's s_wait_tensorcnt after this WMMA
+RB_GAP = 14  # va_vdst(14): no wait whatever VALU is in flight
 
 
 def step_nodes(L, ops, p4, masked):
-    """(nodes, WMMA order, barrier deps) of one step with P4 = p4 (program order = semantics)."""
+    """(nodes, WMMA order, protocol LDS ops, fence) of one step with P4 = p4 (program order = semantics). The step
+    starts with the dQ(s - 1) operands in VGPRs (dS^T(s - 1) read behind the previous step's barrier wait) and op(s + 3)
+    in flight; it ends with readback(s + 1), dO^T(s + 1) 0..3, dS^T(s) and op(s + 4) issued."""
     nodes = []
 
     def add(text, tag=None):
@@ -490,37 +521,41 @@ def step_nodes(L, ops, p4, masked):
     desc = SG_DESC[P]
     tdm, sc = ops["tdm"], ops["sc"]
     n_ = sreg(sc, 0)
-    W = []
-    proto = []  # LDS ops that complete before the barrier signal
-    # entry: the TDM op of tile s + 3 (clamped to tile n - 1), the next iteration's address of this P4, the voffset
-    add(f"s_add_co_i32 {SG_T}, {SG_S}, {p4 + 3}")
-    add(f"s_cmp_ge_i32 {SG_T}, {n_}")
-    add(f"s_cselect_b64 s[{desc + 2}:{desc + 3}], {spair(tdm, 10)}, s[{SG_A[p4]}:{SG_A[p4] + 1}]")
-    add(f"s_mov_b32 s{desc + 1}, {sreg(tdm, 12 + p4)}")
-    tdm_i = add(f"tensor_load_to_lds s[{desc}:{desc + 3}], {ops['g1']}")
-    add(f"s_add_nc_u64 s[{SG_A[p4]}:{SG_A[p4] + 1}], s[{SG_A[p4]}:{SG_A[p4] + 1}], {spair(tdm, 8)}")
+    W, proto = [], []
     vsel = SG_U if p4 == 0 else SG_V[p4 - 1]
     add(f"v_add_nc_u32 {vr(L.vo[P])}, {vsel}, {ops['vl']}")
     if masked:
         add(f"v_subrev_nc_u32 {vr(L.thr[1])}, {SG_M}, {ops['dl']}")
         add(f"v_add_nc_u32 {vr(L.thr[0])}, 16, {vr(L.thr[1])}")
         add(f"v_add_nc_u32 {vr(L.thr[2])}, -16, {vr(L.thr[1])}")
-    # A: dS^T(s - 1) (buffer P ^ 1, written before the previous barrier), Q^T(s) 0..3
-    for t in dsa_texts(L, ops, P ^ 1):
-        proto.append(add(t))
-    qt_a = [add(t) for t in tr_texts(L, ops, "q", slot, range(4))]
-    proto += qt_a
+    # A: S / dP of kv tile 0 || Q^T(s) 0..3
+    # (listed QA_AFTER / QB_AFTER WMMAs into the step: they overwrite Q^T / dO^T(s - 1), which the previous step's
+    # last dK / dV WMMAs read; the emitter's va_vdst bound grows with every WMMA in between)
     sdp0, sdp1 = sdp_wmmas(L, 0), sdp_wmmas(L, 1)
+    qt_a, qt_b = [], []
+    hooks = {}
+
+    def load_qa():
+        qt_a.extend(add(t) for t in tr_texts(L, ops, "q", slot, range(4)))
+
+    def load_qb():
+        qt_b.extend(add(t) for t in tr_texts(L, ops, "q", slot, range(4, 8)) + tr_texts(L, ops, "d", slot, range(4, 8)))
+
+    hooks[QA_AFTER], hooks[QB_AFTER] = load_qa, load_qb
     for t in sdp0:
+        k = len(W)
+        if k in hooks:
+            hooks[k]()
         W.append(add(t))
-    # B: Q^T 4..7, dO^T 4..7 (dO^T 0..3 came in the previous step)
-    qt_b = [add(t) for t in tr_texts(L, ops, "q", slot, range(4, 8)) + tr_texts(L, ops, "d", slot, range(4, 8))]
-    proto += qt_b
-    # readback(s + 1) k-step dt is listed (and ordered) RB_GAP WMMAs after the last kv tile 1 WMMA reading it: the
-    # va_vdst bound of its WAR against those WMMAs is then >= RB_GAP, which in-flight VALU rarely exceed
+    proto += qt_a
+    # B: S / dP of kv tile 1 || softmax kv tile 0; Q^T 4..7, dO^T 4..7; readback(s + 1) dt by dt, RB_GAP WMMAs after
+    # the last kv tile 1 WMMA reading k-step dt
     rb, rb_at = {}, {16 + 4 * dt + 3 + RB_GAP: dt for dt in range(4)}
 
     def wm(t):
+        k = len(W)
+        if k in hooks:
+            hooks[k]()
         W.append(add(t))
         dt = rb_at.get(len(W) - 1)
         if dt is not None:
@@ -528,13 +563,14 @@ def step_nodes(L, ops, p4, masked):
 
     for t in sdp1:
         wm(t)
+    proto += qt_b
     soft0 = [add(t) for hh in range(2) for t in softmax_texts(L, hh, 0, masked)]
     # C: dQ(s - 1) || softmax kv tile 1
     for t in dq_wmmas(L):
         wm(t)
     soft1 = [add(t) for hh in range(2) for t in softmax_texts(L, hh, 1, masked)]
     # D: the dS^T(s) stores (buffer P) after the whole softmax (one va_vdst(0) covers them all), then the dQ(s - 1)
-    # atomics (their WMMAs retired by that wait) and the LD records of s + 1 (the softmax read them)
+    # atomics and the LD records of s + 1 (the softmax read them)
     stores = []
     for kh in range(2):
         for hh in range(2):
@@ -543,12 +579,31 @@ def step_nodes(L, ops, p4, masked):
     proto += stores
     atoms = [add(t) for t in atomic_texts(L, ops, L.vo[P])]
     lds = [add(t) for t in ld_texts(L, ops, nslot)]
+    sigs = {}
+
+    def signal():
+        sigs["tw"] = add("s_wait_tensorcnt 0x1")  # op(s + 2) landed (op(s + 3) may fly) before the signal
+        sigs["fence"] = add("s_wait_dscnt 0x0", tag="fence")
+        sigs["sig"] = add("s_barrier_signal -1")
+
+    post = {}
+
+    def wait():
+        post["bw"] = add("s_barrier_wait -1")
+        # op(s + 4) into slot P4 (tile s's slot: every wave's reads of it preceded the signal), clamped to tile n - 1
+        add(f"s_add_co_i32 {SG_T}, {SG_S}, {p4 + 4}")
+        add(f"s_cmp_ge_i32 {SG_T}, {n_}")
+        add(f"s_cselect_b64 s[{desc + 2}:{desc + 3}], {spair(tdm, 10)}, s[{SG_A[p4]}:{SG_A[p4] + 1}]")
+        add(f"s_mov_b32 s{desc + 1}, {sreg(tdm, 12 + p4)}")
+        post["tdm"] = add(f"tensor_load_to_lds s[{desc}:{desc + 3}], {ops['g1']}")
+        add(f"s_add_nc_u64 s[{SG_A[p4]}:{SG_A[p4] + 1}], s[{SG_A[p4]}:{SG_A[p4] + 1}], {spair(tdm, 8)}")
+        # dS^T(s) (buffer P, every wave's stores preceded the signal): the next step's dQ operands
+        post["dsa"] = [add(t) for t in dsa_texts(L, ops, P)]
+
+    hooks[SIG_BEFORE] = signal
+    hooks[WAIT_BEFORE] = wait
     for kh in range(2):
         for dt in range(8):
-            if len(W) == SIG_BEFORE:  # the signal's nodes stand before the WMMA they must precede (edges point forward)
-                tw = add("s_wait_tensorcnt 0x1")
-                fence = add("s_wait_dscnt 0x0", tag="fence")
-                sig = add("s_barrier_signal -1")
             wm(wmma(L.accV[dt][kh], L.dOT[dt], L.P[kh], L.accV[dt][kh]))
     # E: dK^T; dO^T(s + 1) 0..3 RB_GAP WMMAs after the last dV WMMA reading them (W 56 + 3)
     dnext = []
@@ -563,15 +618,20 @@ def step_nodes(L, ops, p4, masked):
             add(f"s_add_co_i32 {v}, {v}, 0xffffc000")
         if masked:
             add(f"s_add_co_i32 {SG_M}, {SG_M}, -32")
-    bw = add("s_barrier_wait -1")
     build_dag(nodes)
-    # protocol: every read of slot s, the dS^T(s - 1) reads and the stores complete before the signal
+    tw, fence, sig, bw = sigs["tw"], sigs["fence"], sigs["sig"], post["bw"]
+    # protocol: every read of slot s and the dS^T(s) stores complete before the signal; the wait after it
     for i in proto:
         add_order(nodes, i, fence)
-    add_order(nodes, tdm_i, tw)  # tensorcnt 1 after this step's op: op(s + 2) landed before the signal
+    add_order(nodes, W[TW_AFTER], tw)  # late: op(s + 2) has (mostly) landed by then
     add_order(nodes, tw, fence)
     add_order(nodes, fence, sig)
     add_order(nodes, sig, W[SIG_BEFORE])
+    add_order(nodes, sig, bw)
+    add_order(nodes, bw, W[WAIT_BEFORE])
+    add_order(nodes, bw, post["tdm"])
+    for i in post["dsa"]:
+        add_order(nodes, bw, i)
     for j in soft1:
         for i in stores:
             add_order(nodes, j, i)
@@ -580,8 +640,6 @@ def step_nodes(L, ops, p4, masked):
         for j in lds:
             add_order(nodes, i, j)
         add_order(nodes, i, W[ST_BEFORE])
-    # deadlines: the slot-s operands early (the signal's fence then waits for the stores only), the next step's
-    # operands, the atomics one per window from WMMA 49
     for i in qt_a:
         add_order(nodes, i, W[QA_BEFORE])
     for i in qt_b:
@@ -594,10 +652,6 @@ def step_nodes(L, ops, p4, masked):
     for a, i in enumerate(atoms):
         if 49 + a < len(W):
             add_order(nodes, i, W[49 + a])
-    # the barrier wait ends the step
-    for i in range(len(nodes) - 1):
-        if i != bw:
-            add_order(nodes, i, bw)
     return nodes, W, proto, fence
 
 
@@ -614,7 +668,7 @@ def fix_fence(order, proto_nodes, fence_node):
 def region_step(L, ops, p4, masked):
     """(instruction texts, modelled cycles) of one step."""
     nodes, W, proto, fence = step_nodes(L, ops, p4, masked)
-    order, cycles = schedule_slot(nodes, W, bar_deps=proto)
+    order, cycles = schedule_slot(nodes, W, fence=fence, bar_deps=proto)
     fix_fence(order, [nodes[i] for i in proto], nodes[fence])
     return [n.text for n in order], cycles
 
@@ -646,14 +700,20 @@ def region_init(L, ops):
         out.append(f"s_mov_b64 s[{SG_A[p4]}:{SG_A[p4] + 1}], {spair(tdm, 2 * p4)}")
         out.append(f"s_mov_b32 {SG_V[p4]}, {sreg(sc, 2 + p4)}")
     out += [f"s_mov_b32 {SG_U}, {sreg(sc, 2)}", f"s_mov_b32 {SG_S}, 0", f"s_mov_b32 {SG_M}, {sreg(sc, 6)}"]
+    # op 3 into slot 3 (the prologue's barrier already ordered it after every wave's start; step 1's descriptor set),
+    # and dS^T(-1) = 0 (buffer 1, zeroed by the shell): step 0's dQ operands
+    d = SG_DESC[1]
+    out += [f"s_mov_b32 s{d + 1}, {sreg(tdm, 15)}", f"s_mov_b64 s[{d + 2}:{d + 3}], {spair(sc, 8)}",
+            f"tensor_load_to_lds s[{d}:{d + 3}], {ops['g1']}"]  # fmt: skip
+    out += dsa_texts(L, ops, 1)
     return out
 
 
 def region_final(L, ops):
-    """FINAL: dQ(n - 1) from dS^T buffer 1 and its atomics (tile n - 1: SG_U), then dV^T and scale * dK^T to bf16
-    (in place) and whole-row buffer stores (lane voffsets ev / ek per kv tile, + 32 dt)."""
-    out = dsa_texts(L, ops, 1)
-    out += dq_wmmas(L)
+    """FINAL: dQ(n - 1) (its operands dS^T(n - 1) read behind the last step's barrier wait) and its atomics (tile n - 1:
+    SG_U), then dV^T and scale * dK^T to bf16 (in place) and whole-row buffer stores (lane voffsets ev / ek per kv
+    tile, + 32 dt)."""
+    out = dq_wmmas(L)
     out.append(f"v_add_nc_u32 {vr(L.vo[0])}, {SG_U}, {ops['vl']}")
     out += atomic_texts(L, ops, L.vo[0])
     out += [f"v_mov_b32 {vr(L.c1)}, {ops['scale']}", f"v_mov_b32 {vr(L.c1 + 1)}, {ops['scale']}"]
