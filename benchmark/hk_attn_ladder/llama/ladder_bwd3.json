@@ -200,6 +200,122 @@
    },
    "feature": "g5c with the signal before W72 (tensorcnt after W64), the wait before W78",
    "bitwise_with": "b0"
+  },
+  {
+   "id": "g7a",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [
+      "--va-rule",
+      "class",
+      "--sig-before",
+      "72",
+      "--wait-before",
+      "78",
+      "--tw-after",
+      "64",
+      "--atom-after",
+      "58"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g6b + the dQ atomics after W58, spread to the step end (RAW on dq >= 14 XDL)",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "g7b",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [
+      "--va-rule",
+      "class",
+      "--sig-before",
+      "72",
+      "--wait-before",
+      "78",
+      "--tw-after",
+      "64",
+      "--atom-after",
+      "58",
+      "--qa-after",
+      "16",
+      "--qb-after",
+      "20"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g7a + Q^T 0..3 after W16, Q^T / dO^T 4..7 after W20",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "g8a",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [
+      "--va-rule",
+      "class",
+      "--sig-before",
+      "72",
+      "--wait-before",
+      "78",
+      "--tw-after",
+      "64",
+      "--atom-after",
+      "58",
+      "--vm-burst",
+      "2"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g7a + at most 2 atomics in a row (8 cycles between pairs)",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "g8b",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [
+      "--va-rule",
+      "class",
+      "--sig-before",
+      "72",
+      "--wait-before",
+      "78",
+      "--tw-after",
+      "64",
+      "--atom-after",
+      "58",
+      "--vm-burst",
+      "1"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g7a + atomics one at a time (8 cycles apart)",
+   "bitwise_with": "b0"
   }
  ]
 }

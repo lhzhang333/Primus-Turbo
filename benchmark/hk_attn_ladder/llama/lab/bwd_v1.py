@@ -317,7 +317,9 @@ def _check_code_object(path):
         t = table.get(name)
         if t is None:
             raise hiprt.HipError(f"bwd_v1: {name} not in {path}")
-        if t["lds"] != spec["lds"] or t["scratch"] != 0 or t["vgpr_spill"] or t["sgpr_spill"]:
+        # lab: the g4 LDS map grows with the tile pitch B0_XP (272 -> 266240 B, 288 -> 270336 B)
+        lds_ok = (266240, 270336) if name == "k_hk_bwd1_g4" else (spec["lds"],)
+        if t["lds"] not in lds_ok or t["scratch"] != 0 or t["vgpr_spill"] or t["sgpr_spill"]:
             raise hiprt.HipError(f"bwd_v1: {name} in {path}: lds {t['lds']} (want {spec['lds']}), scratch "
                                  f"{t['scratch']}, spill v{t['vgpr_spill']} s{t['sgpr_spill']}")  # fmt: skip
         n0, ns = len(spec["args"]), len(spec["args"]) + len(stride_args(name))

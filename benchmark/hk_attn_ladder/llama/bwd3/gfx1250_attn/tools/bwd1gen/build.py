@@ -193,7 +193,7 @@ def generate(lines, lo, hi, ops, mline, fmap, rec, va_rule):
         for t in succ:
             preds[t].append(name)
     entry, out, exits, sig = {}, {}, {}, {}
-    for it in range(64):
+    for it in range(256):
         changed = False
         for n in names:
             if n == "I":
@@ -202,7 +202,11 @@ def generate(lines, lo, hi, ops, mline, fmap, rec, va_rule):
                 ins_fl = [exits[p] for p in preds[n] if p in exits]
                 if not ins_fl:
                     continue
-                fl_in = M.Flow.join(ins_fl)
+                # monotone: the previous entry flow joins in (a 2-cycle of emitted waits cannot oscillate; every
+                # emitted wait holds for the union of what reached the block)
+                fl_in = M.Flow.join(ins_fl + ([entry[n]] if n in entry and it >= 32 else []))
+                if it >= 32 and len(fl_in.sts) > 1:  # one conservative merged state: monotone, so it converges
+                    fl_in.sts = [E.join(fl_in.sts)]
             sg = fl_in.sig()
             if sig.get(n) == sg:
                 continue
@@ -261,13 +265,18 @@ def main():
     ap.add_argument("--sig-before", type=int, help="the barrier signal before this WMMA of the step")
     ap.add_argument("--wait-before", type=int, help="the barrier wait before this WMMA of the step")
     ap.add_argument("--tw-after", type=int, help="the signal's tensorcnt wait after this WMMA")
+    ap.add_argument("--atom-after", type=int, help="the dQ atomics after this WMMA")
+    ap.add_argument("--vm-burst", type=int, help="model: at most this many VMEM ops in a row")
+    ap.add_argument("--qa-after", type=int, help="Q^T 0..3 listed after this WMMA")
+    ap.add_argument("--qb-after", type=int, help="Q^T 4..7, dO^T 4..7 listed after this WMMA")
     a = ap.parse_args()
     hsaco = load_hsaco()
     out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     G.set_model(LDS_LAT=a.ds_lat, LDS_RATE=a.ds_rate, DS_BLOCK=a.ds_block, SIG_BEFORE=a.sig_before,
-                WAIT_BEFORE=a.wait_before, TW_AFTER=a.tw_after)
-    rec = {"recipe": {"va_rule": a.va_rule, "model": {k: getattr(G, k) for k in ("LDS_LAT", "LDS_RATE", "DS_BLOCK", "SIG_BEFORE", "WAIT_BEFORE", "TW_AFTER")}},
+                WAIT_BEFORE=a.wait_before, TW_AFTER=a.tw_after, ATOM_AFTER=a.atom_after, QA_AFTER=a.qa_after,
+                QB_AFTER=a.qb_after, VM_BURST=a.vm_burst)
+    rec = {"recipe": {"va_rule": a.va_rule, "model": {k: getattr(G, k) for k in ("LDS_LAT", "LDS_RATE", "DS_BLOCK", "SIG_BEFORE", "WAIT_BEFORE", "TW_AFTER", "ATOM_AFTER", "QA_AFTER", "QB_AFTER", "VM_BURST")}},
            "checks": {}, "fail": []}  # fmt: skip
     fail = rec["fail"]
     cmd, s_path, _ = compile_variant(hsaco, a.cxx, out / "shell", reference=False)

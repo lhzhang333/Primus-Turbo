@@ -196,6 +196,7 @@ WMMA_CYC = 8
 DS_BLOCK = 4
 LDS_LAT, LDS_RATE = 120, 8
 BAR_GAP = 12
+VM_BURST, VM_GAP = None, 8  # int: at most VM_BURST VMEM ops in a row, then VM_GAP cycles without one
 MEM = ("DS_LD", "DS_ST", "VM_LD", "VM_ST", "TDM")
 
 
@@ -285,6 +286,7 @@ def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
     out, wmma_at, done = [], {}, {}
     t, last_w, wk, trans_at, ds_last_done = 0, -100, 0, -100, 0
     mem_t, mem_c, ds_next = -100, None, 0
+    vm_run, vm_last = 0, -100
     ds_issued, ds_retired, ds_seq = 0, -1, {}
     bs_wk = 10**6
     bar_deps = set(bar_deps)
@@ -323,14 +325,16 @@ def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
                 return False
             if k in ("DS_LD", "DS_ST") and sum(1 for x in done.values() if x > t) >= DS_MAX:
                 return False
+            if k in ("VM_LD", "VM_ST") and VM_BURST and vm_run >= VM_BURST and t < vm_last + VM_GAP:
+                return False
             # the WMMA after it waits DS_BLOCK: only if it fits before the WMMA's cycle (or the WMMA is not ready)
             if t + DS_BLOCK > last_w + WMMA_CYC and next_wmma_ready() and wk < len(wseq):
                 return False
             return True
         if i == fence:
             return all(j in done and done[j] <= t for j in bar_deps)
-        if k == "BAR_W":
-            return wk >= bs_wk + BAR_GAP or wk >= len(wseq)
+        if k == "BAR_W":  # BAR_GAP WMMAs after the signal, unless its deadline WMMA comes first
+            return wk >= bs_wk + BAR_GAP or wk >= len(wseq) or (bs_wk < 10**6 and wk >= WAIT_BEFORE)
         return True
 
     while len(out) < n:
@@ -347,7 +351,10 @@ def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
         if pick is None:
             t += 1
             if t > 10**6:
-                raise RuntimeError("slot scheduler deadlock")
+                nw = wseq[wk] if wk < len(wseq) else None
+                miss = [p for p, _ in nodes[nw].preds if p not in set(id(x) for x in out) and nodes[p] not in out][:5] if nw is not None else []
+                raise RuntimeError(f"slot scheduler deadlock at WMMA {wk}: ready {[(i, nodes[i].text[:40]) for i in sorted(ready)][:6]}, "
+                                   f"next WMMA missing preds {[(p, nodes[p].text[:50]) for p in miss]}")
             continue
         nd = nodes[pick]
         ready.discard(pick)
@@ -361,6 +368,9 @@ def schedule_slot(nodes, wseq, fence=None, bar_deps=()):
             done[pick] = done_at
         if k in MEM:
             mem_t, mem_c = t, mclass(k)
+        if k in ("VM_LD", "VM_ST"):
+            vm_run = vm_run + 1 if t - vm_last < VM_GAP else 1
+            vm_last = t
         for p, _ in nd.preds:
             if nodes[p].kind == "DS_LD" and p in ds_seq and nd.vuses & nodes[p].vdefs:
                 ds_retired = max(ds_retired, ds_seq[p])
@@ -497,6 +507,7 @@ def atomic_texts(L, ops, vo):
 # A load that overwrites a WMMA operand register stands RB_GAP WMMAs after the WMMA's last reader.
 QA_BEFORE, QB_BEFORE = 24, 40
 QA_AFTER, QB_AFTER = 8, 14
+ATOM_AFTER = None  # int: the dQ atomics listed behind this WMMA (>= 14 XDL after the last dQ WMMA, 47 -> 61), spread to the end
 RB_BEFORE = (44, 52, 60, 68)
 LD_BEFORE = 64
 ST_BEFORE = 52
@@ -547,7 +558,6 @@ def step_nodes(L, ops, p4, masked):
         if k in hooks:
             hooks[k]()
         W.append(add(t))
-    proto += qt_a
     # B: S / dP of kv tile 1 || softmax kv tile 0; Q^T 4..7, dO^T 4..7; readback(s + 1) dt by dt, RB_GAP WMMAs after
     # the last kv tile 1 WMMA reading k-step dt
     rb, rb_at = {}, {16 + 4 * dt + 3 + RB_GAP: dt for dt in range(4)}
@@ -563,7 +573,6 @@ def step_nodes(L, ops, p4, masked):
 
     for t in sdp1:
         wm(t)
-    proto += qt_b
     soft0 = [add(t) for hh in range(2) for t in softmax_texts(L, hh, 0, masked)]
     # C: dQ(s - 1) || softmax kv tile 1
     for t in dq_wmmas(L):
@@ -577,7 +586,11 @@ def step_nodes(L, ops, p4, masked):
             o = P * DS_B + 16 * kh * SP + 32 * hh
             stores.append(add(f"ds_store_b128 {ops['dss']}, {vr(L.DS[kh] + 4 * hh, 4)}{offset(o)}"))
     proto += stores
-    atoms = [add(t) for t in atomic_texts(L, ops, L.vo[P])]
+    atoms = []
+
+    def atomics():
+        atoms.extend(add(t) for t in atomic_texts(L, ops, L.vo[P]))
+
     lds = [add(t) for t in ld_texts(L, ops, nslot)]
     sigs = {}
 
@@ -602,6 +615,10 @@ def step_nodes(L, ops, p4, masked):
 
     hooks[SIG_BEFORE] = signal
     hooks[WAIT_BEFORE] = wait
+    if ATOM_AFTER is None:
+        atomics()  # g6b: right behind the stores, the a-th by WMMA 49 + a
+    else:
+        hooks[ATOM_AFTER] = atomics
     for kh in range(2):
         for dt in range(8):
             wm(wmma(L.accV[dt][kh], L.dOT[dt], L.P[kh], L.accV[dt][kh]))
@@ -620,6 +637,13 @@ def step_nodes(L, ops, p4, masked):
             add(f"s_add_co_i32 {SG_M}, {SG_M}, -32")
     build_dag(nodes)
     tw, fence, sig, bw = sigs["tw"], sigs["fence"], sigs["sig"], post["bw"]
+    proto += qt_a + qt_b
+    # the Q^T / dO^T(s) loads stay behind QA_AFTER / QB_AFTER WMMAs (cross-step WAR against the previous dK / dV)
+    if QA_AFTER > 8 or QB_AFTER > 14:
+        for i in qt_a:
+            add_order(nodes, W[QA_AFTER - 1], i)
+        for i in qt_b:
+            add_order(nodes, W[QB_AFTER - 1], i)
     # protocol: every read of slot s and the dS^T(s) stores complete before the signal; the wait after it
     for i in proto:
         add_order(nodes, i, fence)
@@ -636,7 +660,8 @@ def step_nodes(L, ops, p4, masked):
         for i in stores:
             add_order(nodes, j, i)
     for i in stores:
-        add_order(nodes, i, atoms[0])
+        if atoms and i < atoms[0]:
+            add_order(nodes, i, atoms[0])
         for j in lds:
             add_order(nodes, i, j)
         add_order(nodes, i, W[ST_BEFORE])
@@ -649,9 +674,11 @@ def step_nodes(L, ops, p4, masked):
             add_order(nodes, i, W[RB_BEFORE[dt]])
     for i in lds:
         add_order(nodes, i, W[LD_BEFORE])
-    for a, i in enumerate(atoms):
-        if 49 + a < len(W):
-            add_order(nodes, i, W[49 + a])
+    na = len(atoms)
+    for a, i in enumerate(atoms):  # spread over the WMMAs after ATOM_AFTER (an atomic's issue holds the next memory op)
+        k = 49 + a if ATOM_AFTER is None else ATOM_AFTER + 1 + (a * (len(W) - ATOM_AFTER - 1)) // na
+        if k < len(W):
+            add_order(nodes, i, W[k])
     return nodes, W, proto, fence
 
 
