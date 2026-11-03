@@ -166,7 +166,7 @@ def verify_func(s_lines, objdump_path, out_dir):
     return VO.compare(str(a), str(b), log=log)
 
 
-def generate(lines, lo, hi, ops, mline, fmap, rec, va_rule):
+def generate(lines, lo, hi, ops, mline, fmap, rec, va_rule, xregs=None):
     """The region's lines (the blocks, emitted from their fixed-point entry flows) or None; failed checks to
     rec["fail"]."""
     fail = rec["fail"]
@@ -198,6 +198,10 @@ def generate(lines, lo, hi, ops, mline, fmap, rec, va_rule):
         for n in names:
             if n == "I":
                 fl_in = unknown_flow()
+                if xregs is not None:  # exactly the SGPRs the shell's VMEM / TDM ops read may still be read
+                    x = M.XState(False)
+                    x.regs = set(xregs)
+                    fl_in.xs = [x]
             else:
                 ins_fl = [exits[p] for p in preds[n] if p in exits]
                 if not ins_fl:
@@ -267,6 +271,7 @@ def main():
     ap.add_argument("--tw-after", type=int, help="the signal's tensorcnt wait after this WMMA")
     ap.add_argument("--atom-after", type=int, help="the dQ atomics after this WMMA")
     ap.add_argument("--vm-burst", type=int, help="model: at most this many VMEM ops in a row")
+    ap.add_argument("--xcnt-entry", action="store_true", help="exact XCNT entry state: the shell's VMEM / TDM SGPRs (loop state placed away from them)")
     ap.add_argument("--qa-after", type=int, help="Q^T 0..3 listed after this WMMA")
     ap.add_argument("--qb-after", type=int, help="Q^T 4..7, dO^T 4..7 listed after this WMMA")
     a = ap.parse_args()
@@ -299,7 +304,18 @@ def main():
             fail.append(f"shell {FUNC} has a WMMA / TRANS: {x.text.strip()}")
     ops, mline = parse_marker(shell, lo, hi)
     log(f"marker operands: {ops}")
-    region = generate(shell, lo, hi, ops, mline, fmap, rec, a.va_rule)
+    xregs = None
+    if a.xcnt_entry:
+        xregs = set()
+        for x in parse(shell[lo:mline]):
+            if x.cls in ("VMEM", "FLAT", "TDM"):
+                xregs |= set(r for r in sgpr_defs_uses(x)[1] if r.startswith("s"))
+        ok = G.alloc_sgprs(xregs)
+        rec["recipe"]["xcnt_entry"] = {"shell_vmem_sgprs": sorted(xregs, key=lambda r: int(r[1:])), "placed": ok,
+                                       "desc": G.SG_DESC, "addr": G.SG_A}
+        log(f"xcnt entry: shell VMEM/TDM SGPRs {sorted(xregs, key=lambda r: int(r[1:]))}; loop state placed: {ok} "
+            f"desc {G.SG_DESC} addr {G.SG_A}")
+    region = generate(shell, lo, hi, ops, mline, fmap, rec, a.va_rule, xregs)
     new = list(shell)
     new[mline + 1 : mline + 1] = region
     new = set_vgpr_count_of(new, FUNC, 1024)

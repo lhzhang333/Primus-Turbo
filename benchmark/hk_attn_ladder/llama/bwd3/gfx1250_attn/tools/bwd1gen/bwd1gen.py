@@ -58,6 +58,32 @@ SG_T = "s95"  # temporary
 SCALARS = {f"s{i}" for i in range(72, 104)} | {"vcc", "scc"}
 
 
+def alloc_sgprs(avoid):
+    """Place the loop state in s72..s103 away from `avoid` (SGPRs an in-flight shell TDM / VMEM op may still read at
+    the region entry: writing one would need s_wait_xcnt 0, i.e. wait for that op). Two 4-aligned descriptor sets,
+    four 2-aligned address pairs, eight singles; falls back to the fixed map when they do not fit."""
+    global SG_DESC, SG_A, SG_V, SG_U, SG_S, SG_M, SG_T
+    free = [i for i in range(72, 104) if f"s{i}" not in avoid]
+    used = set()
+
+    def take(n, align):
+        for i in free:
+            if i % align == 0 and all(j in free and j not in used for j in range(i, i + n)):
+                used.update(range(i, i + n))
+                return i
+        return None
+
+    desc = [take(4, 4), take(4, 4)]
+    pairs = [take(2, 2) for _ in range(4)]
+    singles = [take(1, 1) for _ in range(8)]
+    if None in desc + pairs + singles:
+        return False
+    SG_DESC, SG_A = tuple(desc), tuple(pairs)
+    SG_V = tuple(f"s{i}" for i in singles[:4])
+    SG_U, SG_S, SG_M, SG_T = (f"s{i}" for i in singles[4:])
+    return True
+
+
 def vr(r, n=1):
     """Operand text of the n VGPRs at true register r: the encoded low 8 bits, the true numbers in a comment."""
     if r // 256 != (r + n - 1) // 256:

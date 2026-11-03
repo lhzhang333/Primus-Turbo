@@ -316,6 +316,156 @@
    },
    "feature": "g7a + atomics one at a time (8 cycles apart)",
    "bitwise_with": "b0"
+  },
+  {
+   "id": "g9s1",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [
+      "--va-rule",
+      "class",
+      "--vm-burst",
+      "2",
+      "--sig-before",
+      "72",
+      "--wait-before",
+      "78",
+      "--tw-after",
+      "64",
+      "--atom-after",
+      "56"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g8a sweep: --sig-before 72 --wait-before 78 --tw-after 64 --atom-after 56",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "g9s2",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [
+      "--va-rule",
+      "class",
+      "--vm-burst",
+      "2",
+      "--sig-before",
+      "72",
+      "--wait-before",
+      "78",
+      "--tw-after",
+      "64",
+      "--atom-after",
+      "61"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g8a sweep: --sig-before 72 --wait-before 78 --tw-after 64 --atom-after 61",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "g9s3",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [
+      "--va-rule",
+      "class",
+      "--vm-burst",
+      "2",
+      "--sig-before",
+      "70",
+      "--wait-before",
+      "76",
+      "--tw-after",
+      "62",
+      "--atom-after",
+      "58"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g8a sweep: --sig-before 70 --wait-before 76 --tw-after 62 --atom-after 58",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "g9s4",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [
+      "--va-rule",
+      "class",
+      "--vm-burst",
+      "2",
+      "--sig-before",
+      "74",
+      "--wait-before",
+      "79",
+      "--tw-after",
+      "66",
+      "--atom-after",
+      "58"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g8a sweep: --sig-before 74 --wait-before 79 --tw-after 66 --atom-after 58",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "g10",
+   "parent": "b0",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "gen": [
+      "--va-rule",
+      "class",
+      "--vm-burst",
+      "2",
+      "--sig-before",
+      "74",
+      "--wait-before",
+      "79",
+      "--tw-after",
+      "66",
+      "--atom-after",
+      "58",
+      "--xcnt-entry"
+     ],
+     "gen_pkg": "gfx1250_attn",
+     "gen_kernel": "k_attn_bwd_v1"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "g9s4 + exact XCNT entry state, loop SGPRs away from the shell's in-flight TDM descriptors (no s_wait_xcnt in INIT)",
+   "bitwise_with": "b0"
   }
  ]
 }
