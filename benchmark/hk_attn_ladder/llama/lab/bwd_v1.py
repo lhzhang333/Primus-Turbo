@@ -335,7 +335,8 @@ def _check_code_object(path):
     if os.path.isfile(mj):
         with open(mj) as f:
             m = json.load(f)
-        if "flags" in m and _flag_strides(m["flags"]) != int(strided):
+        # a generator rung (hkl.build "gen") records the generator command, not the compile flags: nothing to compare
+        if "flags" in m and "gen/build.py" not in m["flags"] and _flag_strides(m["flags"]) != int(strided):
             raise hiprt.HipError(f"bwd_v1: {path}: the argument layout says HK_STRIDES={int(strided)}, {mj} records "
                                  f"{[f for f in m['flags'] if 'HK_STRIDES' in str(f)]}")  # fmt: skip
     return strided
