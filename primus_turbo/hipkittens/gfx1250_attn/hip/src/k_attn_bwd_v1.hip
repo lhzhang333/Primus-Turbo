@@ -388,18 +388,18 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd1_g4(
     lds_barrier();
 
     // ---- resident operands (v0) -----------------------------------------------------------------------------------
-    opnd_t kf[2][4], vf[2][4], kt[2][4];
+    opnd_t kf[2][4], vf[2][4], kt[b1::DQ_NJ][4];
     {
         const lds_u8 *kr = rows_base<XP>(lds0 + b0::OFF_K + b0::kimg_rows_wave(w), l);
         const lds_u8 *vr = rows_base<XP>(lds0 + b0::OFF_V + b0::kimg_rows_wave(w), l);
-        const lds_u8 *kc = tr_base<XP>(lds0 + b0::OFF_K + b0::kimg_tr_wave(w), l);
+        const lds_u8 *kc = tr_base<XP>(lds0 + b0::OFF_K + (b1::OPT_DQSPLIT ? 128 * (w & 1) : b0::kimg_tr_wave(w)), l);
         static_for<2>([&](auto kh) {
             static_for<4>([&](auto dt) {
                 kf[kh][dt] = load_rows<XP>(kr, 16 * kh, 32 * dt);
                 vf[kh][dt] = load_rows<XP>(vr, 16 * kh, 32 * dt);
             });
         });
-        static_for<2>([&](auto j) { static_for<4>([&](auto c) { kt[j][c] = load_tr<XP>(kc, 32 * c, 16 * j); }); });
+        static_for<b1::DQ_NJ>([&](auto j) { static_for<4>([&](auto c) { kt[j][c] = load_tr<XP>(kc, 32 * c, 16 * j); }); });
     }
     acc_t dVt[8][2], dKt[8][2];
     static_for<8>([&](auto dt) {
@@ -415,7 +415,8 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd1_g4(
     const lds_u8 *q_rows = opaque_lds(rows_base<XP>(lds0 + b0::OFF_Q, l)), *q_tr = opaque_lds(tr_base<XP>(lds0 + b0::OFF_Q, l));
     const lds_u8 *do_rows = opaque_lds(rows_base<XP>(lds0 + b0::OFF_DO, l)), *do_tr = opaque_lds(tr_base<XP>(lds0 + b0::OFF_DO, l));
     const lds_u8 *ld_b = opaque_lds(lds_ptr(lds0 + b0::OFF_LD + b0::ld_lane(l)));
-    const lds_u8 *ds_tr = opaque_lds(tr_base<SP>(lds0 + b0::OFF_DS, l));
+    // BWD1_OPT_DQSPLIT: the wave's q half (16 (w >> 1) columns of dS^T = 32 B) folded into the lane base
+    const lds_u8 *ds_tr = opaque_lds(tr_base<SP>(lds0 + b0::OFF_DS + (b1::OPT_DQSPLIT ? 32 * (w >> 1) : 0), l));
     lds_u8       *ds_st = (lds_u8 *) opaque_lds(rows_base<SP>(lds0 + b0::OFF_DS + b0::ds_rows_wave(w), l));
     // readback(t) items [LO, HI) into X from ring slot SLOT (b1 item order: qA / dA by dt, then the LD records)
     auto readback = [&](auto lo_c, auto hi_c, auto slot_c, XSet &X) __attribute__((always_inline)) {
@@ -432,22 +433,33 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd1_g4(
             }
         });
     };
-    opnd_t dSa[2][4]; // A operands of dQ(s - 1), read at the start of step s
+    opnd_t dSa[b1::DQ_NQH][4]; // A operands of dQ(s - 1), read at the start of step s
     auto   load_dsa = [&](auto buf_c) {
         constexpr int BUF = decltype(buf_c)::value;
-        static_for<2>([&](auto qh) {
+        static_for<b1::DQ_NQH>([&](auto qh) {
             static_for<4>([&](auto c) { dSa[qh][c] = load_tr<SP>(ds_tr + BUF * b0::DS_B, 32 * c, 16 * qh); });
         });
     };
-    const int voff_lane = b0::dqa_voff(l, w, 0, 0, nqp); // (w << 7) | (l << 2)
+    const int voff_lane = b1::OPT_DQSPLIT ? b1::dqs_voff(l, w) : b0::dqa_voff(l, w, 0, 0, nqp); // (w << 7) | (l << 2)
     auto      dq_wmma = [&](acc_t (&dq)[2][2]) { // dQ = dS K: kc outer, 4 chains (qh, j)
         static_for<4>([&](auto c) {
-            static_for<2>([&](auto qh) {
-                static_for<2>([&](auto j) {
-                    if constexpr (c == 0) dq[qh][j] = wmma0(dSa[qh][c], kt[j][c]);
-                    else dq[qh][j] = wmma(dSa[qh][c], kt[j][c], dq[qh][j]);
+            if constexpr (b1::OPT_DQSPLIT) {
+                // 4 chains jj (d tiles 64 (w & 1) + 16 jj) of the wave's 16 q: A = dSa[0][c] for all four
+                static_for<4>([&](auto jj) {
+                    constexpr int  qh = jj / 2, j = jj % 2;
+                    constexpr bool RA = (b1::OPT_REUSE & 2) && jj > 0;
+                    if constexpr (c == 0) dq[qh][j] = wmma0<RA, false>(dSa[0][c], kt[jj][c]);
+                    else dq[qh][j] = wmma<RA, false>(dSa[0][c], kt[jj][c], dq[qh][j]);
                 });
-            });
+            } else {
+                static_for<2>([&](auto qh) {
+                    static_for<2>([&](auto j) {
+                        constexpr bool RA = (b1::OPT_REUSE & 2) && j == 1; // A = dSa[qh][c], as the j = 0 WMMA before it
+                        if constexpr (c == 0) dq[qh][j] = wmma0<RA, false>(dSa[qh][c], kt[j][c]);
+                        else dq[qh][j] = wmma<RA, false>(dSa[qh][c], kt[j][c], dq[qh][j]);
+                    });
+                });
+            }
         });
     };
     // atomics [LO, HI) of the 32 (order qh, j, i), vo = their step voffset; each its own instruction
@@ -456,7 +468,7 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd1_g4(
         static_for<b1::NATOM>([&](auto a) {
             if constexpr ((int) a >= LO && (int) a < HI) {
                 constexpr int qh = a / 16, j = (a / 8) % 2, i = a % 8;
-                buf_atomic_add_f32(r_dqa, vo + b0::dqa_imm(qh, j, i), 0, dq[qh][j][i]);
+                buf_atomic_add_f32(r_dqa, vo + (b1::OPT_DQSPLIT ? b1::dqs_imm(2 * qh + j, i) : b0::dqa_imm(qh, j, i)), 0, dq[qh][j][i]);
             }
         });
     };
@@ -591,7 +603,9 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd1_g4(
         dq_wmma(dq);
         const int vo = voff_nonneg(voff_lane + b0::dqa_voff(0, 0, b1::atom_gh(n, n, G, rot), b1::atom_qt(n, n, G, nqp), nqp));
         static_for<2>([&](auto qh) {
-            static_for<2>([&](auto j) { atomic_add_c<512>(r_dqa, vo + b0::dqa_imm(qh, j, 0), 0, dq[qh][j]); });
+            static_for<2>([&](auto j) {
+                atomic_add_c<512>(r_dqa, vo + (b1::OPT_DQSPLIT ? b1::dqs_imm(2 * qh + j, 0) : b0::dqa_imm(qh, j, 0)), 0, dq[qh][j]);
+            });
         });
     }
 #if HK_STRIDES

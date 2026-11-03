@@ -727,11 +727,14 @@
         "-amdgpu-expert-scheduling-mode",
         "-DHK_ATTN_EXPERT_SCHED_BUILD",
         "-DBWD1_ATOM=2",
-        "-DBWD1_OPT_REGS=15",
+        "-DBWD1_OPT_REGS=31",
         "-DBWD1_OPT_TDM3=1",
-        "-DBWD1_OPT_MASKED=2"
+        "-DBWD1_OPT_MASKED=2",
+        "-DBWD1_OPT_DQSPLIT=1",
+        "-DBWD1_OPT_QTC=1",
+        "-DBWD1_RB1=8"
       ],
-      "hsaco_sha256": "21b1ceb26ccb3f9267f535ed1ee8f04e6c059b616a6d15ddd5dfbf6b2c69acf7",
+      "hsaco_sha256": "9b7cf1f1ee72f961c6c42f44d784c3222db94f48faca585df0975304d67330ed",
       "symbols": {
         "k_hk_bwd1_prep": {
           "block": 256,
@@ -945,7 +948,7 @@
           ],
           "kernarg_size": 92,
           "lds": 266240,
-          "vgpr": 860,
+          "vgpr": 948,
           "sgpr": 74,
           "wavefront_size": 32
         },

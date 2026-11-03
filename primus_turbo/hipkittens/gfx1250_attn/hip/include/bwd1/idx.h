@@ -56,6 +56,31 @@
                       // role branch
 #define BWD1_OPT_TDM3 0
 #endif
+#ifndef BWD1_OPT_REUSE // bit mask of WMMA operand-reuse hints (matrix_a_reuse / matrix_b_reuse) on
+                       // WMMAs whose A / B
+#define BWD1_OPT_REUSE                                                                             \
+    0  //   operand is the previous WMMA's: 1 S / dP (hh 1 after hh 0: B = kf / vf), 2 dQ (j 1 after
+#endif //   j 0: A = dSa), 4 dV / dK (dt > 0 of a kv-tile run: B = P / dS); no instruction change
+#ifndef BWD1_OPT_DQSPLIT // 1: dQ split by (q half, d half) over the 4 waves (wave w: q rows 16 (w
+                         // >> 1) .., d columns
+#define BWD1_OPT_DQSPLIT                                                                           \
+    0  //  64 (w & 1) ..) instead of 4 d quarters: each wave reads half of dS^T (8 tr16 / step
+       //  instead
+#endif //  of 16) and holds K^T for 64 d (+64 VGPR); same WMMAs, atomics and dQ_acc layout
+#ifndef BWD1_OPT_QTC // 1: the 16 QT(s) tr16 of an interleaved step are issued in C (2 per WMMA gap,
+                     // gaps 0..7)
+#define BWD1_OPT_QTC                                                                               \
+    0 //   instead of E1: ~300 cycles before the signal's s_wait_dscnt (LDS latency under load)
+#endif
+#ifndef BWD1_RB1    // readback items issued in E1 (before the signal, uncovered: slot s + 1 is
+                    // readable all of step
+#define BWD1_RB1 -1 //   s); -1 = derived from BWD1_NWIN (none at NWIN 16)
+#endif
+#ifndef BWD1_OPT_E2SALU // 1: E2's sched groups also take 2 SALU per WMMA gap (the next ring op's
+                        // descriptor math runs
+#define BWD1_OPT_E2SALU                                                                            \
+    0 //   under the dK WMMAs instead of as one SALU run after the first of them)
+#endif
 #ifndef BWD1_OPT_REGS // bit mask of llvm.fake.use register holds (kernel-scope steps), see
                       // v1_step.inc:
 #define BWD1_OPT_REGS                                                                              \
@@ -72,7 +97,18 @@ static_assert(ATOM >= 0 && ATOM <= 2, "BWD1_ATOM");
 static_assert(NWIN >= 8 && NWIN <= 16 && NWIN % 2 == 0,
               "BWD1_NWIN: 8..16, even (QT loads in the first 8 E1 gaps)");
 static_assert(HROT == 0 || HROT == 1, "BWD1_HROT");
-constexpr int OPT_MASKED = BWD1_OPT_MASKED, OPT_TDM3 = BWD1_OPT_TDM3, OPT_REGS = BWD1_OPT_REGS;
+constexpr int OPT_MASKED = BWD1_OPT_MASKED, OPT_TDM3 = BWD1_OPT_TDM3, OPT_REGS = BWD1_OPT_REGS,
+              OPT_REUSE = BWD1_OPT_REUSE, OPT_DQSPLIT = BWD1_OPT_DQSPLIT, OPT_QTC = BWD1_OPT_QTC;
+// BWD1_OPT_DQSPLIT: dQ operand counts per wave and the dQ_acc address of wave w's fragment (qh16 =
+// w >> 1, d columns 64 (w & 1) + 16 jj + l % 16 = b0's (w' = 2 (w & 1) + jj / 2, j' = jj % 2)): the
+// block layout (and dqcvt) unchanged
+constexpr int DQ_NQH = OPT_DQSPLIT ? 1 : 2, DQ_NJ = OPT_DQSPLIT ? 4 : 2;
+B0_HD int     dqs_voff(int lane, int w) {
+    return ((w >> 1) * 2 * 8 * 512) | ((w & 1) * 2 * 128) | (lane << 2);
+}
+B0_HD int dqs_imm(int jj, int i) {
+    return ((jj % 2) * 8 + i) * 512 + (jj / 2) * 128;
+}
 static_assert(OPT_MASKED >= 0 && OPT_MASKED <= 2, "BWD1_OPT_MASKED");
 static_assert(OPT_MASKED != 2 || BWD1_SKIP_DEAD, "BWD1_OPT_MASKED=2 is the DEAD-skipping split");
 static_assert(OPT_TDM3 == 0 || OPT_TDM3 == 1, "BWD1_OPT_TDM3");
@@ -118,7 +154,10 @@ B0_HD int     rb_split_items() {
             return it;
     return RB_ITEMS;
 }
-constexpr int RB1  = rb_split_items(); // items 0..RB1-1 before the signal (uncovered)
+constexpr int RB1 =
+    BWD1_RB1 >= 0 ? BWD1_RB1 : rb_split_items(); // items 0..RB1-1 before the signal (uncovered)
+static_assert(RB1 >= 0 && RB1 <= RB_ITEMS, "BWD1_RB1");
+constexpr int OPT_E2SALU = BWD1_OPT_E2SALU;
 constexpr int NUNC = rb_loads(RB1); // DS loads in flight past a FULL step's signal (s_wait_dscnt)
 static_assert(NUNC >= 0 && NUNC < 64, "dscnt is a 6-bit field");
 // item decode: kind 0 qA, 1 dA (hh, dt), 2 ld (hh, k)

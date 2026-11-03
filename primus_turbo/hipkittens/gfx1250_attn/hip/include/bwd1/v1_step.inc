@@ -54,12 +54,14 @@
         auto sdp = [&](auto kh) { // S / dP of kv tile kh: 4 independent chains over dt
             static_for<4>([&](auto dt) {
                 static_for<2>([&](auto hh) {
-                    if constexpr (dt == 0) S[hh][kh] = wmma0(X.qA[hh][dt], kf[kh][dt]);
-                    else S[hh][kh] = wmma(X.qA[hh][dt], kf[kh][dt], S[hh][kh]);
+                    constexpr bool RB = (b1::OPT_REUSE & 1) && hh == 1; // B = kf[kh][dt], as the hh 0 WMMA before it
+                    if constexpr (dt == 0) S[hh][kh] = wmma0<false, RB>(X.qA[hh][dt], kf[kh][dt]);
+                    else S[hh][kh] = wmma<false, RB>(X.qA[hh][dt], kf[kh][dt], S[hh][kh]);
                 });
                 static_for<2>([&](auto hh) {
-                    if constexpr (dt == 0) dP[hh][kh] = wmma0(X.dA[hh][dt], vf[kh][dt]);
-                    else dP[hh][kh] = wmma(X.dA[hh][dt], vf[kh][dt], dP[hh][kh]);
+                    constexpr bool RB = (b1::OPT_REUSE & 1) && hh == 1; // B = vf[kh][dt]
+                    if constexpr (dt == 0) dP[hh][kh] = wmma0<false, RB>(X.dA[hh][dt], vf[kh][dt]);
+                    else dP[hh][kh] = wmma<false, RB>(X.dA[hh][dt], vf[kh][dt], dP[hh][kh]);
                 });
             });
         };
@@ -72,8 +74,9 @@
             static_for<b1::NE>([&](auto e) {
                 if constexpr ((int) e >= LO && (int) e < HI) {
                     constexpr int kh = (e % 16) / 8, dt = e % 8;
-                    if constexpr (e < 16) dVt[dt][kh] = wmma(dOT[dt], cat_u32(pu[0][kh], pu[1][kh]), dVt[dt][kh]);
-                    else dKt[dt][kh] = wmma(QT[dt], cat_u32(du[0][kh], du[1][kh]), dKt[dt][kh]);
+                    constexpr bool RB = (b1::OPT_REUSE & 4) && dt > 0; // B = P / dS of kv tile kh, as the dt - 1 WMMA
+                    if constexpr (e < 16) dVt[dt][kh] = wmma<false, RB>(dOT[dt], cat_u32(pu[0][kh], pu[1][kh]), dVt[dt][kh]);
+                    else dKt[dt][kh] = wmma<false, RB>(QT[dt], cat_u32(du[0][kh], du[1][kh]), dKt[dt][kh]);
                 }
             });
         };
@@ -95,7 +98,7 @@
             sdp(I0);
             load_dsa(std::integral_constant<int, P ^ 1>{});
             load_dot();
-            pattern<16, 0, 0, 32>();
+            pattern<16, 0, 0, 16 + 8 * b1::DQ_NQH>(); // dOT 16 + dSa (16, or 8 with BWD1_OPT_DQSPLIT) tr16
         }
         sched_barrier<0>();
 #if (BWD1_OPT_REGS & 8) && BWD1_KS
@@ -137,18 +140,39 @@
 #else
         const int avo = voff_nonneg(voff_lane + b0::dqa_voff(0, 0, b1::atom_gh(s, n, G, rot), b1::atom_qt(s, n, G, nqp), nqp));
 #endif
-#if BWD1_OPT_MASKED
+#if BWD1_OPT_QTC
+        // BWD1_OPT_QTC: QT(s) (ring slot s, published since the step began) under the dQ WMMAs, 2 per gap in gaps 0..7
+        if constexpr (IL) {
+            load_qt();
+            constexpr int XV = 56 + (MASKED ? b1::MASK_VALU : 0);
+            static_for<16>([&](auto g) {
+                sched_group_barrier<sg::WMMA, 1, 0>();
+                if constexpr ((int) g >= 2) {
+                    constexpr int nv = b1::share(XV, 14, (int) g - 2);
+                    if constexpr (nv > 0) sched_group_barrier<sg::VALU | sg::TRANS, nv, 0>();
+                }
+                if constexpr ((int) g < 8) sched_group_barrier<sg::DS_READ, 2, 0>();
+            });
+        }
+#elif BWD1_OPT_MASKED
         if constexpr (IL) pattern<16, 56 + (MASKED ? b1::MASK_VALU : 0), 0, 0, 2>();
 #else
         if constexpr (!MASKED) pattern<16, 56, 0, 0, 2>();
 #endif
         order_fence(); // every load above stays older than the stores
 #if (BWD1_OPT_REGS & 2) && BWD1_KS
+#if BWD1_OPT_DQSPLIT
+        hka_llvm_fake_use(dSa[0][0]);
+        hka_llvm_fake_use(dSa[0][1]);
+        hka_llvm_fake_use(dSa[0][2]);
+        hka_llvm_fake_use(dSa[0][3]);
+#else
         BWD1_KEEP8(dSa); // C's WMMA A operands: the softmax kh1 temporaries go elsewhere (no WAR v_nop)
+#endif
 #endif
         // all DS loads issued so far (dSa, dOT: G0, ~300 cycles ago) are complete here: one explicit wait instead of
         // LLVM's per-WMMA s_wait_dscnt in E1 (its dV WMMAs read dOT while the QT loads are in flight)
-        if constexpr (IL) wait_dscnt<0>();
+        if constexpr (IL) wait_dscnt<b1::OPT_QTC ? 16 : 0>(); // QTC: the 16 QT loads (the youngest) may stay in flight
         // ST: dS^T(s) -> buffer P
         static_for<2>([&](auto kh) {
             static_for<2>([&](auto hh) { ds_store_b128(ds_st, P * b0::DS_B + b0::ct_imm(SP, 16 * kh, 16 * hh), du[hh][kh]); });
@@ -172,7 +196,7 @@
             // source order == issue order per gap (atomics are ordered memory ops: the DS loads cannot pass them)
             static_for<b1::NE1>([&](auto g) {
                 e_wmma(g, std::integral_constant<int, g + 1>{});
-                if constexpr (g < 8) QT[g] = load_tr<XP>(q_tr + P4 * b0::QT_B, 0, 16 * g);
+                if constexpr (g < 8 && !b1::OPT_QTC) QT[g] = load_tr<XP>(q_tr + P4 * b0::QT_B, 0, 16 * g);
                 constexpr int a0 = b1::ATOM == 0 ? (g == 0 ? 0 : AT1) : (AT1 * g) / b1::NE1;
                 constexpr int a1 = b1::ATOM == 0 ? AT1 : (AT1 * (g + 1)) / b1::NE1;
                 atomics(std::integral_constant<int, a0>{}, std::integral_constant<int, a1>{}, dq, avo);
@@ -183,7 +207,7 @@
             });
             static_for<b1::NE1>([&](auto g) {
                 sched_group_barrier<sg::WMMA, 1, 0>();
-                if constexpr (g < 8) sched_group_barrier<sg::DS_READ, 2, 0>();
+                if constexpr (g < 8 && !b1::OPT_QTC) sched_group_barrier<sg::DS_READ, 2, 0>();
                 constexpr int na = b1::ATOM == 0 ? (g == 0 ? AT1 : 0) : (AT1 * (g + 1)) / b1::NE1 - (AT1 * g) / b1::NE1;
                 if constexpr (na > 0) sched_group_barrier<sg::VMEM, na, 0>();
                 if constexpr (g >= 8) {
@@ -222,6 +246,7 @@
                 if constexpr (nr > 0) sched_group_barrier<sg::DS_READ, nr, 0>();
                 constexpr int na = (AT2 * (g + 1)) / b1::NWIN - (AT2 * g) / b1::NWIN;
                 if constexpr (na > 0) sched_group_barrier<sg::VMEM, na, 0>();
+                if constexpr (b1::OPT_E2SALU && (int) g + 1 < b1::NWIN) sched_group_barrier<sg::SALU, 2, 0>();
             });
         }
 #if (BWD1_OPT_REGS & 4) && BWD1_KS
