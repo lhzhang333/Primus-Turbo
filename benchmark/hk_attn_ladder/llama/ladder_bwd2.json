@@ -854,6 +854,87 @@
    "feature": "r3b + readback items 0..23 in E1",
    "bitwise_with": "b0",
    "side": true
+  },
+  {
+   "id": "r5_null",
+   "parent": "r4_null",
+   "patch": "bwd2_patches/05_qthold.patch",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=15",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2"
+     ],
+     "sha256": "21b1ceb26ccb3f9267f535ed1ee8f04e6c059b616a6d15ddd5dfbf6b2c69acf7"
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "patch 05 (BWD1_OPT_QTHOLD) at 0: b0 byte for byte",
+   "bitwise_with": "b0",
+   "side": true
+  },
+  {
+   "id": "r5a",
+   "parent": "r5_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=31",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_QTC=1",
+      "-DBWD1_RB1=8",
+      "-DBWD1_OPT_QTHOLD=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r4r8 + Q^T(s - 1) held until the Q^T(s) loads in C",
+   "bitwise_with": "b0"
+  },
+  {
+   "id": "s4r8",
+   "parent": "r4_null",
+   "kernels": {
+    "k_attn_bwd_v1": {
+     "src": "src/k_attn_bwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-amdgpu-expert-scheduling-mode",
+      "-DHK_ATTN_EXPERT_SCHED_BUILD",
+      "-DBWD1_ATOM=2",
+      "-DBWD1_OPT_REGS=31",
+      "-DBWD1_OPT_TDM3=1",
+      "-DBWD1_OPT_MASKED=2",
+      "-DBWD1_OPT_DQSPLIT=1",
+      "-DBWD1_OPT_QTC=1",
+      "-DBWD1_RB1=8",
+      "-DHK_STRIDES=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "bwd_v1"
+   },
+   "feature": "r4r8 built with -DHK_STRIDES=1 (per-tensor BSHD / SBHD-view strides)",
+   "bitwise_with": "b0",
+   "side": true
   }
  ],
  "baselines": [

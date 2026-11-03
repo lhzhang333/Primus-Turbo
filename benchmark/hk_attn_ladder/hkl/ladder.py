@@ -54,6 +54,10 @@ def t95(dof):
     return T95[keys[-1]] if keys else 12.71
 
 
+# hwmon sampling period (s); every read of freq1 / power1 is an SMU message on this card, keep it modest
+SCLK_PERIOD = float(os.environ.get("HKL_SCLK_PERIOD", "0.002"))
+
+
 class Sclk:
     """Background sampler of the device's current shader clock (MHz) and, when its hwmon has power1_input,
     socket power (W); inert if not found."""
@@ -95,7 +99,7 @@ class Sclk:
                     fails = 0
                 except (OSError, ValueError):
                     fails += 1
-            time.sleep(0.002)
+            time.sleep(SCLK_PERIOD)
 
     def stop(self):
         self._stop.set()

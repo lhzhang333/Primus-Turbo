@@ -1,0 +1,26 @@
+diff -ruN a/include/bwd1/idx.h b/include/bwd1/idx.h
+--- a/include/bwd1/idx.h	2026-11-03 02:06:30.350574029 +0000
++++ b/include/bwd1/idx.h	2026-11-03 02:06:30.359063898 +0000
+@@ -60,6 +60,9 @@
+ #ifndef BWD1_OPT_E2SALU  // 1: E2's sched groups also take 2 SALU per WMMA gap (the next ring op's descriptor math runs
+ #define BWD1_OPT_E2SALU 0 //   under the dK WMMAs instead of as one SALU run after the first of them)
+ #endif
++#ifndef BWD1_OPT_QTHOLD  // 1 (needs QTC and REGS bit 16): Q^T(s - 1) stays held until the Q^T(s) loads in C, so the
++#define BWD1_OPT_QTHOLD 0 //  softmax temporaries of G1 / C never take its registers (no WAR drain on those loads)
++#endif
+ #ifndef BWD1_OPT_REGS    // bit mask of llvm.fake.use register holds (kernel-scope steps), see v1_step.inc:
+ #define BWD1_OPT_REGS 0  //   1 X.qA / X.dA to the end of G1, 2 dSa to the end of C, 4 E operands to the end of E2,
+ #endif                   //   8 dQ(s - 1) atomic data + voffset through G0 of step s + 1, 16 E2 operands likewise
+diff -ruN a/include/bwd1/v1_step.inc b/include/bwd1/v1_step.inc
+--- a/include/bwd1/v1_step.inc	2026-11-03 02:06:30.350621919 +0000
++++ b/include/bwd1/v1_step.inc	2026-11-03 02:06:30.359406203 +0000
+@@ -143,6 +143,9 @@
+ #if BWD1_OPT_QTC
+         // BWD1_OPT_QTC: QT(s) (ring slot s, published since the step began) under the dQ WMMAs, 2 per gap in gaps 0..7
+         if constexpr (IL) {
++#if BWD1_OPT_QTHOLD && (BWD1_OPT_REGS & 16) && BWD1_KS
++            BWD1_KEEP8_1(QT); // Q^T(s - 1) (loop-carried) held to here: its registers are free only for the loads below
++#endif
+             load_qt();
+             constexpr int XV = 56 + (MASKED ? b1::MASK_VALU : 0);
+             static_for<16>([&](auto g) {

@@ -701,6 +701,32 @@
    },
    "feature": "negative: 8-wave ping-pong (HK's CDNA4 attention schedule)",
    "ref_ms": 1.2211
+  },
+  {
+   "id": "v11_strides",
+   "parent": "v11_best",
+   "kernels": {
+    "k_attn_fwd_v1": {
+     "src": "src/k_attn_fwd_v1.hip",
+     "extra_flags": [
+      "-mllvm",
+      "-structurizecfg-skip-uniform-regions",
+      "-mllvm",
+      "-amdgpu-sched-strategy=coexec",
+      "-DFWD1_LSUM=0",
+      "-DFWD1_OPT_RESC=1",
+      "-DFWD1_MDS=3",
+      "-DFWD1_OPT_UNROLL=1",
+      "-DHK_STRIDES=1"
+     ]
+    }
+   },
+   "launch": {
+    "module": "fwd_v1"
+   },
+   "feature": "v11_best built with -DHK_STRIDES=1 (per-tensor BSHD / SBHD-view strides)",
+   "bitwise_with": "v11_best",
+   "side": true
   }
  ],
  "baselines": [
