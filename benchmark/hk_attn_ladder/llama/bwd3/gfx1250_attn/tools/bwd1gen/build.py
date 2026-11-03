@@ -8,9 +8,9 @@
 
     python3 build.py --out DIR [--cxx CXX] [--va-rule RULE]
 
- 1. compile the marker shell (the manifest's command for k_attn_bwd_v1 plus -DHKGEN=1): DIR/shell.s; and the
-    reference (the manifest's command as is: the HIP kernel, DIR/ref/k_attn_bwd_v1.hsaco), whose operands in high
-    VGPR blocks teach, with the shell's, the s_set_vgpr_msb operand-field map;
+ 1. compile the marker shell (the manifest's command for k_attn_bwd_v1, -DHKGEN=1): DIR/shell.s; and the reference
+    (the same command with -DHKGEN=0: the HIP kernel, DIR/ref/k_attn_bwd_v1.hsaco), whose operands in high VGPR
+    blocks teach, with the shell's, the s_set_vgpr_msb operand-field map;
  2. read the BODY marker of k_hk_bwd1_g4 and the registers LLVM gave its operands; base = 1 + the highest VGPR the
     shell's k_hk_bwd1_g4 references;
  3. generate the region's blocks (bwd1gen); asmkit.emit derives s_set_vgpr_msb, the expert-mode waits and the hazard
@@ -70,8 +70,12 @@ def compile_variant(hsaco, cxx, out_dir, reference):
     tmp.mkdir(parents=True)
     obj = tmp / f"{ENTRY}.cc.hsaco"
     cmd = hsaco.compile_command(cxx, ENTRY, obj)
-    if not reference:
-        cmd = cmd[: cmd.index("-c")] + ["-DHKGEN=1"] + cmd[cmd.index("-c") :]
+    # the manifest builds the shell (-DHKGEN=1); the reference is the same command with HKGEN=0
+    head, tail = cmd[: cmd.index("-c")], cmd[cmd.index("-c") :]
+    if reference:
+        cmd = [f for f in head if not f.startswith("-DHKGEN")] + ["-DHKGEN=0"] + tail
+    elif "-DHKGEN=1" not in head:
+        cmd = head + ["-DHKGEN=1"] + tail
     r = subprocess.run(cmd, cwd=HIP, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"compile failed:\n{r.stderr[-4000:]}")
