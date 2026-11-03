@@ -220,7 +220,9 @@ def _check_code_object(path):
         if not m.get("ok", False) or m.get("hsaco_sha256") != sha:
             raise RuntimeError(f"{path}: stale or failed build ({mj}: ok={m.get('ok')}, sha256 mismatch "
                                f"{m.get('hsaco_sha256', '')[:12]} vs {sha[:12]})")  # fmt: skip
-        if "flags" in m and _flag_strides(m["flags"]) != int(strided):
+        # a generator rung (hkl.build "gen") records the generator command, not the compile flags: nothing to compare
+        gen = "gen/build.py" in m.get("flags", [])
+        if "flags" in m and not gen and _flag_strides(m["flags"]) != int(strided):
             raise RuntimeError(f"{path}: kernarg layout says HK_STRIDES={int(strided)}, but {mj} records the flags "
                                f"{[f for f in m['flags'] if 'HK_STRIDES' in str(f)]}")  # fmt: skip
     return dict(meta, strided=strided)
