@@ -782,9 +782,10 @@
         "-DBWD1_OPT_DQSPLIT=1",
         "-DBWD1_OPT_QTC=1",
         "-DBWD1_RB1=8",
-        "-DHK_STRIDES=1"
+        "-DHK_STRIDES=1",
+        "-DHKGEN=1"
       ],
-      "hsaco_sha256": "52344febff30bb2a53ca533cd17cd8d03b0d343f88424d70a4d5abda709a57cf",
+      "hsaco_sha256": "a996abbd40a14d0c0a87813063e5e75fa14ee58f7cb3d0468949428436fe403f",
       "symbols": {
         "k_hk_bwd1_prep": {
           "block": 256,
@@ -1118,8 +1119,8 @@
           ],
           "kernarg_size": 192,
           "lds": 266240,
-          "vgpr": 948,
-          "sgpr": 82,
+          "vgpr": 1024,
+          "sgpr": 106,
           "wavefront_size": 32
         },
         "k_hk_bwd1_dqcvt": {
@@ -1180,7 +1181,9 @@
           "sgpr": 68,
           "wavefront_size": 32
         }
-      }
+      },
+      "asm_patch": "asm/k_attn_bwd_v1.s.patch",
+      "asm_input_sha256": "e3383ed0a81b5c41ad485b7ffdae92889e0d8a1d1ddf9bfb51e35c812658888d"
     }
   }
 }

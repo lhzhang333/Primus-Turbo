@@ -45,6 +45,14 @@
 #include "hk_attn/ext_bwd.h"
 #include "hk_attn/prims.h"
 
+#ifndef HKGEN
+#define HKGEN 0 // 1: the marker shell of the generated k_hk_bwd1_g4 body (tools/bwd1gen), 0: the HIP kernel
+#endif
+// SGPRs the generated body keeps its loop state in (and vcc / scc): declared clobbered at the marker
+#define HKGEN_CLOBBERS "memory", "vcc", "scc", "s72", "s73", "s74", "s75", "s76", "s77", "s78", "s79", "s80", "s81", \
+    "s82", "s83", "s84", "s85", "s86", "s87", "s88", "s89", "s90", "s91", "s92", "s93", "s94", "s95", "s96", "s97",   \
+    "s98", "s99", "s100", "s101", "s102", "s103"
+
 using namespace hk_attn;
 
 #if BWD1_OPT_REGS
@@ -386,6 +394,87 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd1_g4(
     if (w < b0::ISS_KV) wait_tensorcnt<b1::TCNT>(); // op(0), op(1) landed; op(2) flies
     else wait_tensorcnt<0>();
     lds_barrier();
+
+#if HKGEN
+    // ---- marker shell (HKGEN=1): everything from here to the final barrier is generated (tools/bwd1gen): the
+    // resident operands, every step (the FULL steps, then the diagonal steps with the causal mask: every wave kind
+    // computes, a DEAD wave's P / dS are exact zeros), the dQ drain and the dK / dV epilogue. LLVM computes the
+    // loop-invariant scalars and lane bases below; the generated code writes only VGPRs above every VGPR this shell
+    // references in the region (tools/bwd1gen/build.py checks it) and the SGPRs of HKGEN_CLOBBERS.
+    static_assert(b1::OPT_DQSPLIT != 0 && b1::OPT_TDM3 != 0, "HKGEN: the generated step is BWD1_OPT_DQSPLIT=1, BWD1_OPT_TDM3=1");
+    {
+        typedef int32_t i32x16 __attribute__((ext_vector_type(16)));
+        // TDM: INIT issues op 3, step s = 4 i + P4 issues op(s + 4) (behind its barrier wait). Per P4: the global
+        // address of op(P4 + 4)'s tile with the UNCLAMPED q pair (the generator adds -(one q pair) per iteration and
+        // selects tile n - 1's address once op >= n), bit 63 set (tdm_g0's word 3 bit 31; addresses < 2^57); minus the
+        // q-pair step; tile n - 1's address; the LDS address of slot P4 (op k lands in slot k & 3)
+        auto gaddr = [&](int qt, int gh) {
+            return (uint64_t) (rbase + (uint64_t) b0::role_step_byte(0, rqstep, rhstep, qt, gh)) | (1ull << 63);
+        };
+        i32x16 tdmv;
+        static_for<4>([&](auto p4) {
+            constexpr int k = (int) p4 + G;
+            const uint64_t a = gaddr(nqp - 1 - k / G, (k % G + rot) % G);
+            tdmv[2 * p4] = (int) (uint32_t) a;
+            tdmv[2 * p4 + 1] = (int) (uint32_t) (a >> 32);
+            tdmv[12 + p4] = (int) (lds0 + (uint32_t) b0::role_lds_at(rlds0, rlstep, (int) p4));
+        });
+        const uint64_t alast = gaddr(b0::tile_qt(n - 1, n, G, nqp), b1::tile_gh(n - 1, n, G, rot));
+        const uint64_t nqstep = (uint64_t) (-(int64_t) rqstep); // added once per iteration (s_add_nc_u64)
+        tdmv[8] = (int) (uint32_t) nqstep;
+        tdmv[9] = (int) (uint32_t) (nqstep >> 32);
+        tdmv[10] = (int) (uint32_t) alast;
+        tdmv[11] = (int) (uint32_t) (alast >> 32);
+        // sc: n, nf; the dQ_acc tile scalars ((gh nqp + qt) << 14) of tiles 0..3 (step s's atomics add tile s - 1's
+        // dQ; step 0 adds dQ(-1) = 0 into tile 0); the causal mask base of the first diagonal step (mask_off(qt, hh,
+        // kvw0, w, kh, cshift) = M + 16 hh - 16 kh, M = 32 qt + cshift - kvw0 - 32 w); c1 = scale log2(e); op 3's
+        // global address (tile 3: n >= 4, never clamped)
+        i32x16 scv;
+        scv[0] = n;
+        scv[1] = nf;
+        static_for<4>([&](auto p4) {
+            scv[2 + p4] = b0::dqa_voff(0, 0, b1::tile_gh(p4, n, G, rot), b0::tile_qt(p4, n, G, nqp), nqp);
+        });
+        scv[6] = b0::QS * b0::tile_qt(nf, n, G, nqp) + cshift - kvw0 - b0::KVW * w;
+        scv[7] = __builtin_bit_cast(int, c1);
+        const uint64_t a3 = gaddr(b0::tile_qt(b1::LEAD, n, G, nqp), b1::tile_gh(b1::LEAD, n, G, rot));
+        scv[8] = (int) (uint32_t) a3;
+        scv[9] = (int) (uint32_t) (a3 >> 32);
+        static_for<6>([&](auto i) { scv[10 + i] = 0; });
+        // lane bases (LDS byte addresses; every per-step slot / buffer offset is an instruction immediate)
+        const uint32_t q_rows = lds0 + b0::OFF_Q + (uint32_t) b0::rows_lane(l, XP);
+        const uint32_t do_rows = lds0 + b0::OFF_DO + (uint32_t) b0::rows_lane(l, XP);
+        const uint32_t ld_b = lds0 + b0::OFF_LD + (uint32_t) b0::ld_lane(l);
+        const uint32_t q_tr = lds0 + b0::OFF_Q + (uint32_t) b0::tr_lane(l, XP);
+        const uint32_t do_tr = lds0 + b0::OFF_DO + (uint32_t) b0::tr_lane(l, XP);
+        const uint32_t ds_tr = lds0 + b0::OFF_DS + 32u * (uint32_t) (w >> 1) + (uint32_t) b0::tr_lane(l, SP);
+        const uint32_t ds_st = lds0 + b0::OFF_DS + (uint32_t) b0::ds_rows_wave(w) + (uint32_t) b0::rows_lane(l, SP);
+        const uint32_t k_rows = lds0 + b0::OFF_K + (uint32_t) b0::kimg_rows_wave(w) + (uint32_t) b0::rows_lane(l, XP);
+        const uint32_t v_rows = lds0 + b0::OFF_V + (uint32_t) b0::kimg_rows_wave(w) + (uint32_t) b0::rows_lane(l, XP);
+        const uint32_t k_tr = lds0 + b0::OFF_K + 128u * (uint32_t) (w & 1) + (uint32_t) b0::tr_lane(l, XP);
+        const int      vlane = b1::dqs_voff(l, w);
+        const int      dl = lay::thr_cgr(l, 0); // l % 16 - 8 (l / 16): the mask's lane part
+        // epilogue voffsets per kv tile kh (dt in the immediate, + 32 dt)
+#if HK_STRIDES
+        const int dk_rb = (int) (2 * dk_ss), dv_rb = (int) (2 * dv_ss);
+        const int ek0 = b1::epi_voff_kh_s(l, w, 0, dk_rb), ek1 = b1::epi_voff_kh_s(l, w, 1, dk_rb);
+        const int ev0 = b1::epi_voff_kh_s(l, w, 0, dv_rb), ev1 = b1::epi_voff_kh_s(l, w, 1, dv_rb);
+#else
+        const int ek0 = b0::epi_voff_kh(l, w, 0, Hkv), ek1 = b0::epi_voff_kh(l, w, 1, Hkv);
+        const int ev0 = ek0, ev1 = ek1;
+#endif
+        const u32x8 g1v = rg1;
+        asm volatile("; HKGEN BODY qr=%0 dr=%1 ldb=%2 qtr=%3 dtr=%4 dsr=%5 dss=%6 kr=%7 vr=%8 kc=%9 vl=%10 dl=%11 "
+                     "ek0=%12 ek1=%13 ev0=%14 ev1=%15 tdm=%16 g1=%17 sc=%18 scale=%19 rq=%20 rk=%21 rv=%22"
+                     ::"v"(q_rows), "v"(do_rows), "v"(ld_b), "v"(q_tr), "v"(do_tr), "v"(ds_tr), "v"(ds_st),
+                     "v"(k_rows), "v"(v_rows), "v"(k_tr), "v"(vlane), "v"(dl), "v"(ek0), "v"(ek1), "v"(ev0),
+                     "v"(ev1), "s"(tdmv), "s"(g1v), "s"(scv), "s"(scale), "s"(r_dqa), "s"(r_dk), "s"(r_dv)
+                     : HKGEN_CLOBBERS);
+        split_signal_tdm_lds<0>();
+        split_wait_lds();
+        return;
+    }
+#endif
 
     // ---- resident operands (v0) -----------------------------------------------------------------------------------
     opnd_t kf[2][4], vf[2][4], kt[b1::DQ_NJ][4];
