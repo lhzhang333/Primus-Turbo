@@ -460,8 +460,10 @@ void tn_sk_kernel(const globals_sk g) {
     store(g.ws, acc, {0, z, bm * WM + w / WN, bn * WN + w % WN});
 }
 
-// C[col * ldc + row] = bf16(sum_z ws[z][col][row]) over the mb x nb block, 8 rows per thread (mb % 8 == 0)
-__global__ void sk_reduce_kernel(const float* __restrict__ ws, bf16* __restrict__ c, int mb, int nb, int ldc, int S) {
+// C[col * ldc + row] = bf16(sum_z ws[z][col][row] (+ C when acc)) over the mb x nb block, 8 rows per thread
+// (mb % 8 == 0); with acc the existing C joins the FP32 sum, so it is rounded once
+__global__ void sk_reduce_kernel(const float* __restrict__ ws, bf16* __restrict__ c, int mb, int nb, int ldc, int S,
+                                 int acc_c = 0) {
     const int64_t i = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
     const int64_t n = (int64_t)mb * nb;
     if (i >= n) return;
@@ -476,8 +478,120 @@ __global__ void sk_reduce_kernel(const float* __restrict__ ws, bf16* __restrict_
     }
     const int64_t col = i / mb, row = i % mb;
     bf16* out = c + col * ldc + row;
+    if (acc_c) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[j] += (float)out[j];
+    }
 #pragma unroll
     for (int j = 0; j < 8; ++j) out[j] = (bf16)acc[j];
+}
+
+// ---------------------------------------------------------------- NT split-K over a band of tile columns
+// The tail of an NT grid that would leave most of its last wave idle: tile columns [n_tile0, n_tile0 + gridDim.y)
+// of C, each split along K into gridDim.z workgroups that store FP32 partial tiles into the workspace
+// ([S][n_tiles * BN][m_tiles * BM], column-major blocks) for sk_reduce_kernel.
+struct globals_nt_sk { gl_ab a, b; gl_f ws; int n_tile0; };
+
+template<int BM, int BN, int WM, int WN, int CM, int CN>
+__global__ __cluster_dims__(CM, CN, 1) __launch_bounds__(WM * WN * WARP_THREADS, 1)
+void nt_sk_kernel(const globals_nt_sk g) {
+    using C = CfgNT<BM, BN, WM, WN>;
+    using A_tile = typename C::A_tile;
+    using B_tile = typename C::B_tile;
+    constexpr int WARP_M = C::WARP_M, WARP_N = C::WARP_N;
+    constexpr int NWM = C::NWMMA, NW = NWM / 4, ND = (C::NDS + 3) / 4, PRE_BAR = C::PRE_BAR;
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
+    A_tile (&A_lds)[2] = al.allocate_in<segment<0>, A_tile, 2>();
+    B_tile (&B_lds)[2] = al.allocate_in<segment<0>, B_tile, 2>();
+    sched::lock_simd();
+
+    const int bm = blockIdx.x, bn = g.n_tile0 + blockIdx.y, z = blockIdx.z, w = warpid();
+    const int nk_all = g.a.rows() / BLOCK_K, S = gridDim.z;
+    const int k0 = (int)((int64_t)nk_all * z / S), nk = (int)((int64_t)nk_all * (z + 1) / S) - k0;
+    const int a_col = w / WN * WARP_M;
+    const int b_col = w % WN * WARP_N;
+    const lds_u8_t* a_base[2] = {lds_base(A_lds[0]) + tr_lane_off<BM>(), lds_base(A_lds[1]) + tr_lane_off<BM>()};
+    const lds_u8_t* b_base[2] = {lds_base(B_lds[0]) + tr_lane_off<BN>(), lds_base(B_lds[1]) + tr_lane_off<BN>()};
+    reg_tile<WARP_M, K_STEP> A_reg[2];
+    reg_tile<WARP_N, K_STEP> B_reg[2];
+    acc_tile<WARP_M, WARP_N> acc;
+    zero(acc);
+
+    uint32_t a_mask = 0, b_mask = 0;
+#pragma unroll
+    for (int j = 0; j < CN; ++j) a_mask |= 1u << (bm % CM + CM * j);
+#pragma unroll
+    for (int i = 0; i < CM; ++i) b_mask |= 1u << (i + CM * (bn % CN));
+
+    auto fill = [&](int slot, int k, uint32_t count = 1) {
+        if (w == 0) tdm::load_async(A_lds[slot], g.a, {0, 0, k, bm}, g.a.rows(), g.a.cols(), g.a.cols(), a_mask, count);
+        if (w == 1) tdm::load_async(B_lds[slot], g.b, {0, 0, k, bn}, g.b.rows(), g.b.cols(), g.b.cols(), b_mask, count);
+    };
+
+    fill(0, k0);
+    sync::wait_tdm<0>();
+    sched::compiler_fence();
+    cluster::sync();
+    sched::compiler_fence();
+    load_tr<WARP_M, BM>(A_reg[0], a_base[0], a_col, 0);
+    load_tr<WARP_N, BN>(B_reg[0], b_base[0], b_col, 0);
+    for (int k = 0; k < nk; ++k) {
+        const int cur = k % 2, nxt = (k + 1) % 2;
+        fill(nxt, k + 1 < nk ? k0 + k + 1 : k0, k + 1 < nk);
+        sched::compiler_fence();
+        for (int s = 0; s < KS - 1; ++s) {
+            load_tr<WARP_M, BM>(A_reg[(s + 1) % 2], a_base[cur], a_col, (s + 1) * K_STEP);
+            load_tr<WARP_N, BN>(B_reg[(s + 1) % 2], b_base[cur], b_col, (s + 1) * K_STEP);
+            mma_ABt(acc, A_reg[s % 2], B_reg[s % 2], acc);
+            pin_interleave<NW, ND>();
+            sched::compiler_fence();
+        }
+        constexpr int L = (KS - 1) % 2;
+        mma_ABt_part<0, PRE_BAR>(acc, A_reg[L], B_reg[L]);
+        sched::compiler_fence();
+        sync::wait_ds<0>();
+        sync::wait_tdm<0>();
+        sched::compiler_fence();
+        sync::arrive();
+        if (w == 0) cluster::arrive();
+        sched::compiler_fence();
+        sync::wait();
+        sched::compiler_fence();
+        load_tr<WARP_M, BM>(A_reg[0], a_base[nxt], a_col, 0);
+        load_tr<WARP_N, BN>(B_reg[0], b_base[nxt], b_col, 0);
+        mma_ABt_part<PRE_BAR, NWM>(acc, A_reg[L], B_reg[L]);
+        pin_interleave<(NWM - PRE_BAR + 3) / 4, ND>();
+        sched::compiler_fence();
+        cluster::wait();
+        sched::compiler_fence();
+    }
+    sync::wait_tdm<0>();
+    sync::wait_ds<0>();
+    store(g.ws, acc, {0, z, bm * WM + w / WN, (int)blockIdx.y * WN + w % WN});
+}
+
+// C (column-major [M, N], ldc = M) tile columns [n_tile0, n_tile0 + n_tiles) of the m_tiles x BM leading rows:
+// split-K partials, then the reduce (adding C when acc_c)
+template<int BM, int BN, int WM, int WN, int CM, int CN>
+int launch_nt_sk(const void* a, const void* b, void* c, void* ws, int M, int N, int K, int m_tiles, int n_tile0,
+                 int n_tiles, int splits, int acc_c, hipStream_t s) {
+    using C = CfgNT<BM, BN, WM, WN>;
+    const int mb = m_tiles * BM, nb = n_tiles * BN;
+    if (m_tiles <= 0 || n_tiles <= 0 || m_tiles % CM || n_tiles % CN || n_tile0 % CN || n_tile0 < 0 || mb > M ||
+        (n_tile0 + n_tiles) * BN > N || K % BLOCK_K || splits < 1 || K / BLOCK_K < splits || mb % 8)
+        return 2;
+    globals_nt_sk g{gl_ab((bf16*)a, 1, 1, K, M), gl_ab((bf16*)b, 1, 1, K, N), gl_f((float*)ws, 1, splits, mb, nb),
+                    n_tile0};
+    auto k = nt_sk_kernel<BM, BN, WM, WN, CM, CN>;
+    constexpr size_t lds = 2 * (sizeof(typename C::A_tile) + sizeof(typename C::B_tile));
+    if (hipFuncSetAttribute((const void*)k, hipFuncAttributeMaxDynamicSharedMemorySize, lds) != hipSuccess) return 3;
+    hipLaunchKernelGGL(k, dim3(m_tiles, n_tiles, splits), dim3(C::THREADS), lds, s, g);
+    const int64_t n = (int64_t)mb * nb;
+    bf16* c_band = (bf16*)c + (int64_t)n_tile0 * BN * M;
+    hipLaunchKernelGGL(sk_reduce_kernel, dim3((unsigned)((n / 8 + 255) / 256)), dim3(256), 0, s, (const float*)ws,
+                       c_band, mb, nb, M, splits, acc_c);
+    return hipGetLastError() == hipSuccess ? 0 : 4;
 }
 
 template<int BM, int BN, int WM, int WN, int CM, int CN>
@@ -495,7 +609,7 @@ int launch_tn_sk(const void* a, const void* b, void* c, void* ws, int M, int N, 
     hipLaunchKernelGGL(k, dim3(m_tiles, n_tiles, splits), dim3(C::THREADS), lds, s, g);
     const int64_t n = (int64_t)mb * nb;
     hipLaunchKernelGGL(sk_reduce_kernel, dim3((unsigned)((n / 8 + 255) / 256)), dim3(256), 0, s, (const float*)ws,
-                       (bf16*)c, mb, nb, M, splits);
+                       (bf16*)c, mb, nb, M, splits, 0);
     return hipGetLastError() == hipSuccess ? 0 : 4;
 }
 
@@ -550,6 +664,18 @@ extern "C" int hk_gemm_nt_accumulate(int v, const void* a, const void* b, void* 
     switch (v) {
         case 0: return hk_gemm::launch_nt<256, 256, 4, 2, 4, 4, true>(a, b, c, M, N, K, m_tiles, n_tiles, s);
         case 1: return hk_gemm::launch_nt<256, 256, 4, 2, 2, 4, true>(a, b, c, M, N, K, m_tiles, n_tiles, s);
+        default: return 1;
+    }
+}
+
+// NT split-K over tile columns [n_tile0, n_tile0 + n_tiles) (the tail of a grid), the NT variants' tiles and
+// clusters; ws holds splits x (m_tiles BM) x (n_tiles BN) floats; acc_c adds the existing C
+extern "C" int hk_gemm_nt_splitk(int v, const void* a, const void* b, void* c, void* ws, int M, int N, int K,
+                                 int m_tiles, int n_tile0, int n_tiles, int splits, int acc_c, void* stream) {
+    hipStream_t s = (hipStream_t)stream;
+    switch (v) {
+        case 0: return hk_gemm::launch_nt_sk<256, 256, 4, 2, 4, 4>(a, b, c, ws, M, N, K, m_tiles, n_tile0, n_tiles, splits, acc_c, s);
+        case 1: return hk_gemm::launch_nt_sk<256, 256, 4, 2, 2, 4>(a, b, c, ws, M, N, K, m_tiles, n_tile0, n_tiles, splits, acc_c, s);
         default: return 1;
     }
 }

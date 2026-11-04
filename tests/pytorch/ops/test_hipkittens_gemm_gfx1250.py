@@ -227,3 +227,22 @@ def test_nt_one_partial_wave():
     assert hk.hk_gemm_tn_plan(M, N, K) is None
     a, b = _ints(K, M, 41), _ints(K, N, 42)
     torch.testing.assert_close(hk.hk_gemm_nt(a, b), torch.mm(b.t(), a), rtol=0, atol=0)
+
+
+# NT band plan: a grid whose last wave would be mostly idle (DeepSeek-V3's q_up weight gradient, 576 tiles on
+# 256 CUs) runs two whole waves on the NT kernel and the remaining band of tile columns split along K.
+@pytest.mark.parametrize("M,N,K", [(1536, 24576, 8192), (1536, 24576 + 192, 8192)])
+def test_nt_band_matches_torch_bitwise(M, N, K):
+    hk = _gemm()
+    from primus_turbo.hipkittens.gemm_gfx1250 import _num_cus
+
+    if _num_cus() != 256:
+        pytest.skip("the band shape is chosen for 256 CUs")
+    plan = hk.hk_gemm_nt_plan(M, N, K)
+    assert plan is not None and plan[3] > 1 and plan[4] < plan[2], plan
+    a, b = _ints(K, M, 51), _ints(K, N, 52)
+    torch.testing.assert_close(hk.hk_gemm_nt(a, b), torch.mm(b.t(), a), rtol=0, atol=0)
+    g = torch.Generator(device="cuda").manual_seed(53)
+    c0 = torch.randint(-64, 65, (N, M), device="cuda", generator=g).to(torch.bfloat16)
+    out = hk.hk_gemm_nt(a, b, out=c0.clone(), accumulate=True)
+    torch.testing.assert_close(out, (c0.float() + b.float().t() @ a.float()).bfloat16(), rtol=0, atol=0)

@@ -22,7 +22,8 @@ finish a ragged M or N edge with ``torch.mm``. A grid must fill the GPU: at leas
 CUs (one tile per workgroup), and four waves or more unless the last is 85% full (NT: one wave on at least 85%
 of the CUs also counts, hipBLASLt's NT kernels being further behind than the idle CUs cost). A TN GEMM whose tiles
 cover at most half the CUs but whose K is long splits K across 2-8 workgroups per tile (each split at least
-2048 deep; FP32 partial tiles summed by a second kernel). They refuse (``hk_gemm_tn_supported`` /
+2048 deep; FP32 partial tiles summed by a second kernel). An NT grid whose last wave would be mostly idle runs
+its whole waves of tile columns on the NT kernel and splits the remaining band of columns along K. They refuse (``hk_gemm_tn_supported`` /
 ``hk_gemm_nt_supported`` is False) when K is not a multiple of 128, the block would cover less than
 three quarters of C, or no grid fills the GPU.
 """
@@ -139,21 +140,58 @@ def _plan(kind: str, M: int, N: int, K: int) -> Optional[Tuple[int, int, int, in
                 break
     if best is None:
         best = split_best
+    if best is None and kind == "nt":
+        return _nt_band_plan(M, N, K)
     if best is None or best[2] * best[3] < _MIN_COVER * M * N:
         return None
-    return best[1], best[2], best[3], best[4]
+    return best[1], best[2], best[3], best[4], best[3]
+
+
+def _nt_band_plan(M: int, N: int, K: int) -> Optional[Tuple[int, int, int, int, int]]:
+    """An NT grid whose last wave would leave most CUs idle (q_up's weight gradient: 576 tiles, 2.25 waves):
+    whole waves of tile columns on the NT kernel, the remaining band of columns split along K into one more
+    wave (FP32 partial tiles, then a reduce). ``(variant, M_block, N_block, splits, N_main)``: columns
+    [0, N_main) on the NT kernel, [N_main, N_block) split ``splits`` ways; None if no variant gives at least
+    two whole waves 95% full and a band at least 75% of a wave."""
+    cus = _num_cus()
+    best = None
+    for v, (bm, bn, cm, cn) in _variants("nt").items():
+        mb, nb = M - M % (bm * cm), N - N % (bn * cn)
+        if mb == 0 or nb == 0 or mb * nb < _MIN_COVER * M * N:
+            continue
+        m_tiles, n_tiles = mb // bm, nb // bn
+        waves = m_tiles * n_tiles // cus
+        if waves < 2:
+            continue
+        main_cols = (waves * cus // m_tiles) // cn * cn
+        tail_cols = n_tiles - main_cols
+        if main_cols == 0 or tail_cols == 0 or m_tiles * main_cols < 0.95 * waves * cus:
+            continue
+        tail = m_tiles * tail_cols
+        for splits in _SPLITS:
+            if tail * splits > cus or K // 128 < splits * 8:
+                break
+            if tail * splits < 0.75 * cus:
+                continue
+            # K blocks of work per CU, plus about three blocks of fixed cost per wave
+            est = waves * (K // 128 + 3) + K // 128 / splits + 3
+            if best is None or est * (M * N) / (mb * nb) < best[0]:
+                best = (est * (M * N) / (mb * nb), v, mb, nb, splits, main_cols * bn)
+    return None if best is None else best[1:]
 
 
 @functools.lru_cache(maxsize=4096)
 def hk_gemm_tn_plan(M: int, N: int, K: int) -> Optional[Tuple[int, int, int, int]]:
     """``(variant, M_block, N_block, splits)`` for ``hk_gemm_tn``, or None if it does not take this shape."""
-    return _plan("tn", M, N, K)
+    p = _plan("tn", M, N, K)
+    return None if p is None else p[:4]
 
 
 @functools.lru_cache(maxsize=4096)
-def hk_gemm_nt_plan(M: int, N: int, K: int) -> Optional[Tuple[int, int, int, int]]:
-    """``(variant, M_block, N_block, splits)`` for ``hk_gemm_nt`` (splits is 1), or None if it does not take
-    this shape."""
+def hk_gemm_nt_plan(M: int, N: int, K: int) -> Optional[Tuple[int, int, int, int, int]]:
+    """``(variant, M_block, N_block, splits, N_main)`` for ``hk_gemm_nt``, or None if it does not take this
+    shape: tile columns [0, N_main) on the NT kernel and, when ``splits`` > 1, the band [N_main, N_block)
+    split along K."""
     return _plan("nt", M, N, K)
 
 
@@ -262,11 +300,17 @@ def hk_gemm_nt(
         raise ValueError(
             "out must be a contiguous BF16 tensor of shape [N, M], 256-byte aligned (16-byte to accumulate into)"
         )
-    v, mb, nb, _ = hk_gemm_nt_plan(M, N, K)
+    v, mb, nb, splits, nb_main = hk_gemm_nt_plan(M, N, K)
     bm, bn, _, _ = _variants("nt")[v]
     stream = torch.cuda.current_stream(a.device).cuda_stream
     launch = load_library().hk_gemm_nt_accumulate if accumulate else load_library().hk_gemm_nt
-    rc = launch(v, a.data_ptr(), b.data_ptr(), out.data_ptr(), M, N, K, mb // bm, nb // bn, stream)
+    rc = launch(v, a.data_ptr(), b.data_ptr(), out.data_ptr(), M, N, K, mb // bm, nb_main // bn, stream)
+    if rc == 0 and splits > 1:  # the band of columns [nb_main, nb), split along K
+        ws = torch.empty(splits * mb * (nb - nb_main), dtype=torch.float32, device=a.device)
+        rc = load_library().hk_gemm_nt_splitk(
+            v, a.data_ptr(), b.data_ptr(), out.data_ptr(), ws.data_ptr(), M, N, K, mb // bm, nb_main // bn,
+            (nb - nb_main) // bn, splits, int(accumulate), stream
+        )
     if rc != 0:
         raise RuntimeError(f"hk_gemm_nt launch failed ({rc}) for M={M} N={N} K={K} variant {v}")
     if accumulate:  # the edges as GEMMs with beta = 1; the corner [nb:, mb:] once
