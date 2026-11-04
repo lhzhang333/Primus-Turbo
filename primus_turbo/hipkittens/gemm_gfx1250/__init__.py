@@ -126,7 +126,7 @@ def _plan(kind: str, M: int, N: int, K: int) -> Optional[Tuple[int, int, int, in
             continue
         if kind != "tn" or 2 * tiles > _num_cus():
             # split K only where the tiles cover at most half the CUs: with more, the FP32 partial tiles
-            # cost more than a library kernel with smaller tiles loses (q_up's dgrad: 192 tiles, 0.86x)
+            # cost more than a library kernel with smaller tiles loses (q_up's dgrad, 192 tiles, ran slower split)
             continue
         # one tile per workgroup leaves most CUs idle for the whole (long-K) GEMM: split K instead
         for splits in _SPLITS:
