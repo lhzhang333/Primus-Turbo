@@ -68,6 +68,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe.py",
     # The same op across every visible GPU (EP2+).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe_ep.py",
+    # HipKittens BF16 TN GEMM (primus_turbo/hipkittens/gemm_gfx1250).
+    "tests/pytorch/ops/test_hipkittens_gemm_gfx1250.py",
 )
 
 

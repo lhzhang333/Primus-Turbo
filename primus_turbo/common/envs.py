@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_ODC_GDA_BLOCK: int = 256
     PRIMUS_TURBO_ODC_GDA_PIPE: int = 1
     PRIMUS_TURBO_ODC_GDA_NUM_QP: int = 1
+    PRIMUS_TURBO_HIPKITTENS_INCLUDE: str | None = None
+    PRIMUS_TURBO_HK_GEMM_CACHE_DIR: str | None = None
 
 
 def backend_spec(name: str) -> Callable[[], str | None]:
@@ -255,6 +257,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rocSHMEM QPs/contexts for multi-QP NIC concurrency, clamped to [1, 256]; above 1 selects
     # the multi-QP path.
     "PRIMUS_TURBO_ODC_GDA_NUM_QP": env_clamped_int("PRIMUS_TURBO_ODC_GDA_NUM_QP", 1, 1, 256),
+    # ================== HipKittens gfx1250 GEMM ==================
+    # include/ directory of a HipKittens checkout with the gfx1250 (cdna5) headers, for the GEMM
+    # kernels primus_turbo.hipkittens.gemm_gfx1250 builds at first use. Unset: 3rdparty/hipkittens.
+    "PRIMUS_TURBO_HIPKITTENS_INCLUDE": lambda: os.getenv("PRIMUS_TURBO_HIPKITTENS_INCLUDE") or None,
+    # Where those kernels are cached once built. Unset: ~/.cache/primus_turbo/hk_gemm.
+    "PRIMUS_TURBO_HK_GEMM_CACHE_DIR": lambda: os.getenv("PRIMUS_TURBO_HK_GEMM_CACHE_DIR") or None,
 }
 
 

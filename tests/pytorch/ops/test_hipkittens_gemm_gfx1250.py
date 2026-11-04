@@ -1,0 +1,105 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+"""HipKittens BF16 TN GEMM on gfx1250 (primus_turbo.hipkittens.gemm_gfx1250).
+
+Integer operands in [-3, 3] keep every FP32 partial sum exact, so any correct kernel returns the same
+BF16 result as ``torch.mm``: the numeric cases compare bit for bit. Random BF16 operands are compared
+against an FP32 reference within BF16 output rounding.
+"""
+
+import pytest
+import torch
+
+from primus_turbo.pytorch.core.utils import is_gfx1250
+
+pytestmark = pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx1250()), reason="HipKittens gfx1250 GEMM needs gfx1250"
+)
+
+
+def _gemm():
+    from primus_turbo.hipkittens import gemm_gfx1250
+
+    if not gemm_gfx1250.hk_gemm_available():
+        pytest.skip("HipKittens gfx1250 headers or hipcc unavailable")
+    return gemm_gfx1250
+
+
+def _ints(rows, cols, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    return torch.randint(-3, 4, (rows, cols), device="cuda", generator=g).to(torch.bfloat16)
+
+
+# (M, N, K): whole-cluster blocks (the 224 and the 256 tile families), a ragged M edge (the
+# DeepSeek-V3 vocabulary 129408 = 126 clusters of 1024 + 384), a ragged N edge, short and long K.
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        (8192, 8192, 1024),
+        (7168, 8192, 2048),
+        (16384, 8192, 512),
+        (129408, 1024, 256),
+        (4096, 8704, 128),
+        (24576, 8192, 1536),
+        (7168, 8192, 16384),
+    ],
+)
+def test_tn_matches_torch_bitwise(M, N, K):
+    hk = _gemm()
+    a, b = _ints(M, K, 1), _ints(N, K, 2)
+    assert hk.hk_gemm_tn_supported(a, b)
+    out = hk.hk_gemm_tn(a, b)
+    torch.testing.assert_close(out, torch.mm(b, a.t()), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("M,N,K", [(7168, 8192, 4096), (16384, 8192, 7168)])
+def test_tn_random_close_to_fp32(M, N, K):
+    hk = _gemm()
+    g = torch.Generator(device="cuda").manual_seed(3)
+    a = torch.randn(M, K, device="cuda", generator=g).bfloat16()
+    b = torch.randn(N, K, device="cuda", generator=g).bfloat16()
+    out = hk.hk_gemm_tn(a, b).float()
+    ref = b.float() @ a.float().t()
+    # BF16 output rounding: half an ulp of the largest magnitude, plus FP32 summation-order noise
+    assert ((out - ref).abs().max() / ref.abs().max()).item() < 8e-3
+
+
+def test_out_argument_and_layout():
+    hk = _gemm()
+    a, b = _ints(4096, 512, 4), _ints(8192, 512, 5)
+    out = torch.empty(8192, 4096, dtype=torch.bfloat16, device="cuda")
+    assert hk.hk_gemm_tn(a, b, out=out).data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, torch.mm(b, a.t()), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "M,N,K,why",
+    [
+        (512, 8192, 32768, "fewer tiles than CUs"),
+        (1536, 8192, 24576, "fewer tiles than CUs"),
+        (7168, 8192, 576, "K not a multiple of 128"),
+        (1024, 1024, 128, "fewer tiles than CUs"),
+    ],
+)
+def test_refuses(M, N, K, why):
+    hk = _gemm()
+    a, b = _ints(M, K, 6), _ints(N, K, 7)
+    assert not hk.hk_gemm_tn_supported(a, b), why
+    with pytest.raises(ValueError):
+        hk.hk_gemm_tn(a, b)
+
+
+def test_refuses_layout_and_dtype():
+    hk = _gemm()
+    a, b = _ints(8192, 1024, 8), _ints(8192, 1024, 9)
+    assert hk.hk_gemm_tn_supported(a, b)
+    assert not hk.hk_gemm_tn_supported(a.t(), b)  # not K-contiguous
+    assert not hk.hk_gemm_tn_supported(a.float(), b.float())
+    # the same values 16 bytes into an allocation: contiguous but not 256-byte aligned
+    shifted = torch.empty(a.numel() + 64, dtype=a.dtype, device=a.device)[8 : 8 + a.numel()].view(a.shape)
+    shifted.copy_(a)
+    assert not hk.hk_gemm_tn_supported(shifted, b)
