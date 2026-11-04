@@ -155,3 +155,58 @@ def test_nt_refuses():
     assert not hk.hk_gemm_nt_supported(_ints(8192, 512, 16), _ints(8192, 1024, 17))  # fewer tiles than CUs
     with pytest.raises(ValueError):
         hk.hk_gemm_nt(a[:576], b[:576])
+
+
+# NT with accumulation (out += b.T @ a, a weight gradient added straight into main_grad): the sum is taken in
+# FP32 and rounded once, so on integer data it equals the exact sum rounded to BF16, as a GEMM with beta = 1
+# returns it. Ragged M and N edges (and the corner they share) are added once.
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        (8192, 8192, 1024),
+        (7168, 129408, 512),
+        (16384, 7168, 2048),
+        (7424, 8192, 256),
+        (7168 + 64, 4096 + 96, 1024),
+    ],
+)
+def test_nt_accumulate_rounds_once(M, N, K):
+    hk = _gemm()
+    a, b = _ints(K, M, 31), _ints(K, N, 32)
+    g = torch.Generator(device="cuda").manual_seed(33)
+    c0 = torch.randint(-64, 65, (N, M), device="cuda", generator=g).to(torch.bfloat16)
+    assert hk.hk_gemm_nt_supported(a, b)
+    out = c0.clone()
+    assert hk.hk_gemm_nt(a, b, out=out, accumulate=True).data_ptr() == out.data_ptr()
+    exact = (c0.float() + b.float().t() @ a.float()).bfloat16()
+    torch.testing.assert_close(out, exact, rtol=0, atol=0)
+    torch.testing.assert_close(out, torch.addmm(c0, b.t(), a), rtol=0, atol=0)
+
+
+def test_nt_accumulate_random_close_to_fp32():
+    hk = _gemm()
+    g = torch.Generator(device="cuda").manual_seed(34)
+    a = torch.randn(8192, 7168, device="cuda", generator=g).bfloat16()
+    b = torch.randn(8192, 4096, device="cuda", generator=g).bfloat16()
+    c0 = (torch.randn(4096, 7168, device="cuda", generator=g) * 30).bfloat16()
+    out = hk.hk_gemm_nt(a, b, out=c0.clone(), accumulate=True).float()
+    ref = c0.float() + b.float().t() @ a.float()
+    assert ((out - ref).abs().max() / ref.abs().max()).item() < 8e-3
+
+
+def test_nt_accumulate_out_rules():
+    hk = _gemm()
+    a, b = _ints(1024, 4096, 35), _ints(1024, 4096, 36)
+    with pytest.raises(ValueError):
+        hk.hk_gemm_nt(a, b, accumulate=True)  # nothing to accumulate into
+    # a parameter's slice of a gradient buffer: 16-byte (not 256-byte) aligned
+    buf = torch.zeros(4096 * 4096 + 64, dtype=torch.bfloat16, device="cuda")
+    out = buf[8 : 8 + 4096 * 4096].view(4096, 4096)
+    assert hk.hk_gemm_nt_out_ok(out, a, b, accumulate=True)
+    assert not hk.hk_gemm_nt_out_ok(out, a, b)
+    with pytest.raises(ValueError):
+        hk.hk_gemm_nt(a, b, out=out)
+    hk.hk_gemm_nt(a, b, out=out, accumulate=True)
+    hk.hk_gemm_nt(a, b, out=out, accumulate=True)
+    torch.testing.assert_close(out, (2 * (b.float().t() @ a.float())).bfloat16(), rtol=0, atol=0)
+    assert buf[:8].count_nonzero() == 0 and buf[8 + 4096 * 4096 :].count_nonzero() == 0

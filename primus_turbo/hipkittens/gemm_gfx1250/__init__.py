@@ -12,7 +12,8 @@ GEMM on a transposed weight). The result is row-major [N, M], i.e. ``C = A B^T``
 
 ``hk_gemm_nt(a, b)`` returns ``b.T @ a`` for ``a`` [K, M] and ``b`` [K, N], both with K outermost: the
 weight gradient of a linear layer, ``dW = dY^T x`` with ``a = x`` [tokens, in] and ``b = dY``
-[tokens, out], with neither operand transposed. The result is row-major [N, M] (``dW`` [out, in]).
+[tokens, out], with neither operand transposed. The result is row-major [N, M] (``dW`` [out, in]);
+``accumulate=True`` adds it to ``out`` instead (``main_grad += dW``, one rounding, as a GEMM with beta = 1).
 
 The kernels (``hk_gemm_gfx1250.cpp``) cover a leading block of C whose sides are multiples of a tile
 cluster (TN: 896 or 1024 along M, 1024 along N; NT: 512 or 1024 along M, 1024 along N) with K a multiple
@@ -41,6 +42,7 @@ __all__ = [
     "hipkittens_include",
     "hk_gemm_available",
     "hk_gemm_nt",
+    "hk_gemm_nt_out_ok",
     "hk_gemm_nt_plan",
     "hk_gemm_nt_supported",
     "hk_gemm_tn",
@@ -224,22 +226,51 @@ def hk_gemm_nt_supported(a: torch.Tensor, b: torch.Tensor) -> bool:
     return hk_gemm_available() and hk_gemm_nt_plan(a.shape[1], b.shape[1], a.shape[0]) is not None
 
 
-def hk_gemm_nt(a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """``b.T @ a`` (row-major [N, M]) for BF16 ``a`` [K, M] and ``b`` [K, N]; see the module docstring."""
+def hk_gemm_nt_out_ok(out: torch.Tensor, a: torch.Tensor, b: torch.Tensor, accumulate: bool = False) -> bool:
+    """Whether ``out`` can take ``hk_gemm_nt(a, b)``: a contiguous BF16 [N, M] tensor on the device of ``a``,
+    256-byte aligned to be overwritten, 16-byte aligned to be accumulated into (the alignment of a
+    parameter's slice of a gradient buffer)."""
+    return (
+        out.shape == (b.shape[1], a.shape[1])
+        and out.dtype == torch.bfloat16
+        and out.device == a.device
+        and out.is_contiguous()
+        and out.data_ptr() % (16 if accumulate else 256) == 0
+    )
+
+
+def hk_gemm_nt(
+    a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor] = None, accumulate: bool = False
+) -> torch.Tensor:
+    """``b.T @ a`` (row-major [N, M]) for BF16 ``a`` [K, M] and ``b`` [K, N]; see the module docstring.
+
+    With ``accumulate`` the product is added to ``out`` (``out += b.T @ a``, the sum taken in FP32 and rounded
+    to BF16 once, as a GEMM with beta = 1): a weight gradient accumulated straight into ``main_grad``."""
     if not hk_gemm_nt_supported(a, b):
         raise ValueError(f"hk_gemm_nt does not take a {tuple(a.shape)} x {tuple(b.shape)} {a.dtype} GEMM here")
     K, M = a.shape
     N = b.shape[1]
     if out is None:
+        if accumulate:
+            raise ValueError("accumulate needs out")
         out = torch.empty((N, M), dtype=torch.bfloat16, device=a.device)
-    elif not (out.shape == (N, M) and out.dtype == torch.bfloat16 and out.is_contiguous() and out.data_ptr() % 256 == 0):
-        raise ValueError("out must be a contiguous, 256-byte aligned BF16 tensor of shape [N, M]")
+    elif not hk_gemm_nt_out_ok(out, a, b, accumulate):
+        raise ValueError(
+            "out must be a contiguous BF16 tensor of shape [N, M], 256-byte aligned (16-byte to accumulate into)"
+        )
     v, mb, nb, _ = hk_gemm_nt_plan(M, N, K)
     bm, bn, _, _ = _variants("nt")[v]
     stream = torch.cuda.current_stream(a.device).cuda_stream
-    rc = load_library().hk_gemm_nt(v, a.data_ptr(), b.data_ptr(), out.data_ptr(), M, N, K, mb // bm, nb // bn, stream)
+    launch = load_library().hk_gemm_nt_accumulate if accumulate else load_library().hk_gemm_nt
+    rc = launch(v, a.data_ptr(), b.data_ptr(), out.data_ptr(), M, N, K, mb // bm, nb // bn, stream)
     if rc != 0:
         raise RuntimeError(f"hk_gemm_nt launch failed ({rc}) for M={M} N={N} K={K} variant {v}")
+    if accumulate:  # the edges as GEMMs with beta = 1; the corner [nb:, mb:] once
+        if mb < M:
+            out[:, mb:].addmm_(b.t(), a[:, mb:])
+        if nb < N:
+            out[nb:, :mb].addmm_(b[:, nb:].t(), a[:, :mb])
+        return out
     if mb < M:  # columns [mb, M) of the row-major result
         out[:, mb:] = torch.mm(b.t(), a[:, mb:])
     if nb < N:  # rows [nb, N)

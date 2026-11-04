@@ -19,6 +19,10 @@
 // way, so their K orders agree. A panel row is padded by 16 B every 256 B (32 B per 512-B row): each half-wave
 // of a ds_load_tr16_b128 reads 8 rows x 32 B, and a row pitch of 8 banks (mod 64) keeps those 8 reads on
 // disjoint banks (16 B of padding per row, a pitch of 4 banks, makes them collide in pairs).
+// The accumulating NT kernel (C += A^T B, a weight gradient added into main_grad) brings the C tile through the
+// TDM into the ring slot the last K block leaves free, under that block's MMAs, and adds it to the FP32
+// accumulators before the epilogue: one rounding, as a GEMM with beta = 1. Loading C straight into the
+// accumulator layout instead (8 bytes per lane, 16 columns per load) was slower than a separate add.
 //
 // Built at run time by build.py (hipcc, -DKITTENS_CDNA5 --offload-arch=gfx1250) and called through ctypes.
 #include "kittens.cuh"
@@ -222,6 +226,9 @@ __device__ __forceinline__ void load_tr(reg_tile<ROWS, K_STEP>& dst, const lds_u
     }
 }
 
+// NT globals: c_rows is C seen as the row-major [N, M] it is, which the accumulating kernel loads through the TDM
+struct globals_nt { gl_ab a, b; gl_c c; gl_ab c_rows; };
+
 template<int BM, int BN, int WM, int WN>
 struct CfgNT : Cfg<BM, BN, WM, WN> {
     static_assert(BM % KMAJOR_PAD_INTERVAL == 0 && BN % KMAJOR_PAD_INTERVAL == 0, "panel rows of whole pad intervals");
@@ -234,9 +241,9 @@ struct CfgNT : Cfg<BM, BN, WM, WN> {
     }
 };
 
-template<int BM, int BN, int WM, int WN, int CM, int CN>
+template<int BM, int BN, int WM, int WN, int CM, int CN, bool ACC>
 __global__ __cluster_dims__(CM, CN, 1) __launch_bounds__(WM * WN * WARP_THREADS, 1)
-void nt_kernel(const globals g) {
+void nt_kernel(const globals_nt g) {
     using C = CfgNT<BM, BN, WM, WN>;
     using A_tile = typename C::A_tile;
     using B_tile = typename C::B_tile;
@@ -280,7 +287,18 @@ void nt_kernel(const globals g) {
     load_tr<WARP_N, BN>(B_reg[0], b_base[0], b_col, 0);
     for (int k = 0; k < nk; ++k) {
         const int cur = k % 2, nxt = (k + 1) % 2;
-        fill(nxt, k + 1 < nk ? k + 1 : 0, k + 1 < nk);
+        if constexpr (ACC) {
+            // the last K block leaves slot nxt free: it takes this tile's C, the BN / 2 = 128 rows of the
+            // row-major [N, M] C per half as the A and B panels' [128][BM] shape, under the last block's MMAs
+            if (k + 1 < nk) {
+                fill(nxt, k + 1);
+            } else {
+                if (w == 0) tdm::load_async(A_lds[nxt], g.c_rows, {0, 0, 2 * bn, bm}, g.c_rows.rows(), g.c_rows.cols(), g.c_rows.cols());
+                if (w == 1) tdm::load_async(B_lds[nxt], g.c_rows, {0, 0, 2 * bn + 1, bm}, g.c_rows.rows(), g.c_rows.cols(), g.c_rows.cols());
+            }
+        } else {
+            fill(nxt, k + 1 < nk ? k + 1 : 0, k + 1 < nk);
+        }
         sched::compiler_fence();
         for (int s = 0; s < KS - 1; ++s) {
             load_tr<WARP_M, BM>(A_reg[(s + 1) % 2], a_base[cur], a_col, (s + 1) * K_STEP);
@@ -310,6 +328,28 @@ void nt_kernel(const globals g) {
     }
     sync::wait_tdm<0>();
     sync::wait_ds<0>();
+    if constexpr (ACC) {
+        // C += A^T B: C (in slot nk % 2, waves 0 and 1 waited for it above) added to the FP32 accumulators, so
+        // the sum is rounded once. A lane's 8 accumulator rows of a 16 x 16 block are 8 consecutive M of one N:
+        // 16 contiguous bytes of a panel row. Each wave's WARP_N = 128 columns are one of the two halves.
+        static_assert(BM == BN && BN == 2 * BLOCK_K && WN == 2 && WARP_N == BLOCK_K, "C halves are the panels");
+        sync::sync();
+        const int slot = nk % 2;
+        const lds_u8_t* c_half = w % WN == 0 ? lds_base(A_lds[slot]) : lds_base(B_lds[slot]);
+        const int lane = kittens::laneid(), m0 = w / WN * WARP_M + 8 * (lane / 16);
+#pragma unroll
+        for (int i = 0; i < acc.height; ++i) {
+#pragma unroll
+            for (int j = 0; j < acc.width; ++j) {
+                const bf16x8_t v = *(const lds_bf16x8_t*)(c_half + kmajor_off<BM>(16 * j + lane % 16, m0 + 16 * i));
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    acc.tiles[i][j].data[l].x += (float)v[2 * l];
+                    acc.tiles[i][j].data[l].y += (float)v[2 * l + 1];
+                }
+            }
+        }
+    }
     C_tile& C_lds = *(C_tile*)&__shm[0];
     sync::wait_ds<0>();
     sync::sync();
@@ -319,14 +359,15 @@ void nt_kernel(const globals g) {
     store<THREADS>(g.c, C_lds, {0, 0, bm, bn});
 }
 
-template<int BM, int BN, int WM, int WN, int CM, int CN>
+template<int BM, int BN, int WM, int WN, int CM, int CN, bool ACC = false>
 int launch_nt(const void* a, const void* b, void* c, int M, int N, int K, int m_tiles, int n_tiles, hipStream_t s) {
     using C = CfgNT<BM, BN, WM, WN>;
     if (m_tiles <= 0 || n_tiles <= 0 || m_tiles % CM || n_tiles % CN || m_tiles * BM > M || n_tiles * BN > N ||
         K % BLOCK_K)
         return 2;
-    globals g{gl_ab((bf16*)a, 1, 1, K, M), gl_ab((bf16*)b, 1, 1, K, N), gl_c((bf16*)c, 1, 1, M, N)};
-    auto k = nt_kernel<BM, BN, WM, WN, CM, CN>;
+    globals_nt g{gl_ab((bf16*)a, 1, 1, K, M), gl_ab((bf16*)b, 1, 1, K, N), gl_c((bf16*)c, 1, 1, M, N),
+                 gl_ab((bf16*)c, 1, 1, N, M)};
+    auto k = nt_kernel<BM, BN, WM, WN, CM, CN, ACC>;
     constexpr size_t lds = C::lds_bytes();
     if (hipFuncSetAttribute((const void*)k, hipFuncAttributeMaxDynamicSharedMemorySize, lds) != hipSuccess) return 3;
     hipLaunchKernelGGL(k, dim3(m_tiles, n_tiles), dim3(C::THREADS), lds, s, g);
@@ -498,6 +539,17 @@ extern "C" int hk_gemm_nt(int v, const void* a, const void* b, void* c, int M, i
     switch (v) {
         case 0: return hk_gemm::launch_nt<256, 256, 4, 2, 4, 4>(a, b, c, M, N, K, m_tiles, n_tiles, s);
         case 1: return hk_gemm::launch_nt<256, 256, 4, 2, 2, 4>(a, b, c, M, N, K, m_tiles, n_tiles, s);
+        default: return 1;
+    }
+}
+
+// NT with accumulation: C += A^T B (C read and written in BF16, the sum taken in FP32), same variants
+extern "C" int hk_gemm_nt_accumulate(int v, const void* a, const void* b, void* c, int M, int N, int K, int m_tiles,
+                                     int n_tiles, void* stream) {
+    hipStream_t s = (hipStream_t)stream;
+    switch (v) {
+        case 0: return hk_gemm::launch_nt<256, 256, 4, 2, 4, 4, true>(a, b, c, M, N, K, m_tiles, n_tiles, s);
+        case 1: return hk_gemm::launch_nt<256, 256, 4, 2, 2, 4, true>(a, b, c, M, N, K, m_tiles, n_tiles, s);
         default: return 1;
     }
 }
