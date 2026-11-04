@@ -70,6 +70,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe_ep.py",
     # The dense SwiGLU op (Triton, 2-D tiles) of the Llama-3.1-8B MLP.
     "tests/pytorch/ops/test_activation.py::test_swiglu",
+    # Fused QKV RoPE (Triton and FlyDSL backends) at the dense GQA layouts.
+    "tests/pytorch/ops/test_rope.py",
 )
 
 

@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_GROUPED_GEMM_BACKEND: str | None = None
     PRIMUS_TURBO_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_SPARSE_ATTN_BACKEND: str | None = None
+    PRIMUS_TURBO_ROPE_BACKEND: str | None = None
     PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND: str | None = None
     PRIMUS_TURBO_AUTO_TUNE: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
@@ -165,6 +166,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_ATTN_BACKEND": backend_spec("PRIMUS_TURBO_ATTN_BACKEND"),
     # Sparse-attention (DeepSeek-V4 sparse-MLA) backend, e.g. FLYDSL, TRITON, or "autotune".
     "PRIMUS_TURBO_SPARSE_ATTN_BACKEND": backend_spec("PRIMUS_TURBO_SPARSE_ATTN_BACKEND"),
+    # Fused QKV RoPE (``primus_turbo.pytorch.ops.rope.fused_qkv_rope``) backend: TRITON or FLYDSL
+    # (case-insensitive). Unset (or blank): TRITON on gfx1250, FLYDSL elsewhere. Read at the first call.
+    "PRIMUS_TURBO_ROPE_BACKEND": backend_spec("PRIMUS_TURBO_ROPE_BACKEND"),
     # MoE dispatch/combine EP backend: TURBO (the default when unset), DEEP_EP, or a custom EP name
     # such as UCCL_EP. "autotune" is rejected with an AssertionError.
     "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend_spec("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"),
