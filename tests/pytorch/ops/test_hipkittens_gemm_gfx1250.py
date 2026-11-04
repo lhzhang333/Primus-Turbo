@@ -76,11 +76,22 @@ def test_out_argument_and_layout():
     torch.testing.assert_close(out, torch.mm(b, a.t()), rtol=0, atol=0)
 
 
+# TN split-K: blocks whose tiles cover at most half the CUs and a long K (DeepSeek-V3's kv_up dgrad)
+@pytest.mark.parametrize("M,N,K", [(512, 8192, 32768), (1024, 4096, 24576), (512, 8192 + 384, 16384)])
+def test_tn_splitk_matches_torch_bitwise(M, N, K):
+    hk = _gemm()
+    plan = hk.hk_gemm_tn_plan(M, N, K)
+    assert plan is not None and plan[3] > 1
+    a, b = _ints(M, K, 21), _ints(N, K, 22)
+    assert hk.hk_gemm_tn_supported(a, b)
+    torch.testing.assert_close(hk.hk_gemm_tn(a, b), torch.mm(b, a.t()), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "M,N,K,why",
     [
-        (512, 8192, 32768, "fewer tiles than CUs"),
-        (1536, 8192, 24576, "fewer tiles than CUs"),
+        (512, 8192, 2048, "fewer tiles than CUs and K too short to split"),
+        (1536, 8192, 24576, "192 tiles: more than half the CUs, no split-K"),
         (7168, 8192, 576, "K not a multiple of 128"),
         (1024, 1024, 128, "fewer tiles than CUs"),
     ],

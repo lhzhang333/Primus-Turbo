@@ -333,6 +333,131 @@ int launch_nt(const void* a, const void* b, void* c, int M, int N, int K, int m_
     return hipGetLastError() == hipSuccess ? 0 : 4;
 }
 
+
+// ---------------------------------------------------------------- TN split-K: grid z splits K
+// For long-K GEMMs with fewer tiles than CUs (a dgrad onto a narrow input): workgroup (x, y, z) accumulates
+// K-blocks [z nk / S, (z + 1) nk / S) of its tile and stores the FP32 partial tile straight from registers
+// into split z of the workspace ([S][N_block][M_block], column-major blocks); reduce_kernel sums the S
+// partials into C.
+using gl_f = gl<float, -1, -1, -1, -1, ducks::gl_layout::col_major>;
+struct globals_sk { gl_ab a, b; gl_f ws; };
+
+template<int BM, int BN, int WM, int WN, int CM, int CN>
+__global__ __cluster_dims__(CM, CN, 1) __launch_bounds__(WM * WN * WARP_THREADS, 1)
+void tn_sk_kernel(const globals_sk g) {
+    using C = Cfg<BM, BN, WM, WN>;
+    using A_tile = typename C::A_tile;
+    using B_tile = typename C::B_tile;
+    constexpr int WARP_M = C::WARP_M, WARP_N = C::WARP_N;
+    constexpr int NWM = C::NWMMA, NW = NWM / 4, ND = (C::NDS + 3) / 4, PRE_BAR = C::PRE_BAR;
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
+    A_tile (&A_lds)[2] = al.allocate_in<segment<0>, A_tile, 2>();
+    B_tile (&B_lds)[2] = al.allocate_in<segment<0>, B_tile, 2>();
+    sched::lock_simd();
+
+    const int bm = blockIdx.x, bn = blockIdx.y, z = blockIdx.z, w = warpid();
+    const int nk_all = g.a.cols() / BLOCK_K, S = gridDim.z;
+    const int k0 = (int)((int64_t)nk_all * z / S), nk = (int)((int64_t)nk_all * (z + 1) / S) - k0;
+    const int a_off = w / WN * WARP_M * BLOCK_K;
+    const int b_off = w % WN * WARP_N * BLOCK_K;
+    reg_tile<WARP_M, K_STEP> A_reg[2];
+    reg_tile<WARP_N, K_STEP> B_reg[2];
+    acc_tile<WARP_M, WARP_N> acc;
+    zero(acc);
+
+    uint32_t a_mask = 0, b_mask = 0;
+#pragma unroll
+    for (int j = 0; j < CN; ++j) a_mask |= 1u << (bm % CM + CM * j);
+#pragma unroll
+    for (int i = 0; i < CM; ++i) b_mask |= 1u << (i + CM * (bn % CN));
+
+    auto fill = [&](int slot, int k, uint32_t count = 1) {
+        if (w == 0) tdm::load_async(A_lds[slot], g.a, {0, 0, bm, k}, g.a.rows(), g.a.cols(), g.a.cols(), a_mask, count);
+        if (w == 1) tdm::load_async(B_lds[slot], g.b, {0, 0, bn, k}, g.b.rows(), g.b.cols(), g.b.cols(), b_mask, count);
+    };
+
+    fill(0, k0);
+    sync::wait_tdm<0>();
+    sched::compiler_fence();
+    cluster::sync();
+    sched::compiler_fence();
+    load(A_reg[0], A_lds[0], a_off);
+    load(B_reg[0], B_lds[0], b_off);
+    for (int k = 0; k < nk; ++k) {
+        const int cur = k % 2, nxt = (k + 1) % 2;
+        fill(nxt, k + 1 < nk ? k0 + k + 1 : k0, k + 1 < nk);
+        sched::compiler_fence();
+        for (int s = 0; s < KS - 1; ++s) {
+            load(A_reg[(s + 1) % 2], A_lds[cur], a_off + (s + 1) * K_STEP);
+            load(B_reg[(s + 1) % 2], B_lds[cur], b_off + (s + 1) * K_STEP);
+            mma_ABt(acc, A_reg[s % 2], B_reg[s % 2], acc);
+            pin_interleave<NW, ND>();
+            sched::compiler_fence();
+        }
+        constexpr int L = (KS - 1) % 2;
+        mma_ABt_part<0, PRE_BAR>(acc, A_reg[L], B_reg[L]);
+        sched::compiler_fence();
+        sync::wait_ds<0>();
+        sync::wait_tdm<0>();
+        sched::compiler_fence();
+        sync::arrive();
+        if (w == 0) cluster::arrive();
+        sched::compiler_fence();
+        sync::wait();
+        sched::compiler_fence();
+        load(A_reg[0], A_lds[nxt], a_off);
+        load(B_reg[0], B_lds[nxt], b_off);
+        mma_ABt_part<PRE_BAR, NWM>(acc, A_reg[L], B_reg[L]);
+        pin_interleave<(NWM - PRE_BAR + 3) / 4, ND>();
+        sched::compiler_fence();
+        cluster::wait();
+        sched::compiler_fence();
+    }
+    sync::wait_tdm<0>();
+    sync::wait_ds<0>();
+    store(g.ws, acc, {0, z, bm * WM + w / WN, bn * WN + w % WN});
+}
+
+// C[col * ldc + row] = bf16(sum_z ws[z][col][row]) over the mb x nb block, 8 rows per thread (mb % 8 == 0)
+__global__ void sk_reduce_kernel(const float* __restrict__ ws, bf16* __restrict__ c, int mb, int nb, int ldc, int S) {
+    const int64_t i = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    const int64_t n = (int64_t)mb * nb;
+    if (i >= n) return;
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = 0.f;
+    for (int s = 0; s < S; ++s) {
+        const float4* q = reinterpret_cast<const float4*>(ws + s * n + i);
+        const float4 v0 = q[0], v1 = q[1];
+        acc[0] += v0.x; acc[1] += v0.y; acc[2] += v0.z; acc[3] += v0.w;
+        acc[4] += v1.x; acc[5] += v1.y; acc[6] += v1.z; acc[7] += v1.w;
+    }
+    const int64_t col = i / mb, row = i % mb;
+    bf16* out = c + col * ldc + row;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) out[j] = (bf16)acc[j];
+}
+
+template<int BM, int BN, int WM, int WN, int CM, int CN>
+int launch_tn_sk(const void* a, const void* b, void* c, void* ws, int M, int N, int K, int m_tiles, int n_tiles,
+                 int splits, hipStream_t s) {
+    using C = Cfg<BM, BN, WM, WN>;
+    const int mb = m_tiles * BM, nb = n_tiles * BN;
+    if (m_tiles <= 0 || n_tiles <= 0 || m_tiles % CM || n_tiles % CN || mb > M || nb > N || K % BLOCK_K ||
+        splits < 1 || K / BLOCK_K < splits || mb % 8)
+        return 2;
+    globals_sk g{gl_ab((bf16*)a, 1, 1, M, K), gl_ab((bf16*)b, 1, 1, N, K), gl_f((float*)ws, 1, splits, mb, nb)};
+    auto k = tn_sk_kernel<BM, BN, WM, WN, CM, CN>;
+    constexpr size_t lds = 2 * (sizeof(typename C::A_tile) + sizeof(typename C::B_tile));
+    if (hipFuncSetAttribute((const void*)k, hipFuncAttributeMaxDynamicSharedMemorySize, lds) != hipSuccess) return 3;
+    hipLaunchKernelGGL(k, dim3(m_tiles, n_tiles, splits), dim3(C::THREADS), lds, s, g);
+    const int64_t n = (int64_t)mb * nb;
+    hipLaunchKernelGGL(sk_reduce_kernel, dim3((unsigned)((n / 8 + 255) / 256)), dim3(256), 0, s, (const float*)ws,
+                       (bf16*)c, mb, nb, M, splits);
+    return hipGetLastError() == hipSuccess ? 0 : 4;
+}
+
 }  // namespace hk_gemm
 
 // ---------------------------------------------------------------- C API (ctypes)
@@ -373,6 +498,18 @@ extern "C" int hk_gemm_nt(int v, const void* a, const void* b, void* c, int M, i
     switch (v) {
         case 0: return hk_gemm::launch_nt<256, 256, 4, 2, 4, 4>(a, b, c, M, N, K, m_tiles, n_tiles, s);
         case 1: return hk_gemm::launch_nt<256, 256, 4, 2, 2, 4>(a, b, c, M, N, K, m_tiles, n_tiles, s);
+        default: return 1;
+    }
+}
+
+// TN split-K: the TN variants' tiles and clusters; ws holds splits x (m_tiles BM) x (n_tiles BN) floats
+extern "C" int hk_gemm_tn_splitk(int v, const void* a, const void* b, void* c, void* ws, int M, int N, int K,
+                                 int m_tiles, int n_tiles, int splits, void* stream) {
+    hipStream_t s = (hipStream_t)stream;
+    switch (v) {
+        case 0: return hk_gemm::launch_tn_sk<256, 256, 4, 2, 4, 4>(a, b, c, ws, M, N, K, m_tiles, n_tiles, splits, s);
+        case 1: return hk_gemm::launch_tn_sk<224, 256, 2, 4, 4, 4>(a, b, c, ws, M, N, K, m_tiles, n_tiles, splits, s);
+        case 2: return hk_gemm::launch_tn_sk<256, 256, 4, 2, 2, 4>(a, b, c, ws, M, N, K, m_tiles, n_tiles, splits, s);
         default: return 1;
     }
 }

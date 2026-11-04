@@ -104,4 +104,6 @@ def load_library() -> ctypes.CDLL:
     lib.hk_gemm_nt.argtypes = lib.hk_gemm_tn.argtypes
     lib.hk_gemm_nt_variant.restype = ctypes.c_int
     lib.hk_gemm_nt_variant.argtypes = lib.hk_gemm_tn_variant.argtypes
+    lib.hk_gemm_tn_splitk.restype = ctypes.c_int
+    lib.hk_gemm_tn_splitk.argtypes = [ctypes.c_int] + [ctypes.c_void_p] * 4 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
     return lib

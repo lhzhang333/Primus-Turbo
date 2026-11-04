@@ -17,11 +17,12 @@ weight gradient of a linear layer, ``dW = dY^T x`` with ``a = x`` [tokens, in] a
 The kernels (``hk_gemm_gfx1250.cpp``) cover a leading block of C whose sides are multiples of a tile
 cluster (TN: 896 or 1024 along M, 1024 along N; NT: 512 or 1024 along M, 1024 along N) with K a multiple
 of 128; ``hk_gemm_tn`` / ``hk_gemm_nt`` run that block with the variant that fills the GPU best and
-finish a ragged M or N edge with ``torch.mm``. They refuse (``hk_gemm_tn_supported`` /
-``hk_gemm_nt_supported`` is False) when K is not a multiple of 128, the block would cover
-less than three quarters of C, or it has fewer tiles than the GPU has CUs (one tile per workgroup
-and no split-K, so such a GEMM would leave CUs idle throughout), or a grid of fewer than four waves of
-workgroups whose last wave is less than 85% full.
+finish a ragged M or N edge with ``torch.mm``. A grid must fill the GPU: at least as many workgroups as
+CUs (one tile per workgroup), and four waves or more unless the last is 85% full. A TN GEMM whose tiles
+cover at most half the CUs but whose K is long splits K across 2-8 workgroups per tile (each split at least
+2048 deep; FP32 partial tiles summed by a second kernel). They refuse (``hk_gemm_tn_supported`` /
+``hk_gemm_nt_supported`` is False) when K is not a multiple of 128, the block would cover less than
+three quarters of C, or no grid fills the GPU.
 """
 
 from __future__ import annotations
@@ -83,44 +84,70 @@ def _num_cus() -> int:
     return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
 
-def _plan(kind: str, M: int, N: int, K: int) -> Optional[Tuple[int, int, int]]:
-    """``(variant, M_block, N_block)`` among the ``kind`` variants: the one with the most useful work per
-    CU slot (covered area times the occupancy of the last wave of workgroups, one workgroup per CU)."""
+_SPLITS = (2, 3, 4, 6, 8)
+_MIN_K_BLOCKS_PER_SPLIT = 16  # 2048 along K per split: the partial-tile traffic stays small next to the MMAs
+
+
+def _grid_ok(units: int) -> Tuple[bool, float]:
+    """Whether a grid of ``units`` workgroups (one per CU at a time) fills the GPU, and its last-wave fill."""
+    if units < _num_cus():
+        return False, 0.0
+    waves = math.ceil(units / _num_cus())
+    fill = units / (waves * _num_cus())
+    # a short grid whose last wave is mostly empty: a library kernel with other tile shapes does better
+    return not (waves < 4 and fill < 0.85), fill
+
+
+def _plan(kind: str, M: int, N: int, K: int) -> Optional[Tuple[int, int, int, int]]:
+    """``(variant, M_block, N_block, splits)`` among the ``kind`` variants: the one with the most useful work
+    per CU slot (covered area times the occupancy of the last wave of workgroups, one workgroup per CU).
+    TN shapes with too few tiles to fill the GPU and a long K split K across workgroups (``splits`` > 1)."""
     if K <= 0 or K % 128 or M <= 0 or N <= 0:
         return None
     best = None
+    split_best = None
     for v, (bm, bn, cm, cn) in _variants(kind).items():
         mb, nb = M - M % (bm * cm), N - N % (bn * cn)
         if mb == 0 or nb == 0:
             continue
         tiles = (mb // bm) * (nb // bn)
-        if tiles < _num_cus():
-            # one tile per workgroup and no split-K: fewer tiles than CUs leaves part of the GPU idle
-            # for the whole (often long-K) GEMM
+        ok, fill = _grid_ok(tiles)
+        if ok:
+            score = (mb * nb) * fill
+            if best is None or score > best[0] * 1.0001:
+                best = (score, v, mb, nb, 1)
             continue
-        waves = math.ceil(tiles / _num_cus())
-        fill = tiles / (waves * _num_cus())
-        if waves < 4 and fill < 0.85:
-            # a short grid whose last wave is mostly empty: a library kernel with split-K or other
-            # tile shapes does better there
+        if kind != "tn" or 2 * tiles > _num_cus():
+            # split K only where the tiles cover at most half the CUs: with more, the FP32 partial tiles
+            # cost more than a library kernel with smaller tiles loses (q_up's dgrad: 192 tiles, 0.86x)
             continue
-        score = (mb * nb) * fill
-        if best is None or score > best[0] * 1.0001:
-            best = (score, v, mb, nb)
+        # one tile per workgroup leaves most CUs idle for the whole (long-K) GEMM: split K instead
+        for splits in _SPLITS:
+            if K // 128 < splits * _MIN_K_BLOCKS_PER_SPLIT:
+                break
+            ok, fill = _grid_ok(tiles * splits)
+            if ok:
+                score = (mb * nb) * fill
+                if split_best is None or score > split_best[0] * 1.0001:
+                    split_best = (score, v, mb, nb, splits)
+                break
+    if best is None:
+        best = split_best
     if best is None or best[2] * best[3] < _MIN_COVER * M * N:
         return None
-    return best[1], best[2], best[3]
+    return best[1], best[2], best[3], best[4]
 
 
 @functools.lru_cache(maxsize=4096)
-def hk_gemm_tn_plan(M: int, N: int, K: int) -> Optional[Tuple[int, int, int]]:
-    """``(variant, M_block, N_block)`` for ``hk_gemm_tn``, or None if it does not take this shape."""
+def hk_gemm_tn_plan(M: int, N: int, K: int) -> Optional[Tuple[int, int, int, int]]:
+    """``(variant, M_block, N_block, splits)`` for ``hk_gemm_tn``, or None if it does not take this shape."""
     return _plan("tn", M, N, K)
 
 
 @functools.lru_cache(maxsize=4096)
-def hk_gemm_nt_plan(M: int, N: int, K: int) -> Optional[Tuple[int, int, int]]:
-    """``(variant, M_block, N_block)`` for ``hk_gemm_nt``, or None if it does not take this shape."""
+def hk_gemm_nt_plan(M: int, N: int, K: int) -> Optional[Tuple[int, int, int, int]]:
+    """``(variant, M_block, N_block, splits)`` for ``hk_gemm_nt`` (splits is 1), or None if it does not take
+    this shape."""
     return _plan("nt", M, N, K)
 
 
@@ -155,10 +182,16 @@ def hk_gemm_tn(a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor] = N
         out = torch.empty((N, M), dtype=torch.bfloat16, device=a.device)
     elif not (out.shape == (N, M) and out.dtype == torch.bfloat16 and out.is_contiguous() and out.data_ptr() % 256 == 0):
         raise ValueError("out must be a contiguous, 256-byte aligned BF16 tensor of shape [N, M]")
-    v, mb, nb = hk_gemm_tn_plan(M, N, K)
+    v, mb, nb, splits = hk_gemm_tn_plan(M, N, K)
     bm, bn, _, _ = _variants("tn")[v]
     stream = torch.cuda.current_stream(a.device).cuda_stream
-    rc = load_library().hk_gemm_tn(v, a.data_ptr(), b.data_ptr(), out.data_ptr(), M, N, K, mb // bm, nb // bn, stream)
+    if splits > 1:
+        ws = torch.empty(splits * mb * nb, dtype=torch.float32, device=a.device)
+        rc = load_library().hk_gemm_tn_splitk(
+            v, a.data_ptr(), b.data_ptr(), out.data_ptr(), ws.data_ptr(), M, N, K, mb // bm, nb // bn, splits, stream
+        )
+    else:
+        rc = load_library().hk_gemm_tn(v, a.data_ptr(), b.data_ptr(), out.data_ptr(), M, N, K, mb // bm, nb // bn, stream)
     if rc != 0:
         raise RuntimeError(f"hk_gemm_tn launch failed ({rc}) for M={M} N={N} K={K} variant {v}")
     if mb < M:  # columns [mb, M) of the row-major result
@@ -201,7 +234,7 @@ def hk_gemm_nt(a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor] = N
         out = torch.empty((N, M), dtype=torch.bfloat16, device=a.device)
     elif not (out.shape == (N, M) and out.dtype == torch.bfloat16 and out.is_contiguous() and out.data_ptr() % 256 == 0):
         raise ValueError("out must be a contiguous, 256-byte aligned BF16 tensor of shape [N, M]")
-    v, mb, nb = hk_gemm_nt_plan(M, N, K)
+    v, mb, nb, _ = hk_gemm_nt_plan(M, N, K)
     bm, bn, _, _ = _variants("nt")[v]
     stream = torch.cuda.current_stream(a.device).cuda_stream
     rc = load_library().hk_gemm_nt(v, a.data_ptr(), b.data_ptr(), out.data_ptr(), M, N, K, mb // bm, nb // bn, stream)
