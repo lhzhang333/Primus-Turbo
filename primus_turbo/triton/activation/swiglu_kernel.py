@@ -290,3 +290,65 @@ def swiglu_bwd_kernel(
         grad_down.to(grad_x_data_type),
         mask=mask,
     )
+
+
+@triton.jit
+def swiglu_dense_fwd_kernel(
+    x_ptr,
+    out_ptr,
+    num_rows,
+    half_cols,
+    stride_x_row,
+    stride_out_row,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """``out = silu(x[:, :N]) * x[:, N:]`` over a 2-D grid of [BLOCK_M, BLOCK_N] tiles, fp32 math."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rows = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (rows[:, None] < num_rows) & (cols[None, :] < half_cols)
+    x_offs = rows[:, None] * stride_x_row + cols[None, :]
+    gate = tl.load(x_ptr + x_offs, mask=mask).to(tl.float32)
+    up = tl.load(x_ptr + x_offs + half_cols, mask=mask).to(tl.float32)
+    out = gate * tl.sigmoid(gate) * up
+    tl.store(
+        out_ptr + rows[:, None] * stride_out_row + cols[None, :],
+        out.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+@triton.jit
+def swiglu_dense_bwd_kernel(
+    grad_out_ptr,
+    x_ptr,
+    grad_x_ptr,
+    num_rows,
+    half_cols,
+    stride_grad_out_row,
+    stride_x_row,
+    stride_grad_x_row,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Gradient of :func:`swiglu_dense_fwd_kernel`; both halves of ``grad_x`` in one pass, fp32 math."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rows = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (rows[:, None] < num_rows) & (cols[None, :] < half_cols)
+    x_offs = rows[:, None] * stride_x_row + cols[None, :]
+    gate = tl.load(x_ptr + x_offs, mask=mask).to(tl.float32)
+    up = tl.load(x_ptr + x_offs + half_cols, mask=mask).to(tl.float32)
+    grad_out = tl.load(grad_out_ptr + rows[:, None] * stride_grad_out_row + cols[None, :], mask=mask).to(
+        tl.float32
+    )
+    sigmoid = tl.sigmoid(gate)
+    # the expression order of Megatron's swiglu_back
+    grad_gate = grad_out * sigmoid * (1 + gate * (1 - sigmoid)) * up
+    grad_up = grad_out * (gate * sigmoid)
+    grad_x_offs = rows[:, None] * stride_grad_x_row + cols[None, :]
+    tl.store(grad_x_ptr + grad_x_offs, grad_gate.to(grad_x_ptr.dtype.element_ty), mask=mask)
+    tl.store(grad_x_ptr + grad_x_offs + half_cols, grad_up.to(grad_x_ptr.dtype.element_ty), mask=mask)

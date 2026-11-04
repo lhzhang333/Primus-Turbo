@@ -88,6 +88,8 @@ _GFX1250_ENABLED_TESTS = (
     # Host-only: a subprocess imports every primus_turbo.flydsl module and holds each launch
     # declared at module level to the no-mutable-global rule. The rest of that file stays skipped here.
     "tests/pytorch/ops/test_flydsl_autotune.py::test_no_module_level_launch_reads_a_mutable_global",
+    # The dense SwiGLU op (Triton, 2-D tiles) of the Llama-3.1-8B MLP.
+    "tests/pytorch/ops/test_activation.py::test_swiglu",
 )
 
 
