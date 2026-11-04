@@ -19,7 +19,8 @@ The kernels (``hk_gemm_gfx1250.cpp``) cover a leading block of C whose sides are
 cluster (TN: 896 or 1024 along M, 1024 along N; NT: 512 or 1024 along M, 1024 along N) with K a multiple
 of 128; ``hk_gemm_tn`` / ``hk_gemm_nt`` run that block with the variant that fills the GPU best and
 finish a ragged M or N edge with ``torch.mm``. A grid must fill the GPU: at least as many workgroups as
-CUs (one tile per workgroup), and four waves or more unless the last is 85% full. A TN GEMM whose tiles
+CUs (one tile per workgroup), and four waves or more unless the last is 85% full (NT: one wave on at least 85%
+of the CUs also counts, hipBLASLt's NT kernels being further behind than the idle CUs cost). A TN GEMM whose tiles
 cover at most half the CUs but whose K is long splits K across 2-8 workgroups per tile (each split at least
 2048 deep; FP32 partial tiles summed by a second kernel). They refuse (``hk_gemm_tn_supported`` /
 ``hk_gemm_nt_supported`` is False) when K is not a multiple of 128, the block would cover less than
@@ -90,10 +91,13 @@ _SPLITS = (2, 3, 4, 6, 8)
 _MIN_K_BLOCKS_PER_SPLIT = 16  # 2048 along K per split: the partial-tile traffic stays small next to the MMAs
 
 
-def _grid_ok(units: int) -> Tuple[bool, float]:
-    """Whether a grid of ``units`` workgroups (one per CU at a time) fills the GPU, and its last-wave fill."""
+def _grid_ok(units: int, one_partial_wave: bool = False) -> Tuple[bool, float]:
+    """Whether a grid of ``units`` workgroups (one per CU at a time) fills the GPU, and its last-wave fill.
+    ``one_partial_wave``: a single wave at least 85% full is enough (the NT kernels, where hipBLASLt's NT
+    kernels are slow enough that one HipKittens wave on 85% of the CUs still finishes first)."""
     if units < _num_cus():
-        return False, 0.0
+        fill = units / _num_cus()
+        return (one_partial_wave and fill >= 0.85), fill
     waves = math.ceil(units / _num_cus())
     fill = units / (waves * _num_cus())
     # a short grid whose last wave is mostly empty: a library kernel with other tile shapes does better
@@ -113,7 +117,7 @@ def _plan(kind: str, M: int, N: int, K: int) -> Optional[Tuple[int, int, int, in
         if mb == 0 or nb == 0:
             continue
         tiles = (mb // bm) * (nb // bn)
-        ok, fill = _grid_ok(tiles)
+        ok, fill = _grid_ok(tiles, one_partial_wave=kind == "nt")
         if ok:
             score = (mb * nb) * fill
             if best is None or score > best[0] * 1.0001:

@@ -210,3 +210,20 @@ def test_nt_accumulate_out_rules():
     hk.hk_gemm_nt(a, b, out=out, accumulate=True)
     torch.testing.assert_close(out, (2 * (b.float().t() @ a.float())).bfloat16(), rtol=0, atol=0)
     assert buf[:8].count_nonzero() == 0 and buf[8 + 4096 * 4096 :].count_nonzero() == 0
+
+
+def test_nt_one_partial_wave():
+    """NT takes a grid of one wave on at least 85% of the CUs (DeepSeek-V3's shared-expert FC2 weight gradient,
+    224 tiles on 256 CUs); TN does not."""
+    hk = _gemm()
+    from primus_turbo.hipkittens.gemm_gfx1250 import _num_cus
+
+    cus = _num_cus()
+    M, N, K = 2048, 7168, 1024
+    tiles = (M // 256) * (N // 1024 * 4)
+    if not (0.85 * cus <= tiles < cus):
+        pytest.skip(f"{tiles} tiles is not one partial wave on {cus} CUs")
+    assert hk.hk_gemm_nt_plan(M, N, K) is not None
+    assert hk.hk_gemm_tn_plan(M, N, K) is None
+    a, b = _ints(K, M, 41), _ints(K, N, 42)
+    torch.testing.assert_close(hk.hk_gemm_nt(a, b), torch.mm(b.t(), a), rtol=0, atol=0)
