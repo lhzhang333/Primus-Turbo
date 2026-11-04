@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from primus_turbo.pytorch.ops.activation import (
     geglu_with_probs,
+    swiglu,
     swiglu_with_probs,
 )
 from tests.pytorch.test_utils import get_tolerances
@@ -172,3 +173,57 @@ def test_glu_with_probs(batch_size, sequence_length, hidden_size, dtype, with_to
 
     torch.testing.assert_close(grad_x, grad_x_ref.view_as(grad_x), **get_tolerances(dtype))
     torch.testing.assert_close(grad_probs, grad_probs_ref.view_as(grad_probs), **get_tolerances(probs_dtype))
+
+
+def _swiglu_ref(x: torch.Tensor):
+    """Megatron's bias-free SwiGLU: fp32 math, rounded once."""
+    gate, up = torch.chunk(x.float(), 2, dim=-1)
+    return (F.silu(gate) * up).to(x.dtype)
+
+
+def _swiglu_bwd_ref(grad: torch.Tensor, x: torch.Tensor):
+    """Megatron's swiglu_back: fp32 math, rounded once."""
+    gate, up = torch.chunk(x.float(), 2, dim=-1)
+    grad = grad.float()
+    sig = torch.sigmoid(gate)
+    return torch.cat((grad * sig * (1 + gate * (1 - sig)) * up, grad * (gate * sig)), dim=-1).to(x.dtype)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(1, 2), (3, 16), (5, 2 * 1000), (64, 2 * 1024), (130, 2 * 14336), (2, 37, 2 * 4096), (4, 8, 2 * 1408)],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_swiglu(shape, dtype):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    x = (torch.randn(shape, device="cuda", dtype=torch.float32) * 3).to(dtype).requires_grad_()
+    out = swiglu(x)
+    assert out.shape == (*shape[:-1], shape[-1] // 2) and out.dtype == dtype
+    torch.testing.assert_close(out, _swiglu_ref(x.detach()), **get_tolerances(dtype))
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    torch.testing.assert_close(x.grad, _swiglu_bwd_ref(grad, x.detach()), **get_tolerances(dtype))
+
+
+def test_swiglu_strided_rows():
+    """A row stride larger than the row (a column slice): unit last-dim stride is all the kernels need."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    base = torch.randn(96, 3000, device="cuda", dtype=torch.bfloat16)
+    x = base[:, 100:2148].detach().requires_grad_()  # [96, 2048], row stride 3000
+    out = swiglu(x)
+    torch.testing.assert_close(out, _swiglu_ref(x.detach()), **get_tolerances(torch.bfloat16))
+    grad = torch.randn(96, 2000, device="cuda", dtype=torch.bfloat16)[:, :1024]  # strided grad
+    out.backward(grad)
+    torch.testing.assert_close(x.grad, _swiglu_bwd_ref(grad, x.detach()), **get_tolerances(torch.bfloat16))
+
+
+def test_swiglu_empty():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    x = torch.empty(0, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    out = swiglu(x)
+    assert out.shape == (0, 32)
+    out.sum().backward()
+    assert x.grad.shape == (0, 64)

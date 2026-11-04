@@ -13,11 +13,44 @@ from primus_turbo.pytorch.kernels.activation.geglu_impl import (
     geglu_fwd_with_probs,
 )
 from primus_turbo.pytorch.kernels.activation.swiglu_impl import (
+    swiglu_bwd,
     swiglu_bwd_with_probs,
+    swiglu_fwd,
     swiglu_fwd_with_probs,
 )
 
-__all__ = ["swiglu_with_probs", "geglu_with_probs"]
+__all__ = ["swiglu", "swiglu_with_probs", "geglu_with_probs"]
+
+
+class SwiGLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor):
+        x_shape = x.shape
+        x_2d = x.reshape(-1, x_shape[-1])
+        if x_2d.stride(-1) != 1:
+            x_2d = x_2d.contiguous()
+        out = swiglu_fwd(x_2d)
+        ctx.save_for_backward(x_2d)
+        ctx.x_shape = x_shape
+        return out.view(*x_shape[:-1], x_shape[-1] // 2)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (x_2d,) = ctx.saved_tensors
+        grad_2d = grad_output.reshape(-1, grad_output.shape[-1])
+        if grad_2d.stride(-1) != 1:
+            grad_2d = grad_2d.contiguous()
+        return swiglu_bwd(grad_2d, x_2d).view(ctx.x_shape)
+
+
+def swiglu(x: torch.Tensor) -> torch.Tensor:
+    """``silu(gate) * up``, where ``gate`` / ``up`` are the first / second half of ``x``'s last dim.
+
+    The bias-free SwiGLU of a dense MLP (Megatron's ``SwiGLUFunction``), without the routing
+    probabilities of :func:`swiglu_with_probs`. Forward and backward each run one elementwise pass
+    in fp32, rounded once to ``x``'s dtype.
+    """
+    return SwiGLU.apply(x)
 
 
 class GLUWithProbs(torch.autograd.Function):
