@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""HipKittens BF16 TN GEMM on gfx1250 (primus_turbo.hipkittens.gemm_gfx1250).
+"""HipKittens BF16 TN and NT GEMMs on gfx1250 (primus_turbo.hipkittens.gemm_gfx1250).
 
 Integer operands in [-3, 3] keep every FP32 partial sum exact, so any correct kernel returns the same
 BF16 result as ``torch.mm``: the numeric cases compare bit for bit. Random BF16 operands are compared
@@ -103,3 +103,44 @@ def test_refuses_layout_and_dtype():
     shifted = torch.empty(a.numel() + 64, dtype=a.dtype, device=a.device)[8 : 8 + a.numel()].view(a.shape)
     shifted.copy_(a)
     assert not hk.hk_gemm_tn_supported(shifted, b)
+
+
+# NT (a [K, M], b [K, N] -> b.T @ a): whole clusters, the LM head's weight-gradient shape (a ragged N
+# edge: 129408 = 126 clusters of 1024 + 384), the 2x4 cluster (M = 3 x 512), a ragged M edge.
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        (8192, 8192, 1024),
+        (7168, 129408, 512),
+        (16384, 7168, 2048),
+        (1536, 32768, 1024),
+        (7424, 8192, 256),
+    ],
+)
+def test_nt_matches_torch_bitwise(M, N, K):
+    hk = _gemm()
+    a, b = _ints(K, M, 11), _ints(K, N, 12)
+    assert hk.hk_gemm_nt_supported(a, b)
+    out = hk.hk_gemm_nt(a, b)
+    torch.testing.assert_close(out, torch.mm(b.t(), a), rtol=0, atol=0)
+
+
+def test_nt_random_close_to_fp32():
+    hk = _gemm()
+    g = torch.Generator(device="cuda").manual_seed(13)
+    a = torch.randn(8192, 7168, device="cuda", generator=g).bfloat16()
+    b = torch.randn(8192, 4096, device="cuda", generator=g).bfloat16()
+    out = hk.hk_gemm_nt(a, b).float()
+    ref = b.float().t() @ a.float()
+    assert ((out - ref).abs().max() / ref.abs().max()).item() < 8e-3
+
+
+def test_nt_refuses():
+    hk = _gemm()
+    a, b = _ints(8192, 4096, 14), _ints(8192, 4096, 15)  # 16 x 16 tiles: one full wave
+    assert hk.hk_gemm_nt_supported(a, b)
+    assert not hk.hk_gemm_nt_supported(a[:576], b[:576])  # K not a multiple of 128
+    assert not hk.hk_gemm_nt_supported(a.t(), b)  # not contiguous
+    assert not hk.hk_gemm_nt_supported(_ints(8192, 512, 16), _ints(8192, 1024, 17))  # fewer tiles than CUs
+    with pytest.raises(ValueError):
+        hk.hk_gemm_nt(a[:576], b[:576])

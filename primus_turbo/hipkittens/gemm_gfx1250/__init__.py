@@ -10,10 +10,15 @@
 forward GEMM of a linear layer with ``a`` the weight and ``b`` the activations (and the input-gradient
 GEMM on a transposed weight). The result is row-major [N, M], i.e. ``C = A B^T`` column-major.
 
+``hk_gemm_nt(a, b)`` returns ``b.T @ a`` for ``a`` [K, M] and ``b`` [K, N], both with K outermost: the
+weight gradient of a linear layer, ``dW = dY^T x`` with ``a = x`` [tokens, in] and ``b = dY``
+[tokens, out], with neither operand transposed. The result is row-major [N, M] (``dW`` [out, in]).
+
 The kernels (``hk_gemm_gfx1250.cpp``) cover a leading block of C whose sides are multiples of a tile
-cluster (896 or 1024 along M, 1024 along N) with K a multiple of 128; ``hk_gemm_tn`` runs that block
-with the variant that fills the GPU best and finishes a ragged M or N edge with ``torch.mm``. It
-refuses (``hk_gemm_tn_supported`` is False) when K is not a multiple of 128, the block would cover
+cluster (TN: 896 or 1024 along M, 1024 along N; NT: 512 or 1024 along M, 1024 along N) with K a multiple
+of 128; ``hk_gemm_tn`` / ``hk_gemm_nt`` run that block with the variant that fills the GPU best and
+finish a ragged M or N edge with ``torch.mm``. They refuse (``hk_gemm_tn_supported`` /
+``hk_gemm_nt_supported`` is False) when K is not a multiple of 128, the block would cover
 less than three quarters of C, or it has fewer tiles than the GPU has CUs (one tile per workgroup
 and no split-K, so such a GEMM would leave CUs idle throughout), or a grid of fewer than four waves of
 workgroups whose last wave is less than 85% full.
@@ -34,6 +39,9 @@ __all__ = [
     "HipKittensGemmUnavailable",
     "hipkittens_include",
     "hk_gemm_available",
+    "hk_gemm_nt",
+    "hk_gemm_nt_plan",
+    "hk_gemm_nt_supported",
     "hk_gemm_tn",
     "hk_gemm_tn_plan",
     "hk_gemm_tn_supported",
@@ -58,12 +66,13 @@ def hk_gemm_available() -> bool:
 
 
 @functools.lru_cache(maxsize=None)
-def _variants() -> dict:
+def _variants(kind: str = "tn") -> dict:
     lib = load_library()
+    query = lib.hk_gemm_tn_variant if kind == "tn" else lib.hk_gemm_nt_variant
     out, v = {}, 0
     while True:
         vals = [ctypes.c_int() for _ in range(4)]
-        if lib.hk_gemm_tn_variant(v, *[ctypes.byref(x) for x in vals]) != 0:
+        if query(v, *[ctypes.byref(x) for x in vals]) != 0:
             return out
         out[v] = tuple(x.value for x in vals)  # (BM, BN, CM, CN)
         v += 1
@@ -74,17 +83,13 @@ def _num_cus() -> int:
     return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
 
-@functools.lru_cache(maxsize=4096)
-def hk_gemm_tn_plan(M: int, N: int, K: int) -> Optional[Tuple[int, int, int]]:
-    """``(variant, M_block, N_block)`` for ``hk_gemm_tn``, or None if it does not take this shape.
-
-    Among the variants, the one with the most useful work per CU slot: covered area times the
-    occupancy of the last wave of workgroups (one workgroup per CU).
-    """
+def _plan(kind: str, M: int, N: int, K: int) -> Optional[Tuple[int, int, int]]:
+    """``(variant, M_block, N_block)`` among the ``kind`` variants: the one with the most useful work per
+    CU slot (covered area times the occupancy of the last wave of workgroups, one workgroup per CU)."""
     if K <= 0 or K % 128 or M <= 0 or N <= 0:
         return None
     best = None
-    for v, (bm, bn, cm, cn) in _variants().items():
+    for v, (bm, bn, cm, cn) in _variants(kind).items():
         mb, nb = M - M % (bm * cm), N - N % (bn * cn)
         if mb == 0 or nb == 0:
             continue
@@ -105,6 +110,18 @@ def hk_gemm_tn_plan(M: int, N: int, K: int) -> Optional[Tuple[int, int, int]]:
     if best is None or best[2] * best[3] < _MIN_COVER * M * N:
         return None
     return best[1], best[2], best[3]
+
+
+@functools.lru_cache(maxsize=4096)
+def hk_gemm_tn_plan(M: int, N: int, K: int) -> Optional[Tuple[int, int, int]]:
+    """``(variant, M_block, N_block)`` for ``hk_gemm_tn``, or None if it does not take this shape."""
+    return _plan("tn", M, N, K)
+
+
+@functools.lru_cache(maxsize=4096)
+def hk_gemm_nt_plan(M: int, N: int, K: int) -> Optional[Tuple[int, int, int]]:
+    """``(variant, M_block, N_block)`` for ``hk_gemm_nt``, or None if it does not take this shape."""
+    return _plan("nt", M, N, K)
 
 
 def hk_gemm_tn_supported(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -139,7 +156,7 @@ def hk_gemm_tn(a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor] = N
     elif not (out.shape == (N, M) and out.dtype == torch.bfloat16 and out.is_contiguous() and out.data_ptr() % 256 == 0):
         raise ValueError("out must be a contiguous, 256-byte aligned BF16 tensor of shape [N, M]")
     v, mb, nb = hk_gemm_tn_plan(M, N, K)
-    bm, bn, _, _ = _variants()[v]
+    bm, bn, _, _ = _variants("tn")[v]
     stream = torch.cuda.current_stream(a.device).cuda_stream
     rc = load_library().hk_gemm_tn(v, a.data_ptr(), b.data_ptr(), out.data_ptr(), M, N, K, mb // bm, nb // bn, stream)
     if rc != 0:
@@ -148,4 +165,50 @@ def hk_gemm_tn(a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor] = N
         out[:, mb:] = torch.mm(b, a[mb:].t())
     if nb < N:  # rows [nb, N)
         torch.mm(b[nb:], a.t(), out=out[nb:])
+    return out
+
+
+def hk_gemm_nt_supported(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether ``hk_gemm_nt(a, b)`` runs here (shape, dtype, layout, alignment, size)."""
+    if not (
+        a.dim() == 2
+        and b.dim() == 2
+        and a.dtype == torch.bfloat16
+        and b.dtype == torch.bfloat16
+        and a.is_cuda
+        and b.is_cuda
+        and a.device == b.device
+        and a.is_contiguous()
+        and b.is_contiguous()
+        and a.shape[0] == b.shape[0]
+        and a.shape[1] % 8 == 0  # 16-byte rows for the TDM
+        and b.shape[1] % 8 == 0
+        and a.data_ptr() % 256 == 0
+        and b.data_ptr() % 256 == 0
+        and max(a.numel(), b.numel(), a.shape[1] * b.shape[1]) * 2 < _MAX_BYTES
+    ):
+        return False
+    return hk_gemm_available() and hk_gemm_nt_plan(a.shape[1], b.shape[1], a.shape[0]) is not None
+
+
+def hk_gemm_nt(a: torch.Tensor, b: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """``b.T @ a`` (row-major [N, M]) for BF16 ``a`` [K, M] and ``b`` [K, N]; see the module docstring."""
+    if not hk_gemm_nt_supported(a, b):
+        raise ValueError(f"hk_gemm_nt does not take a {tuple(a.shape)} x {tuple(b.shape)} {a.dtype} GEMM here")
+    K, M = a.shape
+    N = b.shape[1]
+    if out is None:
+        out = torch.empty((N, M), dtype=torch.bfloat16, device=a.device)
+    elif not (out.shape == (N, M) and out.dtype == torch.bfloat16 and out.is_contiguous() and out.data_ptr() % 256 == 0):
+        raise ValueError("out must be a contiguous, 256-byte aligned BF16 tensor of shape [N, M]")
+    v, mb, nb = hk_gemm_nt_plan(M, N, K)
+    bm, bn, _, _ = _variants("nt")[v]
+    stream = torch.cuda.current_stream(a.device).cuda_stream
+    rc = load_library().hk_gemm_nt(v, a.data_ptr(), b.data_ptr(), out.data_ptr(), M, N, K, mb // bm, nb // bn, stream)
+    if rc != 0:
+        raise RuntimeError(f"hk_gemm_nt launch failed ({rc}) for M={M} N={N} K={K} variant {v}")
+    if mb < M:  # columns [mb, M) of the row-major result
+        out[:, mb:] = torch.mm(b.t(), a[:, mb:])
+    if nb < N:  # rows [nb, N)
+        torch.mm(b[:, nb:].t(), a, out=out[nb:])
     return out
