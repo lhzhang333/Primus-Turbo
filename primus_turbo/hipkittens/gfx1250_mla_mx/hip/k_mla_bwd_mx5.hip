@@ -56,6 +56,14 @@ using namespace mx;
 #ifndef KEEP_WAR
 #define KEEP_WAR 1  // bit 0: keep the previous slot's dV / dK A fragments alive past the next loads (as DQ_KEEP)
 #endif
+#ifndef MIDSYNC
+// the per-step TDM wait + barrier + issue of round s + 2 between slots MIDSYNC - 1 and MIDSYNC of step s (0: at the step
+// start); slot 7 then prefetches step s + 1's tile 0 and its slot-0 A fragments, so a step starts with no barrier
+#define MIDSYNC 0  // measured: 4 + MS_PA 1 spills (1.45 ms), MS_PA 0 0.914 vs 0.912 (step 2315 vs 2361 cycles): off
+#endif
+#ifndef MS_PA
+#define MS_PA 1  // MIDSYNC: slot 7 also prefetches the next step's slot-0 A fragments (0: loaded at the step start)
+#endif
 #ifndef LTDT_G
 #define LTDT_G 0  // 1: lse / delta C tuples by buffer loads LTDT_D tiles ahead (slower: 1.000 / 0.978 / 0.962 ms, D 2 / 3 / 4)
 #endif
@@ -234,17 +242,17 @@ __host__ __device__ constexpr int gs(int k) { return k <= 0 ? 0 : k <= 4 ? 3 * k
 static_assert(gs(NQT) == 20, "groups");
 }  // namespace
 
-extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
-void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
-               const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
-               const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
-               const unsigned char *__restrict__ DO8, const unsigned char *__restrict__ DOS,
-               const unsigned char *__restrict__ DO8T, const unsigned char *__restrict__ DOTS,
-               const unsigned char *__restrict__ Q8T, const unsigned char *__restrict__ QTS,
-               const float *__restrict__ LSE2, const float *__restrict__ DELTA, bf16 *__restrict__ DK,
-               bf16 *__restrict__ DV, float scale, int S, int H, int B, long long dk_sb, long long dk_ss,
-               long long dv_sb, long long dv_ss) {
-    __shared__ __attribute__((aligned(1024))) unsigned char smem[LDS_B];
+// the kernel body; SPLIT: dK's nope columns (d < 128) to DK (its rows d 0..127 only) and the rope columns to DKP (the
+// fused-RoPE path: DK = the kv gradient [.., 0:128], DKP a per-head [b, s, h, 64] buffer), else 192-column dK rows
+template <bool SPLIT>
+__device__ __forceinline__ void dkdv_body(
+    const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS, const unsigned char *__restrict__ K8,
+    const unsigned char *__restrict__ KS, const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
+    const unsigned char *__restrict__ DO8, const unsigned char *__restrict__ DOS, const unsigned char *__restrict__ DO8T,
+    const unsigned char *__restrict__ DOTS, const unsigned char *__restrict__ Q8T, const unsigned char *__restrict__ QTS,
+    const float *__restrict__ LSE2, const float *__restrict__ DELTA, bf16 *__restrict__ DK, bf16 *__restrict__ DV,
+    float scale, int S, int H, int B, long long dk_sb, long long dk_ss, long long dv_sb, long long dv_ss,
+    bf16 *__restrict__ DKP, long long dkp_sb, long long dkp_ss, unsigned char *smem) {
     lock_simd();
     const uint32_t lds0 = lds_addr(smem);
     const int tid = (int)__builtin_amdgcn_workitem_id_x();
@@ -378,20 +386,40 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
 #endif
     // one step: q16 tile qt in slot qt (fragments of tile qt + 1 loaded at the slot's start), with the dV / dK groups
     // gs(qt) .. gs(qt + 1) - 1 of the previous step (A fragments of slot qt + 1 loaded at the slot's start)
-    auto step = [&](const StepAddr &a, int q0, i32x16 (&pB)[NJ], i32x16 (&dsB)[NJ], int (&dss)[NJ],
-                    const i32x16 (&pBo)[NJ], const i32x16 (&dsBo)[NJ], const int (&dsso)[NJ], auto diag_c,
-                    auto prev_c) __attribute__((always_inline)) {
+    auto step = [&](int s, const StepAddr &a, int q0, i32x16 (&pB)[NJ], i32x16 (&dsB)[NJ], int (&dss)[NJ],
+                    const i32x16 (&pBo)[NJ], const i32x16 (&dsBo)[NJ], const int (&dsso)[NJ], QTile &pre_t,
+                    AFrag (&pre_a)[3], auto diag_c, auto prev_c) __attribute__((always_inline)) {
         constexpr bool DIAG = decltype(diag_c)::value, PREV = decltype(prev_c)::value;
         // the causal mask as constant-vs-threshold compares: q < kv iff 16 qt + r < thr[j] = kv - q0 - 8 lh
         int thr[NJ];
         static_for<NJ>([&](auto jj) { thr[(int)jj] = kvw + 16 * (int)jj + lr - q0 - 8 * lh; });
         f32x8 dsprev[NJ];
         AFrag ab[20];
+#if MIDSYNC
+        StepAddr an;  // step s + 1 (after the mid-step barrier)
+        if constexpr (PREV) {
+            if constexpr (MS_PA)
+                static_for<gs(1)>([&](auto i) { ab[(int)i] = pre_a[(int)i]; });
+            else
+                static_for<gs(1)>([&](auto i) { ab[(int)i] = ldA(a, std::integral_constant<int, (int)i>{}); });
+        }
+        QTile cur = pre_t;
+#else
         if constexpr (PREV)
             static_for<gs(1)>([&](auto i) { ab[(int)i] = ldA(a, std::integral_constant<int, (int)i>{}); });
         QTile cur = load_qtile<0>(a);
+#endif
         static_for<NQT>([&](auto qq) {
             constexpr int qt = qq;
+#if MIDSYNC
+            if constexpr (qt == MIDSYNC) {
+                tensor_wait<0>();  // round s + 1 landed: the q part of step s + 1, the A part of step s
+                bar_signal();
+                bar_wait();          // visible; every wave is done with step s - 1 (q part) and the dV / dK of s - 2
+                issue_round(s + 2);  // q part of step s + 2 into step s - 1's q stage, A part of s + 1 into s - 2's
+                an = addr(s + 1);
+            }
+#endif
             QTile nxt;
             if constexpr (qt + 1 < NQT) nxt = load_qtile<(qt + 1 < NQT ? qt + 1 : 0)>(a);
             if constexpr (PREV && qt + 1 < NQT)
@@ -399,6 +427,14 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
                     constexpr int g = gs(qt + 1) + (int)i;
                     ab[g] = ldA(a, std::integral_constant<int, g>{});
                 });
+#if MIDSYNC
+            if constexpr (qt + 1 == NQT) {  // step s + 1's tile 0 and slot-0 A fragments (A part of step s); past the
+                                            // last step: stale LDS, never used
+                pre_t = load_qtile<0>(an);
+                if constexpr (MS_PA)
+                    static_for<gs(1)>([&](auto i) { pre_a[(int)i] = ldA(an, std::integral_constant<int, (int)i>{}); });
+            }
+#endif
 #if KEEP_WAR & 1
             if constexpr (PREV && qt >= 1)
                 static_for<gs(qt) - gs(qt - 1)>([&](auto i) {  // slot qt - 1's fragments (its WMMAs may be in flight)
@@ -459,15 +495,25 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
 
     i32x16 pBo[NJ], dsBo[NJ];
     int dsso[NJ];
+    QTile pre_t;
+    AFrag pre_a[gs(1)];
+#if MIDSYNC
+    tensor_wait<TDM_PER_ROUND>();  // round 0 (the q part of step 0) landed; round 1 may be in flight
+    bar_signal();
+    bar_wait();
+    pre_t = load_qtile<0>(addr(0));
+#endif
     auto run = [&](int s, auto diag_c, auto prev_c) __attribute__((always_inline)) {
+#if !MIDSYNC
         tensor_wait<TDM_PER_ROUND>();  // round s landed: the q part of step s, the A part of step s - 1
         bar_signal();
         bar_wait();          // visible to every wave; every wave is done with step s - 1 (and the dV / dK of s - 2)
         issue_round(s + 2);  // q part of step s + 2 into step s - 1's q stage, A part of s + 1 into step s - 2's A stage
+#endif
         const StepAddr a = addr(s);
         i32x16 pB[NJ], dsB[NJ];
         int dss[NJ] = {};
-        step(a, qs0 + s * QS_, pB, dsB, dss, pBo, dsBo, dsso, diag_c, prev_c);
+        step(s, a, qs0 + s * QS_, pB, dsB, dss, pBo, dsBo, dsso, pre_t, pre_a, diag_c, prev_c);
         static_for<NJ>([&](auto jj) {
             pBo[(int)jj] = pB[(int)jj];
             dsBo[(int)jj] = dsB[(int)jj];
@@ -506,17 +552,21 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
     // idle since the barrier above), then one TDM store each (wave 0: dK, 384 B rows; wave 1: dV, 256 B rows)
     constexpr int XDK = 2 * D_QK, XDV = 2 * D_V, O_SDK = 0, O_SDV = KB * XDK;
     static_assert(O_SDV + KB * XDV <= ARING, "staging inside the q ring");
+    // SPLIT: the nope part as 256-byte rows at O_SDK, the rope part as 128-byte rows at O_SDP (same total bytes)
+    constexpr int XDN = SPLIT ? 2 * 128 : XDK, O_SDP = O_SDK + KB * 2 * 128;
     {
         const int ln = lane_now();
         static_for<NJ>([&](auto jj) {
             constexpr int j = jj;
             const unsigned r = (unsigned)(KBW * wv + 16 * j + (ln & 15)), hh = (unsigned)(ln >> 4);
-            const unsigned dkr = lds0 + O_SDK + r * XDK + 16 * hh, dvr = lds0 + O_SDV + r * XDV + 16 * hh;
+            const unsigned dkr = lds0 + O_SDK + r * XDN + 16 * hh, dvr = lds0 + O_SDV + r * XDV + 16 * hh;
+            const unsigned dpr = lds0 + O_SDP + r * 128 + 16 * hh;
             static_for<12>([&](auto dd) {
                 constexpr int d = dd;
                 bf16x8 w;
                 static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dk[d][j][(int)rr] * scale); });
-                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(dkr + 32 * d) = __builtin_bit_cast(u32x4, w);
+                const unsigned a = (SPLIT && d >= 8) ? dpr + 32 * (d - 8) : dkr + 32 * d;
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)a = __builtin_bit_cast(u32x4, w);
             });
             static_for<8>([&](auto dd) {
                 constexpr int d = dd;
@@ -531,16 +581,59 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
     {
         const unsigned rows = (unsigned)min(KB, S - kv0);
         if (wv == 0) {
-            const unsigned long long g = (unsigned long long)(uintptr_t)(DK + (long long)b * dk_sb + (long long)kv0 * dk_ss +
-                                                                         (long long)h * D_QK);
-            tdm_store(tdm_g0(lds0 + O_SDK, g), tdm_g1(tdm_w0(0, 0, 0), rows, XDK, KB, 2ull * (unsigned long long)dk_ss));
+            if constexpr (SPLIT) {
+                // DK: the kv gradient's rows (head stride as dV's view: 256 elements), DKP: [b, s, h, 64]
+                const unsigned long long g = (unsigned long long)(uintptr_t)(DK + (long long)b * dk_sb +
+                                                                             (long long)kv0 * dk_ss + (long long)h * 256);
+                tdm_store(tdm_g0(lds0 + O_SDK, g), tdm_g1(tdm_w0(0, 0, 0), rows, XDN, KB, 2ull * (unsigned long long)dk_ss));
+            } else {
+                const unsigned long long g = (unsigned long long)(uintptr_t)(DK + (long long)b * dk_sb +
+                                                                             (long long)kv0 * dk_ss + (long long)h * D_QK);
+                tdm_store(tdm_g0(lds0 + O_SDK, g), tdm_g1(tdm_w0(0, 0, 0), rows, XDK, KB, 2ull * (unsigned long long)dk_ss));
+            }
         } else if (wv == 1) {
             const unsigned long long g = (unsigned long long)(uintptr_t)(DV + (long long)b * dv_sb + (long long)kv0 * dv_ss +
-                                                                         (long long)h * D_V);
+                                                                         (long long)h * (SPLIT ? 256 : D_V));
             tdm_store(tdm_g0(lds0 + O_SDV, g), tdm_g1(tdm_w0(0, 0, 0), rows, XDV, KB, 2ull * (unsigned long long)dv_ss));
+        } else if (SPLIT && wv == 2) {
+            const unsigned long long g = (unsigned long long)(uintptr_t)(DKP + (long long)b * dkp_sb +
+                                                                         (long long)kv0 * dkp_ss + (long long)h * 64);
+            tdm_store(tdm_g0(lds0 + O_SDP, g), tdm_g1(tdm_w0(0, 0, 0), rows, 128, KB, 2ull * (unsigned long long)dkp_ss));
         }
     }
     tensor_wait<0>();
+}
+
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
+               const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
+               const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
+               const unsigned char *__restrict__ DO8, const unsigned char *__restrict__ DOS,
+               const unsigned char *__restrict__ DO8T, const unsigned char *__restrict__ DOTS,
+               const unsigned char *__restrict__ Q8T, const unsigned char *__restrict__ QTS,
+               const float *__restrict__ LSE2, const float *__restrict__ DELTA, bf16 *__restrict__ DK,
+               bf16 *__restrict__ DV, float scale, int S, int H, int B, long long dk_sb, long long dk_ss,
+               long long dv_sb, long long dv_ss) {
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[LDS_B];
+    dkdv_body<false>(Q8, QS, K8, KS, V8, VSR, DO8, DOS, DO8T, DOTS, Q8T, QTS, LSE2, DELTA, DK, DV, scale, S, H, B, dk_sb,
+                     dk_ss, dv_sb, dv_ss, nullptr, 0, 0, smem);
+}
+
+// the fused-RoPE path's variant: DK / DV views of the kv gradient [b, s, h, 256] (DK at d 0, DV at d 128; the head
+// stride 256 is fixed), dK's rope columns to DKP [b, s, h, 64] (dkp_sb / dkp_ss its b / s strides)
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+void k_dkdv_mxr(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
+                const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
+                const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
+                const unsigned char *__restrict__ DO8, const unsigned char *__restrict__ DOS,
+                const unsigned char *__restrict__ DO8T, const unsigned char *__restrict__ DOTS,
+                const unsigned char *__restrict__ Q8T, const unsigned char *__restrict__ QTS,
+                const float *__restrict__ LSE2, const float *__restrict__ DELTA, bf16 *__restrict__ DK,
+                bf16 *__restrict__ DV, float scale, int S, int H, int B, long long dk_sb, long long dk_ss,
+                long long dv_sb, long long dv_ss, bf16 *__restrict__ DKP, long long dkp_sb, long long dkp_ss) {
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[LDS_B];
+    dkdv_body<true>(Q8, QS, K8, KS, V8, VSR, DO8, DOS, DO8T, DOTS, Q8T, QTS, LSE2, DELTA, DK, DV, scale, S, H, B, dk_sb,
+                    dk_ss, dv_sb, dv_ss, DKP, dkp_sb, dkp_ss, smem);
 }
 
 // =====================================================================================================================

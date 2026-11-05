@@ -103,6 +103,12 @@ _RC_ARGS = [("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("X8T", "ptr"), ("XTS", 
             ("aux", "ptr"), ("S", "i32"), ("H", "i32"), ("sb", "i64"), ("ss", "i64"), ("sh", "i64"), ("yb", "i64"),
             ("ys", "i64"), ("yh", "i64"), ("mode", "i32"), ("pre", "f32")]  # fmt: skip
 _RCP_ARGS = _RC_ARGS[:8] + [("B", "i32")] + _RC_ARGS[8:]  # persistent: B before S
+_RCTR_ARGS = [("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("X8T", "ptr"), ("XTS", "ptr"), ("kbar", "ptr"), ("aux", "ptr"),
+              ("S", "i32"), ("H", "i32"), ("sb", "i64"), ("ss", "i64"), ("sh", "i64"), ("PE", "ptr"), ("pb", "i64"),
+              ("ps", "i64"), ("ph", "i64"), ("COS", "ptr"), ("SIN", "ptr"), ("mode", "i32"), ("pre", "f32")]  # fmt: skip
+_KBR_ARGS = [("X", "ptr"), ("kbar", "ptr"), ("S", "i32"), ("H", "i32"), ("sb", "i64"), ("ss", "i64"), ("sh", "i64"),
+             ("PE", "ptr"), ("pb", "i64"), ("ps", "i64"), ("ph", "i64"), ("COS", "ptr"), ("SIN", "ptr"),
+             ("stride", "i32")]  # fmt: skip
 KERNELS = {
     "k_mxq_kbar": (
         "k_mxq.hip",
@@ -126,6 +132,8 @@ KERNELS = {
     "k_mxq_rc128": ("k_mxq.hip", 256, _RC_ARGS),
     "k_mxq_rct192": ("k_mxq.hip", 256, _RC_ARGS),
     "k_mxq_rct128": ("k_mxq.hip", 256, _RC_ARGS),
+    "k_mxq_rctr192": ("k_mxq.hip", 256, _RCTR_ARGS),
+    "k_mxq_kbar_rope": ("k_mxq.hip", 768, _KBR_ARGS),
     "k_mxq_rcp192": ("k_mxq.hip", 512, _RCP_ARGS),
     "k_mxq_rcp128": ("k_mxq.hip", 512, _RCP_ARGS),
     "k_mla_fwd_mx": (
@@ -178,6 +186,12 @@ KERNELS = {
             ("dv_ss", "i64"),
         ],
     ),
+    "k_dkdv_mxr": ("k_mla_bwd_mx.hip", 128, None),  # = k_dkdv_mx's args + DKP, dkp_sb, dkp_ss (filled below)
+    "k_rope_bwd_q": ("k_mxq.hip", 256, [("G", "ptr"), ("B", "i32"), ("S", "i32"), ("H", "i32"), ("gb", "i64"),
+                                         ("gs", "i64"), ("gh", "i64"), ("COS", "ptr"), ("SIN", "ptr")]),
+    "k_rope_bwd_kpe": ("k_mxq.hip", 256, [("GH", "ptr"), ("GP", "ptr"), ("B", "i32"), ("S", "i32"), ("H", "i32"),
+                                           ("hb", "i64"), ("hs", "i64"), ("hh", "i64"), ("pb", "i64"), ("ps", "i64"),
+                                           ("COS", "ptr"), ("SIN", "ptr")]),
     "k_dq_mx": (
         "k_mla_bwd_mx.hip",
         128,
@@ -204,6 +218,8 @@ KERNELS = {
         ],
     ),
 }
+KERNELS["k_dkdv_mxr"] = (KERNELS["k_dkdv_mx"][0], 128,
+                         KERNELS["k_dkdv_mx"][2] + [("DKP", "ptr"), ("dkp_sb", "i64"), ("dkp_ss", "i64")])
 # rung b2's dV / dK kernels (k_mla_bwd_mx2.hip) take k_dkdv_mx's arguments
 KERNELS["k_dv_mx"] = KERNELS["k_dk_mx"] = KERNELS["k_dkdv_mx"]
 _SIZE = {"ptr": 8, "i64": 8, "f64": 8, "i32": 4, "u32": 4, "f32": 4}
@@ -375,6 +391,44 @@ def quant_rc(x, d, mode=0, kbar=None, y=None, pre=1.0, tag="", kname="rc"):
             [x, x8, xs, x8t, xts, kbar if kbar is not None else _dummy(dev), yy, aux, s, h, x.stride(0), x.stride(1),
              x.stride(2), yy.stride(0), yy.stride(1), yy.stride(2), mode, float(pre)], tag)  # fmt: skip
     return x8, xs, (aux if mode & 6 else None), x8t, xts
+
+
+def kbar_rope(x, pe, cos, sin, tag="", stride=KBAR_STRIDE):
+    """kbar of k = [x[..., :128] | rope(pe)] (x [b, s, h, >= 128], pe [b, s, 1 or h, 64], cos / sin [s, 64] bf16)."""
+    b, s, h, _ = x.shape
+    kbar = torch.empty(b, h, D_QK, device=x.device, dtype=torch.float32)
+    _launch("k_mxq_kbar_rope", (b * h, 1, 1),
+            [x, kbar, s, h, x.stride(0), x.stride(1), x.stride(2), pe, pe.stride(0), pe.stride(1),
+             pe.stride(2) if pe.shape[2] > 1 else 0, cos, sin, stride], tag)  # fmt: skip
+    return kbar
+
+
+def quant_rope(x, pe, cos, sin, mode=0, kbar=None, pre=1.0, tag=""):
+    """k_mxq_rctr192: rows + cols of [x[..., :128] | rope(pe)] (q: pe = x[..., 128:]; k: x = kv, pe = k_pe [b, s, 1, 64])
+    -> (x8, xs, aux | None, x8t, xts) as quant_rc(.., 192, ..)."""
+    b, s, h, _ = x.shape
+    dev = x.device
+    x8 = torch.empty(b, h, s, 192, device=dev, dtype=torch.uint8)
+    xs = torch.empty(b, h, s, 8, device=dev, dtype=torch.uint8)
+    x8t = torch.empty(b, h, 192, s, device=dev, dtype=torch.uint8)
+    xts = torch.empty(b, h, s // 128, 192, 4, device=dev, dtype=torch.uint8)
+    aux = torch.empty(b, h, s, device=dev, dtype=torch.float32) if mode & 6 else _dummy(dev)
+    _launch("k_mxq_rctr192", (s // 128, h, b),
+            [x, x8, xs, x8t, xts, kbar if kbar is not None else _dummy(dev), aux, s, h, x.stride(0), x.stride(1),
+             x.stride(2), pe, pe.stride(0), pe.stride(1), pe.stride(2) if pe.shape[2] > 1 else 0, cos, sin, mode,
+             float(pre)], tag)  # fmt: skip
+    return x8, xs, (aux if mode & 6 else None), x8t, xts
+
+
+def rope_ref(pe, cos, sin):
+    """Megatron's MLA rotary on the last dim (64, interleaved pairs in, halves out), fp32 per op, bf16 out; cos / sin
+    broadcast over the leading dims of pe as given."""
+    x = pe.float()
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    c, sn = cos.float(), sin.float()
+    left = x1 * c[..., :32] - x2 * sn[..., :32]
+    right = x2 * c[..., 32:] + x1 * sn[..., 32:]
+    return torch.cat([left, right], dim=-1).to(torch.bfloat16)
 
 
 def quant_all(q, k, v, recipe="m4", scale=SCALE, tag=""):

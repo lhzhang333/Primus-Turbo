@@ -312,3 +312,28 @@ b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 
   warmth, which the real backward pays too).
 - **Training gate g120d** (package m7 + b5 + k_mxq_rct, 120 iterations): mx 727.5 vs hk 738.3 ms / iteration (-1.5%;
   before: -0.6%); final-window loss 0.0818 both, grad-norm ratio max 1.023.
+
+## 2026-11-05 (e): MLA RoPE fused into the MX quantization and the backward epilogues (plan P4, first producer)
+
+Megatron's apply_rope_fusion path (MI455X DSv3 config): `fused_apply_mla_rope_for_q` rotates q's d 128..191 in place
+(0.060 ms), `fused_apply_mla_rope_for_kv` writes bf16 key / value copies (0.079 ms), the core attention then
+quantizes query / key / value; the backward's RoPE kernels (kv 0.19 ms incl. the head sum of the k_pe gradient)
+copy dk / dv into the kv gradient. Fused path (`mx.mla_rope_attention(q, kv, k_pe, cos, sin, scale)`, SBHD, autograd):
+- `k_mxq_rctr192`: rows + cols of [x nope | rope(pe)]: the nope part by one TDM load into 384-byte LDS rows (pad 128 B
+  after every 256), the pre-RoPE pe part (q: x + 128; k: k_pe with head stride 0) by a second TDM load into the X8T
+  staging (free until the cols phase), the rotation in fp32 rounded to bf16 written into d 128..191, then rc_tile.
+  q 0.096 ms (rct on the roped query 0.082), k 0.091 (0.078). `k_mxq_kbar_rope`: kbar of the roped k (0.016).
+  Codes / scales / kbar bit-exact against torch RoPE (per-op fp32) + k_mxq_rct (`scratch_mx/py/rope_q_test.py`).
+- backward: `k_dkdv_mxr` (b5's dkdv body, template SPLIT): dK's nope columns and dV straight into the kv gradient
+  [s, b, h, 256] (one TDM store each), dK's rope columns into a per-head [s, b, h, 64] buffer (a third store);
+  `k_rope_bwd_q` (inverse rotation of dq's d 128..191 in place, 0.030 ms), `k_rope_bwd_kpe` (fixed-order fp32 sum over
+  the heads, inverse rotation: 0.089 -> 0.015 ms with 16-byte loads of 4 heads at a time). dkv bit-exact, the per-head
+  buffer bit-exact, dq within 1 bf16 ulp (the compiler fuses a multiply-add; `#pragma clang fp contract(off)` does
+  not override HIP's -ffp-contract=fast), dk_pe within the reference's own bf16 rounding of the head sum.
+- Package op vs (torch RoPE + hk_mx): out bit-exact, dkv bit-exact, dq 117 dB / bit-exact on small shapes
+  (`scratch_mx/py/rope_pkg_test.py`; pytest `test_rope_fused_matches_unfused`). Forward + backward through autograd
+  at the proxy shape: 2.668 vs 2.865 ms (Megatron's RoPE kernels + hk_mx): -0.20 ms per layer and micro-batch.
+- Primus (local worktree branch, not pushed): opt-in patch `PRIMUS_TURBO_MLA_ROPE_FUSION=1` wraps
+  MultiLatentAttention.forward with the fused path for eligible calls (training-style, no inference / packed / CP /
+  TP / SP / recompute / offload, YaRN + apply_rope_fusion, causal, 128 + 64 / 128 heads, s % 256 == 0), else
+  Megatron's forward.

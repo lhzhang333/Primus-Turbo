@@ -554,7 +554,227 @@ __device__ __forceinline__ void rcp_body(const bf16 *__restrict__ X, unsigned ch
     }
     if (wv == 0) tensor_wait<0>();
 }
+
+// ---- MLA RoPE fused into the quantization (DeepSeek's interleaved rotary on d 128..191, Megatron's
+// fused_apply_mla_rope_for_q / _for_kv math): for the pe input x (64 values, pairs x1 = x[2 i], x2 = x[2 i + 1], i < 32)
+// and the position's cos / sin rows c, sn (64 bf16): out[i] = x1 c[i] - x2 sn[i], out[32 + i] = x2 c[32 + i] + x1 sn[32 +
+// i], computed in fp32 (the compiler may fuse a multiply-add: within 1 bf16 ulp of per-op rounding) and rounded to bf16.
+__device__ __forceinline__ void rope8(const u32x4 x0, const u32x4 x1, const u32x4 cl, const u32x4 sl, const u32x4 cr,
+                                      const u32x4 sr, u32x4 &left, u32x4 &right) {
+    // x0, x1: pe values 16 m .. 16 m + 15 (pairs 8 m .. 8 m + 7); cl / sl: cos / sin 8 m .. +7; cr / sr: 32 + 8 m .. +7
+    const bf16x8 xa = __builtin_bit_cast(bf16x8, x0), xb = __builtin_bit_cast(bf16x8, x1);
+    const bf16x8 c0 = __builtin_bit_cast(bf16x8, cl), s0 = __builtin_bit_cast(bf16x8, sl);
+    const bf16x8 c1 = __builtin_bit_cast(bf16x8, cr), s1 = __builtin_bit_cast(bf16x8, sr);
+    bf16x8 lo, hi;
+    static_for<8>([&](auto kk) {
+        constexpr int k = kk;
+        const float a = (float)(k < 4 ? xa[2 * k] : xb[2 * (k - 4)]);
+        const float b = (float)(k < 4 ? xa[2 * k + 1] : xb[2 * (k - 4) + 1]);
+        lo[k] = (bf16)__fsub_rn(__fmul_rn(a, (float)c0[k]), __fmul_rn(b, (float)s0[k]));
+        hi[k] = (bf16)__fadd_rn(__fmul_rn(b, (float)c1[k]), __fmul_rn(a, (float)s1[k]));
+    });
+    left = __builtin_bit_cast(u32x4, lo);
+    right = __builtin_bit_cast(u32x4, hi);
+}
+
+// rct_body for D = 192 with the pe columns roped on the way in: the nope part (d 0..127) of X by one TDM load into
+// 384-byte LDS rows (pad 128 B after every 256), the pre-RoPE pe part (64 values per row) of PE (q: X + 128; k: k_pe,
+// shared by the heads: ph = 0) by a second TDM load into a side buffer; the rotation writes d 128..191 of the rows.
+__device__ __forceinline__ void rctr_body(const bf16 *__restrict__ X, unsigned char *__restrict__ X8,
+                                          unsigned char *__restrict__ XS, unsigned char *__restrict__ X8T,
+                                          unsigned char *__restrict__ XTS, const float *__restrict__ kbar,
+                                          float *__restrict__ aux, int S, int H, long long sb, long long ss,
+                                          long long sh, const bf16 *__restrict__ PE, long long pb, long long ps,
+                                          long long ph, const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN,
+                                          int mode, float pre, unsigned char *smem) {
+    constexpr int D = 192, XR = D * 2, NT = 256, RS = 8;
+    constexpr int O_X8 = 128 * XR, O_XS = O_X8 + 128 * D, O_X8T = O_XS + 128 * RS, O_XTS = O_X8T + D * 128,
+                  O_KB = O_XTS + D * 4,
+                  O_PE = O_X8T;  // pe side buffer (128 x 128 B) in the X8T staging, written only in the cols phase
+    const int kt = blockIdx.x, h = blockIdx.y, b = blockIdx.z, t = threadIdx.x;
+    const int wv = __builtin_amdgcn_readfirstlane(t >> 5);
+    const long long bh = (long long)b * H + h;
+    const unsigned lds0 = (unsigned)(uintptr_t)smem;
+    if (wv == 0) {
+        const unsigned long long gx = (unsigned long long)(uintptr_t)(X + b * sb + (long long)(kt * 128) * ss + h * sh);
+        tdm_load(tdm_g0(lds0, gx), tdm_g1(tdm_w0(0, 64, 32), 128, 256, 128, 2ull * (unsigned long long)ss));
+        const unsigned long long gp = (unsigned long long)(uintptr_t)(PE + b * pb + (long long)(kt * 128) * ps + h * ph);
+        tdm_load(tdm_g0(lds0 + O_PE, gp), tdm_g1(tdm_w0(0, 0, 0), 128, 128, 128, 2ull * (unsigned long long)ps));
+    }
+    float *kb_lds = (float *)(smem + O_KB);
+    if (mode & 3) {
+        for (int i = t; i < D; i += NT) kb_lds[i] = kbar[bh * D + i];
+    }
+    if (wv == 0) tensor_wait<0>();
+    __syncthreads();
+    // rotation: item (row r, group m of 8 pairs): 512 items, 2 per thread
+    for (int it = t; it < 128 * 4; it += NT) {
+        const int r = it >> 2, m = it & 3;
+        const unsigned char *pe = smem + O_PE + r * 128 + 32 * m;
+        const bf16 *cs = COS + (long long)(kt * 128 + r) * 64, *sn = SIN + (long long)(kt * 128 + r) * 64;
+        u32x4 lo, hi;
+        rope8(*(const u32x4 *)pe, *(const u32x4 *)(pe + 16), *(const u32x4 *)(cs + 8 * m), *(const u32x4 *)(sn + 8 * m),
+              *(const u32x4 *)(cs + 32 + 8 * m), *(const u32x4 *)(sn + 32 + 8 * m), lo, hi);
+        *(u32x4 *)(smem + r * XR + 2 * (128 + 8 * m)) = lo;
+        *(u32x4 *)(smem + r * XR + 2 * (160 + 8 * m)) = hi;
+    }
+    __syncthreads();
+    rc_tile<D, NT>(smem, smem + O_X8, smem + O_XS, smem + O_X8T, smem + O_XTS, kb_lds, nullptr, aux, b, h, kt, bh, S,
+                   0, 0, 0, mode & ~4, pre);
+    __syncthreads();
+    if (wv == 0) {
+        constexpr unsigned W0 = tdm_w0(0, 0, 0);
+        const long long row0 = bh * S + (long long)kt * 128;
+        tdm_store(tdm_g0(lds0 + O_X8, (unsigned long long)(uintptr_t)(X8 + row0 * D)), tdm_g1(W0, 128, D, 128, D));
+        tdm_store(tdm_g0(lds0 + O_XS, (unsigned long long)(uintptr_t)(XS + row0 * RS)),
+                  tdm_g1(W0, 1, 128 * RS, 1, 128 * RS));
+        tdm_store(tdm_g0(lds0 + O_X8T, (unsigned long long)(uintptr_t)(X8T + (bh * D) * S + (long long)kt * 128)),
+                  tdm_g1(W0, D, 128, D, (unsigned long long)S));
+        tdm_store(tdm_g0(lds0 + O_XTS, (unsigned long long)(uintptr_t)(XTS + ((bh * (S / 128) + kt) * D) * 4)),
+                  tdm_g1(W0, 1, D * 4, 1, D * 4));
+        tensor_wait<0>();
+    }
+}
 }  // namespace
+
+// k_mxq_rctr192: rows + cols of [X nope | rope(PE)] in one pass (q: PE = X + 128; k: X = kv, PE = k_pe, ph = 0); grid
+// (S / 128, H, B), 256 threads
+extern "C" __global__ __launch_bounds__(256) void k_mxq_rctr192(
+    const bf16 *__restrict__ X, unsigned char *__restrict__ X8, unsigned char *__restrict__ XS,
+    unsigned char *__restrict__ X8T, unsigned char *__restrict__ XTS, const float *__restrict__ kbar,
+    float *__restrict__ aux, int S, int H, long long sb, long long ss, long long sh, const bf16 *__restrict__ PE,
+    long long pb, long long ps, long long ph, const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN, int mode,
+    float pre) {
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[128 * 384 + 128 * 192 + 128 * 8 + 192 * 128 + 192 * 4 +
+                                                                 192 * 4];
+    rctr_body(X, X8, XS, X8T, XTS, kbar, aux, S, H, sb, ss, sh, PE, pb, ps, ph, COS, SIN, mode, pre, smem);
+}
+
+// ---- the RoPE backward of the fused path (Megatron's rotary_bwd_q / _kv math): for the gradient g of the roped pe
+// values (halves gl = g[0..31], gr = g[32..63]) the input gradient x1[i] = gl c[i] + gr sn[32 + i] (to pe[2 i]), x2[i] =
+// -gl sn[i] + gr c[32 + i] (to pe[2 i + 1]), fp32 per op, bf16 out.
+__device__ __forceinline__ void irope8(const f32x8 &gl, const f32x8 &gr, const u32x4 cl, const u32x4 sl, const u32x4 cr,
+                                       const u32x4 sr, u32x4 &o0, u32x4 &o1) {
+    const bf16x8 c0 = __builtin_bit_cast(bf16x8, cl), s0 = __builtin_bit_cast(bf16x8, sl);
+    const bf16x8 c1 = __builtin_bit_cast(bf16x8, cr), s1 = __builtin_bit_cast(bf16x8, sr);
+    bf16x8 a, b;
+    static_for<8>([&](auto kk) {
+        constexpr int k = kk;
+        const bf16 x1 = (bf16)__fadd_rn(__fmul_rn(gl[k], (float)c0[k]), __fmul_rn(gr[k], (float)s1[k]));
+        const bf16 x2 = (bf16)__fsub_rn(__fmul_rn(gr[k], (float)c1[k]), __fmul_rn(gl[k], (float)s0[k]));
+        if constexpr (k < 4) {
+            a[2 * k] = x1;
+            a[2 * k + 1] = x2;
+        } else {
+            b[2 * (k - 4)] = x1;
+            b[2 * (k - 4) + 1] = x2;
+        }
+    });
+    o0 = __builtin_bit_cast(u32x4, a);
+    o1 = __builtin_bit_cast(u32x4, b);
+}
+
+// k_rope_bwd_q: in place on G [b, s, h, 192] (d 128..191: the roped gradient -> the pre-RoPE one); 4 lanes per row
+// (the lanes of a row in one wave: all of its loads before its stores); grid (B S H / 64), 256 threads
+extern "C" __global__ __launch_bounds__(256) void k_rope_bwd_q(bf16 *__restrict__ G, int B, int S, int H, long long gb,
+                                                               long long gs, long long gh,
+                                                               const bf16 *__restrict__ COS,
+                                                               const bf16 *__restrict__ SIN) {
+    const long long row = (long long)blockIdx.x * 64 + (threadIdx.x >> 2);
+    const int m = threadIdx.x & 3;
+    if (row >= (long long)B * S * H) return;
+    const int h = (int)(row % H), s = (int)((row / H) % S), b = (int)(row / ((long long)H * S));
+    bf16 *g = G + b * gb + (long long)s * gs + h * gh + 128;
+    const bf16 *cs = COS + (long long)s * 64, *sn = SIN + (long long)s * 64;
+    const f32x8 gl = bf8_to_f32(*(const u32x4 *)(g + 8 * m)), gr = bf8_to_f32(*(const u32x4 *)(g + 32 + 8 * m));
+    u32x4 o0, o1;
+    irope8(gl, gr, *(const u32x4 *)(cs + 8 * m), *(const u32x4 *)(sn + 8 * m), *(const u32x4 *)(cs + 32 + 8 * m),
+           *(const u32x4 *)(sn + 32 + 8 * m), o0, o1);
+    *(u32x4 *)(g + 16 * m) = o0;
+    *(u32x4 *)(g + 16 * m + 8) = o1;
+}
+
+// k_rope_bwd_kpe: GP [b, s, 64] = the pre-RoPE gradient of k_pe from the heads' roped gradients GH [b, s, h, 64] (fp32
+// sum over h in a fixed order, then the inverse rotation); grid (B S), 256 threads: thread = (head slice hs of 32, value
+// group of 8), 16-byte loads of heads hs, hs + 32, .. issued together, then the 32 slices summed through LDS
+extern "C" __global__ __launch_bounds__(256) void k_rope_bwd_kpe(const bf16 *__restrict__ GH, bf16 *__restrict__ GP,
+                                                                 int B, int S, int H, long long hb, long long hs_,
+                                                                 long long hh, long long pb, long long ps,
+                                                                 const bf16 *__restrict__ COS,
+                                                                 const bf16 *__restrict__ SIN) {
+    __shared__ float part[32][64 + 4];
+    __shared__ float tot[64];
+    const int bs = blockIdx.x, b = bs / S, s = bs % S;
+    const int t = threadIdx.x, vg = t & 7, hsl = t >> 3;
+    const bf16 *gh = GH + b * hb + (long long)s * hs_ + 8 * vg;
+    f32x8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    int h = hsl;
+    for (; h + 96 < H; h += 128) {  // 4 heads at a time
+        u32x4 w[4];
+        static_for<4>([&](auto u) { w[(int)u] = *(const u32x4 *)(gh + (long long)(h + 32 * (int)u) * hh); });
+        static_for<4>([&](auto u) { acc = acc + bf8_to_f32(w[(int)u]); });
+    }
+    for (; h < H; h += 32) acc = acc + bf8_to_f32(*(const u32x4 *)(gh + (long long)h * hh));
+    static_for<8>([&](auto e) { part[hsl][8 * vg + (int)e] = acc[(int)e]; });
+    __syncthreads();
+    if (t < 64) {
+        float sum = 0.f;
+        for (int k = 0; k < 32; ++k) sum += part[k][t];  // fixed order: deterministic
+        tot[t] = sum;
+    }
+    __syncthreads();
+    if (t < 4) {
+        const int m = t;  // pairs 8 m .. 8 m + 7
+        f32x8 gl, gr;
+        static_for<8>([&](auto k) {
+            gl[(int)k] = tot[8 * m + (int)k];
+            gr[(int)k] = tot[32 + 8 * m + (int)k];
+        });
+        const bf16 *cs = COS + (long long)s * 64, *sn = SIN + (long long)s * 64;
+        u32x4 o0, o1;
+        irope8(gl, gr, *(const u32x4 *)(cs + 8 * m), *(const u32x4 *)(sn + 8 * m), *(const u32x4 *)(cs + 32 + 8 * m),
+               *(const u32x4 *)(sn + 32 + 8 * m), o0, o1);
+        bf16 *gp = GP + b * pb + (long long)s * ps + 16 * m;
+        *(u32x4 *)gp = o0;
+        *(u32x4 *)(gp + 8) = o1;
+    }
+}
+
+// k_mxq_kbar_rope: kbar of k = [X nope | rope(PE)] (as k_mxq_kbar; the roped pe values rounded to bf16 as quantized)
+extern "C" __global__ __launch_bounds__(768) void k_mxq_kbar_rope(const bf16 *__restrict__ X, float *__restrict__ kbar,
+                                                                  int S, int H, long long sb, long long ss,
+                                                                  long long sh, const bf16 *__restrict__ PE,
+                                                                  long long pb, long long ps, long long ph,
+                                                                  const bf16 *__restrict__ COS,
+                                                                  const bf16 *__restrict__ SIN, int stride) {
+    constexpr int D = 192;
+    __shared__ float part[32][D + 4];
+    const int bh = blockIdx.x, b = bh / H, h = bh % H;
+    const int t = threadIdx.x, cg = t % 24, rg = t / 24;
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    for (int s = rg * stride; s < S; s += 32 * stride) {
+        f32x8 v;
+        if (cg < 16) {
+            v = bf8_to_f32(*(const u32x4 *)(X + b * sb + (long long)s * ss + h * sh + 8 * cg));
+        } else {
+            const int m = (cg - 16) & 3;
+            const bf16 *pe = PE + b * pb + (long long)s * ps + h * ph + 16 * m;
+            const bf16 *cs = COS + (long long)s * 64, *sn = SIN + (long long)s * 64;
+            u32x4 lo, hi;
+            rope8(*(const u32x4 *)pe, *(const u32x4 *)(pe + 8), *(const u32x4 *)(cs + 8 * m), *(const u32x4 *)(sn + 8 * m),
+                  *(const u32x4 *)(cs + 32 + 8 * m), *(const u32x4 *)(sn + 32 + 8 * m), lo, hi);
+            v = bf8_to_f32(cg < 20 ? lo : hi);
+        }
+        static_for<8>([&](auto i) { acc[(int)i] += v[(int)i]; });
+    }
+    static_for<8>([&](auto i) { part[rg][8 * cg + (int)i] = acc[(int)i]; });
+    __syncthreads();
+    if (t < D) {
+        float sum = 0.f;
+        for (int g = 0; g < 32; ++g) sum += part[g][t];
+        kbar[(long long)bh * D + t] = sum / (float)((S + stride - 1) / stride);
+    }
+}
 
 // grid (B * H), block 768 = 24 column groups of 8 d x 32 row groups. The mean of every stride-th row: any constant
 // shift of k is softmax-invariant, so an approximate mean centres k as well (and the backward uses the same kbar).

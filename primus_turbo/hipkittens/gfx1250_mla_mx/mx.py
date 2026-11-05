@@ -48,6 +48,7 @@ import torch
 from primus_turbo.hipkittens.gfx1250_mla import hiprt
 
 D_QK, D_V = 192, 128
+D_NOPE = 128  # q / k columns before the rope part
 KBAR_STRIDE = 16
 LOG2E = 1.4426950408889634
 HIP = Path(__file__).resolve().parent / "hip"
@@ -66,6 +67,13 @@ _COLS_ARGS = (("X", "ptr"), ("X8T", "ptr"), ("XTS", "ptr"), ("kbar", "ptr"), ("S
 _RC_ARGS = (("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("X8T", "ptr"), ("XTS", "ptr"), ("kbar", "ptr"), ("Y", "ptr"),
             ("aux", "ptr"), ("S", "i32"), ("H", "i32"), ("sb", "i64"), ("ss", "i64"), ("sh", "i64"), ("yb", "i64"),
             ("ys", "i64"), ("yh", "i64"), ("mode", "i32"), ("pre", "f32"))  # fmt: skip
+_RCTR_ARGS = (("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("X8T", "ptr"), ("XTS", "ptr"), ("kbar", "ptr"),
+              ("aux", "ptr"), ("S", "i32"), ("H", "i32"), ("sb", "i64"), ("ss", "i64"), ("sh", "i64"), ("PE", "ptr"),
+              ("pb", "i64"), ("ps", "i64"), ("ph", "i64"), ("COS", "ptr"), ("SIN", "ptr"), ("mode", "i32"),
+              ("pre", "f32"))  # fmt: skip
+_KBR_ARGS = (("X", "ptr"), ("kbar", "ptr"), ("S", "i32"), ("H", "i32"), ("sb", "i64"), ("ss", "i64"), ("sh", "i64"),
+             ("PE", "ptr"), ("pb", "i64"), ("ps", "i64"), ("ph", "i64"), ("COS", "ptr"), ("SIN", "ptr"),
+             ("stride", "i32"))  # fmt: skip
 # kernel -> (source, workgroup size, arguments in order)
 KERNELS = {
     "k_mxq_kbar": (
@@ -88,6 +96,13 @@ KERNELS = {
     "k_mxq_cols192": ("k_mxq.hip", 256, _COLS_ARGS),
     "k_mxq_rct192": ("k_mxq.hip", 256, _RC_ARGS),
     "k_mxq_rct128": ("k_mxq.hip", 256, _RC_ARGS),
+    "k_mxq_rctr192": ("k_mxq.hip", 256, _RCTR_ARGS),
+    "k_mxq_kbar_rope": ("k_mxq.hip", 768, _KBR_ARGS),
+    "k_rope_bwd_q": ("k_mxq.hip", 256, (("G", "ptr"), ("B", "i32"), ("S", "i32"), ("H", "i32"), ("gb", "i64"),
+                                        ("gs", "i64"), ("gh", "i64"), ("COS", "ptr"), ("SIN", "ptr"))),
+    "k_rope_bwd_kpe": ("k_mxq.hip", 256, (("GH", "ptr"), ("GP", "ptr"), ("B", "i32"), ("S", "i32"), ("H", "i32"),
+                                          ("hb", "i64"), ("hs", "i64"), ("hh", "i64"), ("pb", "i64"), ("ps", "i64"),
+                                          ("COS", "ptr"), ("SIN", "ptr"))),
     "k_mla_fwd_mx": (
         "k_mla_fwd_mx7.hip",
         128,
@@ -164,6 +179,8 @@ KERNELS = {
         ),
     ),  # fmt: skip
 }
+KERNELS["k_dkdv_mxr"] = (KERNELS["k_dkdv_mx"][0], 128,
+                         KERNELS["k_dkdv_mx"][2] + (("DKP", "ptr"), ("dkp_sb", "i64"), ("dkp_ss", "i64")))
 # k_mxq modes (k_mxq.hip): 1 subtract kbar, 2 aux = x . kbar, 4 aux = x . Y, 16 scale layout R2, 32 quantize x * pre
 MODE_Q, MODE_K, MODE_DO = 2 | 16 | 32, 1 | 16, 4
 _SIZE = {"ptr": 8, "i64": 8, "i32": 4, "f32": 4}
@@ -403,3 +420,131 @@ def attn_bwd(dout, out, lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr
             [q8, qs, k8, ks, v8, vsr, do8, dos, k8t, kts, lse2, delta, dq, sc, s, h, b, dq.stride(0),
              dq.stride(1)])  # fmt: skip
     return dq, dk, dv
+
+
+# ------------------------------------------------------------------------------------- the fused-RoPE path
+# MLA's rotary (Megatron fused_apply_mla_rope_for_q / _for_kv: interleaved pairs of d 128..191 in, halves out) folded
+# into the quantization and the backward's epilogues: no bf16 query / key / value are materialized.
+
+
+def rope_unsupported_reason(q, kv, kpe, cos, sin, causal):
+    """Why the fused-RoPE path cannot take q [b, s, h, 192], kv [b, s, h, 256], kpe [b, s, 1, 64], cos / sin [>= s, 64]
+    (BSHD views), or None."""
+    if not causal:
+        return "causal only"
+    b, s, h, dq = q.shape
+    if dq != D_QK or kv.shape != (b, s, h, 256) or kpe.shape[-1] != 64 or kpe.shape[:2] != (b, s):
+        return "MLA shapes only: q [.., 192], kv [.., 256], k_pe [.., 64]"
+    if s % 256 != 0:
+        return f"seqlen {s} must be a multiple of 256"
+    if cos.dtype != torch.bfloat16 or sin.dtype != torch.bfloat16 or cos.numel() < s * 64 or sin.numel() < s * 64:
+        return "cos / sin: bf16, >= seqlen rows of 64"
+    if not (cos.is_contiguous() and sin.is_contiguous()):
+        return "cos / sin must be contiguous"
+    for t in (q, kv, kpe):
+        if t.stride(-1) != 1 or t.data_ptr() % 16 or any(x % 8 for x in t.stride()[:-1]):
+            return "q / kv / k_pe need a contiguous last dim and 16-byte aligned rows"
+    if (h != 1 and kv.stride(2) != 256) or (h != 1 and q.stride(2) != D_QK):
+        return "q / kv heads must be packed (head strides 192 / 256)"
+    return None
+
+
+def kbar_rope(kv, kpe, cos, sin, stride=KBAR_STRIDE):
+    b, s, h, _ = kv.shape
+    kbar = torch.empty(b, h, D_QK, device=kv.device, dtype=torch.float32)
+    _launch("k_mxq_kbar_rope", (b * h, 1, 1),
+            [kv, kbar, s, h, kv.stride(0), kv.stride(1), kv.stride(2), kpe, kpe.stride(0), kpe.stride(1), 0, cos, sin,
+             stride])  # fmt: skip
+    return kbar
+
+
+def quant_rope(x, pe, pe_head_stride, cos, sin, mode=0, kbar=None, pre=1.0):
+    """k_mxq_rctr192: rows + cols of [x[..., :128] | rope(pe)] -> (x8, xs, aux | None, x8t, xts) as quant_rc(.., 192)."""
+    b, s, h, _ = x.shape
+    dev = x.device
+    x8 = torch.empty(b, h, s, D_QK, device=dev, dtype=torch.uint8)
+    xs = torch.empty(b, h, s, 8, device=dev, dtype=torch.uint8)
+    x8t = torch.empty(b, h, D_QK, s, device=dev, dtype=torch.uint8)
+    xts = torch.empty(b, h, s // 128, D_QK, 4, device=dev, dtype=torch.uint8)
+    aux = torch.empty(b, h, s, device=dev, dtype=torch.float32) if mode & 6 else None
+    _launch("k_mxq_rctr192", (s // 128, h, b),
+            [x, x8, xs, x8t, xts, kbar if kbar is not None else _dummy(dev), aux if aux is not None else _dummy(dev), s,
+             h, x.stride(0), x.stride(1), x.stride(2), pe, pe.stride(0), pe.stride(1), pe_head_stride, cos, sin, mode,
+             float(pre)])  # fmt: skip
+    return x8, xs, aux, x8t, xts
+
+
+def attn_fwd_rope(q, kv, kpe, cos, sin, softmax_scale):
+    """q [b, s, h, 192] (d 128..191 before RoPE), kv [b, s, h, 256] ([k nope | v]), kpe [b, s, 1, 64] (before RoPE,
+    shared by the heads), cos / sin [>= s, 64] bf16 -> (out [b, s, h, 128] bf16 (BSHD view of SBHD storage), lse [b, h,
+    s], *saved for attn_bwd_rope)."""
+    b, s, h, _ = q.shape
+    pre = float(softmax_scale) * LOG2E
+    kbar = kbar_rope(kv, kpe, cos, sin)
+    q8, qs, qk, q8t, qts = quant_rope(q, q[..., D_NOPE:], q.stride(2), cos, sin, mode=MODE_Q, kbar=kbar, pre=pre)
+    k8, ks, _, k8t, kts = quant_rope(kv, kpe, 0, cos, sin, mode=MODE_K, kbar=kbar)
+    v8, vsr, _, v8t, vs = quant_rc(kv[..., D_NOPE:], D_V)
+    out = torch.empty(s, b, h, D_V, device=q.device, dtype=torch.bfloat16).transpose(0, 1)
+    lse_c = torch.empty(b, h, s, device=q.device, dtype=torch.float32)
+    nqb = s // 256
+    paired = nqb % 2 == 0 and (b * h) % 8 == 0
+    _launch("k_mla_fwd_mx", (nqb // 2 if paired else nqb, h, b),
+            [q8, qs, k8, ks, v8t, vs, out, lse_c, float(softmax_scale), s, h, b, out.stride(0), out.stride(1)])
+    lse = torch.add(lse_c, qk, alpha=float(softmax_scale))
+    return (out, lse, lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr)
+
+
+def attn_bwd_rope(dout, out, lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr, cos, sin, softmax_scale):
+    """-> (dq [b, s, h, 192] (the gradient of q before RoPE), dkv [b, s, h, 256], dkpe [b, s, 64]), BSHD views of SBHD
+    storage."""
+    b, h, s, _ = q8.shape
+    dev = q8.device
+    if dout.stride(-1) != 1 or dout.data_ptr() % 16:
+        dout = dout.contiguous()
+    do8, dos, delta, do8t, dots = quant_rc(dout, D_V, mode=MODE_DO, y=out)
+    lse2 = lse_c * LOG2E
+    dq = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    dkv = torch.empty(s, b, h, 256, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    dkph = torch.empty(s, b, h, 64, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    dk, dv = dkv[..., :D_NOPE], dkv[..., D_NOPE:]
+    sc = float(softmax_scale)
+    _launch("k_dkdv_mxr", (math.ceil(s / DKDV_KV_ROWS), h, b),
+            [q8, qs, k8, ks, v8, vsr, do8, dos, do8t, dots, q8t, qts, lse2, delta, dk, dv, sc, s, h, b, dk.stride(0),
+             dk.stride(1), dv.stride(0), dv.stride(1), dkph, dkph.stride(0), dkph.stride(1)])  # fmt: skip
+    _launch("k_dq_mx", (s // 256, h, b),
+            [q8, qs, k8, ks, v8, vsr, do8, dos, k8t, kts, lse2, delta, dq, sc, s, h, b, dq.stride(0),
+             dq.stride(1)])  # fmt: skip
+    _launch("k_rope_bwd_q", ((b * s * h + 63) // 64, 1, 1),
+            [dq, b, s, h, dq.stride(0), dq.stride(1), dq.stride(2), cos, sin])
+    dkpe = torch.empty(s, b, 64, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    _launch("k_rope_bwd_kpe", (b * s, 1, 1),
+            [dkph, dkpe, b, s, h, dkph.stride(0), dkph.stride(1), dkph.stride(2), dkpe.stride(0), dkpe.stride(1), cos,
+             sin])  # fmt: skip
+    return dq, dkv, dkpe
+
+
+class _MLARopeAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, kv, kpe, cos, sin, softmax_scale):
+        qb, kvb, kpeb = q.transpose(0, 1), kv.transpose(0, 1), kpe.transpose(0, 1)
+        cos2, sin2 = cos.reshape(-1, 64), sin.reshape(-1, 64)
+        res = attn_fwd_rope(qb, kvb, kpeb.reshape(kpeb.shape[0], kpeb.shape[1], 1, 64), cos2, sin2, softmax_scale)
+        out = res[0]
+        ctx.save_for_backward(out, cos2, sin2, *res[2:])
+        ctx.softmax_scale = softmax_scale
+        ctx.kpe_shape = kpe.shape
+        return out.transpose(0, 1)
+
+    @staticmethod
+    def backward(ctx, dout):
+        out, cos2, sin2, *saved = ctx.saved_tensors
+        dq, dkv, dkpe = attn_bwd_rope(dout.transpose(0, 1), out, *saved, cos2, sin2, ctx.softmax_scale)
+        return dq.transpose(0, 1), dkv.transpose(0, 1), dkpe.transpose(0, 1).reshape(ctx.kpe_shape), None, None, None
+
+
+def mla_rope_attention(q, kv, kpe, cos, sin, softmax_scale):
+    """Causal MLA attention on the MXFP8 kernels with Megatron's MLA RoPE fused in (apply_rope_fusion layout), SBHD:
+    q [s, b, h, 192] (the q up-projection, d 128..191 before RoPE), kv [s, b, h, 256] (the kv up-projection: [k nope |
+    v]), kpe [s, b, 1, 64] or [s, b, 64] (k_pos_emb before RoPE), cos / sin [>= s, 1, 1, 64] bf16 (RotaryEmbedding's
+    cached cos / sin) -> out [s, b, h, 128] bf16 (contiguous). Gradients flow to q, kv and kpe."""
+    return _MLARopeAttention.apply(q, kv, kpe, cos, sin, softmax_scale)

@@ -225,3 +225,63 @@ def test_production_shape_head_slice(monkeypatch):
     _settings(monkeypatch, "hk_mx", "hk_mx")
     q, k, v, dout = _inputs(1, 4096, 4096, 4, layout="sbhd")
     _check_mx(_run(q, k, v, dout), _reference_by_heads(q, k, v, dout, MLA_SCALE), "hk_mx")
+
+
+# ---------------------------------------------------------------------------
+# The fused-RoPE path (mx.mla_rope_attention)
+# ---------------------------------------------------------------------------
+
+
+def _rope_ref(pe, cos, sin):
+    """Megatron's MLA rotary (interleaved pairs in, halves out), fp32 per op, bf16 out."""
+    x = pe.float()
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    c, s = cos.float(), sin.float()
+    return torch.cat([x1 * c[..., :32] - x2 * s[..., :32], x2 * c[..., 32:] + x1 * s[..., 32:]], -1).to(torch.bfloat16)
+
+
+@needs_hk_mx
+@pytest.mark.parametrize(("b", "s", "h"), [(1, 256, 2), (2, 512, 4)])
+def test_rope_fused_matches_unfused(b, s, h):
+    """mla_rope_attention == RoPE (torch) followed by the hk_mx attention: out bitwise, dq within 1 bf16 ulp, dkv bitwise,
+    dk_pe within the reference's own bf16 rounding of the head sum."""
+    mx = _mx()
+    g = torch.Generator(device="cuda").manual_seed(11)
+    q = torch.randn(s, b, h, 192, generator=g, device="cuda").to(torch.bfloat16)
+    kv = torch.randn(s, b, h, 256, generator=g, device="cuda").to(torch.bfloat16)
+    kvc = torch.randn(s, b, 576, generator=g, device="cuda").to(torch.bfloat16)
+    ang = torch.rand(s, 64, generator=g, device="cuda") * 6.0
+    cos = ang.cos().to(torch.bfloat16).reshape(s, 1, 1, 64).contiguous()
+    sin = ang.sin().to(torch.bfloat16).reshape(s, 1, 1, 64).contiguous()
+    dout = torch.randn(s, b, h, 128, generator=g, device="cuda").to(torch.bfloat16)
+
+    q1, kv1, kvc1 = (t.clone().requires_grad_() for t in (q, kv, kvc))
+    out1 = mx.mla_rope_attention(q1, kv1, kvc1[..., 512:].unsqueeze(2), cos, sin, MLA_SCALE)
+    out1.backward(dout)
+
+    class _Unfused(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, qq, kk, vv):
+            r = mx.attn_fwd(qq.transpose(0, 1), kk.transpose(0, 1), vv.transpose(0, 1), MLA_SCALE, True)
+            ctx.save_for_backward(r[0], *r[2:])
+            return r[0].transpose(0, 1)
+
+        @staticmethod
+        def backward(ctx, do):
+            o, *saved = ctx.saved_tensors
+            dq, dk, dv = mx.attn_bwd(do.transpose(0, 1), o, *saved, MLA_SCALE)
+            return dq.transpose(0, 1), dk.transpose(0, 1), dv.transpose(0, 1)
+
+    q2, kv2, kvc2 = (t.clone().requires_grad_() for t in (q, kv, kvc))
+    kpe2 = kvc2[..., 512:].unsqueeze(2)
+    query = torch.cat([q2[..., :128], _rope_ref(q2[..., 128:], cos, sin)], -1)
+    key = torch.cat([kv2[..., :128], _rope_ref(kpe2, cos, sin).expand(s, b, h, 64)], -1)
+    out2 = _Unfused.apply(query.contiguous(), key.contiguous(), kv2[..., 128:].contiguous())
+    out2.backward(dout)
+
+    assert torch.equal(out1, out2)
+    assert torch.equal(kv1.grad, kv2.grad)
+    dq_diff = (q1.grad.float() - q2.grad.float()).abs()
+    assert bool((dq_diff <= q2.grad.float().abs() * 2.0**-7).all())
+    assert compute_snr(kvc2.grad[..., 512:].float(), kvc1.grad[..., 512:].float()) > 45
+    assert kvc1.grad[..., :512].abs().max() == 0
