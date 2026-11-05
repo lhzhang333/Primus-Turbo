@@ -18,6 +18,8 @@ import re
 import pytest
 import torch
 
+import primus_turbo.common.envs as envs
+
 from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.pytorch.ops import flash_attn_func
 from tests.pytorch.ops.test_attention_flydsl_gfx1250_mla import (
@@ -454,11 +456,14 @@ def test_zero_ticket_touches_only_the_counter():
 
 def test_max_scratch_bytes_setting(monkeypatch):
     bwd = _hk("bwd")
+    # envs caches a variable at its first read: drop the cached value after every write
     for text, want in (("", None), ("2.2e9", 2_200_000_000), ("4096", 4096)):
         monkeypatch.setenv(bwd.MAX_SCRATCH_BYTES_ENV, text)
+        envs.reset_cache(bwd.MAX_SCRATCH_BYTES_ENV)
         assert bwd._bytes_setting(bwd.MAX_SCRATCH_BYTES_ENV) == want
     for text in ("0", "-1", "lots", "inf", "nan"):
         monkeypatch.setenv(bwd.MAX_SCRATCH_BYTES_ENV, text)
+        envs.reset_cache(bwd.MAX_SCRATCH_BYTES_ENV)
         with pytest.raises(ValueError, match="positive byte count"):
             bwd._bytes_setting(bwd.MAX_SCRATCH_BYTES_ENV)
 
