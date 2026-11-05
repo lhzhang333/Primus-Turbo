@@ -228,3 +228,13 @@ b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 
   tile's loads fenced ahead of this tile's math): dkdv 1.139 -> 0.979 ms; dq PF_KV 1 (pair m + 1's K / V fragments
   fenced ahead of pair m, the dQ phase's K^T fragments 4 buffers / two ahead, the first two during pair 3): dq 0.741
   -> 0.671. **b3 backward 1.707 ms** (bf16 HK 1.981). VGPRs 764 / 933, no spills.
+- forward rung m7 (`kern/k_mla_fwd_mx7.hip` = m6 defaults only): two q blocks per workgroup (nqb - 1 - p and p of one
+  (b, h): 34 tiles each for nqb 16), the ring index running on across them (the first block's last three tile slots
+  load the second block's first three tiles; the same kv tiles), pairs of a (b, h) on one XCD; the block body one
+  instantiation inside a loop (two calls duplicated it: ~260 spills). Host grid (nqb / 2, H, B) when nqb % 2 == 0 and
+  B H % 8 == 0 (pair_mode), else m6's. 0.440 -> 0.432 ms. QKFIRST: in slots 1, 2 the QK(q_{i+1}) WMMAs before PV(q_{i-1})
+  (P(q_{i-1}) is converted at the very end of slot i - 1; ATT showed slot 1 opening with ~40 VALU while its PVs waited):
+  **0.426 ms**. Package: forward m7 (mx.py launches the paired grid), pytest 28 pass.
+- ATT of the pipelined b3: dkdv 2805 cycles / step (from 3714), now LDS-bound (240 loads at ~4.9 cycles, 39%); dq 3683
+  cycles / tile. b4 with b3's pipelining and staging (NJ_DK 3: NJ 4 spills 28): dv 0.420 + dk 0.720 = 1.14 ms vs b3's
+  dkdv 0.978: the S recomputation in both kernels does not pay; b3 stays.

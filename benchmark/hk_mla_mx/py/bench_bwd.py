@@ -89,7 +89,8 @@ def one(name, tag):
         args = [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"],
                 bz["dots"], bz["q8t"], bz["qts"], lse, bz["delta"], dk, dv, float(L.SCALE), s, h, b, dk.stride(0),
                 dk.stride(1), dv.stride(0), dv.stride(1)]  # fmt: skip
-        grid = (s // 128 if name == "k_dkdv_mx" else -(-s // 256), h, b)
+        rows = 128 if name == "k_dkdv_mx" else (192 if name == "k_dk_mx" and tag[:1] == "4" else 256)
+        grid = (-(-s // rows), h, b)
     else:
         args = [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["k8t"],
                 bz["kts"], lse, bz["delta"], dq, float(L.SCALE), s, h, b, dq.stride(0), dq.stride(1)]  # fmt: skip

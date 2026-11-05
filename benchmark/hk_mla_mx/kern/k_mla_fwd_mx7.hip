@@ -4,6 +4,11 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
+// k_mla_fwd_mx (rung m7) -- m6 with paired blocks: a workgroup runs q blocks nqb - 1 - p and p of one (b, h) (2 (16 - p)
+// + 2 (p + 1) = 34 tiles for nqb 16: balanced), the ring index running on across the two blocks, so the first block's
+// last three tile slots TDM-load the second block's first three tiles (the same kv tiles); half the workgroup launches.
+// The pairs of a (b, h) on one XCD. B H % 8 != 0 or nqb odd: one block per workgroup (pair_mode() on host and device).
+// m6's notes follow.
 // k_mla_fwd_mx (rung m6) -- m4's tile / slot pipeline (QK(q_{i+1}) and PV(q_{i-1}) WMMAs with softmax(q_i)) and its
 // operand recipe (Q8 of q * scale * log2 e, R2 scales, K centred), with a branch-free softmax:
 //  - per lane (q column) integer shifts: lm = max S'' (S'' = S' - m out of the nope WMMA, C = -m); d = ceil(lm) when
@@ -58,6 +63,12 @@ constexpr unsigned W0_KN = tdm_w0(0, 32, 20), W0_KR = tdm_w0(0, 16, 36), W0_V = 
 #endif
 #ifndef NO_GUARD
 #define NO_GUARD 0
+#endif
+#ifndef PAIR
+#define PAIR 1
+#endif
+#ifndef QKFIRST
+#define QKFIRST 1
 #endif
 #ifndef XCD_MAP
 #define XCD_MAP 1  // workgroups of one (b, h) on one XCD (dispatch: linear id L -> XCD L % 8): K / V reuse in its L2
@@ -352,6 +363,9 @@ MX_INLINE void guard_rescale(QState (&st)[QT]) {
 }
 }  // namespace
 
+
+MX_INLINE bool pair_mode(int nqb, int H, int B) { return PAIR && nqb % 2 == 0 && (B * H) % 8 == 0; }
+
 extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
 void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
                   const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
@@ -364,44 +378,42 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
     const int tid = (int)__builtin_amdgcn_workitem_id_x();
     const int wv = wave_id(tid);
     const int lane = tid & 31, lr = lane & 15, lh = lane >> 4;
-    const int cnt0 = wv == 0 ? 1 : 0;
     const int nqb = S / BM;
-#if XCD_MAP
-    // linear id L = x + nqb (y + H z) goes to XCD L % 8; the k-th workgroup of XCD c (k = L / 8) takes q block
-    // nqb - 1 - k % nqb (longest first) of bh = c + 8 (k / nqb): one XCD streams a (b, h)'s K / V for all its q
-    // blocks. Needs B H % 8 == 0 (else the plain order).
-    int qb, h, b;
-    if ((B * H) % 8 == 0) {
+    // blocks: paired (grid (nqb / 2, H, B)): the k-th workgroup of XCD c (k = L / 8) takes pair p = k % (nqb / 2) of
+    // bh = c + 8 (k / (nqb / 2)): q blocks nqb - 1 - p, then p. Else (grid (nqb, H, B)): m6's XCD order, one block.
+    const bool paired = pair_mode(nqb, H, B);
+    int qbA, qbB, h, b;
+    if (paired) {
+        const int np = nqb / 2;
+        const int L = (int)blockIdx.x + np * ((int)blockIdx.y + H * (int)blockIdx.z);
+        const int k = L >> 3;
+        const int bhx = (L & 7) + 8 * (k / np);
+        qbA = nqb - 1 - k % np;
+        qbB = k % np;
+        h = bhx % H;
+        b = bhx / H;
+    } else if ((B * H) % 8 == 0) {
         const int L = (int)blockIdx.x + nqb * ((int)blockIdx.y + H * (int)blockIdx.z);
         const int k = L >> 3;
         const int bhx = (L & 7) + 8 * (k / nqb);
-        qb = nqb - 1 - k % nqb;
+        qbA = nqb - 1 - k % nqb;
+        qbB = -1;
         h = bhx % H;
         b = bhx / H;
     } else {
-        qb = nqb - 1 - (int)blockIdx.x;
+        qbA = nqb - 1 - (int)blockIdx.x;
+        qbB = -1;
         h = (int)blockIdx.y;
         b = (int)blockIdx.z;
     }
-#else
-    const int qb = nqb - 1 - (int)blockIdx.x;
-    const int h = (int)blockIdx.y, b = (int)blockIdx.z;
-#endif
-    const int q0 = qb * BM;
-    const int n = (q0 + BM) / NB;
+    const int nA = 2 * (qbA + 1), nB = qbB >= 0 ? 2 * (qbB + 1) : 0;
     const unsigned long long bh = (unsigned long long)b * H + h;
-    const unsigned long long gq = (unsigned long long)(uintptr_t)Q8 + (bh * S + q0) * D_QK;
-    const unsigned long long gqs = (unsigned long long)(uintptr_t)QS + (bh * S + q0) * 8;
     const unsigned long long gk = (unsigned long long)(uintptr_t)K8 + bh * S * D_QK;
     const unsigned long long gks = (unsigned long long)(uintptr_t)KS + bh * S * 8;
     const unsigned long long gv = (unsigned long long)(uintptr_t)V8T + bh * D_V * S;
     const unsigned long long gvs = (unsigned long long)(uintptr_t)VS + bh * (unsigned long long)(S / NB) * VS_B;
 
-#if TDM_SPLIT
-    // the tile's 5 TDM ops spread over the waves (LLVM waits for tensorcnt <= 10 before every TDM op: with all 5 on one
-    // wave, 3 tiles in flight = 15 ops, its oldest transfers block it). Two TDM instructions per wave and tile:
-    // wave 0 K nope | -, wave 1 K rope | K scales, wave 2 V | -, wave 3 V scales | - (- = NULL descriptor). The
-    // wave's descriptor constants are formed once (no per-tile selects): op A of tile tt = base + tt * step.
+    // the tile's 5 TDM ops spread over the waves (m6 TDM_SPLIT): two per wave and tile
     constexpr int TDM_PER_TILE = 2;
     const unsigned a_lds = wv == 0 ? 0u : wv == 1 ? 128u : wv == 2 ? (unsigned)(K_B + KS_B) : (unsigned)(K_B + KS_B + V_B);
     const unsigned long long a_base = wv == 0 ? gk : wv == 1 ? gk + 128 : wv == 2 ? gv : gvs;
@@ -410,271 +422,203 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
     const i32x8 a_g1 = tdm_g1(wv == 0 ? W0_KN : wv == 1 ? W0_KR : wv == 2 ? W0_V : W0_S, 128,
                               wv == 0 ? 128u : wv == 1 ? 64u : wv == 2 ? 128u : 4u, 128,
                               wv <= 1 ? (unsigned long long)D_QK : wv == 2 ? (unsigned long long)S : 4ull);
-    const i32x8 a_g1d = tdm_g1(wv == 0 ? W0_KN : wv == 1 ? W0_KR : wv == 2 ? W0_V : W0_S, 1,
-                               wv == 0 ? 128u : wv == 1 ? 64u : wv == 2 ? 128u : 4u, 128,
-                               wv <= 1 ? (unsigned long long)D_QK : wv == 2 ? (unsigned long long)S : 4ull);
-    const i32x8 b_g1 = tdm_g1(W0_S, 128, 8, NB, 8), b_g1d = tdm_g1(W0_S, 1, 8, NB, 8);
+    const i32x8 b_g1 = tdm_g1(W0_S, 128, 8, NB, 8);
     const int b_cnt = wv == 1 ? 1 : 0;
-    auto issue_slot = [&](int t) {
-        const bool real = t < n;
-        const int tt = real ? t : n - 1;
-        const unsigned st = lds0 + (unsigned)((t & (NSTG - 1)) * STG_B);
-        tdm_load(tdm_g0(st + a_lds, a_base + (unsigned long long)tt * a_step, 1), real ? a_g1 : a_g1d);
-        tdm_load(tdm_g0(st + K_B, gks + (unsigned long long)tt * (NB * 8), b_cnt), real ? b_g1 : b_g1d);
+    // ring slot g (global over the workgroup's blocks): kv tile g of block A, then kv tile g - nA of block B (the same
+    // (b, h): the same K / V), past the end a NULL descriptor
+    auto issue_slot = [&](int g) {
+        const int tb = g - nA;
+        const bool real = g < nA || tb < nB;
+        const int tt = g < nA ? g : (tb < nB ? tb : 0);
+        const unsigned st = lds0 + (unsigned)((g & (NSTG - 1)) * STG_B);
+        tdm_load(tdm_g0(st + a_lds, a_base + (unsigned long long)tt * a_step, real ? 1 : 0), a_g1);
+        tdm_load(tdm_g0(st + K_B, gks + (unsigned long long)tt * (NB * 8), real ? b_cnt : 0), b_g1);
     };
-#else
-    constexpr int TDM_PER_TILE = 5;
-    auto issue_slot = [&](int t) {
-        const bool real = t < n;
-        const int tt = real ? t : n - 1;
-        const unsigned rk = real ? NB : 1, rv = real ? D_V : 1;
-        const unsigned st = lds0 + (unsigned)((t & (NSTG - 1)) * STG_B);
-        const unsigned long long k0 = (unsigned long long)tt * NB;
-        tdm_load(tdm_g0(st, gk + k0 * D_QK, cnt0), tdm_g1(W0_KN, rk, 128, NB, D_QK));
-        tdm_load(tdm_g0(st + 128, gk + k0 * D_QK + 128, cnt0), tdm_g1(W0_KR, rk, 64, NB, D_QK));
-        tdm_load(tdm_g0(st + K_B, gks + k0 * 8, cnt0), tdm_g1(W0_S, rk, 8, NB, 8));
-        tdm_load(tdm_g0(st + K_B + KS_B, gv + k0, cnt0), tdm_g1(W0_V, rv, 128, D_V, (unsigned long long)S));
-        tdm_load(tdm_g0(st + K_B + KS_B + V_B, gvs + (unsigned long long)tt * VS_B, cnt0), tdm_g1(W0_S, rv, 4, D_V, 4));
-    };
-#endif
-    auto stage = [&](int t) { return lds0 + (unsigned)((t & (NSTG - 1)) * STG_B); };
-
-    tdm_load(tdm_g0(lds0 + Q_OFF, gq, wv == 1 ? 1 : 0), tdm_g1(W0_KN, BM, 128, BM, D_QK));
-    tdm_load(tdm_g0(lds0 + Q_OFF + 128, gq + 128, wv == 2 ? 1 : 0), tdm_g1(W0_KR, BM, 64, BM, D_QK));
-    tdm_load(tdm_g0(lds0 + QS_OFF, gqs, wv == 3 ? 1 : 0), tdm_g1(W0_S, BM, 8, BM, 8));
-    issue_slot(0);
-    issue_slot(1);
-    issue_slot(2);
-    tensor_wait<0>();
-    bar_signal();
-    bar_wait();  // B_0
-
-#if TDM_ONLY
-    for (int t = 0; t < n; ++t) {
-        issue_slot(t + 3);
-        fence();
-        tensor_wait<2 * TDM_PER_TILE>();
-        bar_signal();
-        bar_wait();
-        fence();
-    }
-    tensor_wait<0>();
-    if (lane == 0 && wv == 0) LSE[bh * S + q0] = (float)n;
-    return;
-#endif
-    auto qaddr = [&]() __attribute__((always_inline)) {
-        const int ln = lane_now();
-        const unsigned row = (unsigned)(16 * wv + (ln & 15)), hh = (unsigned)(ln >> 4);
-        return QAddr{pin(lds0 + Q_OFF + row * XK + 64 * hh), pin(lds0 + Q_OFF + row * XK + 128 + 32 * hh),
-                     pin(lds0 + QS_OFF + row * 8 + 4 * hh)};
-    };
-    QState st[QT];
-    static_for<QT>([&](auto ii) {
-        constexpr int i = ii;
-        st[i].mref = 0.f;
-        st[i].D = 0;
-        st[i].m = 0.f;
-        st[i].os = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-        static_for<NDT>([&](auto dd) { st[i].o[(int)dd] = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}; });
-    });
+    auto stage = [&](int g) { return lds0 + (unsigned)((g & (NSTG - 1)) * STG_B); };
     const i32x16 ones = {ONES, ONES, ONES, ONES, ONES, ONES, ONES, ONES,
                          ONES, ONES, ONES, ONES, ONES, ONES, ONES, ONES};
 
-    KFrag kf;
-    VFrag vf;
-    {
-        const KAddr ka = kaddr(stage(0), lr, lh);
-        static_for<NKV>([&](auto jj) { load_k1<(int)jj>(kf, ka); });
-    }
+    // one q block: rb = its ring base (the global ring slot of its tile 0); its tiles 0..2 already issued
+    auto run_block = [&](const int qb, const int rb) __attribute__((always_inline)) {
+        const int q0 = qb * BM;
+        const int n = (q0 + BM) / NB;
+        const unsigned long long gq = (unsigned long long)(uintptr_t)Q8 + (bh * S + q0) * D_QK;
+        const unsigned long long gqs = (unsigned long long)(uintptr_t)QS + (bh * S + q0) * 8;
+        tdm_load(tdm_g0(lds0 + Q_OFF, gq, wv == 1 ? 1 : 0), tdm_g1(W0_KN, BM, 128, BM, D_QK));
+        tdm_load(tdm_g0(lds0 + Q_OFF + 128, gq + 128, wv == 2 ? 1 : 0), tdm_g1(W0_KR, BM, 64, BM, D_QK));
+        tdm_load(tdm_g0(lds0 + QS_OFF, gqs, wv == 3 ? 1 : 0), tdm_g1(W0_S, BM, 8, BM, 8));
+        tensor_wait<0>();
+        bar_signal();
+        bar_wait();  // B_0 of the block: its Q and tiles 0..2 in LDS; the previous block's O store done
 
-    f32x8 sa[NKV], sb[NKV];
-    i32x16 pa, pbb;
-    QFrag qf[2];
-    {
-        const QAddr qa = qaddr();
-        load_q<0>(qf[0], qa);
-        load_q<1>(qf[1], qa);
-    }
-    {
-        const f32x8 mt0 = mtuple(st[0].m);
-        static_for<16>([&](auto ww) { qk_w<(int)ww>(sa, kf, qf[0], mt0); });
-    }
-    fence();
-
-    // tile t: on entry sa = S''(q0) of tile t, qf[1] = Q(q1), kf = K(t). Slot 3 computes QK(q0) of tile t + 1 (not
-    // LAST).
-    auto tile = [&](int t, const QAddr &qa, auto first_c, auto diag_c, auto last_c) __attribute__((always_inline)) {
-        constexpr bool FIRST = decltype(first_c)::value, DIAG = decltype(diag_c)::value,
-                       LAST = decltype(last_c)::value;
-        const VAddr va = vaddr(stage(t), lr, lh, lane);
-        const KAddr ka = kaddr(stage(t + 1), lr, lh);
-        fence();
-        issue_slot(t + 3);
-        load_v(vf, va);
-        fence();
-        const int kvrow0 = t * NB + 8 * lh;
+        auto qaddr = [&]() __attribute__((always_inline)) {
+            const int ln = lane_now();
+            const unsigned row = (unsigned)(16 * wv + (ln & 15)), hh = (unsigned)(ln >> 4);
+            return QAddr{pin(lds0 + Q_OFF + row * XK + 64 * hh), pin(lds0 + Q_OFF + row * XK + 128 + 32 * hh),
+                         pin(lds0 + QS_OFF + row * 8 + 4 * hh)};
+        };
+        QState st[QT];
         static_for<QT>([&](auto ii) {
             constexpr int i = ii;
-            f32x8(&scur)[NKV] = (i % 2 == 0) ? sa : sb;
-            f32x8(&snext)[NKV] = (i % 2 == 0) ? sb : sa;
-            i32x16 &pcur = (i % 2 == 0) ? pa : pbb;
-            i32x16 &pprev = (i % 2 == 0) ? pbb : pa;
-            const int qr_i = q0 + 64 * i + 16 * wv + lr;
-            const int thr = qr_i - kvrow0;
-            if constexpr (i == 1) {
-                tensor_wait<2 * TDM_PER_TILE>();
-                bar_signal();  // B_{t+1}
-                fence();
-            }
-            if constexpr (i == QT - 1) {
-                bar_wait();
-                if constexpr (!LAST) {
-                    static_for<NKV>([&](auto jj) { load_k1<(int)jj>(kf, ka); });
-                }
-                fence();
-            }
-            constexpr int NPV = (i >= 1) ? NDT + 1 : 0;
-            constexpr int NQK = (i + 1 < QT || !LAST) ? 16 : 0;
-            constexpr int NW = NPV + NQK;
-            constexpr int qn_mt = (i + 1) % QT;
-            const f32x8 mtn = mtuple(st[qn_mt].m);
-            constexpr bool LOADQ = !(LAST && i >= 2);
-            const int pvsc = pv_scale(st[i - 1 < 0 ? 0 : i - 1].D);
-#if SCHED == 0
-            constexpr int NSTEP = NW > 0 ? NW : 1;
-            float pm[4];
-            float pscale = 0.f;
-            static_for<NSTEP>([&](auto kk) {
-                constexpr int k = kk;
-                if constexpr (k == 0 && LOADQ) {
-                    load_q<(i + 2) % QT>(qf[i % 2], qa);
-                    fence();
-                }
-                if constexpr (k < NPV) {
-                    pv_w<k>(st[i - 1 < 0 ? 0 : i - 1], vf, pprev, pvsc, ones);
-                } else if constexpr (k < NW) {
-                    qk_w<k - NPV>(snext, kf, qf[(i + 1) % 2], mtn);
-                }
-                fence();
-                static_for<NCHUNK>([&](auto cc) {
-                    constexpr int c = cc;
-                    if constexpr (c * NSTEP / NCHUNK == k) {
-                        sm_chunk<c, FIRST, DIAG>(st[i], scur, pcur, thr, pm, pscale, t == 0);
-                        fence();
-                    }
-                });
-            });
-#else
-            // one region: the slot's loads, WMMAs and softmax in program order, then the issue windows
-            if constexpr (LOADQ) load_q<(i + 2) % QT>(qf[i % 2], qa);
-            static_for<NW>([&](auto kk) {
-                constexpr int k = kk;
-                if constexpr (k < NPV) {
-                    pv_w<k>(st[i - 1 < 0 ? 0 : i - 1], vf, pprev, pvsc, ones);
-                } else {
-                    qk_w<k - NPV>(snext, kf, qf[(i + 1) % 2], mtn);
-                }
-            });
-            softmax<FIRST, DIAG>(st[i], scur, pcur, thr, t == 0);
-            // windows: the q loads up front, then per WMMA [VALU, TRANS, VALU, TRANS (, TRANS)]: 64 exps over the
-            // slot's WMMAs (NW 16 or 25), the 55-odd VALU two per window
-            if constexpr (LOADQ) sgb<SG_DSR, 7>();
-            constexpr int NWIN = NW > 0 ? NW : 1;
-            constexpr int T3 = 64 - 2 * NWIN > 0 ? 64 - 2 * NWIN : 0;  // windows with a third exp
-            static_for<NWIN>([&](auto kk) {
-                constexpr int k = kk;
-                if constexpr (k < NW) sgb<SG_WMMA, 1>();
-                sgb<SG_VALU, 1>();
-                sgb<SG_TRANS, 1>();
-                sgb<SG_VALU, 1>();
-                sgb<SG_TRANS, 1>();
-                if constexpr (k < T3) sgb<SG_TRANS, 1>();
-            });
-            fence();
-#endif
-            (void)pprev;
+            st[i].mref = 0.f;
+            st[i].D = 0;
+            st[i].m = 0.f;
+            st[i].os = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            static_for<NDT>([&](auto dd) { st[i].o[(int)dd] = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}; });
         });
-        // tail: PV(q3)
-        const int pvs3 = pv_scale(st[QT - 1].D);
-        static_for<NDT + 1>([&](auto ww) { pv_w<(int)ww>(st[QT - 1], vf, pbb, pvs3, ones); });
-        fence();
-    };
-#if FIRST_PEEL
-    if (n > 2) {
-        tile(0, qaddr(), std::true_type{}, std::false_type{}, std::false_type{});
+        KFrag kf;
+        VFrag vf;
+        {
+            const KAddr ka = kaddr(stage(rb), lr, lh);
+            static_for<NKV>([&](auto jj) { load_k1<(int)jj>(kf, ka); });
+        }
+        f32x8 sa[NKV], sb[NKV];
+        i32x16 pa, pbb;
+        QFrag qf[2];
         {
             const QAddr qa = qaddr();
-            for (int t = 1; t < n - 2; ++t) tile(t, qa, std::false_type{}, std::false_type{}, std::false_type{});
+            load_q<0>(qf[0], qa);
+            load_q<1>(qf[1], qa);
+        }
+        {
+            const f32x8 mt0 = mtuple(st[0].m);
+            static_for<16>([&](auto ww) { qk_w<(int)ww>(sa, kf, qf[0], mt0); });
+        }
+        fence();
+        // tile t: on entry sa = S''(q0) of tile t, qf[1] = Q(q1), kf = K(t). Slot 3 computes QK(q0) of tile t + 1 (not
+        // LAST).
+        auto tile = [&](int t, const QAddr &qa, auto first_c, auto diag_c, auto last_c) __attribute__((always_inline)) {
+            constexpr bool FIRST = decltype(first_c)::value, DIAG = decltype(diag_c)::value,
+                           LAST = decltype(last_c)::value;
+            const VAddr va = vaddr(stage(rb + t), lr, lh, lane);
+            const KAddr ka = kaddr(stage(rb + t + 1), lr, lh);
+            fence();
+            issue_slot(rb + t + 3);
+            load_v(vf, va);
+            fence();
+            const int kvrow0 = t * NB + 8 * lh;
+            static_for<QT>([&](auto ii) {
+                constexpr int i = ii;
+                f32x8(&scur)[NKV] = (i % 2 == 0) ? sa : sb;
+                f32x8(&snext)[NKV] = (i % 2 == 0) ? sb : sa;
+                i32x16 &pcur = (i % 2 == 0) ? pa : pbb;
+                i32x16 &pprev = (i % 2 == 0) ? pbb : pa;
+                const int qr_i = q0 + 64 * i + 16 * wv + lr;
+                const int thr = qr_i - kvrow0;
+                if constexpr (i == 1) {
+                    tensor_wait<2 * TDM_PER_TILE>();
+                    bar_signal();  // B_{t+1}
+                    fence();
+                }
+                if constexpr (i == QT - 1) {
+                    bar_wait();
+                    if constexpr (!LAST) {
+                        static_for<NKV>([&](auto jj) { load_k1<(int)jj>(kf, ka); });
+                    }
+                    fence();
+                }
+                constexpr int NPV = (i >= 1) ? NDT + 1 : 0;
+                constexpr int NQK = (i + 1 < QT || !LAST) ? 16 : 0;
+                constexpr int NW = NPV + NQK;
+                constexpr int qn_mt = (i + 1) % QT;
+                const f32x8 mtn = mtuple(st[qn_mt].m);
+                constexpr bool LOADQ = !(LAST && i >= 2);
+                const int pvsc = pv_scale(st[i - 1 < 0 ? 0 : i - 1].D);
+                // one region: the slot's loads, WMMAs and softmax in program order, then the issue windows
+                if constexpr (LOADQ) load_q<(i + 2) % QT>(qf[i % 2], qa);
+                // WMMA order: QK(q_{i+1}) first where its K is resident (slots 1, 2: P(q_{i-1}), the PV's B operand, is
+                // converted at the very end of slot i - 1 and needs the slack); slot 3 keeps PV first (its QK reads the
+                // next tile's K fragments, loaded in this slot)
+                constexpr bool QKF = QKFIRST && i >= 1 && i <= 2;
+                static_for<NW>([&](auto kk) {
+                    constexpr int k = kk;
+                    if constexpr (QKF) {
+                        if constexpr (k < NQK) {
+                            qk_w<k>(snext, kf, qf[(i + 1) % 2], mtn);
+                        } else {
+                            pv_w<k - NQK>(st[i - 1 < 0 ? 0 : i - 1], vf, pprev, pvsc, ones);
+                        }
+                    } else if constexpr (k < NPV) {
+                        pv_w<k>(st[i - 1 < 0 ? 0 : i - 1], vf, pprev, pvsc, ones);
+                    } else {
+                        qk_w<k - NPV>(snext, kf, qf[(i + 1) % 2], mtn);
+                    }
+                });
+                softmax<FIRST, DIAG>(st[i], scur, pcur, thr, t == 0);
+                // windows: the q loads up front, then per WMMA [VALU, TRANS, VALU, TRANS (, TRANS)]: 64 exps over the
+                // slot's WMMAs (NW 16 or 25), the 55-odd VALU two per window
+                if constexpr (LOADQ) sgb<SG_DSR, 7>();
+                constexpr int NWIN = NW > 0 ? NW : 1;
+                constexpr int T3 = 64 - 2 * NWIN > 0 ? 64 - 2 * NWIN : 0;  // windows with a third exp
+                static_for<NWIN>([&](auto kk) {
+                    constexpr int k = kk;
+                    if constexpr (k < NW) sgb<SG_WMMA, 1>();
+                    sgb<SG_VALU, 1>();
+                    sgb<SG_TRANS, 1>();
+                    sgb<SG_VALU, 1>();
+                    sgb<SG_TRANS, 1>();
+                    if constexpr (k < T3) sgb<SG_TRANS, 1>();
+                });
+                fence();
+                (void)pprev;
+            });
+            // tail: PV(q3)
+            const int pvs3 = pv_scale(st[QT - 1].D);
+            static_for<NDT + 1>([&](auto ww) { pv_w<(int)ww>(st[QT - 1], vf, pbb, pvs3, ones); });
+            fence();
+        };
+        {
+            // the overflow guard between chunks of GCHUNK tiles: D grows by at most the row max's rise over a chunk, so
+            // O stays finite unless the max climbs > ~56 log2 units (39 nats) within GCHUNK tiles after a check
+            const QAddr qa = qaddr();
+            for (int t0 = 0; t0 < n - 2; t0 += GCHUNK) {
+                const int t1 = t0 + GCHUNK < n - 2 ? t0 + GCHUNK : n - 2;
+                for (int t = t0; t < t1; ++t) tile(t, qa, std::false_type{}, std::false_type{}, std::false_type{});
+    #if !NO_GUARD
+                const int d01 = st[0].D > st[1].D ? st[0].D : st[1].D, d23 = st[2].D > st[3].D ? st[2].D : st[3].D;
+                if (__builtin_amdgcn_ballot_w32((d01 > d23 ? d01 : d23) > DGUARD) != 0u) guard_rescale(st);
+    #endif
+            }
         }
         tile(n - 2, qaddr(), std::false_type{}, std::true_type{}, std::false_type{});
-    } else {
-        tile(0, qaddr(), std::true_type{}, std::true_type{}, std::false_type{});
-    }
-#else
-    {
-        // the overflow guard between chunks of GCHUNK tiles: D grows by at most the row max's rise over a chunk, so
-        // O stays finite unless the max climbs > ~56 log2 units (39 nats) within GCHUNK tiles after a check
-        const QAddr qa = qaddr();
-        for (int t0 = 0; t0 < n - 2; t0 += GCHUNK) {
-            const int t1 = t0 + GCHUNK < n - 2 ? t0 + GCHUNK : n - 2;
-            for (int t = t0; t < t1; ++t) tile(t, qa, std::false_type{}, std::false_type{}, std::false_type{});
-#if !NO_GUARD
-            const int d01 = st[0].D > st[1].D ? st[0].D : st[1].D, d23 = st[2].D > st[3].D ? st[2].D : st[3].D;
-            if (__builtin_amdgcn_ballot_w32((d01 > d23 ? d01 : d23) > DGUARD) != 0u) guard_rescale(st);
-#endif
+        tile(n - 1, qaddr(), std::false_type{}, std::true_type{}, std::true_type{});
+        // epilogue: lse by plain stores (both lane halves, the same value: no exec change); O as bf16 rows into the LDS
+        // staging block, then one TDM store of the block's 256 x 256 B by wave 0 (the scattered SBHD global stores held
+        // their data VGPRs for hundreds of cycles each: s_wait_xcnt ~5.6k cycles per block)
+        static_for<QT>([&](auto ii) {
+            constexpr int i = ii;
+            const int qr_i = q0 + 64 * i + 16 * wv + lr;
+            const float l = st[i].os[0];
+            LSE[(bh * S) + qr_i] = (st[i].mref + __builtin_log2f(l)) * LN2;
+        });
+        static_for<QT>([&](auto ii) {
+            constexpr int i = ii;
+            const float l = st[i].os[0];
+            const float inv = l > 0.f ? 1.0f / l : 0.f;
+            const int ln = lane_now();
+            const unsigned rowb = lds0 + O_OFF + (unsigned)((64 * i + 16 * wv + (ln & 15)) * XO + 16 * (ln >> 4));
+            static_for<NDT>([&](auto dd) {
+                constexpr int dt = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(st[i].o[dt][(int)rr] * inv); });
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(rowb + 32 * dt) = __builtin_bit_cast(u32x4, w);
+            });
+        });
+        bar_signal();
+        bar_wait();
+        if (wv == 0) {
+            const unsigned long long go = (unsigned long long)(uintptr_t)(O + (long long)b * o_sb + (long long)q0 * o_ss +
+                                                                         (long long)h * D_V);
+            tdm_store(tdm_g0(lds0 + O_OFF, go), tdm_g1(tdm_w0(0, 0, 0), BM, 2 * D_V, BM, 2ull * (unsigned long long)o_ss));
         }
-    }
-    tile(n - 2, qaddr(), std::false_type{}, std::true_type{}, std::false_type{});
-#endif
-    tile(n - 1, qaddr(), std::false_type{}, std::true_type{}, std::true_type{});
+    };
 
-#if OSTAGE
-    // epilogue: lse by plain stores (both lane halves, the same value: no exec change); O as bf16 rows into the LDS
-    // staging block, then one TDM store of the block's 256 x 256 B by wave 0 (the scattered SBHD global stores held
-    // their data VGPRs for hundreds of cycles each: s_wait_xcnt ~5.6k cycles per block)
-    tensor_wait<0>();  // no ring TDM in flight (the staging block is separate, but keep the wave's count clean)
-    static_for<QT>([&](auto ii) {
-        constexpr int i = ii;
-        const int qr_i = q0 + 64 * i + 16 * wv + lr;
-        const float l = st[i].os[0];
-        LSE[(bh * S) + qr_i] = (st[i].mref + __builtin_log2f(l)) * LN2;
-    });
-    static_for<QT>([&](auto ii) {
-        constexpr int i = ii;
-        const float l = st[i].os[0];
-        const float inv = l > 0.f ? 1.0f / l : 0.f;
-        const int ln = lane_now();
-        const unsigned rowb = lds0 + O_OFF + (unsigned)((64 * i + 16 * wv + (ln & 15)) * XO + 16 * (ln >> 4));
-        static_for<NDT>([&](auto dd) {
-            constexpr int dt = dd;
-            bf16x8 w;
-            static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(st[i].o[dt][(int)rr] * inv); });
-            *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(rowb + 32 * dt) = __builtin_bit_cast(u32x4, w);
-        });
-    });
-    bar_signal();
-    bar_wait();
-    if (wv == 0) {
-        const unsigned long long go = (unsigned long long)(uintptr_t)(O + (long long)b * o_sb + (long long)q0 * o_ss +
-                                                                     (long long)h * D_V);
-        tdm_store(tdm_g0(lds0 + O_OFF, go), tdm_g1(tdm_w0(0, 0, 0), BM, 2 * D_V, BM, 2ull * (unsigned long long)o_ss));
-    }
-#else
-    // epilogue: both lane halves of a row store its lse (the same value): no exec change
-    static_for<QT>([&](auto ii) {
-        constexpr int i = ii;
-        const int qr_i = q0 + 64 * i + 16 * wv + lr;
-        const float l = st[i].os[0];
-        const float inv = l > 0.f ? 1.0f / l : 0.f;
-        bf16 *orow = O + (long long)b * o_sb + (long long)qr_i * o_ss + (long long)h * D_V;
-        static_for<NDT>([&](auto dd) {
-            constexpr int dt = dd;
-            bf16x8 w;
-            static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(st[i].o[dt][(int)rr] * inv); });
-            *(u32x4 *)(orow + 16 * dt + 8 * lh) = __builtin_bit_cast(u32x4, w);
-        });
-        LSE[(bh * S) + qr_i] = (st[i].mref + __builtin_log2f(l)) * LN2;
-    });
-#endif
+    // workgroup prologue: tiles 0..2 of the first block (ring slots 0..2); the blocks' Q loads are in run_block
+    issue_slot(0);
+    issue_slot(1);
+    issue_slot(2);
+    // one instantiation of the block body, run once or twice (two calls would duplicate it: ~260 VGPR spills)
+    const int nblk = qbB >= 0 ? 2 : 1;
+    for (int blk = 0; blk < nblk; ++blk) run_block(blk == 0 ? qbA : qbB, blk == 0 ? 0 : nA);
     tensor_wait<0>();
 }

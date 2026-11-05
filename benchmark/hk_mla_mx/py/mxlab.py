@@ -49,7 +49,7 @@ EXPERT_P = EXPERT + ["-mllvm", "-greedy-regclass-priority-trumps-globalness"]
 def recipe_of(tag, kind="fwd"):
     """The operand recipe a build tag expects: "m4" (Q8 pre-scaled to log2 units, scale layout R2) for forward rungs m4 /
     m5 (tags 4*, 5*, 6*) and backward rungs b1 / b2 (tags 1*, 2*), else "r1"."""
-    return "m4" if tag[:1] in (("4", "5", "6") if kind == "fwd" else ("1", "2", "3", "4")) else "r1"
+    return "m4" if tag[:1] in (("4", "5", "6", "7") if kind == "fwd" else ("1", "2", "3", "4")) else "r1"
 
 
 def split_tag(tag):
@@ -436,9 +436,11 @@ def fwd_mx(qz, scale=SCALE, out=None, tag=""):
     if out is None:
         out = torch.empty(s, b, h, D_V, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     lse = torch.empty(b, h, s, device=dev, dtype=torch.float32)
+    nqb = s // 256
+    paired = tag[:1] == "7" and nqb % 2 == 0 and (b * h) % 8 == 0  # rung m7: two q blocks per workgroup
     _launch(
         "k_mla_fwd_mx",
-        (s // 256, h, b),
+        (nqb // 2 if paired else nqb, h, b),
         [
             qz["q8"],
             qz["qs"],
@@ -765,9 +767,9 @@ def bwd_mx(qz, bz, lse, scale=SCALE, tag=""):
     args = [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"], bz["dots"],
             bz["q8t"], bz["qts"], lse, bz["delta"], dk, dv, float(scale), s, h, b, dk.stride(0), dk.stride(1),
             dv.stride(0), dv.stride(1)]  # fmt: skip
-    if tag[:1] in ("2", "4"):  # b2 / b4: dV and dK as two kernels
+    if tag[:1] in ("2", "4"):  # b2 / b4: dV and dK as two kernels (kv rows per workgroup: 64 NJ_DV, 64 NJ_DK)
         _launch("k_dv_mx", (-(-s // 256), h, b), args, tag)
-        _launch("k_dk_mx", (-(-s // 256), h, b), args, tag)
+        _launch("k_dk_mx", (-(-s // (192 if tag[:1] == "4" else 256)), h, b), args, tag)
     else:
         _launch("k_dkdv_mx", (s // 128, h, b), args, tag)
     _launch("k_dq_mx", (s // 256, h, b),

@@ -93,7 +93,7 @@ for name in a.shapes.split(","):
     res["finite"] = bool(torch.isfinite(o1.float()).all().item() and torch.isfinite(lse1).all().item())
     qf, kf = L.deq_qk(qz["q8"], qz["qs"], r2=m4), L.deq_qk(qz["k8"], qz["ks"], r2=m4)
     vf = L.deq_vt(qz["v8t"], qz["vs"])
-    emu = {"5": L.emu_fwd5, "6": L.emu_fwd6}.get(a.tag[:1], L.emu_fwd4)
+    emu = {"5": L.emu_fwd5, "6": L.emu_fwd6, "7": L.emu_fwd6}.get(a.tag[:1], L.emu_fwd4)
     oe, lsee = emu(qf, kf, vf) if m4 else L.emu_fwd(qf, kf, vf)
     res["o_vs_emu"] = L.snr(o1.float(), oe)
     res["lse_vs_emu"] = L.snr(lse1, lsee)
