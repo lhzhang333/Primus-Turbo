@@ -99,6 +99,9 @@ _COLS_ARGS = [
     ("sh", "i64"),
     ("mode", "i32"),
 ]
+_RC_ARGS = [("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("X8T", "ptr"), ("XTS", "ptr"), ("kbar", "ptr"), ("Y", "ptr"),
+            ("aux", "ptr"), ("S", "i32"), ("H", "i32"), ("sb", "i64"), ("ss", "i64"), ("sh", "i64"), ("yb", "i64"),
+            ("ys", "i64"), ("yh", "i64"), ("mode", "i32"), ("pre", "f32")]  # fmt: skip
 KERNELS = {
     "k_mxq_kbar": (
         "k_mxq.hip",
@@ -118,6 +121,8 @@ KERNELS = {
     "k_mxq_rows128": ("k_mxq.hip", 256, _ROWS_ARGS),
     "k_mxq_cols128": ("k_mxq.hip", 256, _COLS_ARGS),
     "k_mxq_cols192": ("k_mxq.hip", 256, _COLS_ARGS),
+    "k_mxq_rc192": ("k_mxq.hip", 256, _RC_ARGS),
+    "k_mxq_rc128": ("k_mxq.hip", 256, _RC_ARGS),
     "k_mla_fwd_mx": (
         "k_mla_fwd_mx.hip",
         128,
@@ -338,6 +343,44 @@ def quant_cols(x, d, kbar=None, tag=""):
 
 
 KBAR_STRIDE = 16  # k_mxq_kbar samples every 16th row (any constant shift of k is softmax-invariant)
+
+
+def quant_rc(x, d, mode=0, kbar=None, y=None, pre=1.0, tag=""):
+    """k_mxq_rc{192,128}: rows and cols of x [b, s, h, d] in one pass -> (x8, xs, aux | None, x8t, xts), the layouts of
+    quant_rows / quant_cols (cols: kbar subtracted when mode & 1, never pre-scaled)."""
+    b, s, h, _ = x.shape
+    dev = x.device
+    x8 = torch.empty(b, h, s, d, device=dev, dtype=torch.uint8)
+    xs = torch.empty(b, h, s, 8 if d == 192 else 4, device=dev, dtype=torch.uint8)
+    x8t = torch.empty(b, h, d, s, device=dev, dtype=torch.uint8)
+    xts = torch.empty(b, h, s // 128, d, 4, device=dev, dtype=torch.uint8)
+    aux = torch.empty(b, h, s, device=dev, dtype=torch.float32) if mode & 6 else _dummy(dev)
+    yy = y if y is not None else x
+    _launch(f"k_mxq_rc{d}", (s // 128, h, b),
+            [x, x8, xs, x8t, xts, kbar if kbar is not None else _dummy(dev), yy, aux, s, h, x.stride(0), x.stride(1),
+             x.stride(2), yy.stride(0), yy.stride(1), yy.stride(2), mode, float(pre)], tag)  # fmt: skip
+    return x8, xs, (aux if mode & 6 else None), x8t, xts
+
+
+def quant_all(q, k, v, recipe="m4", scale=SCALE, tag=""):
+    """Every MX operand of both passes from one read of q / k / v (k_mxq_kbar + 3 x k_mxq_rc): (qz as quant_inputs,
+    the backward's q8t / qts / k8t / kts / v8 / vsr)."""
+    b, s, h, _ = q.shape
+    m4 = recipe == "m4"
+    kbar = kbar_of(k, tag)
+    q8, qs, qk, q8t, qts = quant_rc(q, D_QK, mode=2 | (48 if m4 else 0), kbar=kbar, pre=scale * LOG2E if m4 else 1.0,
+                                    tag=tag)  # fmt: skip
+    k8, ks, _, k8t, kts = quant_rc(k, D_QK, mode=1 | (16 if m4 else 0), kbar=kbar, tag=tag)
+    v8, vsr, _, v8t, vs = quant_rc(v, D_V, tag=tag)
+    qz = {"b": b, "s": s, "h": h, "center_k": True, "recipe": recipe, "q8": q8, "qs": qs, "k8": k8, "ks": ks,
+          "v8t": v8t, "vs": vs, "kbar": kbar, "qd": None, "kd": None, "qk": qk}  # fmt: skip
+    return qz, {"q8t": q8t, "qts": qts, "k8t": k8t, "kts": kts, "v8": v8, "vsr": vsr}
+
+
+def quant_bwd_do(qz, pre, o, do, tag=""):
+    """The backward's remaining operands after quant_all: dO rows (+ delta = rowsum(dO * O)) and cols in one pass."""
+    do8, dos, delta, do8t, dots = quant_rc(do, D_V, mode=4, y=o, tag=tag)
+    return dict(pre, do8=do8, dos=dos, delta=delta, do8t=do8t, dots=dots)
 
 
 def kbar_of(k, tag="", stride=KBAR_STRIDE):

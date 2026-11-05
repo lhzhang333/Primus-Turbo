@@ -33,6 +33,14 @@ arms = {
     "rows128_v": (lambda: L.quant_rows(v, 128, tag=a.tag), 2 * n128 + n128 + n128 // 32),
     "cols128_v": (lambda: L.quant_cols(v, 128, tag=a.tag), 2 * n128 + n128 + n128 // 32),
     "cols192_q": (lambda: L.quant_cols(q, 192, tag=a.tag), 2 * n192 + n192 + n192 // 32),
+    # one pass: rows + cols (reads x once, writes both layouts)
+    "rc192_q": (
+        lambda: L.quant_rc(q, 192, mode=50, kbar=kbar, pre=0.195, tag=a.tag),
+        2 * n192 + 2 * n192 + n192 // 12,
+    ),
+    "rc192_k": (lambda: L.quant_rc(k, 192, mode=17, kbar=kbar, tag=a.tag), 2 * n192 + 2 * n192 + n192 // 12),
+    "rc128_v": (lambda: L.quant_rc(v, 128, tag=a.tag), 2 * n128 + 2 * n128 + n128 // 16),
+    "quant_all": (lambda: L.quant_all(q, k, v, tag=a.tag), 4 * (2 * n192 + n128)),
 }
 res = {}
 for n, (f, nbytes) in arms.items():
