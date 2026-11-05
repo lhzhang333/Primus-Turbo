@@ -62,7 +62,7 @@ for name in a.shapes.split(","):
     # --- quantization twins
     kbar_ref = k.float().mean(1).permute(0, 1, 2) if center else None  # b h d
     if center:
-        kbar_ref = k.float().mean(1)  # [b, h, 192]
+        kbar_ref = k.float()[:, ::L.KBAR_STRIDE].mean(1)  # [b, h, 192]: the sampled mean
         res["kbar_maxrel"] = ((qz["kbar"] - kbar_ref).abs().max() / kbar_ref.abs().max()).item()
     for nm, x, kb in (("q", q, None), ("k", k, qz["kbar"] if center else None)):
         codes, exps = L.ref_quant_qk(x, kb)

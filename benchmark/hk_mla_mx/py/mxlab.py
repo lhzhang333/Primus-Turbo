@@ -31,14 +31,18 @@ E4M3_MAX = 448.0
 FLAGS = ["-x", "hip", "--offload-arch=gfx1250", "--cuda-device-only", "--no-gpu-bundle-output", "-O3", "-std=c++20"]
 
 # kernel name -> (source, block, [(arg, kind)]); offsets follow natural alignment
+_ROWS_ARGS = [("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("kbar", "ptr"), ("Y", "ptr"), ("aux", "ptr"),
+              ("XD", "ptr"), ("B", "i32"), ("S", "i32"), ("H", "i32"), ("sb", "i64"), ("ss", "i64"), ("sh", "i64"),
+              ("yb", "i64"), ("ys", "i64"), ("yh", "i64"), ("mode", "i32")]
+_COLS_ARGS = [("X", "ptr"), ("X8T", "ptr"), ("XTS", "ptr"), ("kbar", "ptr"), ("S", "i32"), ("H", "i32"),
+              ("sb", "i64"), ("ss", "i64"), ("sh", "i64"), ("mode", "i32")]
 KERNELS = {
     "k_mxq_kbar": ("k_mxq.hip", 768, [("K", "ptr"), ("kbar", "ptr"), ("S", "i32"), ("H", "i32"), ("sb", "i64"),
-                                       ("ss", "i64"), ("sh", "i64")]),
-    "k_mxq_qk": ("k_mxq.hip", 256, [("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("kbar", "ptr"), ("qk", "ptr"),
-                                     ("B", "i32"), ("S", "i32"), ("H", "i32"), ("sb", "i64"), ("ss", "i64"),
-                                     ("sh", "i64"), ("mode", "i32")]),
-    "k_mxq_vt": ("k_mxq.hip", 256, [("V", "ptr"), ("V8T", "ptr"), ("VS", "ptr"), ("S", "i32"), ("H", "i32"),
-                                     ("sb", "i64"), ("ss", "i64"), ("sh", "i64")]),
+                                       ("ss", "i64"), ("sh", "i64"), ("stride", "i32")]),
+    "k_mxq_rows192": ("k_mxq.hip", 256, _ROWS_ARGS),
+    "k_mxq_rows128": ("k_mxq.hip", 256, _ROWS_ARGS),
+    "k_mxq_cols128": ("k_mxq.hip", 256, _COLS_ARGS),
+    "k_mxq_cols192": ("k_mxq.hip", 256, _COLS_ARGS),
     "k_mla_fwd_mx": ("k_mla_fwd_mx.hip", 128, [("Q8", "ptr"), ("QS", "ptr"), ("K8", "ptr"), ("KS", "ptr"),
                                                 ("V8T", "ptr"), ("VS", "ptr"), ("O", "ptr"), ("LSE", "ptr"),
                                                 ("scale", "f32"), ("S", "i32"), ("H", "i32"), ("B", "i32"),
@@ -108,28 +112,70 @@ def _launch(name, grid, values, tag=""):
 # ----------------------------------------------------------------------------------------- quantization (GPU kernels)
 
 
-def quant_inputs(q, k, v, center_k=True, tag=""):
-    """q, k [b, s, h, 192], v [b, s, h, 128] bf16 (d contiguous; any b / s / h strides) -> the MX operands."""
+def _dummy(dev):
+    t = _DUMMY.get(dev)
+    if t is None:
+        t = _DUMMY[dev] = torch.zeros(64, device=dev, dtype=torch.float32)
+    return t
+
+
+_DUMMY = {}
+
+
+def quant_rows(x, d, mode=0, kbar=None, y=None, want_deq=False, tag=""):
+    """k_mxq_rows{192,128}: x [b, s, h, d] -> (x8 [b, h, s, d], xs [b, h, s, 8 | 4], aux [b, h, s] | None,
+    xd [b, s, h, d] bf16 | None)."""
+    b, s, h, _ = x.shape
+    dev = x.device
+    rs = 8 if d == 192 else 4
+    x8 = torch.empty(b, h, s, d, device=dev, dtype=torch.uint8)
+    xs = torch.empty(b, h, s, rs, device=dev, dtype=torch.uint8)
+    aux = torch.empty(b, h, s, device=dev, dtype=torch.float32) if mode & 6 else _dummy(dev)
+    xd = torch.empty(b, s, h, d, device=dev, dtype=torch.bfloat16) if want_deq else _dummy(dev)
+    yy = y if y is not None else x
+    m = mode | (8 if want_deq else 0)
+    rows_per_block = 8 * 8 * (4 if d == 192 else 8)  # 8 waves x 8 row groups x rows per group
+    assert s % (rows_per_block // 8) == 0
+    _launch(f"k_mxq_rows{d}", ((b * h * s + rows_per_block - 1) // rows_per_block, 1, 1),
+            [x, x8, xs, kbar if kbar is not None else _dummy(dev), yy, aux, xd, b, s, h, x.stride(0), x.stride(1),
+             x.stride(2), yy.stride(0), yy.stride(1), yy.stride(2), m], tag)
+    return x8, xs, (aux if mode & 6 else None), (xd if want_deq else None)
+
+
+def quant_cols(x, d, kbar=None, tag=""):
+    """k_mxq_cols{128,192}: x [b, s, h, d] -> (x8t [b, h, d, s], xts [b, h, s / 128, d, 4])."""
+    b, s, h, _ = x.shape
+    dev = x.device
+    x8t = torch.empty(b, h, d, s, device=dev, dtype=torch.uint8)
+    xts = torch.empty(b, h, s // 128, d, 4, device=dev, dtype=torch.uint8)
+    _launch(f"k_mxq_cols{d}", (s // 128, h, b),
+            [x, x8t, xts, kbar if kbar is not None else _dummy(dev), s, h, x.stride(0), x.stride(1), x.stride(2),
+             1 if kbar is not None else 0], tag)
+    return x8t, xts
+
+
+KBAR_STRIDE = 16  # k_mxq_kbar samples every 16th row (any constant shift of k is softmax-invariant)
+
+
+def kbar_of(k, tag="", stride=KBAR_STRIDE):
+    b, s, h, _ = k.shape
+    kbar = torch.empty(b, h, D_QK, device=k.device, dtype=torch.float32)
+    _launch("k_mxq_kbar", (b * h, 1, 1), [k, kbar, s, h, k.stride(0), k.stride(1), k.stride(2), stride], tag)
+    return kbar
+
+
+def quant_inputs(q, k, v, center_k=True, want_deq=False, tag=""):
+    """q, k [b, s, h, 192], v [b, s, h, 128] bf16 (d contiguous; any b / s / h strides) -> the forward's MX operands
+    (+ the dequantized q / k as bf16 [b, s, h, 192] when want_deq: the bf16 backward's consistent inputs)."""
     b, s, h, _ = q.shape
-    dev = q.device
     assert s % 256 == 0 and q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
-    u8 = torch.uint8
-    out = {"b": b, "s": s, "h": h}
-    kbar = torch.zeros(b, h, D_QK, device=dev, dtype=torch.float32)
-    if center_k:
-        _launch("k_mxq_kbar", (b * h, 1, 1), [k, kbar, s, h, k.stride(0), k.stride(1), k.stride(2)], tag)
-    qk = torch.zeros(b, h, s, device=dev, dtype=torch.float32)
-    for name, x, mode in (("q", q, 2 if center_k else 0), ("k", k, 1 if center_k else 0)):
-        x8 = torch.empty(b, h, s, D_QK, device=dev, dtype=u8)
-        xs = torch.empty(b, h, s, 8, device=dev, dtype=u8)
-        rows = b * h * s
-        _launch("k_mxq_qk", ((rows + 31) // 32, 1, 1),
-                [x, x8, xs, kbar, qk, b, s, h, x.stride(0), x.stride(1), x.stride(2), mode], tag)
-        out[name + "8"], out[name + "s"] = x8, xs
-    v8t = torch.empty(b, h, D_V, s, device=dev, dtype=u8)
-    vs = torch.empty(b, h, s // 128, D_V, 4, device=dev, dtype=u8)
-    _launch("k_mxq_vt", (s // 128, h, b), [v, v8t, vs, s, h, v.stride(0), v.stride(1), v.stride(2)], tag)
-    out.update(v8t=v8t, vs=vs, kbar=kbar, qk=qk, center_k=center_k)
+    out = {"b": b, "s": s, "h": h, "center_k": center_k}
+    kbar = kbar_of(k, tag) if center_k else None
+    q8, qs, qk, qd = quant_rows(q, D_QK, mode=2 if center_k else 0, kbar=kbar, want_deq=want_deq, tag=tag)
+    k8, ks, _, kd = quant_rows(k, D_QK, mode=1 if center_k else 0, kbar=kbar, want_deq=want_deq, tag=tag)
+    v8t, vs = quant_cols(v, D_V, tag=tag)
+    out.update(q8=q8, qs=qs, k8=k8, ks=ks, v8t=v8t, vs=vs, kbar=kbar, qd=qd, kd=kd,
+               qk=qk if qk is not None else torch.zeros(b, h, s, device=q.device))
     return out
 
 

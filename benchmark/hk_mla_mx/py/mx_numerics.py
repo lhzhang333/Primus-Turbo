@@ -181,7 +181,7 @@ def emu(q, k, v, do, variant):
         o[:, q0:q0 + TILE] = (acc / l[..., None]).permute(0, 2, 1, 3)
         lse[:, :, q0:q0 + TILE] = (m + torch.log2(l)) / LOG2E
     o = o.to(torch.bfloat16).float()
-    if variant in ("bf16", "mx_fwd"):
+    if variant in ("bf16", "mx_fwd", "mx_fwdc"):
         do_r = dof
         do_c = dof
         vr = vf if variant == "bf16" else vf
@@ -204,7 +204,7 @@ def emu(q, k, v, do, variant):
     dk = torch.zeros_like(dq)
     dv = torch.zeros(b, s, h, D_V, device=dev)
     for q0 in range(0, s, TILE):
-        qs, ks = (qq, kq) if variant in ("mx_a", "mx_b") else (qf, kf)  # mx_fwd: the bf16 backward on mx lse
+        qs, ks = (qq, kq) if variant in ("mx_a", "mx_b", "mx_fwdc") else (qf, kf)  # mx_fwd: bf16 bwd on mx lse
         S_all = torch.einsum("bqhd,bkhd->bhqk", qs[:, q0:q0 + TILE], ks[:, :q0 + TILE])
         msk = qi[q0:q0 + TILE, None] >= qi[None, :q0 + TILE]
         S_all = S_all.masked_fill(~msk, float("-inf"))
@@ -214,7 +214,7 @@ def emu(q, k, v, do, variant):
         if variant == "bf16":
             Pv, dSv = P.to(torch.bfloat16).float(), dS.to(torch.bfloat16).float()
             dSq = dSk = dSv
-        elif variant in ("mx_fwd",):
+        elif variant in ("mx_fwd", "mx_fwdc"):
             Pv, dSv = P.to(torch.bfloat16).float(), dS.to(torch.bfloat16).float()
             dSq = dSk = dSv
         else:
