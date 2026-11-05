@@ -567,10 +567,27 @@ extern "C" __global__ __launch_bounds__(768) void k_mxq_kbar(const bf16 *__restr
     const int t = threadIdx.x, cg = t % 24, rg = t / 24;
     const bf16 *base = K + b * sb + h * sh + 8 * cg;
     float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#if RC_FAST
+    // the row loads of a thread issued together (8 at a time: one latency instead of eight), summed in the same order
+    int s = rg * stride;
+    for (; s + 7 * 32 * stride < S; s += 8 * 32 * stride) {
+        u32x4 w[8];
+        static_for<8>([&](auto u) { w[(int)u] = *(const u32x4 *)(base + (long long)(s + (int)u * 32 * stride) * ss); });
+        static_for<8>([&](auto u) {
+            const f32x8 v = bf8_to_f32(w[(int)u]);
+            static_for<8>([&](auto i) { acc[(int)i] += v[(int)i]; });
+        });
+    }
+    for (; s < S; s += 32 * stride) {
+        const f32x8 v = bf8_to_f32(*(const u32x4 *)(base + (long long)s * ss));
+        static_for<8>([&](auto i) { acc[(int)i] += v[(int)i]; });
+    }
+#else
     for (int s = rg * stride; s < S; s += 32 * stride) {
         const f32x8 v = bf8_to_f32(*(const u32x4 *)(base + (long long)s * ss));
         static_for<8>([&](auto i) { acc[(int)i] += v[(int)i]; });
     }
+#endif
     static_for<8>([&](auto i) { part[rg][8 * cg + (int)i] = acc[(int)i]; });
     __syncthreads();
     if (t < D) {

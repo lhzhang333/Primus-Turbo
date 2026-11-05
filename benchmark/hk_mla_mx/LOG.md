@@ -307,3 +307,8 @@ b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 
   workgroup per CU) is slower (q 0.104): kept in the lab only.
 - Package: quantization on k_mxq_rct; forward 0.672 ms (quantization 0.214), backward 1.670 (dout quantization 0.069);
   pytest 28 pass.
+- k_mxq_kbar: the row loads of a thread issued 8 at a time (same summation order: bit-exact): 0.021 -> 0.020 ms.
+- dkdv and dq on two streams: slower (1.70 vs 1.57 ms back to back; isolated sums 1.46: the difference is cache
+  warmth, which the real backward pays too).
+- **Training gate g120d** (package m7 + b5 + k_mxq_rct, 120 iterations): mx 727.5 vs hk 738.3 ms / iteration (-1.5%;
+  before: -0.6%); final-window loss 0.0818 both, grad-norm ratio max 1.023.
