@@ -291,3 +291,19 @@ b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 
   spills; their loads moved behind a fence after q tile 1..3 of the pair: 0.611-0.649 (slower).
 - **b5 backward 1.584 ms** (b3 1.651; dkdv 0.909 + dq 0.598; bf16 HK 1.971). Toy..mid pass with b3's SNRs. Package:
   backward b5 (hip/k_mla_bwd_mx5.hip), pytest 28 pass.
+
+## 2026-11-05 (d): quantization through TDM (the HBM limit was mis-measured)
+
+- Bandwidth: torch's `copy_` reaches only 7.7 TB/s on gfx1250; a Triton copy of 1 GiB 18.5 TB/s, Megatron's MLA kv
+  RoPE kernel 15.6 TB/s (`scratch_mx/py/bw2.py`). The quantization kernels (6.4-8.7 TB/s) were not near the limit.
+- Package per call (`scratch_mx/py/pkg_time.py`, b2 s4096 h128): hk_mx forward 0.769 ms (quantization 0.334) vs bf16
+  HK 0.625; backward 1.656 (dout quantization 0.097) vs 1.969.
+- `k_mxq_rct192/128` (rows + cols in one pass, the 128-row bf16 tile by one TDM load, the four outputs staged in LDS and
+  written by four TDM stores; bit-exact with k_mxq_rc): q 0.125 -> 0.095, k 0.119 -> 0.087, v 0.075 -> 0.049, dO
+  0.097 -> 0.065 ms. Probes: TDM traffic alone 0.054 ms (q), the compute alone 0.070: compute-latency bound. RC_FAST:
+  tree reductions (the per-block amax and the row dots were 32-long dependent chains), the kbar slice in registers,
+  the 8-lane dot reduction by DPP instead of ds_bpermute: q 0.081, k 0.078, v 0.051, dO 0.070 (codes / scales still
+  bit-exact; aux within 1e-6). A persistent variant (`k_mxq_rcp`: 3 input buffers, 2 staging sets, one 512-thread
+  workgroup per CU) is slower (q 0.104): kept in the lab only.
+- Package: quantization on k_mxq_rct; forward 0.672 ms (quantization 0.214), backward 1.670 (dout quantization 0.069);
+  pytest 28 pass.

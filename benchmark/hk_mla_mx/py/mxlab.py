@@ -102,6 +102,7 @@ _COLS_ARGS = [
 _RC_ARGS = [("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("X8T", "ptr"), ("XTS", "ptr"), ("kbar", "ptr"), ("Y", "ptr"),
             ("aux", "ptr"), ("S", "i32"), ("H", "i32"), ("sb", "i64"), ("ss", "i64"), ("sh", "i64"), ("yb", "i64"),
             ("ys", "i64"), ("yh", "i64"), ("mode", "i32"), ("pre", "f32")]  # fmt: skip
+_RCP_ARGS = _RC_ARGS[:8] + [("B", "i32")] + _RC_ARGS[8:]  # persistent: B before S
 KERNELS = {
     "k_mxq_kbar": (
         "k_mxq.hip",
@@ -123,6 +124,10 @@ KERNELS = {
     "k_mxq_cols192": ("k_mxq.hip", 256, _COLS_ARGS),
     "k_mxq_rc192": ("k_mxq.hip", 256, _RC_ARGS),
     "k_mxq_rc128": ("k_mxq.hip", 256, _RC_ARGS),
+    "k_mxq_rct192": ("k_mxq.hip", 256, _RC_ARGS),
+    "k_mxq_rct128": ("k_mxq.hip", 256, _RC_ARGS),
+    "k_mxq_rcp192": ("k_mxq.hip", 512, _RCP_ARGS),
+    "k_mxq_rcp128": ("k_mxq.hip", 512, _RCP_ARGS),
     "k_mla_fwd_mx": (
         "k_mla_fwd_mx.hip",
         128,
@@ -347,7 +352,10 @@ def quant_cols(x, d, kbar=None, tag=""):
 KBAR_STRIDE = 16  # k_mxq_kbar samples every 16th row (any constant shift of k is softmax-invariant)
 
 
-def quant_rc(x, d, mode=0, kbar=None, y=None, pre=1.0, tag=""):
+RCP_WGS = 256  # k_mxq_rcp workgroups (one per CU)
+
+
+def quant_rc(x, d, mode=0, kbar=None, y=None, pre=1.0, tag="", kname="rc"):
     """k_mxq_rc{192,128}: rows and cols of x [b, s, h, d] in one pass -> (x8, xs, aux | None, x8t, xts), the layouts of
     quant_rows / quant_cols (cols: kbar subtracted when mode & 1, never pre-scaled)."""
     b, s, h, _ = x.shape
@@ -358,7 +366,12 @@ def quant_rc(x, d, mode=0, kbar=None, y=None, pre=1.0, tag=""):
     xts = torch.empty(b, h, s // 128, d, 4, device=dev, dtype=torch.uint8)
     aux = torch.empty(b, h, s, device=dev, dtype=torch.float32) if mode & 6 else _dummy(dev)
     yy = y if y is not None else x
-    _launch(f"k_mxq_rc{d}", (s // 128, h, b),
+    if kname == "rcp":  # persistent: one workgroup per CU
+        _launch(f"k_mxq_rcp{d}", (min(RCP_WGS, (s // 128) * h * b), 1, 1),
+                [x, x8, xs, x8t, xts, kbar if kbar is not None else _dummy(dev), yy, aux, b, s, h, x.stride(0),
+                 x.stride(1), x.stride(2), yy.stride(0), yy.stride(1), yy.stride(2), mode, float(pre)], tag)  # fmt: skip
+        return x8, xs, (aux if mode & 6 else None), x8t, xts
+    _launch(f"k_mxq_{kname}{d}", (s // 128, h, b),
             [x, x8, xs, x8t, xts, kbar if kbar is not None else _dummy(dev), yy, aux, s, h, x.stride(0), x.stride(1),
              x.stride(2), yy.stride(0), yy.stride(1), yy.stride(2), mode, float(pre)], tag)  # fmt: skip
     return x8, xs, (aux if mode & 6 else None), x8t, xts

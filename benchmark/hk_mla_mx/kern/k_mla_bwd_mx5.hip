@@ -56,6 +56,14 @@ using namespace mx;
 #ifndef KEEP_WAR
 #define KEEP_WAR 1  // bit 0: keep the previous slot's dV / dK A fragments alive past the next loads (as DQ_KEEP)
 #endif
+#ifndef MIDSYNC
+// the per-step TDM wait + barrier + issue of round s + 2 between slots MIDSYNC - 1 and MIDSYNC of step s (0: at the step
+// start); slot 7 then prefetches step s + 1's tile 0 and its slot-0 A fragments, so a step starts with no barrier
+#define MIDSYNC 0  // measured: 4 + MS_PA 1 spills (1.45 ms), MS_PA 0 0.914 vs 0.912 (step 2315 vs 2361 cycles): off
+#endif
+#ifndef MS_PA
+#define MS_PA 1  // MIDSYNC: slot 7 also prefetches the next step's slot-0 A fragments (0: loaded at the step start)
+#endif
 #ifndef LTDT_G
 #define LTDT_G 0  // 1: lse / delta C tuples by buffer loads LTDT_D tiles ahead (slower: 1.000 / 0.978 / 0.962 ms, D 2 / 3 / 4)
 #endif
@@ -378,20 +386,40 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
 #endif
     // one step: q16 tile qt in slot qt (fragments of tile qt + 1 loaded at the slot's start), with the dV / dK groups
     // gs(qt) .. gs(qt + 1) - 1 of the previous step (A fragments of slot qt + 1 loaded at the slot's start)
-    auto step = [&](const StepAddr &a, int q0, i32x16 (&pB)[NJ], i32x16 (&dsB)[NJ], int (&dss)[NJ],
-                    const i32x16 (&pBo)[NJ], const i32x16 (&dsBo)[NJ], const int (&dsso)[NJ], auto diag_c,
-                    auto prev_c) __attribute__((always_inline)) {
+    auto step = [&](int s, const StepAddr &a, int q0, i32x16 (&pB)[NJ], i32x16 (&dsB)[NJ], int (&dss)[NJ],
+                    const i32x16 (&pBo)[NJ], const i32x16 (&dsBo)[NJ], const int (&dsso)[NJ], QTile &pre_t,
+                    AFrag (&pre_a)[3], auto diag_c, auto prev_c) __attribute__((always_inline)) {
         constexpr bool DIAG = decltype(diag_c)::value, PREV = decltype(prev_c)::value;
         // the causal mask as constant-vs-threshold compares: q < kv iff 16 qt + r < thr[j] = kv - q0 - 8 lh
         int thr[NJ];
         static_for<NJ>([&](auto jj) { thr[(int)jj] = kvw + 16 * (int)jj + lr - q0 - 8 * lh; });
         f32x8 dsprev[NJ];
         AFrag ab[20];
+#if MIDSYNC
+        StepAddr an;  // step s + 1 (after the mid-step barrier)
+        if constexpr (PREV) {
+            if constexpr (MS_PA)
+                static_for<gs(1)>([&](auto i) { ab[(int)i] = pre_a[(int)i]; });
+            else
+                static_for<gs(1)>([&](auto i) { ab[(int)i] = ldA(a, std::integral_constant<int, (int)i>{}); });
+        }
+        QTile cur = pre_t;
+#else
         if constexpr (PREV)
             static_for<gs(1)>([&](auto i) { ab[(int)i] = ldA(a, std::integral_constant<int, (int)i>{}); });
         QTile cur = load_qtile<0>(a);
+#endif
         static_for<NQT>([&](auto qq) {
             constexpr int qt = qq;
+#if MIDSYNC
+            if constexpr (qt == MIDSYNC) {
+                tensor_wait<0>();  // round s + 1 landed: the q part of step s + 1, the A part of step s
+                bar_signal();
+                bar_wait();          // visible; every wave is done with step s - 1 (q part) and the dV / dK of s - 2
+                issue_round(s + 2);  // q part of step s + 2 into step s - 1's q stage, A part of s + 1 into s - 2's
+                an = addr(s + 1);
+            }
+#endif
             QTile nxt;
             if constexpr (qt + 1 < NQT) nxt = load_qtile<(qt + 1 < NQT ? qt + 1 : 0)>(a);
             if constexpr (PREV && qt + 1 < NQT)
@@ -399,6 +427,14 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
                     constexpr int g = gs(qt + 1) + (int)i;
                     ab[g] = ldA(a, std::integral_constant<int, g>{});
                 });
+#if MIDSYNC
+            if constexpr (qt + 1 == NQT) {  // step s + 1's tile 0 and slot-0 A fragments (A part of step s); past the
+                                            // last step: stale LDS, never used
+                pre_t = load_qtile<0>(an);
+                if constexpr (MS_PA)
+                    static_for<gs(1)>([&](auto i) { pre_a[(int)i] = ldA(an, std::integral_constant<int, (int)i>{}); });
+            }
+#endif
 #if KEEP_WAR & 1
             if constexpr (PREV && qt >= 1)
                 static_for<gs(qt) - gs(qt - 1)>([&](auto i) {  // slot qt - 1's fragments (its WMMAs may be in flight)
@@ -459,15 +495,25 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
 
     i32x16 pBo[NJ], dsBo[NJ];
     int dsso[NJ];
+    QTile pre_t;
+    AFrag pre_a[gs(1)];
+#if MIDSYNC
+    tensor_wait<TDM_PER_ROUND>();  // round 0 (the q part of step 0) landed; round 1 may be in flight
+    bar_signal();
+    bar_wait();
+    pre_t = load_qtile<0>(addr(0));
+#endif
     auto run = [&](int s, auto diag_c, auto prev_c) __attribute__((always_inline)) {
+#if !MIDSYNC
         tensor_wait<TDM_PER_ROUND>();  // round s landed: the q part of step s, the A part of step s - 1
         bar_signal();
         bar_wait();          // visible to every wave; every wave is done with step s - 1 (and the dV / dK of s - 2)
         issue_round(s + 2);  // q part of step s + 2 into step s - 1's q stage, A part of s + 1 into step s - 2's A stage
+#endif
         const StepAddr a = addr(s);
         i32x16 pB[NJ], dsB[NJ];
         int dss[NJ] = {};
-        step(a, qs0 + s * QS_, pB, dsB, dss, pBo, dsBo, dsso, diag_c, prev_c);
+        step(s, a, qs0 + s * QS_, pB, dsB, dss, pBo, dsBo, dsso, pre_t, pre_a, diag_c, prev_c);
         static_for<NJ>([&](auto jj) {
             pBo[(int)jj] = pB[(int)jj];
             dsBo[(int)jj] = dsB[(int)jj];

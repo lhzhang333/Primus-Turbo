@@ -20,7 +20,8 @@ logits of a row's first 128 keys must stay under 126 in log2 units, i.e. 87 nats
 (``k_mla_bwd_mx5.hip``: k_dkdv_mx software-pipelined across steps, k_dq_mx); all in XCD-local workgroup order with the
 TDM ops spread over the waves
 and the outputs written through LDS by TDM stores (benchmark/hk_mla_mx/LOG.md, 2026-11-05 (b)),
-quantization ``k_mxq.hip`` (kbar; rows + cols of a tensor in one read). With ``for_mx_bwd`` the forward quantizes
+quantization ``k_mxq.hip`` (kbar; rows + cols of a tensor in one read: ``k_mxq_rct``, the tile in and the four
+outputs out by TDM). With ``for_mx_bwd`` the forward quantizes
 q / k / v once for both passes: rows for itself, cols for the backward. ``saved`` = (lse of the centred logits, q8, qs,
 k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr), and the backward quantizes only dout (rows + cols + delta). Without it
 the forward makes only its own operands and returns ``saved = ()``. ``prepare_bwd`` makes ``saved`` from a bf16
@@ -85,8 +86,8 @@ KERNELS = {
     "k_mxq_rows128": ("k_mxq.hip", 256, _ROWS_ARGS),
     "k_mxq_cols128": ("k_mxq.hip", 256, _COLS_ARGS),
     "k_mxq_cols192": ("k_mxq.hip", 256, _COLS_ARGS),
-    "k_mxq_rc192": ("k_mxq.hip", 256, _RC_ARGS),
-    "k_mxq_rc128": ("k_mxq.hip", 256, _RC_ARGS),
+    "k_mxq_rct192": ("k_mxq.hip", 256, _RC_ARGS),
+    "k_mxq_rct128": ("k_mxq.hip", 256, _RC_ARGS),
     "k_mla_fwd_mx": (
         "k_mla_fwd_mx7.hip",
         128,
@@ -313,7 +314,7 @@ def quant_rc(x, d, mode=0, kbar=None, y=None, pre=1.0):
     xts = torch.empty(b, h, s // 128, d, 4, device=dev, dtype=torch.uint8)
     aux = torch.empty(b, h, s, device=dev, dtype=torch.float32) if mode & 6 else None
     yy = y if y is not None else x
-    _launch(f"k_mxq_rc{d}", (s // 128, h, b),
+    _launch(f"k_mxq_rct{d}", (s // 128, h, b),
             [x, x8, xs, x8t, xts, kbar if kbar is not None else _dummy(dev), yy,
              aux if aux is not None else _dummy(dev), s, h, x.stride(0), x.stride(1), x.stride(2), yy.stride(0),
              yy.stride(1), yy.stride(2), mode, float(pre)])  # fmt: skip
