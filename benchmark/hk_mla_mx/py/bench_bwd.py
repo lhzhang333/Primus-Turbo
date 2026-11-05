@@ -85,11 +85,11 @@ def one(name, tag):
     r = L.recipe_of(tag, "bwd")
     qz, bz = QZ[r], BZ[r]
     lse = LSE[r] * L.LOG2E if r == "m4" else LSE[r]
-    if name == "k_dkdv_mx":
+    if name in ("k_dkdv_mx", "k_dv_mx", "k_dk_mx"):
         args = [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"],
                 bz["dots"], bz["q8t"], bz["qts"], lse, bz["delta"], dk, dv, float(L.SCALE), s, h, b, dk.stride(0),
                 dk.stride(1), dv.stride(0), dv.stride(1)]  # fmt: skip
-        grid = (s // 128, h, b)
+        grid = (s // 128 if name == "k_dkdv_mx" else -(-s // 256), h, b)
     else:
         args = [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["k8t"],
                 bz["kts"], lse, bz["delta"], dq, float(L.SCALE), s, h, b, dq.stride(0), dq.stride(1)]  # fmt: skip
@@ -98,7 +98,11 @@ def one(name, tag):
 
 
 for tag in a.tags.split(","):
-    arms["dkdv" + tag] = one("k_dkdv_mx", tag)
+    if tag.startswith("2"):
+        arms["dv" + tag] = one("k_dv_mx", tag)
+        arms["dk" + tag] = one("k_dk_mx", tag)
+    else:
+        arms["dkdv" + tag] = one("k_dkdv_mx", tag)
     arms["dq" + tag] = one("k_dq_mx", tag)
     rec = L.recipe_of(tag, "bwd")
     arms["mx" + tag] = lambda t=tag, r=rec: L.bwd_mx(QZ[r], BZ[r], LSE[r], tag=t)

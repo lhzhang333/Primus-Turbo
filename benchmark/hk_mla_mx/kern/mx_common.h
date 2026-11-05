@@ -147,6 +147,9 @@ MX_INLINE void bar_wait() {
 MX_INLINE void lock_simd() { __builtin_amdgcn_s_setreg(154, 1); }
 MX_INLINE int wave_id(int tid) { return __builtin_amdgcn_readfirstlane(tid) >> 5; }
 MX_INLINE float exp2_raw(float x) { return __builtin_amdgcn_exp2f(x); }
+// bit_cast of a 32-bit value to float. Use it for vector elements: clang's __builtin_bit_cast(float, v[i]) on an
+// ext_vector_type element ignores the index (always element 0; seen at -O3 as a <0,0,0,0,4,4,4,4> shuffle).
+MX_INLINE float as_f(uint32_t x) { return __builtin_bit_cast(float, x); }
 MX_INLINE float peer(float x) {  // the value of lane l ^ 16
     const unsigned u = __builtin_bit_cast(unsigned, x);
     const unsigned v = __builtin_amdgcn_permlanex16(u, u, 0x76543210u, 0xFEDCBA98u, false, false);

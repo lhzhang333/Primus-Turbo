@@ -80,9 +80,7 @@ MX_INLINE int lane_now() {
     return l;
 }
 MX_INLINE f32x8 f8(u32x4 a, u32x4 b) {
-    return f32x8{__builtin_bit_cast(float, a[0]), __builtin_bit_cast(float, a[1]), __builtin_bit_cast(float, a[2]),
-                 __builtin_bit_cast(float, a[3]), __builtin_bit_cast(float, b[0]), __builtin_bit_cast(float, b[1]),
-                 __builtin_bit_cast(float, b[2]), __builtin_bit_cast(float, b[3])};
+    return f32x8{as_f(a[0]), as_f(a[1]), as_f(a[2]), as_f(a[3]), as_f(b[0]), as_f(b[1]), as_f(b[2]), as_f(b[3])};
 }
 // MX-quantize two 8-value column halves x0, x1 (16 values of this lane + 16 of its peer: one block of 32): the E8M0
 // byte and the two E4M3 pairs

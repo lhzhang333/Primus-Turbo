@@ -174,10 +174,10 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
                         d1 = lds_b128(lds_ptr(st + O_DEL), (16 * qt + 8 * lh) * 4 + 16);
             float nl[8], del[8];
             static_for<4>([&](auto e) {
-                nl[(int)e] = -__builtin_bit_cast(float, l0[(int)e]) * LOG2E;
-                nl[(int)e + 4] = -__builtin_bit_cast(float, l1[(int)e]) * LOG2E;
-                del[(int)e] = __builtin_bit_cast(float, d0[(int)e]);
-                del[(int)e + 4] = __builtin_bit_cast(float, d1[(int)e]);
+                nl[(int)e] = -as_f(l0[(int)e]) * LOG2E;
+                nl[(int)e + 4] = -as_f(l1[(int)e]) * LOG2E;
+                del[(int)e] = as_f(d0[(int)e]);
+                del[(int)e + 4] = as_f(d1[(int)e]);
             });
             static_for<NJ>([&](auto jj) {
                 constexpr int j = jj;

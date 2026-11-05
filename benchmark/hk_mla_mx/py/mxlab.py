@@ -669,73 +669,28 @@ def quant_bwd(qz, q, k, v, o, do, tag=""):
 
 
 def bwd_mx(qz, bz, lse, scale=SCALE, tag=""):
-    """dq, dk [b, s, h, 192], dv [b, s, h, 128] bf16 (BSHD views of SBHD storage) from the MX operands. Rung b1
-    (tags 1*) takes the m4 recipe's operands and the lse in log2 units."""
+    """dq, dk [b, s, h, 192], dv [b, s, h, 128] bf16 (BSHD views of SBHD storage) from the MX operands. Rungs b1 / b2
+    (tags 1*, 2*) take the m4 recipe's operands and the lse in log2 units; b2 runs dV and dK as two kernels
+    (k_dv_mx, k_dk_mx: 4 kv16 tiles per wave, 256 kv rows per workgroup) instead of k_dkdv_mx (128 rows)."""
     b, s, h = qz["b"], qz["s"], qz["h"]
     dev = qz["q8"].device
     if recipe_of(tag, "bwd") == "m4":
-        assert qz.get("recipe") == "m4", "rung b1 needs the m4 recipe's operands"
+        assert qz.get("recipe") == "m4", "rungs b1 / b2 need the m4 recipe's operands"
         lse = lse * LOG2E
     dq = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     dk = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     dv = torch.empty(s, b, h, D_V, device=dev, dtype=torch.bfloat16).transpose(0, 1)
-    _launch(
-        "k_dkdv_mx",
-        (s // 128, h, b),
-        [
-            qz["q8"],
-            qz["qs"],
-            qz["k8"],
-            qz["ks"],
-            bz["v8"],
-            bz["vsr"],
-            bz["do8"],
-            bz["dos"],
-            bz["do8t"],
-            bz["dots"],
-            bz["q8t"],
-            bz["qts"],
-            lse,
-            bz["delta"],
-            dk,
-            dv,
-            float(scale),
-            s,
-            h,
-            b,
-            dk.stride(0),
-            dk.stride(1),
-            dv.stride(0),
-            dv.stride(1),
-        ],
-        tag,
-    )
-    _launch(
-        "k_dq_mx",
-        (s // 256, h, b),
-        [
-            qz["q8"],
-            qz["qs"],
-            qz["k8"],
-            qz["ks"],
-            bz["v8"],
-            bz["vsr"],
-            bz["do8"],
-            bz["dos"],
-            bz["k8t"],
-            bz["kts"],
-            lse,
-            bz["delta"],
-            dq,
-            float(scale),
-            s,
-            h,
-            b,
-            dq.stride(0),
-            dq.stride(1),
-        ],
-        tag,
-    )
+    args = [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"], bz["dots"],
+            bz["q8t"], bz["qts"], lse, bz["delta"], dk, dv, float(scale), s, h, b, dk.stride(0), dk.stride(1),
+            dv.stride(0), dv.stride(1)]  # fmt: skip
+    if tag.startswith("2"):
+        _launch("k_dv_mx", (-(-s // 256), h, b), args, tag)
+        _launch("k_dk_mx", (-(-s // 256), h, b), args, tag)
+    else:
+        _launch("k_dkdv_mx", (s // 128, h, b), args, tag)
+    _launch("k_dq_mx", (s // 256, h, b),
+            [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["k8t"], bz["kts"],
+             lse, bz["delta"], dq, float(scale), s, h, b, dq.stride(0), dq.stride(1)], tag)  # fmt: skip
     return dq, dk, dv
 
 
