@@ -636,6 +636,44 @@ def emu_fwd4(qf, kf, vf, tau2=1.75, p_exp=-7, bm=256, nb=128):
     return o.permute(0, 2, 1, 3), lse
 
 
+def emu_fwd5(qf, kf, vf, tau2=3.75, p_exp=-5, bm=256, nb=128):
+    """fp32 emulation of rung m5: as emu_fwd4, but P = e4m3(p / 2^p_exp) 2^p_exp with p_exp -5 (headroom 14: tau2
+    3.75) and, after the first tile, an integer shift d = ceil(max(lm, 0)) applied through the P conversion's scale
+    (S'' itself is not adjusted: exp2(S'') 2^-d)."""
+    b, h, s, _ = qf.shape
+    dev = qf.device
+    ps = 2.0**p_exp
+    o = torch.zeros(b, h, s, D_V, device=dev)
+    lse = torch.zeros(b, h, s, device=dev)
+    qi = torch.arange(s, device=dev)
+    for q0 in range(0, s, bm):
+        Q = qf[:, :, q0 : q0 + bm]
+        m = torch.zeros(b, h, bm, device=dev)
+        l = torch.zeros(b, h, bm, device=dev)
+        acc = torch.zeros(b, h, bm, D_V, device=dev)
+        for t, k0 in enumerate(range(0, q0 + bm, nb)):
+            S = torch.einsum("bhqd,bhkd->bhqk", Q, kf[:, :, k0 : k0 + nb]) - m[..., None]
+            msk = qi[q0 : q0 + bm, None] >= qi[None, k0 : k0 + nb]
+            S = S.masked_fill(~msk, float("-inf"))
+            lm = S.amax(-1)
+            if t == 0:
+                d, corr = lm, torch.zeros_like(lm)
+                p = torch.exp2(S - d[..., None])
+            else:
+                need = (lm > tau2).reshape(b, h, bm // 16, 16).any(-1, keepdim=True).expand(-1, -1, -1, 16)
+                need = need.reshape(b, h, bm)
+                d = torch.where(need, torch.ceil(torch.clamp(lm, min=0.0)), torch.zeros_like(lm))
+                corr = torch.exp2(-d)
+                p = torch.exp2(S) * corr[..., None]
+            pq = e4m3(p / ps).float() * ps
+            l = corr * l + pq.sum(-1)
+            acc = acc * corr[..., None] + pq @ vf[:, :, k0 : k0 + nb]
+            m = m + d
+        o[:, :, q0 : q0 + bm] = acc / l[..., None]
+        lse[:, :, q0 : q0 + bm] = (m + torch.log2(l)) / LOG2E
+    return o.permute(0, 2, 1, 3), lse
+
+
 def snr(x, ref):
     x, ref = x.double(), ref.double()
     n = (x - ref).pow(2).sum().item()

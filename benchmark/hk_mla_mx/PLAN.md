@@ -67,6 +67,22 @@ fused into the producers (RoPE / up-projection epilogues) in Primus.
   DSv3 proxy e2e (throughput and the training gate); quantization fused into the producers.
 - P5 extreme tuning: power-aware schedules, asm generators, ATT-driven fixes, end-to-end overlap.
 
+## 3b. Status (2026-11-05 06:15; details in LOG.md)
+
+| piece | rung | state |
+|---|---|---|
+| quantization | k_mxq rows / cols, kbar (every 16th row) | GPU: bit-exact vs twins; fwd set 0.24 ms |
+| | k_mxq_rc (rows + cols in one read; both passes' operands at once) | compiled, untested |
+| forward | m0 (reference) | GPU: 53 dB vs emulation, 0.99 ms (bf16 HK 0.73): latency-bound |
+| | m1 / m2 / m3 (pipelined; m3 sched_barrier-interleaved) | compiled, untested; m3 VALU-issue-bound by ISA count |
+| | m4 (Q pre-scaled log2, C-init -m, ones-WMMA row sum, lazy rescale branch, overlapped rope, R2 scales) | compiled (~275 VALU / tile vs 783), untested |
+| | m5 (= m4 + P headroom 14, integer rescale shift via the P conversion scale, Q resident) | draft, after m4's review |
+| backward | b0 (reference, dS lane-local, dQ recomputed) | compiled, untested (lse/delta read bug fixed: clang bit_cast) |
+| | b1 (m4 recipe, negated-C lse2 / delta, peeled diagonal) | compiled, untested |
+| | b2 (dV / dK split, 4 kv16 tiles per wave: WMMA- instead of LDS-bound) | compiled, untested |
+| Turbo | hk_mx (m4 + b1 + rc; fp8-only saved tensors) | CPU tests pass; GPU numerics pending |
+| e2e | training gate scripts (mx_gate.sh, summary) | prepared |
+
 ## 4. Rules
 
 GPU2 only, through `scratch_mx/g2.sh` (lock, FAULT interlock, dmesg check, hard timeout); new kernels on toy
