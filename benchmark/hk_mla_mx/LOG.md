@@ -138,3 +138,10 @@ twice (+20% WMMAs in total) for an LDS-bound -> WMMA-bound change (model: dK/dV 
 
 GPU session script: `scratch_mx/session_gpu.sh <gpu> [first step]` (each step through g<gpu>.sh with its own timeout,
 logs in scratch_mx/logs/session_<n>.log, stops at the first failure).
+
+**Training gate prepared** (outside the repo, `/home/lihuzhan/projects/2026_1023__v2/scripts`): `mx_gate.sh <tag> <rounds>
+<arm>...` (DSv3 proxy, 4 GPUs, Primus worktree `Primus-v4-mx` = detached origin/dev/mi455x_v4 c6bd8c649, TURBO_DIR =
+this worktree, own FlyDSL caches; arms fly / hk / mx (hk_mx both passes) / mxf (hk_mx forward + hk backward), `_warm`
+fills caches; TRAIN_ITERS default 200) and `mx_gate_summary.py logs/<tag> --ref hk` (mean |dloss|, final-window loss,
+grad-norm ratio, median iteration time). Order after the kernel tests pass: `mx_gate.sh gate1 1 hk_warm mx_warm` then
+`mx_gate.sh gate2 2 hk mx mxf`.
