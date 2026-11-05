@@ -337,3 +337,6 @@ copy dk / dv into the kv gradient. Fused path (`mx.mla_rope_attention(q, kv, k_p
   MultiLatentAttention.forward with the fused path for eligible calls (training-style, no inference / packed / CP /
   TP / SP / recompute / offload, YaRN + apply_rope_fusion, causal, 128 + 64 / 128 heads, s % 256 == 0), else
   Megatron's forward.
+- **Training gate g120f** (120 iterations, same seed): bf16 HK 740.0, hk_mx 729.9 (-1.4%), **hk_mx + fused RoPE
+  (mxr: Primus patch d909dab0 on local branch dev/lhz/mla_rope_fused_mx) 720.7 ms / iteration (-2.6%)**; final-window
+  loss 0.0818 in all three, grad-norm ratio max 1.024; the log shows the fused path active, no fallback.
