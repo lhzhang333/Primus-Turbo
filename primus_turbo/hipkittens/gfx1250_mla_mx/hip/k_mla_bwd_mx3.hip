@@ -33,6 +33,9 @@ using namespace mx;
 #ifndef PF_KV
 #define PF_KV 1
 #endif
+#ifndef DQ_PRO_PARTIAL
+#define DQ_PRO_PARTIAL 1
+#endif
 #ifndef DQ_SGB
 #define DQ_SGB 0  // 1: sched_group_barrier windows in the pair phase (measured slower: 0.703 vs 0.631 ms)
 #endif
@@ -616,7 +619,11 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     }
     issue_tile(0);
     issue_tile(1);
+#if DQ_PRO_PARTIAL
+    tensor_wait<TDM_PER_TILE>();  // the block's Q / dO region and tile 0 (in order); tile 1's ops may stay in flight
+#else
     tensor_wait<0>();
+#endif
     bar_signal();
     bar_wait();
 

@@ -253,3 +253,7 @@ b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 
   ~27.6k outside (prologue ~5.3k, two diagonal tiles, staging 0.85k, final store 1.8k). Pairing blocks as in m7 would
   hide prologues and stores, but LDS is full (dq 320 KB: the second block's Q region and the first block's dQ staging
   collide); needs an LDS plan.
+- dq DQ_PRO_PARTIAL (start on the Q / dO region + tile 0): 0.6256 -> 0.6253 ms (kept, noise level).
+- **Training gate g200c** (package m7 + b3 as of 5c57ffdd, 1-GPU DSv3 proxy, 200 iterations): mx 735.0 vs hk 739.7
+  ms / iteration (-0.6%, quantization included); final-window loss 0.0320 vs 0.0319. Earlier: m4 + b1 785.3 (g200),
+  m6 + b3 without prefetch 745.6 (g200b).
