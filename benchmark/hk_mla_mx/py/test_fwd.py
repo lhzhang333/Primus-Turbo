@@ -35,7 +35,8 @@ dev = torch.device("cuda")
 if not a.no_build:
     t0 = time.time()
     L.build()
-    L.build(["k_mla_fwd_mx1.hip"])
+    if a.tag:
+        L.build_tag("fwd", a.tag)
     print(f"built in {time.time() - t0:.1f} s", flush=True)
 
 

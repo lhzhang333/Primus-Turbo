@@ -26,6 +26,8 @@ ap.add_argument("--settle-s", type=float, default=1.0)
 ap.add_argument("--flush-mb", type=int, default=512)
 ap.add_argument("--tags", default="", help="comma list of k_mla_bwd_mx build tags ('' = the default build)")
 ap.add_argument("--no-hk", action="store_true")
+ap.add_argument("--build", action="store_true", help="build every tag (and the forward of each recipe) first")
+ap.add_argument("--fwd-m4", default="4xp", help="the forward build tag that makes the m4 recipe's o / lse")
 a = ap.parse_args()
 
 dev = torch.device("cuda")
@@ -38,9 +40,24 @@ def sbhd(d):
 
 
 q, k, v, do = sbhd(L.D_QK), sbhd(L.D_QK), sbhd(L.D_V), sbhd(L.D_V)
-qz = L.quant_inputs(q, k, v)
-o, lse = L.fwd_mx(qz)
-bz = L.quant_bwd(qz, q, k, v, o, do)
+tags = a.tags.split(",")
+recipes = sorted({L.recipe_of(t, "bwd") for t in tags})
+fwd_tag = {"r1": "", "m4": a.fwd_m4}
+if a.build:
+    L.build()
+    for r in recipes:
+        L.build_tag("fwd", fwd_tag[r])
+    for t in tags:
+        L.build_tag("bwd", t)
+QZ, BZ, LSE = {}, {}, {}
+for r in recipes:
+    QZ[r] = L.quant_inputs(q, k, v, recipe=r)
+    o_, LSE[r] = L.fwd_mx(QZ[r], tag=fwd_tag[r])
+    BZ[r] = L.quant_bwd(QZ[r], q, k, v, o_, do)
+    if r == "r1":
+        o, lse, qz, bz = o_, LSE[r], QZ[r], BZ[r]
+if "r1" not in recipes:
+    o, lse, qz, bz = o_, LSE[recipes[0]], QZ[recipes[0]], BZ[recipes[0]]
 flops = 2.0 * b * h * (s * (s + 1) / 2) * (2 * L.D_QK + 3 * L.D_V)  # S, dP, dV, dQ, dK
 flush = torch.empty(a.flush_mb * (1 << 20), dtype=torch.uint8, device=dev)
 arms = {}
@@ -65,6 +82,9 @@ dv = torch.empty(s, b, h, L.D_V, device=dev, dtype=torch.bfloat16).transpose(0, 
 
 
 def one(name, tag):
+    r = L.recipe_of(tag, "bwd")
+    qz, bz = QZ[r], BZ[r]
+    lse = LSE[r] * L.LOG2E if r == "m4" else LSE[r]
     if name == "k_dkdv_mx":
         args = [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"],
                 bz["dots"], bz["q8t"], bz["qts"], lse, bz["delta"], dk, dv, float(L.SCALE), s, h, b, dk.stride(0),
@@ -80,7 +100,8 @@ def one(name, tag):
 for tag in a.tags.split(","):
     arms["dkdv" + tag] = one("k_dkdv_mx", tag)
     arms["dq" + tag] = one("k_dq_mx", tag)
-    arms["mx" + tag] = lambda t=tag: L.bwd_mx(qz, bz, lse, tag=t)
+    rec = L.recipe_of(tag, "bwd")
+    arms["mx" + tag] = lambda t=tag, r=rec: L.bwd_mx(QZ[r], BZ[r], LSE[r], tag=t)
 
 for f in arms.values():
     f()

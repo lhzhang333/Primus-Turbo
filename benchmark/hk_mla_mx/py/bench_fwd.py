@@ -26,6 +26,7 @@ ap.add_argument("--settle-s", type=float, default=1.0)
 ap.add_argument("--flush-mb", type=int, default=512)
 ap.add_argument("--tags", default="", help="comma list of k_mla_fwd_mx build tags ('' = the default build)")
 ap.add_argument("--no-hk", action="store_true")
+ap.add_argument("--build", action="store_true", help="build every tag first")
 a = ap.parse_args()
 
 dev = torch.device("cuda")
@@ -38,6 +39,10 @@ def sbhd(d):
 
 
 q, k, v = sbhd(L.D_QK), sbhd(L.D_QK), sbhd(L.D_V)
+if a.build:
+    L.build()
+    for t in a.tags.split(","):
+        L.build_tag("fwd", t)
 qzs = {r: L.quant_inputs(q, k, v, recipe=r) for r in sorted({L.recipe_of(t) for t in a.tags.split(",")})}
 flops = 2.0 * b * h * (s * (s + 1) / 2) * (L.D_QK + L.D_V)
 flush = torch.empty(a.flush_mb * (1 << 20), dtype=torch.uint8, device=dev)

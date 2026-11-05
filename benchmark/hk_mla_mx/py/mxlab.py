@@ -46,10 +46,24 @@ EXPERT = [
 EXPERT_P = EXPERT + ["-mllvm", "-greedy-regclass-priority-trumps-globalness"]
 
 
-def recipe_of(tag):
-    """The operand recipe a forward build tag expects: "m4" (Q8 pre-scaled to log2 units, scale layout R2) for rung m4
-    (tags 4*), else "r1"."""
-    return "m4" if tag.startswith("4") else "r1"
+def recipe_of(tag, kind="fwd"):
+    """The operand recipe a build tag expects: "m4" (Q8 pre-scaled to log2 units, scale layout R2) for forward rung m4
+    (tags 4*) and backward rung b1 (tags 1*), else "r1"."""
+    return "m4" if tag.startswith("4" if kind == "fwd" else "1") else "r1"
+
+
+def split_tag(tag):
+    """A build tag = <rung digits><flags>: flags "" (plain), "x" (EXPERT), "xp" (EXPERT_P)."""
+    i = len(tag) - len(tag.lstrip("0123456789"))
+    return tag[:i], tag[i:]
+
+
+def build_tag(kind, tag, defines=()):
+    """Build kern/k_mla_<kind>_mx<rung>.hip with the tag's flags into BUILD/k_mla_<kind>_mx<tag>.hsaco (kind: fwd /
+    bwd), the path kernel(name, tag) loads."""
+    rung, fl = split_tag(tag)
+    flags = {"": (), "x": EXPERT, "xp": EXPERT_P}[fl]
+    return build([f"k_mla_{kind}_mx{rung}.hip"], defines=defines, tag=fl, flags=flags)
 
 
 # kernel name -> (source, block, [(arg, kind)]); offsets follow natural alignment
@@ -612,9 +626,13 @@ def quant_bwd(qz, q, k, v, o, do, tag=""):
 
 
 def bwd_mx(qz, bz, lse, scale=SCALE, tag=""):
-    """dq, dk [b, s, h, 192], dv [b, s, h, 128] bf16 (BSHD views of SBHD storage) from the MX operands."""
+    """dq, dk [b, s, h, 192], dv [b, s, h, 128] bf16 (BSHD views of SBHD storage) from the MX operands. Rung b1
+    (tags 1*) takes the m4 recipe's operands and the lse in log2 units."""
     b, s, h = qz["b"], qz["s"], qz["h"]
     dev = qz["q8"].device
+    if recipe_of(tag, "bwd") == "m4":
+        assert qz.get("recipe") == "m4", "rung b1 needs the m4 recipe's operands"
+        lse = lse * LOG2E
     dq = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     dk = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     dv = torch.empty(s, b, h, D_V, device=dev, dtype=torch.bfloat16).transpose(0, 1)
@@ -715,9 +733,11 @@ def mxq(x, dim):
 
 
 def emu_bwd(qz, bz, lse, scale=SCALE, chunk=256):
-    """fp32 emulation of k_dkdv_mx / k_dq_mx on the quantized operands: dq, dk [b, s, h, 192], dv [b, s, h, 128]."""
-    qf = deq_qk(qz["q8"], qz["qs"])
-    kf = deq_qk(qz["k8"], qz["ks"])
+    """fp32 emulation of k_dkdv_mx / k_dq_mx on the quantized operands: dq, dk [b, s, h, 192], dv [b, s, h, 128]
+    (recipe m4: Q8 already in log2 units)."""
+    m4 = qz.get("recipe") == "m4"
+    qf = deq_qk(qz["q8"], qz["qs"], r2=m4)
+    kf = deq_qk(qz["k8"], qz["ks"], r2=m4)
     vr = deq_rows(bz["v8"], bz["vsr"], D_V)
     dor = deq_rows(bz["do8"], bz["dos"], D_V)
     doc = deq_cols(bz["do8t"], bz["dots"])
@@ -735,7 +755,7 @@ def emu_bwd(qz, bz, lse, scale=SCALE, chunk=256):
         for q0 in range(0, s, chunk):
             qs_ = slice(q0, q0 + chunk)
             S = torch.einsum("bhqd,bhkd->bhqk", qf[:, sl, qs_], kf[:, sl, : q0 + chunk])
-            P = torch.exp2(S * (scale * LOG2E) - lse[:, sl, qs_, None] * LOG2E)
+            P = torch.exp2((S if m4 else S * (scale * LOG2E)) - lse[:, sl, qs_, None] * LOG2E)
             P = P.masked_fill(qi[qs_, None] < qi[None, : q0 + chunk], 0.0)
             dP = torch.einsum("bhqd,bhkd->bhqk", dor[:, sl, qs_], vr[:, sl, : q0 + chunk])
             dS = P * (dP - delta[:, sl, qs_, None])

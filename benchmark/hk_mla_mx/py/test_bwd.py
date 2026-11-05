@@ -34,9 +34,8 @@ dev = torch.device("cuda")
 if not a.no_build:
     t0 = time.time()
     L.build()
-    L.build(["k_mla_fwd_mx3.hip"])
-    if a.tag:
-        L.build(["k_mla_bwd_mx.hip"], tag=a.tag, flags=L.EXPERT if "x" in a.tag else ())
+    L.build_tag("fwd", a.fwd_tag)
+    L.build_tag("bwd", a.tag)
     print(f"built in {time.time() - t0:.1f} s", flush=True)
 
 ok_all = True
@@ -49,7 +48,10 @@ for name in a.shapes.split(","):
         return torch.randn(s, b, h, d, generator=g, device=dev).to(torch.bfloat16).transpose(0, 1)
 
     q, k, v, do = t(L.D_QK), t(L.D_QK), t(L.D_V), t(L.D_V)
-    qz = L.quant_inputs(q, k, v)
+    qz = L.quant_inputs(q, k, v, recipe=L.recipe_of(a.fwd_tag))
+    assert L.recipe_of(a.fwd_tag) == L.recipe_of(a.tag, "bwd"), (
+        "forward and backward rungs of different recipes"
+    )
     o, lse = L.fwd_mx(qz, tag=a.fwd_tag)
     bz = L.quant_bwd(qz, q, k, v, o, do)
     g1 = L.bwd_mx(qz, bz, lse, tag=a.tag)
