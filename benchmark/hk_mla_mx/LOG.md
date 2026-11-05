@@ -241,3 +241,9 @@ b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 
 - dq fragment addresses pinned per tile (bases + immediate offsets): ATT showed a v_add3 per dQ group computing the next
   K^T fragment address into a register the group's WMMAs still read (~31-cycle write-after-read stall + 4 v_nop, 12 per
   tile). dq 0.669 -> 0.625 ms, **b3 backward 1.651 ms** (bf16 HK 1.971).
+- m7 ATT: 80% of the wave time in the tile loop now (m6 58%); per workgroup (two blocks) ~19.5k cycles outside it:
+  first-block prologue TDM ~3.5-4k (the TDM issue queue stalls the wave), epilogue staging ds_stores ~1.5k per block
+  (16-way bank conflicts: the TDM store forbids padding), the last block's TDM-store wait ~1k. PRO_PARTIAL (the first
+  block's Q before its tiles, then tensor_wait<4>: compute starts once Q and tile 0 landed): 0.4246 -> 0.4238 ms (noise
+  level; kept). The loop: 2236 cycles / tile, still with VALU-only runs (the max3 of q_i at the slot start) and WMMA-only
+  runs where the sched_group_barrier windows meet dependences.

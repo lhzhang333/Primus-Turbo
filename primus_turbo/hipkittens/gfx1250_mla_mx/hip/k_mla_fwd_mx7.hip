@@ -67,6 +67,9 @@ constexpr unsigned W0_KN = tdm_w0(0, 32, 20), W0_KR = tdm_w0(0, 16, 36), W0_V = 
 #ifndef PAIR
 #define PAIR 1
 #endif
+#ifndef PRO_PARTIAL
+#define PRO_PARTIAL 1
+#endif
 #ifndef QKFIRST
 #define QKFIRST 1
 #endif
@@ -444,12 +447,24 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
         const int n = (q0 + BM) / NB;
         const unsigned long long gq = (unsigned long long)(uintptr_t)Q8 + (bh * S + q0) * D_QK;
         const unsigned long long gqs = (unsigned long long)(uintptr_t)QS + (bh * S + q0) * 8;
-        tdm_load(tdm_g0(lds0 + Q_OFF, gq, wv == 1 ? 1 : 0), tdm_g1(W0_KN, BM, 128, BM, D_QK));
-        tdm_load(tdm_g0(lds0 + Q_OFF + 128, gq + 128, wv == 2 ? 1 : 0), tdm_g1(W0_KR, BM, 64, BM, D_QK));
-        tdm_load(tdm_g0(lds0 + QS_OFF, gqs, wv == 3 ? 1 : 0), tdm_g1(W0_S, BM, 8, BM, 8));
-        tensor_wait<0>();
+        if (rb == 0) {
+            // first block: its Q went out in the workgroup prologue ahead of tiles 0..2 (in-order completion): once
+            // Q and tile 0 landed only tiles 1, 2 (2 ops each) may stay in flight, which the loop's B_{t+1} waits cover
+#if PRO_PARTIAL
+            tensor_wait<2 * TDM_PER_TILE>();
+#else
+            tensor_wait<0>();
+#endif
+        } else {
+            // second block: its tiles 0..2 came during the first block; its Q now (the region is free: the first
+            // block's last Q read was before its last tile's B_{t+1} wait)
+            tdm_load(tdm_g0(lds0 + Q_OFF, gq, wv == 1 ? 1 : 0), tdm_g1(W0_KN, BM, 128, BM, D_QK));
+            tdm_load(tdm_g0(lds0 + Q_OFF + 128, gq + 128, wv == 2 ? 1 : 0), tdm_g1(W0_KR, BM, 64, BM, D_QK));
+            tdm_load(tdm_g0(lds0 + QS_OFF, gqs, wv == 3 ? 1 : 0), tdm_g1(W0_S, BM, 8, BM, 8));
+            tensor_wait<0>();
+        }
         bar_signal();
-        bar_wait();  // B_0 of the block: its Q and tiles 0..2 in LDS; the previous block's O store done
+        bar_wait();  // B_0 of the block: its Q and tile 0 in LDS; the previous block's O store done
 
         auto qaddr = [&]() __attribute__((always_inline)) {
             const int ln = lane_now();
@@ -613,7 +628,15 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
         }
     };
 
-    // workgroup prologue: tiles 0..2 of the first block (ring slots 0..2); the blocks' Q loads are in run_block
+    // workgroup prologue: the first block's Q and tiles 0..2 (ring slots 0..2); the second block's Q in run_block
+    {
+        // the first block's Q, then its tiles 0..2 (ring slots 0..2)
+        const unsigned long long gq = (unsigned long long)(uintptr_t)Q8 + (bh * S + (unsigned long long)qbA * BM) * D_QK;
+        const unsigned long long gqs = (unsigned long long)(uintptr_t)QS + (bh * S + (unsigned long long)qbA * BM) * 8;
+        tdm_load(tdm_g0(lds0 + Q_OFF, gq, wv == 1 ? 1 : 0), tdm_g1(W0_KN, BM, 128, BM, D_QK));
+        tdm_load(tdm_g0(lds0 + Q_OFF + 128, gq + 128, wv == 2 ? 1 : 0), tdm_g1(W0_KR, BM, 64, BM, D_QK));
+        tdm_load(tdm_g0(lds0 + QS_OFF, gqs, wv == 3 ? 1 : 0), tdm_g1(W0_S, BM, 8, BM, 8));
+    }
     issue_slot(0);
     issue_slot(1);
     issue_slot(2);
