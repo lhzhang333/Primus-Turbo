@@ -48,3 +48,28 @@ decides.
 GPU: from 03:50 GPU2 runs a foreign qwen38 server (178 GB), GPU3 another session (k3-hk), GPU1 a pr597 job; GPU0 is
 idle but the ladder's logs/GPU0.FAULT (11-03, a foreign pmc SMU hang, pre-reboot) is in place and clearing it was
 refused to me: CPU work until a GPU is free / the user clears it.
+
+**MX forward m0 + quantization on the GPU** (GPU3 via `scratch_mx/g3.sh`, shared with the K3 session's lock; GPU2 taken by
+a foreign qwen38 server). `py/test_fwd.py`: toy / small / mid / prod all PASS: quantization outputs bit-exact against the
+torch twins (codes, exponents, pads, kbar, q . kbar); o / lse against the fp32 emulation of the kernel's algorithm
+53-55 / 99-102 dB (kernel correct); against the fp32 reference on the bf16 inputs o 23.3-24.6 dB, lse 47-55 dB (the
+recipe floor, as emulated); deterministic, finite.
+
+Timing, b2 s4096 h128 (`py/bench_fwd.py`, hot / cold ms): bf16 HK fwd 0.732 / 0.737; MX m0 0.997 / 0.984; quantization
+(kbar + Q rows + K rows + V cols) 0.33 -> 0.24 after: kbar from every 16th row (any constant shift of k is
+softmax-invariant; the backward uses the same kbar), rows in X8's (b, h, s) order with the kbar slice loaded once per wave
+(scattered byte stores of the (s, b, h) order were slower), cols with 4-byte LDS reads. Per kernel (`py/bench_quant.py`):
+kbar 0.024, Q / K rows 0.080 / 0.078, V cols 0.088 ms: 5-8 TB/s, to be fused into the producers in Primus (P4).
+
+m0 ablations (hot ms): full 1.005, no exp 0.977, no softmax 0.956, no QK WMMA 0.838, no PV WMMA 0.898, no K/V LDS
+reads 0.895: m0 is latency-bound (per q tile QK -> max -> exp -> PV in series, all 92 fragment reads of a tile waited
+for before any WMMA), not VALU-bound. ~5100 cycles per 128-kv tile against an issue bound of ~1500.
+
+Rungs written while the node was down (compiled, not yet run): m1 (K fragments of tile t + 1 prefetched after the last
+QK of tile t, B_{t+1} signalled after QK of q tile 0, QK(q_{i+1}) before softmax(q_i), diagonal tiles split, branch-free
+rescale: 1024 VGPRs, 8 spills), m2 (m1 with Q read from LDS per tile: 1012 VGPRs, no spill), m3 (m2 with every slot
+interleaved WMMA / softmax chunk by sched_barrier fences: slot i = PV(q_{i-1}) + QK(next) | softmax(q_i) chunks,
+QK(q0) of tile t + 1 in slot 3, 16 / 24 / 24 / 24 WMMAs + an 8-WMMA tail per tile; 956 VGPRs, no spill).
+
+04:31 UTC: GPU3 MES hang in the K3 session's Megatron job (TE arm), hive-wide mode2 reset stuck in
+amdgpu_dpm_mode2_reset, kfd workers in D state: the node needs a power cycle. GPU work stopped.
