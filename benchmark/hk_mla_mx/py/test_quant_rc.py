@@ -36,6 +36,12 @@ for recipe in ("r1", "m4"):
     torch.cuda.synchronize()
     for nm in ("q8", "qs", "k8", "ks", "v8t", "vs", "kbar", "qk"):
         eq = torch.equal(qz[nm], qz2[nm])
+        if not eq and nm == "qk":  # fp32 dot q . kbar: the two kernels sum in different orders (~1 ulp of |qk|max)
+            d = (qz[nm] - qz2[nm]).abs().max().item()
+            eq = d <= 4e-7 * qz[nm].abs().max().item()
+            print(recipe, nm, f"max|diff| {d:.3g} (fp32 order)", "ok" if eq else "DIFF")
+            ok &= eq
+            continue
         ok &= eq
         print(recipe, nm, "equal" if eq else "DIFF")
     for nm in ("q8t", "qts", "k8t", "kts", "v8", "vsr", "do8", "dos", "delta", "do8t", "dots"):

@@ -47,9 +47,9 @@ EXPERT_P = EXPERT + ["-mllvm", "-greedy-regclass-priority-trumps-globalness"]
 
 
 def recipe_of(tag, kind="fwd"):
-    """The operand recipe a build tag expects: "m4" (Q8 pre-scaled to log2 units, scale layout R2) for forward rung m4
-    (tags 4*) and backward rung b1 (tags 1*), else "r1"."""
-    return "m4" if tag.startswith("4" if kind == "fwd" else "1") else "r1"
+    """The operand recipe a build tag expects: "m4" (Q8 pre-scaled to log2 units, scale layout R2) for forward rungs m4 /
+    m5 (tags 4*, 5*, 6*) and backward rungs b1 / b2 (tags 1*, 2*), else "r1"."""
+    return "m4" if tag[:1] in (("4", "5", "6") if kind == "fwd" else ("1", "2")) else "r1"
 
 
 def split_tag(tag):
@@ -199,6 +199,8 @@ KERNELS = {
         ],
     ),
 }
+# rung b2's dV / dK kernels (k_mla_bwd_mx2.hip) take k_dkdv_mx's arguments
+KERNELS["k_dv_mx"] = KERNELS["k_dk_mx"] = KERNELS["k_dkdv_mx"]
 _SIZE = {"ptr": 8, "i64": 8, "f64": 8, "i32": 4, "u32": 4, "f32": 4}
 
 
@@ -671,6 +673,48 @@ def emu_fwd5(qf, kf, vf, tau2=3.75, p_exp=-5, bm=256, nb=128):
             m = m + d
         o[:, :, q0 : q0 + bm] = acc / l[..., None]
         lse[:, :, q0 : q0 + bm] = (m + torch.log2(l)) / LOG2E
+    return o.permute(0, 2, 1, 3), lse
+
+
+def emu_fwd6(qf, kf, vf, tau2=3.75, pe=5, bm=256, nb=128):
+    """fp32 emulation of rung m6 (per q row, no wave-uniform decision): S'' = S' - m (m from 0); lm = max S''. First
+    tile: d = ceil(lm), S'' -= d before the exp2 (exact), the reference mref = d. Later tiles: d = ceil(lm) if lm > tau2
+    else 0; p = exp2(S'') unshifted and P = e4m3(p / 2^(d - pe)) 2^-pe (the shift goes into the conversion scale).
+    O and the row sum accumulate relative to mref: weight 2^D, D = m - mref (the PV WMMA's per-lane E8M0 B scale), so
+    O is never rescaled. lse = mref + log2(l)."""
+    b, h, s, _ = qf.shape
+    dev = qf.device
+    ps = 2.0**-pe
+    o = torch.zeros(b, h, s, D_V, device=dev)
+    lse = torch.zeros(b, h, s, device=dev)
+    qi = torch.arange(s, device=dev)
+    for q0 in range(0, s, bm):
+        Q = qf[:, :, q0 : q0 + bm]
+        m = torch.zeros(b, h, bm, device=dev)
+        D = torch.zeros(b, h, bm, device=dev)
+        mref = torch.zeros(b, h, bm, device=dev)
+        l = torch.zeros(b, h, bm, device=dev)
+        acc = torch.zeros(b, h, bm, D_V, device=dev)
+        for t, k0 in enumerate(range(0, q0 + bm, nb)):
+            S = torch.einsum("bhqd,bhkd->bhqk", Q, kf[:, :, k0 : k0 + nb]) - m[..., None]
+            msk = qi[q0 : q0 + bm, None] >= qi[None, k0 : k0 + nb]
+            S = S.masked_fill(~msk, float("-inf"))
+            lm = S.amax(-1)
+            if t == 0:
+                d = torch.ceil(lm)
+                mref = d.clone()
+                P = e4m3(torch.exp2(S - d[..., None]) / ps).float() * ps
+                w = torch.ones_like(d)
+            else:
+                d = torch.where(lm > tau2, torch.ceil(lm), torch.zeros_like(lm))
+                P = e4m3(torch.exp2(S) / torch.exp2(d - pe)[..., None]).float() * ps
+                D = D + d
+                w = torch.exp2(D)
+            l = l + w * P.sum(-1)
+            acc = acc + w[..., None] * (P @ vf[:, :, k0 : k0 + nb])
+            m = m + d
+        o[:, :, q0 : q0 + bm] = acc / l[..., None]
+        lse[:, :, q0 : q0 + bm] = (mref + torch.log2(l)) / LOG2E
     return o.permute(0, 2, 1, 3), lse
 
 

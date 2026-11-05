@@ -145,3 +145,45 @@ this worktree, own FlyDSL caches; arms fly / hk / mx (hk_mx both passes) / mxf (
 fills caches; TRAIN_ITERS default 200) and `mx_gate_summary.py logs/<tag> --ref hk` (mean |dloss|, final-window loss,
 grad-norm ratio, median iteration time). Order after the kernel tests pass: `mx_gate.sh gate1 1 hk_warm mx_warm` then
 `mx_gate.sh gate2 2 hk mx mxf`.
+
+## 2026-11-05 (b): heliosr-1b112-a30-4 (1 x MI455X, GPU0 shared with other sessions through logs/gpu0.lock)
+
+**Reproduction** (container lhz-mx-dsv3, image tas-20261019; every GPU job through `scratch_mx/gx.sh`: GPU0 lock,
+timeout, dmesg check). All GPU checks of the 11-05 session list pass: quantization (rc vs rows / cols bit-exact; the
+fp32 q . kbar differs by summation order only, <= 1e-6, now compared with a tolerance), m4 / m3 forward toy..prod
+(53 dB vs emulation), b0 / b1 / b2 backward toy..mid (46-53 dB), Turbo hk_mx pytest 28 pass. Lab fixes: KERNELS lacked
+b2's k_dv_mx / k_dk_mx; recipe_of mapped backward tags 2* to r1. Timing (b2 s4096 h128, hot / cold ms): bf16 HK fwd
+0.624 / 0.638, bwd 1.983 / 1.994; m0 0.880, m3xp 0.865, m4xp 0.713 / 0.699; fwd quant 0.207, quant_all 0.328; bwd b0
+4.08, b1 3.02 (dkdv 1.92 + dq 1.05), b2 3.03 (dv 0.72 + dk 1.16 + dq 1.05), bwd quant 0.350.
+
+**Training gate (1 GPU)**: DSv3 proxy 1-GPU variant (EP1, 32 experts, MBS 2, GBS 16, mock data), 200 iterations, same
+seed: final-window loss hk 0.0319, mx 0.0320, mxf 0.0320, mxb 0.0319; mean |dloss| vs hk 0.0002-0.0003, grad-norm ratio
+max 1.07 (mx) / 1.13 (mxf); median iteration hk 739 ms, mx 785, mxf 747, mxb 784 (MX not faster yet). Mock data
+drives the loss to ~0.03, so this is a weak quality test (no tokenized data on this node).
+
+**ATT of m4** (`scratch_mx/att.sh`, `py/att_tl.py`, `py/att_trip.py`): 3056 cycles per 128-kv tile and wave (WMMA
+floor ~800). Per tile: 271 exps at >= 2 cycles each, issued in bursts of 8 between WMMA pairs (XDL idle half the
+time); the rescale decision ~94 cycles per q tile (v_cmp -> SGPR -> s_cmp ~55, s_cmp -> branch 13, taken branch 25);
+TDM issue ~300 (s_wait_tensorcnt 0xa that LLVM puts before reused descriptor SGPRs); 64 v_nop.
+
+**Issue-rate micro** (`scratch_mx/micro/gen_issue*.py`, ATT): v_exp_f32 alone 1 / 2 cycles, alternating with VALU or
+packed VALU 1 / cycle each; v_exp_f16 / bf16 half rate (4 cycles); MX 16x16x128 WMMA back to back 8 cycles (also
+fp8 16x16x128 and bf16 16x16x32: 8); with WMMAs in flight other instructions issue at ~1 / 2 cycles: W + 3 T 10.7,
+W + 6 V 12.9, W + 3 T + 3 V 12.8 cycles per window (also with v_nop / v_mov fillers: 12.5); matrix_a/b_reuse changes
+nothing. Floor for 100 W + 256 T + ~210 V + ~120 LDS per tile: ~1350-1450 cycles.
+
+**Rung m6** (`kern/k_mla_fwd_mx6.hip`, recipe m4 operands; emulation `emu_fwd6`): branch-free softmax with per-lane
+integer shifts: exp2(S'') does not wait for the max (the shift goes into the P conversion scale); O and the row sum
+accumulate relative to a fixed per-lane reference with the PV WMMAs' per-lane E8M0 B scale 2^(D - PE), so O is never
+rescaled (guard when D > 48, once per tile); no branch per q tile; TAU2 0.75, PE 8. Numerics (CPU emulation, o / lse
+dB vs fp32): randn m4 23.74 / 50.78, m6 23.49 / 50.54; kbias 23.95 -> 23.71; peaked 20.97 -> 20.94; spiky 22.40 ->
+22.34 (the max element of P is no longer a power of two; P headroom variants all equal). GPU: 51-55 dB vs emu6,
+toy..prod pass. Scheduling: sched_group_barrier windows [WMMA, VALU, TRANS, VALU, TRANS (, TRANS)] per slot (SCHED 1)
+beat m4-style fences (SCHED 0: 0.751 ms). A peeled first tile costs ~300 VGPR spills (FIRST_PEEL 0: the first tile is
+a runtime flag; unshifted exps need |S'| < 126 on the first tile). m6xp 0.680 -> 0.673 ms (pvs formed per PV group:
+a long-lived WMMA scale VGPR must sit in v0..v255).
+
+**XCD locality**: TDM-only skeleton of m6 (TDM_ONLY 1) = 0.242 ms: 2.9 GB moved per call; with the default order the
+16 q blocks of a (b, h) go to 8 XCDs (dispatch L -> XCD L % 8), each XCD runs 16 (b, h) at once (~21 MB > 4 MB L2).
+XCD_MAP 1 (k-th workgroup of XCD c takes q block nqb - 1 - k % nqb of bh = c + 8 (k / nqb)): TDM-only 0.172 ms, **m6xp
+0.525 / 0.531 ms** (bf16 HK fwd 0.630). The same mapping should help the bf16 HK and the MX backward kernels.
