@@ -356,3 +356,16 @@ copy dk / dv into the kv gradient. Fused path (`mx.mla_rope_attention(q, kv, k_p
   (steady state ~4.5k cycles before the first loop step incl. TDM issue stalls and the first wait, ~6k after:
   the last A phase, staging, the store wait); only one workgroup fits a CU, so it is exposed.
 - Package per call now: forward 0.655 ms (quantization 0.210) vs bf16 HK 0.629; backward 1.646 vs 1.974.
+- dkdv TDM_INC (lab b5 only, not yet in the package): each wave's 3 TDM ops keep their next step, global address and
+  LDS stage in SGPRs and advance per round (the per-round descriptor math was ~87 SALU / step): dkdv 0.911 -> 0.903 ms,
+  backward 1.563 -> 1.560; toy..mid and the fused-RoPE backward test pass. To do: copy to the package + pytest.
+
+## State at the 2026-11-05 stop (~13:00 UTC; GPU handed over)
+
+Package (branch head): forward m7 (PIN_P 2) 0.420 ms kernel, 0.655 ms per call with quantization (bf16 HK 0.629);
+backward b5 1.584 (lab with TDM_INC 1.560), 1.646 per call (bf16 HK 1.974); fused RoPE path mla_rope_attention
+(-0.20 ms per layer call vs Megatron's RoPE kernels + hk_mx). Training gate g120f: bf16 HK 740.0, hk_mx 729.9, hk_mx +
+fused RoPE 720.7 ms / iteration, same loss. Next: (1) TDM_INC into the package; (2) the per-workgroup overhead of dkdv
+(~20%: needs a persistent / paired design with an LDS plan for the 80 KB staging) and dq (~10%); (3) generated asm
+schedules (port tools/asmkit + fwdgen / bwdgen to the MX kernels): the loops are 1.6-1.8x their issue floors;
+(4) the fused-RoPE quantization kernels (q 0.096, k 0.091 ms vs ~0.055 memory floor).
