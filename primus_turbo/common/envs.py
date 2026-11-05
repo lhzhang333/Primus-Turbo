@@ -43,6 +43,9 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_GROUPED_GEMM_BACKEND: str | None = None
     PRIMUS_TURBO_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_SPARSE_ATTN_BACKEND: str | None = None
+    PRIMUS_TURBO_MLA_FWD_IMPL: str = ""
+    PRIMUS_TURBO_MLA_BWD_IMPL: str = ""
+    PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES: str | None = None
     PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND: str | None = None
     PRIMUS_TURBO_AUTO_TUNE: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
@@ -168,6 +171,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MoE dispatch/combine EP backend: TURBO (the default when unset), DEEP_EP, or a custom EP name
     # such as UCCL_EP. "autotune" is rejected with an AssertionError.
     "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend_spec("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"),
+    # ================== gfx1250 MLA attention (qk 192 / v 128) ==================
+    # Kernels of the MLA forward / backward: "flydsl" (also unset or blank) or "hk" (the HIP kernels of
+    # primus_turbo/hipkittens/gfx1250_mla, which fall back to FlyDSL per call when they cannot take it). Any
+    # case; another value raises ValueError at the first MLA pass. Read once, when
+    # attention_flydsl_gfx1250_mla_impl is imported.
+    "PRIMUS_TURBO_MLA_FWD_IMPL": lambda: os.getenv("PRIMUS_TURBO_MLA_FWD_IMPL", ""),
+    "PRIMUS_TURBO_MLA_BWD_IMPL": lambda: os.getenv("PRIMUS_TURBO_MLA_BWD_IMPL", ""),
+    # dS scratch budget of the "hk" MLA backward in bytes (int or float syntax, e.g. 2.2e9); unset or blank
+    # = no limit. Parsed (ValueError unless positive) when hipkittens/gfx1250_mla/bwd.py is imported.
+    "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES": lambda: os.getenv(
+        "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES"
+    ),
     # ================== Auto-tune ==================
     # "1" turns auto-tuning across registered kernel backends on for every op, and the FlyDSL
     # kernel-level tuners with it. An explicit per-op backend still wins over it, and so does

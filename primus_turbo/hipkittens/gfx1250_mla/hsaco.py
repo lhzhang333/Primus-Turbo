@@ -95,13 +95,14 @@ def unavailable_reason(names: Iterable[str], bin_dir: Path = BIN_DIR) -> Optiona
 def find_compiler(cxx: Optional[str] = None) -> Optional[str]:
     """amdclang++: ``cxx``, $PRIMUS_TURBO_HK_CXX, PATH, then $ROCM_PATH / $ROCM_HOME / /opt/rocm; None when the
     first one given is not an executable."""
-    for c in (cxx, os.environ.get(CXX_ENV)):
+    # Build-time settings (this module also runs from setup.py, standard library only): not in envs.
+    for c in (cxx, os.environ.get(CXX_ENV)):  # envs: allow
         if c:
             return shutil.which(c)
     found = shutil.which("amdclang++")
     if found:
         return found
-    for root in (os.environ.get("ROCM_PATH"), os.environ.get("ROCM_HOME"), "/opt/rocm"):
+    for root in (os.environ.get("ROCM_PATH"), os.environ.get("ROCM_HOME"), "/opt/rocm"):  # envs: allow
         if root:
             p = Path(root) / "llvm" / "bin" / "amdclang++"
             if p.is_file():

@@ -17,11 +17,11 @@ bitwise equal to the FlyDSL one, so either backward takes either forward's out /
 (``hk_mla_fwd_unsupported_reason`` / ``hk_mla_bwd_unsupported_reason``) runs on FlyDSL, with one warning per reason.
 """
 
-import os
 from typing import Optional, Tuple
 
 import torch
 
+import primus_turbo.common.envs as envs
 from primus_turbo.common.logger import logger
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     _eager_custom_op,
@@ -35,8 +35,8 @@ MLA_FWD_IMPL_ENV = "PRIMUS_TURBO_MLA_FWD_IMPL"
 MLA_BWD_IMPL_ENV = "PRIMUS_TURBO_MLA_BWD_IMPL"
 # Read once at import, like the kernels' other switches: the passes route on module constants, which
 # torch.compile traces without a guard on the environment.
-MLA_FWD_IMPL_SETTING = os.environ.get(MLA_FWD_IMPL_ENV, "")
-MLA_BWD_IMPL_SETTING = os.environ.get(MLA_BWD_IMPL_ENV, "")
+MLA_FWD_IMPL_SETTING = envs.PRIMUS_TURBO_MLA_FWD_IMPL
+MLA_BWD_IMPL_SETTING = envs.PRIMUS_TURBO_MLA_BWD_IMPL
 
 
 def _impl(env: str, setting: str) -> str:

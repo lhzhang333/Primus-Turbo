@@ -32,12 +32,12 @@ backward.
 """
 
 import math
-import os
 import struct
 import threading
 
 import torch
 
+import primus_turbo.common.envs as envs
 from primus_turbo.common.logger import logger
 
 from . import hiprt, hsaco, limits
@@ -56,9 +56,10 @@ TICKET_OFFSET_B = DS_GUARD_B - 64  # the ticket counter, inside the front guard
 MAX_SCRATCH_BYTES_ENV = "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES"
 
 
-def _bytes_setting(name):
-    """A positive byte count from the environment (int or float syntax, e.g. 2.2e9), or None if unset."""
-    text = os.environ.get(name, "").strip()
+def _bytes_setting(name, raw):
+    """A positive byte count from the setting ``raw`` of variable ``name`` (int or float syntax, e.g. 2.2e9), or
+    None if unset or blank."""
+    text = (raw or "").strip()
     if not text:
         return None
     try:
@@ -71,7 +72,7 @@ def _bytes_setting(name):
 
 
 # Read when this module is first imported (by the first HIP backward): None = no limit.
-MAX_SCRATCH_BYTES = _bytes_setting(MAX_SCRATCH_BYTES_ENV)
+MAX_SCRATCH_BYTES = _bytes_setting(MAX_SCRATCH_BYTES_ENV, envs.PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES)
 
 
 class ScratchBudgetError(NotImplementedError):
