@@ -17,4 +17,6 @@ primus_turbo/_build_info.py
 primus_turbo/_version.py
 .coverage*
 !primus_turbo/hipkittens/gfx1250_mla/hip/src/*.hip
+!primus_turbo/hipkittens/gfx1250_mla_mx/hip/*.hip
+!benchmark/hk_mla_mx/**/*.hip
 primus_turbo/hipkittens/gfx1250_mla/bin/

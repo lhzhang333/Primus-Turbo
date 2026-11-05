@@ -47,6 +47,17 @@ KERNELS = {
                                                 ("V8T", "ptr"), ("VS", "ptr"), ("O", "ptr"), ("LSE", "ptr"),
                                                 ("scale", "f32"), ("S", "i32"), ("H", "i32"), ("B", "i32"),
                                                 ("o_sb", "i64"), ("o_ss", "i64")]),
+    "k_dkdv_mx": ("k_mla_bwd_mx.hip", 128, [("Q8", "ptr"), ("QS", "ptr"), ("K8", "ptr"), ("KS", "ptr"), ("V8", "ptr"),
+                                             ("VSR", "ptr"), ("DO8", "ptr"), ("DOS", "ptr"), ("DO8T", "ptr"),
+                                             ("DOTS", "ptr"), ("Q8T", "ptr"), ("QTS", "ptr"), ("LSE", "ptr"),
+                                             ("DELTA", "ptr"), ("DK", "ptr"), ("DV", "ptr"), ("scale", "f32"),
+                                             ("S", "i32"), ("H", "i32"), ("B", "i32"), ("dk_sb", "i64"),
+                                             ("dk_ss", "i64"), ("dv_sb", "i64"), ("dv_ss", "i64")]),
+    "k_dq_mx": ("k_mla_bwd_mx.hip", 128, [("Q8", "ptr"), ("QS", "ptr"), ("K8", "ptr"), ("KS", "ptr"), ("V8", "ptr"),
+                                           ("VSR", "ptr"), ("DO8", "ptr"), ("DOS", "ptr"), ("K8T", "ptr"),
+                                           ("KTS", "ptr"), ("LSE", "ptr"), ("DELTA", "ptr"), ("DQ", "ptr"),
+                                           ("scale", "f32"), ("S", "i32"), ("H", "i32"), ("B", "i32"),
+                                           ("dq_sb", "i64"), ("dq_ss", "i64")]),
 }
 _SIZE = {"ptr": 8, "i64": 8, "f64": 8, "i32": 4, "u32": 4, "f32": 4}
 
@@ -319,3 +330,177 @@ def snr(x, ref):
     x, ref = x.double(), ref.double()
     n = (x - ref).pow(2).sum().item()
     return 10 * math.log10(ref.pow(2).sum().item() / max(n, 1e-300))
+
+
+# ------------------------------------------------------------------------------------------------ backward (GPU)
+
+
+def quant_bwd(qz, q, k, v, o, do, tag=""):
+    """The backward's extra MX operands: V and dO rows (+ delta = rowsum(dO * O)), dO cols, Q cols, K cols (centred by
+    the forward's kbar). q, k, v, o, do [b, s, h, d] bf16."""
+    v8, vsr, _, _ = quant_rows(v, D_V, tag=tag)
+    do8, dos, delta, _ = quant_rows(do, D_V, mode=4, y=o, tag=tag)
+    do8t, dots = quant_cols(do, D_V, tag=tag)
+    q8t, qts = quant_cols(q, D_QK, tag=tag)
+    k8t, kts = quant_cols(k, D_QK, kbar=qz["kbar"], tag=tag)
+    return dict(v8=v8, vsr=vsr, do8=do8, dos=dos, delta=delta, do8t=do8t, dots=dots, q8t=q8t, qts=qts, k8t=k8t,
+                kts=kts)
+
+
+def bwd_mx(qz, bz, lse, scale=SCALE, tag=""):
+    """dq, dk [b, s, h, 192], dv [b, s, h, 128] bf16 (BSHD views of SBHD storage) from the MX operands."""
+    b, s, h = qz["b"], qz["s"], qz["h"]
+    dev = qz["q8"].device
+    dq = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    dk = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    dv = torch.empty(s, b, h, D_V, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    _launch("k_dkdv_mx", (s // 128, h, b),
+            [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"],
+             bz["dots"], bz["q8t"], bz["qts"], lse, bz["delta"], dk, dv, float(scale), s, h, b, dk.stride(0),
+             dk.stride(1), dv.stride(0), dv.stride(1)], tag)
+    _launch("k_dq_mx", (s // 256, h, b),
+            [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["k8t"], bz["kts"],
+             lse, bz["delta"], dq, float(scale), s, h, b, dq.stride(0), dq.stride(1)], tag)
+    return dq, dk, dv
+
+
+# ------------------------------------------------------------------------------------- backward references
+
+
+def deq_rows(x8, xs, d):
+    """Rows dequantization for d = 128 (one interleaved chunk) -> fp32 [b, h, s, 128]."""
+    p = perm_chunk(128).to(x8.device)
+    codes = x8[..., p].view(torch.float8_e4m3fn).float()
+    e = xs.to(torch.int32) - 127
+    sc = torch.ldexp(torch.ones_like(e, dtype=torch.float32), e)
+    return (codes.reshape(*codes.shape[:-1], d // 32, 32) * sc[..., None]).reshape(codes.shape)
+
+
+def deq_cols(x8t, xts):
+    """Cols dequantization: X8T [b, h, d, s] / XTS [b, h, s / 128, d, 4] -> fp32 [b, h, s, d]."""
+    b, h, d, s = x8t.shape
+    codes = deinterleave_kv(x8t).view(torch.float8_e4m3fn).float()  # b h d s
+    e = xts.to(torch.int32) - 127
+    sc = torch.ldexp(torch.ones_like(e, dtype=torch.float32), e).permute(0, 1, 3, 2, 4).reshape(b, h, d, s // 32)
+    return (codes.reshape(b, h, d, s // 32, 32) * sc[..., None]).reshape(b, h, d, s).transpose(2, 3)
+
+
+def mxq(x, dim):
+    """Fake MX quantization of fp32 x along dim (blocks of 32, the kernels' scale rule)."""
+    xm = x.movedim(dim, -1)
+    codes, e = mx_quant_last(xm)
+    sc = torch.ldexp(torch.ones_like(e, dtype=torch.float32), e)
+    deq = (codes.float().reshape(*codes.shape[:-1], codes.shape[-1] // 32, 32) * sc[..., None]).reshape(codes.shape)
+    return deq.movedim(-1, dim)
+
+
+def emu_bwd(qz, bz, lse, scale=SCALE, chunk=256):
+    """fp32 emulation of k_dkdv_mx / k_dq_mx on the quantized operands: dq, dk [b, s, h, 192], dv [b, s, h, 128]."""
+    qf = deq_qk(qz["q8"], qz["qs"])
+    kf = deq_qk(qz["k8"], qz["ks"])
+    vr = deq_rows(bz["v8"], bz["vsr"], D_V)
+    dor = deq_rows(bz["do8"], bz["dos"], D_V)
+    doc = deq_cols(bz["do8t"], bz["dots"])
+    qt = deq_cols(bz["q8t"], bz["qts"])
+    kt = deq_cols(bz["k8t"], bz["kts"])
+    b, h, s, _ = qf.shape
+    dev = qf.device
+    delta = bz["delta"]
+    qi = torch.arange(s, device=dev)
+    dq = torch.zeros(b, h, s, D_QK, device=dev)
+    dk = torch.zeros(b, h, s, D_QK, device=dev)
+    dv = torch.zeros(b, h, s, D_V, device=dev)
+    for h0 in range(0, h, 8):
+        sl = slice(h0, h0 + 8)
+        for q0 in range(0, s, chunk):
+            qs_ = slice(q0, q0 + chunk)
+            S = torch.einsum("bhqd,bhkd->bhqk", qf[:, sl, qs_], kf[:, sl, : q0 + chunk])
+            P = torch.exp2(S * (scale * LOG2E) - lse[:, sl, qs_, None] * LOG2E)
+            P = P.masked_fill(qi[qs_, None] < qi[None, : q0 + chunk], 0.0)
+            dP = torch.einsum("bhqd,bhkd->bhqk", dor[:, sl, qs_], vr[:, sl, : q0 + chunk])
+            dS = P * (dP - delta[:, sl, qs_, None])
+            Pq = e4m3(P * 256.0).float() / 256.0
+            dv[:, sl, : q0 + chunk] += torch.einsum("bhqk,bhqd->bhkd", Pq, doc[:, sl, qs_])
+            dk[:, sl, : q0 + chunk] += torch.einsum("bhqk,bhqd->bhkd", mxq(dS, 2), qt[:, sl, qs_]) * scale
+            dq[:, sl, qs_] = torch.einsum("bhqk,bhkd->bhqd", mxq(dS, 3), kt[:, sl, : q0 + chunk]) * scale
+    t = lambda x: x.permute(0, 2, 1, 3)  # noqa: E731
+    return t(dq), t(dk), t(dv)
+
+
+def ref_bwd(q, k, v, do, scale=SCALE):
+    """fp32 autograd attention backward on the (bf16) inputs: dq, dk, dv [b, s, h, d]."""
+    b, s, h, _ = q.shape
+    dq = torch.zeros(b, s, h, D_QK, device=q.device)
+    dk = torch.zeros_like(dq)
+    dv = torch.zeros(b, s, h, D_V, device=q.device)
+    mask = torch.ones(s, s, device=q.device, dtype=torch.bool).tril()
+    for h0 in range(0, h, 8):
+        sl = slice(h0, h0 + 8)
+        qq, kk, vv = (t[:, :, sl].float().detach().clone().requires_grad_() for t in (q, k, v))
+        sc = torch.einsum("bqhd,bkhd->bhqk", qq, kk) * scale
+        sc = sc.masked_fill(~mask, float("-inf"))
+        p = torch.softmax(sc, -1)
+        o = torch.einsum("bhqk,bkhd->bqhd", p, vv)
+        o.backward(do[:, :, sl].float())
+        dq[:, :, sl], dk[:, :, sl], dv[:, :, sl] = qq.grad, kk.grad, vv.grad
+    return dq, dk, dv
+
+
+# ------------------------------------------------------------- torch twins of the quantization kernels (any device)
+
+
+def _interleave_last(codes_u8, n):
+    """Logical-order bytes [..., n] -> MX-interleaved stored order (n = 128 or 64 per chunk)."""
+    out = torch.empty_like(codes_u8)
+    out[..., perm_chunk(n).to(codes_u8.device)] = codes_u8
+    return out
+
+
+def twin_rows(x, d, kbar=None):
+    """k_mxq_rows{192,128} twin: x [b, s, h, d] -> x8 [b, h, s, d] (stored order), xs [b, h, s, 8 | 4]."""
+    xf = x.float().permute(0, 2, 1, 3)
+    if kbar is not None:
+        xf = xf - kbar[:, :, None, :]
+    codes, e = mx_quant_last(xf)
+    cu = codes.view(torch.uint8)
+    if d == 192:
+        x8 = torch.cat([_interleave_last(cu[..., :128], 128), _interleave_last(cu[..., 128:], 64)], -1)
+        xs = torch.cat([(e + 127).to(torch.uint8), torch.full_like(e[..., :2], 127, dtype=torch.uint8)], -1)
+    else:
+        x8 = _interleave_last(cu, 128)
+        xs = (e + 127).to(torch.uint8)
+    return x8, xs
+
+
+def twin_cols(x, d, kbar=None):
+    """k_mxq_cols{128,192} twin: x [b, s, h, d] -> x8t [b, h, d, s] (s interleaved per 128), xts [b, h, s/128, d, 4]."""
+    b, s, h, _ = x.shape
+    xf = x.float().permute(0, 2, 3, 1)  # b h d s
+    if kbar is not None:
+        xf = xf - kbar[:, :, :, None]
+    codes, e = mx_quant_last(xf)  # e: b h d s/32
+    cu = codes.view(torch.uint8).reshape(b, h, d, s // 128, 128)
+    x8t = _interleave_last(cu, 128).reshape(b, h, d, s)
+    xts = (e + 127).to(torch.uint8).reshape(b, h, d, s // 128, 4).permute(0, 1, 3, 2, 4).contiguous()
+    return x8t, xts
+
+
+def twin_inputs(q, k, v, kbar_stride=KBAR_STRIDE):
+    b, s, h, _ = q.shape
+    kbar = k.float()[:, ::kbar_stride].mean(1)  # [b, h, 192]
+    q8, qs = twin_rows(q, 192)
+    k8, ks = twin_rows(k, 192, kbar)
+    v8t, vs = twin_cols(v, 128)
+    qk = torch.einsum("bshd,bhd->bhs", q.float(), kbar)
+    return dict(b=b, s=s, h=h, center_k=True, q8=q8, qs=qs, k8=k8, ks=ks, v8t=v8t, vs=vs, kbar=kbar, qk=qk)
+
+
+def twin_bwd(qz, q, k, v, o, do):
+    v8, vsr = twin_rows(v, 128)
+    do8, dos = twin_rows(do, 128)
+    delta = (do.float() * o.float()).sum(-1).permute(0, 2, 1).contiguous()
+    do8t, dots = twin_cols(do, 128)
+    q8t, qts = twin_cols(q, 192)
+    k8t, kts = twin_cols(k, 192, qz["kbar"])
+    return dict(v8=v8, vsr=vsr, do8=do8, dos=dos, delta=delta, do8t=do8t, dots=dots, q8t=q8t, qts=qts, k8t=k8t,
+                kts=kts)
