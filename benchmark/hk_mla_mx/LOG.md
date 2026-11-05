@@ -73,3 +73,54 @@ QK(q0) of tile t + 1 in slot 3, 16 / 24 / 24 / 24 WMMAs + an 8-WMMA tail per til
 
 04:31 UTC: GPU3 MES hang in the K3 session's Megatron job (TE arm), hive-wide mode2 reset stuck in
 amdgpu_dpm_mode2_reset, kfd workers in D state: the node needs a power cycle. GPU work stopped.
+
+**Turbo integration (P4 start, CPU only).** `primus_turbo/hipkittens/gfx1250_mla_mx` (kernels m0 / b0 + `mx.py`: build at
+first use into a per-user cache, one builder per node via flock, ~4 s for the three sources) and `hk_mx` for
+`PRIMUS_TURBO_MLA_FWD_IMPL` / `_BWD_IMPL`: any b / s / h strides (no fold, no copy), SBHD outputs, any backward after
+any forward (an hk_mx forward saves its MX operands; an hk_mx backward after a bf16 forward quantizes q / k itself;
+a bf16 backward after an hk_mx forward takes its out / lse), fallback hk_mx -> hk -> FlyDSL. Tests
+`tests/pytorch/ops/test_attention_hipkittens_gfx1250_mla_mx.py`: settings / shape rules / routing 15 pass on CPU,
+numerics pending. Found on the way: the root `.gitignore` has `*.hip`, the earlier commits had no kernel sources
+(fixed: negation rules, 4703aca9).
+
+**Static ISA analysis (`py/isa_stat.py`, CPU).** Per 128-kv tile and wave (main loop):
+
+| rung / flags | VGPR | WMMA | VALU | TRANS | LDS | s_wait_alu | loop spills |
+|---|---|---|---|---|---|---|---|
+| m0 | 1021 | 96 | 1552 | 260 | 90 | - | 0 |
+| m3 | 956 | 96 | 783 (390 packed) | 260 | 118 | - | 0 |
+| m3 x | 956 | 96 | 783 | 260 | 118 | 38 | 0 |
+| m4 x / xp | 894 / 918 | 100 | ~515 incl. the rescale branches (~275 without) | 259 | 114 | 6 | 0 |
+
+(x = `-mllvm -amdgpu-expert-scheduling-mode`, which every bf16 HK kernel uses: without it LDS patterns were 4.6x slow
+in the bf16 micro; xp = x + `-mllvm -greedy-regclass-priority-trumps-globalness`.) By the bf16 window rule (a WMMA
+window hides <= ~4 VALU; a packed f32 op costs ~1 extra cycle) m3 is VALU-issue-bound (~1200 cyc / tile vs ~870 of
+WMMA): hence m4.
+
+**Rung m4** (`kern/k_mla_fwd_mx4.hip`, recipe m4): Q8 quantized from q * scale * log2(e) (k_mxq mode 32: S' in log2
+units, no multiply); the nope WMMA's accumulator starts at Mt = -m (no exp-argument fma); the row sum is one more PV
+WMMA against an all-ones V^T tile (the sum of the quantized P, the values PV takes; no pk_add); O / row-sum rescale only
+in a wave-uniform lazy branch (TAU2 1.75 bits: P <= 431 < 448); rope as a WMMA over d 64..191 with E8M0 0 on d 64..127
+(scale layout R2 = [s0..s3, 0, 0, s4, s5], k_mxq mode 16): 24-VGPR [nope | rope] fragments read as two overlapping
+operands (LLVM allocates v[n:n+15] / v[n+8:n+23] without copies), no zero halves; Q double-buffered; LDS addresses
+precomputed. Emulation `emu_fwd4` (CPU): o / lse within 0.05 dB of m3 on randn / kbias / peaked data.
+
+**Rung b1** (`kern/k_mla_bwd_mx1.hip`, recipe m4): the S and dP WMMAs start at LSE2 / DELTA with the C modifier = neg
+(builtin modC 1 = -C, 2 = |C|; scale operands may be SGPRs): P = exp2(S' - lse2) and dP - delta with no VALU; mask only
+on the diagonal steps / tiles; dkdv 2 kv16 tiles per wave (3 spills), dq as b0 + the above; 749 / 911 VGPRs, no spills.
+
+**Register allocation rules found (gfx1250, HIP C++, ~900-1000 VGPR kernels):**
+- DS addresses and WMMA scale operands must live in v0..v255 (no VGPR-MSB remap); bank 0 fills and the greedy allocator
+  spills them: `-greedy-regclass-priority-trumps-globalness` (as bf16 HK bwd) and no long-lived per-lane LDS offsets
+  (recompute from a volatile `v_mbcnt` lane id where the addresses are formed).
+- A branch between two instantiations of a big body inside one loop costs ~100 VGPRs (929 -> 1024 + spills): peel the
+  special iterations into their own loop.
+- Causal masks as per-element index compares hoist ~64 index registers: compare a compile-time constant (16 j + r)
+  against one per-lane threshold.
+- In the dq kernel the e8m0-bits exponent spills 468 B where mx_exp / exp2i does not (allocator noise; kept per kernel).
+- Expert mode: a ds_load whose address a just-issued VALU wrote waits for every in-flight VALU (WMMAs included) once
+  more than one class is pending; also WAR on fragment registers (double-buffer Q; V / K loads drain once per tile).
+
+**GPU session plan (when the node is back):** test_fwd --tag {3, 3x, 4xp} toy..prod; bench_fwd --build --tags
+,x,xp,2xp,3,3x,3xp,4,4x,4xp; test_bwd --fwd-tag 4xp --tag 1xp (and b0 --tag xp); bench_bwd --build --tags
+,x,xp,1xp; then Turbo pytest (hk_mx numerics); update the package with the winners.
