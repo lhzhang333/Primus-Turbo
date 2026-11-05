@@ -107,6 +107,12 @@ MX_INLINE void tdm_load(i32x4 g0, i32x8 g1) {
     const i32x8 z8 = {0, 0, 0, 0, 0, 0, 0, 0};
     __builtin_amdgcn_tensor_load_to_lds(g0, g1, z4, z4, z8, 0);
 }
+// TDM store of a 2-D LDS tile to global memory (the same descriptor groups as tdm_load)
+MX_INLINE void tdm_store(i32x4 g0, i32x8 g1) {
+    const i32x4 z4 = {0, 0, 0, 0};
+    const i32x8 z8 = {0, 0, 0, 0, 0, 0, 0, 0};
+    __builtin_amdgcn_tensor_store_from_lds(g0, g1, z4, z4, z8, 0);
+}
 template <int N> MX_INLINE void tensor_wait() { __builtin_amdgcn_s_wait_tensorcnt((short)N); }
 // group 1: w0 (element size, LDS row padding), dim 0 unbounded, tdim1 rows in bounds, tile0 columns x tile1 rows, the
 // row stride in elements

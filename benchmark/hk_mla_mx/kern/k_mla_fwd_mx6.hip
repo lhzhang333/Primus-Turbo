@@ -37,7 +37,14 @@ constexpr int STG_B = K_B + KS_B + V_B + VS_B;
 constexpr int NSTG = 4;
 constexpr int Q_OFF = NSTG * STG_B;
 constexpr int QS_OFF = Q_OFF + BM * XK;
-constexpr int LDS_B = QS_OFF + BM * 8;
+constexpr int LDS_RING_Q = QS_OFF + BM * 8;
+#ifndef OSTAGE
+#define OSTAGE 1  // epilogue: O staged in LDS (256 B rows), one TDM store per block
+#endif
+constexpr int XO = 2 * D_V;                        // staging row stride (bytes): no pad (the TDM store
+                                                   // ignores LDS padding: rows after the first come out wrong)
+constexpr int O_OFF = LDS_RING_Q;                  // staging: BM rows x XO
+constexpr int LDS_B = OSTAGE ? O_OFF + BM * XO : LDS_RING_Q;
 static_assert(LDS_B <= 327680, "LDS");
 constexpr unsigned W0_KN = tdm_w0(0, 32, 20), W0_KR = tdm_w0(0, 16, 36), W0_V = tdm_w0(0, 32, 4), W0_S = tdm_w0(0, 0, 0);
 #ifndef TAU2_X100
@@ -621,8 +628,39 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
 #endif
     tile(n - 1, qaddr(), std::false_type{}, std::true_type{}, std::true_type{});
 
-    // epilogue: both lane halves of a row store its lse (the same value): no exec change, which would wait for every
-    // in-flight store to read its operands (s_wait_xcnt 0, ~4k cycles per block measured)
+#if OSTAGE
+    // epilogue: lse by plain stores (both lane halves, the same value: no exec change); O as bf16 rows into the LDS
+    // staging block, then one TDM store of the block's 256 x 256 B by wave 0 (the scattered SBHD global stores held
+    // their data VGPRs for hundreds of cycles each: s_wait_xcnt ~5.6k cycles per block)
+    tensor_wait<0>();  // no ring TDM in flight (the staging block is separate, but keep the wave's count clean)
+    static_for<QT>([&](auto ii) {
+        constexpr int i = ii;
+        const int qr_i = q0 + 64 * i + 16 * wv + lr;
+        const float l = st[i].os[0];
+        LSE[(bh * S) + qr_i] = (st[i].mref + __builtin_log2f(l)) * LN2;
+    });
+    static_for<QT>([&](auto ii) {
+        constexpr int i = ii;
+        const float l = st[i].os[0];
+        const float inv = l > 0.f ? 1.0f / l : 0.f;
+        const int ln = lane_now();
+        const unsigned rowb = lds0 + O_OFF + (unsigned)((64 * i + 16 * wv + (ln & 15)) * XO + 16 * (ln >> 4));
+        static_for<NDT>([&](auto dd) {
+            constexpr int dt = dd;
+            bf16x8 w;
+            static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(st[i].o[dt][(int)rr] * inv); });
+            *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(rowb + 32 * dt) = __builtin_bit_cast(u32x4, w);
+        });
+    });
+    bar_signal();
+    bar_wait();
+    if (wv == 0) {
+        const unsigned long long go = (unsigned long long)(uintptr_t)(O + (long long)b * o_sb + (long long)q0 * o_ss +
+                                                                     (long long)h * D_V);
+        tdm_store(tdm_g0(lds0 + O_OFF, go), tdm_g1(tdm_w0(0, 0, 0), BM, 2 * D_V, BM, 2ull * (unsigned long long)o_ss));
+    }
+#else
+    // epilogue: both lane halves of a row store its lse (the same value): no exec change
     static_for<QT>([&](auto ii) {
         constexpr int i = ii;
         const int qr_i = q0 + 64 * i + 16 * wv + lr;
@@ -637,5 +675,6 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
         });
         LSE[(bh * S) + qr_i] = (st[i].mref + __builtin_log2f(l)) * LN2;
     });
+#endif
     tensor_wait<0>();
 }

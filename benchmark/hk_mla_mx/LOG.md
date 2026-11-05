@@ -203,3 +203,9 @@ XCD_MAP 1 (k-th workgroup of XCD c takes q block nqb - 1 - k % nqb of bh = c + 8
   0.636, m4 0.704); TDM-only skeleton 0.175 ms.
 - ATT per block (m6c): only 57% of a wave's time is in the tile loop: per block ~18-22k cycles outside it (prologue:
   initial TDM wait ~1.3k; two diagonal tiles; epilogue) plus 1-3k cycles between blocks.
+- epilogue: O through LDS (OSTAGE 1): bf16 rows written to a staging block (256 x 256 B after the Q region; LDS
+  304 KB), barrier, one `tensor_store_from_lds` by wave 0. The scattered SBHD global stores (16 rows 64 KB apart per
+  instruction) held their data VGPRs for hundreds of cycles each (s_wait_xcnt ~5.6k cycles per block). Probe
+  (`scratch_mx/probe/tst.hip`): the TDM store does not honour LDS padding (rows after the first come out wrong), so
+  the staging rows are unpadded (the ds_stores of 16 rows at one column conflict; still far cheaper). **m6xp 0.441 /
+  0.447 ms**.
