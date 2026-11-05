@@ -28,10 +28,10 @@ using namespace mx;
 // software prefetch of the next fragment set (registers permitting): q16 tiles (dkdv), kv16 pairs (dq), dV / dK / dQ
 // A fragments
 #ifndef PF_Q
-#define PF_Q 0
+#define PF_Q 1
 #endif
 #ifndef PF_KV
-#define PF_KV 0
+#define PF_KV 1
 #endif
 #ifndef OSTAGE
 #define OSTAGE 1  // epilogues through LDS and TDM stores
@@ -40,7 +40,7 @@ using namespace mx;
 #define DQ_QB 1  // dq: mx_exp / exp2i dS quantization (the e8m0-bits form spills 468 B in this kernel)
 #endif
 #ifndef PF_A
-#define PF_A 1
+#define PF_A 2
 #endif
 
 namespace {
@@ -297,6 +297,7 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
 #if PF_Q
             QTile nxt;
             if constexpr (qt + 1 < NQT) nxt = load_qtile<qt + 1>(a);
+            fence();  // the next tile's loads ahead of this tile's math: distinct registers, no write-after-read wait
 #else
             const QTile cur = load_qtile<qt>(a);
 #endif
@@ -336,6 +337,43 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
 #endif
         });
         // dV^T += dO^T P (d16 tiles 0..7 of dO^T), dK^T += Q^T dS (12 of Q^T): 20 A fragments in one prefetched sequence
+#if PF_A == 2
+        // 4 buffers, loads two groups ahead and fenced before the group's WMMAs: the buffer a load overwrites was read
+        // two groups earlier (PF_A 1 let the scheduler sink the loads under the WMMAs into the registers they still read:
+        // ~36-cycle write-after-read waits, 20 per step)
+        auto ld = [&](auto dc) __attribute__((always_inline)) {
+            constexpr int d = decltype(dc)::value;
+            if constexpr (d < 8)
+                return load_afrag<d, 0>(a.dot, a.dots);
+            else
+                return load_afrag<d - 8, 1>(a.qt, a.qts);
+        };
+        AFrag ab[4];
+        ab[0] = ld(std::integral_constant<int, 0>{});
+        ab[1] = ld(std::integral_constant<int, 1>{});
+        static_for<20>([&](auto dd) {
+            constexpr int d = dd;
+            if constexpr (d + 2 < 20) ab[(d + 2) % 4] = ld(std::integral_constant<int, d + 2>{});
+            fence();
+            const AFrag &af = ab[d % 4];
+            static_for<NJ>([&](auto jj) {
+                constexpr int j = jj;
+                if constexpr (d < 8) {
+                    if constexpr (d % 2 == 0)
+                        dv[d][j] = wmma_mx<0, 0>(af.x, pB[j], dv[d][j], af.s, PSCALE);
+                    else
+                        dv[d][j] = wmma_mx<1, 0>(af.x, pB[j], dv[d][j], af.s, PSCALE);
+                } else {
+                    constexpr int e = d - 8;
+                    if constexpr (e % 2 == 0)
+                        dk[e][j] = wmma_mx<0, 0>(af.x, dsB[j], dk[e][j], af.s, dss[j]);
+                    else
+                        dk[e][j] = wmma_mx<1, 0>(af.x, dsB[j], dk[e][j], af.s, dss[j]);
+                }
+            });
+            fence();
+        });
+#else
 #if PF_A
         AFrag af = load_afrag<0, 0>(a.dot, a.dots);
 #endif
@@ -371,6 +409,7 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
             if constexpr (d + 1 < 20) af = an;
 #endif
         });
+#endif
     };
 
     // the steps that cross the diagonal (q0 < kv0 + 192: at most 3) run masked, in their own loop (no branch between
@@ -610,6 +649,99 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
         const int kv0 = t * NBK;
         i32x16 dsB[QTW];
         int dss[QTW] = {0, 0, 0, 0};
+#if PF_KV
+        // kv16 pairs (2m, 2m + 1) = MX block m of the dQ reduction. Pair m + 1's K / V fragments load (fenced) ahead of
+        // pair m's math (two buffers); the dQ phase's K^T fragments load two groups ahead into four buffers, the first
+        // two during pair 3 (loads issued just before use waited ~100+ cycles each)
+        struct KVPair {
+            i32x32 kx[2];
+            i32x16 va[2];
+            int ksc[2], vsc[2];
+        };
+        auto ldkv = [&](auto mc, KVPair &kv) __attribute__((always_inline)) {
+            constexpr int m = decltype(mc)::value;
+            static_for<2>([&](auto uu) {
+                constexpr int u = uu;
+                const int krow = 16 * (2 * m + u) + lr;
+                const lds_u8 *kp = lds_ptr(st + Q_O_K + (unsigned)(krow * XK));
+                kv.kx[u] = frag24(lds_b128(kp, 64 * lh), lds_b128(kp, 64 * lh + 16), lds_b128(kp, 64 * lh + 32),
+                                  lds_b128(kp, 64 * lh + 48), lds_b128(kp, 128 + 32 * lh), lds_b128(kp, 128 + 32 * lh + 16));
+                kv.ksc[u] = (int)lds_b32(lds_ptr(st + Q_O_KS), krow * 8 + 4 * lh);
+                kv.va[u] = lds_frag64(lds_ptr(st + Q_O_V + (unsigned)(krow * X128)), 64 * lh);
+                kv.vsc[u] = (int)lds_b32(lds_ptr(st + Q_O_VS), krow * 4);
+            });
+        };
+        struct AF {
+            i32x16 x;
+            int s;
+        };
+        auto lda = [&](auto dc) __attribute__((always_inline)) {
+            constexpr int dt = decltype(dc)::value;
+            return AF{lds_frag64(lds_ptr(st + Q_O_KT + (unsigned)((16 * dt + lr) * X128)), 64 * lh),
+                      (int)lds_b32(lds_ptr(st + Q_O_KTS), (32 * (dt / 2) + lane) * 4)};
+        };
+        AF ab[4];
+        KVPair kvb[2];
+        ldkv(std::integral_constant<int, 0>{}, kvb[0]);
+        static_for<NKV / 2>([&](auto mm) {
+            constexpr int m = mm;
+            if constexpr (m + 1 < NKV / 2) {
+                ldkv(std::integral_constant<int, m + 1>{}, kvb[(m + 1) % 2]);
+            } else {
+                ab[0] = lda(std::integral_constant<int, 0>{});
+                ab[1] = lda(std::integral_constant<int, 1>{});
+            }
+            fence();
+            const KVPair &kv = kvb[m % 2];
+            static_for<QTW>([&](auto ii) {
+                constexpr int i = ii;
+                const int thr = q0 + 64 * i + 16 * wv + lr - kv0 - 8 * lh;  // masked iff 16 j + r > thr
+                f32x8 ds[2];
+                static_for<2>([&](auto uu) {
+                    constexpr int u = uu;
+                    constexpr int j = 2 * m + u;
+                    f32x8 z = wmma_mxc<0, 0, 1>(lo16(kv.kx[u]), lo16(qx[i]), ltq[i], kv.ksc[u], qscb[i]);
+                    const f32x8 sv = wmma_mx<1, 1>(mid16(kv.kx[u]), mid16(qx[i]), z, kv.ksc[u], qscb[i]);
+                    const f32x8 dp = wmma_mxc<0, 0, 1>(kv.va[u], dob[i], dtq[i], kv.vsc[u], dscb[i]);
+                    static_for<8>([&](auto rr) {
+                        constexpr int r = rr;
+                        float pv = exp2_raw(sv[r]);
+                        if constexpr (DIAG) pv = (16 * j + r > thr) ? 0.f : pv;
+                        ds[u][r] = pv * dp[r];
+                    });
+                });
+                float am = 0.f;
+                static_for<8>([&](auto rr) {
+                    am = __builtin_fmaxf(am, __builtin_fabsf(ds[0][(int)rr]));
+                    am = __builtin_fmaxf(am, __builtin_fabsf(ds[1][(int)rr]));
+                });
+                const int e = mx_exp(__builtin_fmaxf(am, peer(am)));
+                const float sc = exp2i(e);
+                const u32x2 q0v = cvt8_e4m3(ds[0], sc), q1v = cvt8_e4m3(ds[1], sc);
+                dsB[i][4 * m] = (int)q0v[0];
+                dsB[i][4 * m + 1] = (int)q0v[1];
+                dsB[i][4 * m + 2] = (int)q1v[0];
+                dsB[i][4 * m + 3] = (int)q1v[1];
+                dss[i] |= (e + 127) << (8 * m);
+            });
+            fence();
+        });
+        // dQ^T += K^T dS^T: A = K8T rows d, K = this tile's kv
+        static_for<12>([&](auto dd) {
+            constexpr int dt = dd;
+            if constexpr (dt + 2 < 12) ab[(dt + 2) % 4] = lda(std::integral_constant<int, dt + 2>{});
+            fence();
+            const AF &af = ab[dt % 4];
+            static_for<QTW>([&](auto ii) {
+                constexpr int i = ii;
+                if constexpr (dt % 2 == 0)
+                    dq[dt][i] = wmma_mx<0, 0>(af.x, dsB[i], dq[dt][i], af.s, dss[i]);
+                else
+                    dq[dt][i] = wmma_mx<1, 0>(af.x, dsB[i], dq[dt][i], af.s, dss[i]);
+            });
+            fence();
+        });
+#else
         // kv16 pairs (2m, 2m + 1) = MX block m of the dQ reduction: K / V fragments of the pair, then every q tile
         static_for<NKV / 2>([&](auto mm) {
             constexpr int m = mm;
@@ -679,6 +811,7 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
                     dq[dt][i] = wmma_mx<1, 0>(a, dsB[i], dq[dt][i], as, dss[i]);
             });
         });
+#endif
     };
     for (int t = 0; t < n - 2; ++t) tile(t, std::false_type{});
     tile(n - 2, std::true_type{});

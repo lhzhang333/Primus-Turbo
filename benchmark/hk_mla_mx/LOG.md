@@ -222,3 +222,9 @@ b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 
 - LDS micro (`scratch_mx/micro/gen_lds.py`, ATT): with 4 waves loading, a ds_load costs ~6.2 cycles per wave whatever
   its width (b128 / b64): the instruction count, not the bytes, is the limit (~245 B/cycle/CU for b128). k_dkdv_mx
   issues 243 per 128-row step (~1500 of its 3700 cycles), the forward ~120 per tile (~750 of 2233).
+- b3 software pipelining (ATT: loads issued just before use, s_wait_dscnt 67-139 cycles per q16 tile; PF_A 1 let the
+  scheduler sink each A-fragment load under the WMMAs into the registers they still read, ~36-cycle write-after-read
+  waits, 20 per step): dkdv PF_A 2 (4 buffers, loads two groups ahead, fenced before the WMMAs) + PF_Q 1 (the next q16
+  tile's loads fenced ahead of this tile's math): dkdv 1.139 -> 0.979 ms; dq PF_KV 1 (pair m + 1's K / V fragments
+  fenced ahead of pair m, the dQ phase's K^T fragments 4 buffers / two ahead, the first two during pair 3): dq 0.741
+  -> 0.671. **b3 backward 1.707 ms** (bf16 HK 1.981). VGPRs 764 / 933, no spills.
