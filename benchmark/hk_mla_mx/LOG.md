@@ -257,3 +257,8 @@ b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 
 - **Training gate g200c** (package m7 + b3 as of 5c57ffdd, 1-GPU DSv3 proxy, 200 iterations): mx 735.0 vs hk 739.7
   ms / iteration (-0.6%, quantization included); final-window loss 0.0320 vs 0.0319. Earlier: m4 + b1 785.3 (g200),
   m6 + b3 without prefetch 745.6 (g200b).
+- m7 DMASK (static mask classes for the two diagonal tiles: per (q16, k16) sub-tile fully kept / fully masked / mixed
+  known at compile time, fully masked q tiles of the last diagonal tile skipped; DSKIP / DSOFT select either half):
+  correct (toy..prod, the extra-shape sweep `scratch_mx/py/shapes_fwd.py`: xcd / paired / plain orders all pass), but
+  either half perturbs the global register allocation (150-200 VGPR spills): 0.453 vs 0.423 ms. Kept off (DMASK 0 =
+  the committed m7 code, 976 VGPRs, 1 spill).
