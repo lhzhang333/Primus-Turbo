@@ -29,12 +29,14 @@ ap.add_argument("--no-center", action="store_true")
 ap.add_argument("--data", default="randn")
 ap.add_argument("--no-build", action="store_true")
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--tag", default="", help="k_mla_fwd_mx<tag>.hsaco (e.g. 1 = rung m1)")
 a = ap.parse_args()
 
 dev = torch.device("cuda")
 if not a.no_build:
     t0 = time.time()
     L.build()
+    L.build(["k_mla_fwd_mx1.hip"])
     print(f"built in {time.time() - t0:.1f} s", flush=True)
 
 
@@ -79,8 +81,8 @@ for name in a.shapes.split(","):
         qk_ref = torch.einsum("bshd,bhd->bhs", q.float(), qz["kbar"])
         res["qk_maxrel"] = ((qz["qk"] - qk_ref).abs().max() / qk_ref.abs().max().clamp(min=1e-30)).item()
     # --- forward
-    o1, lse1 = L.fwd_mx(qz)
-    o2, lse2 = L.fwd_mx(qz)
+    o1, lse1 = L.fwd_mx(qz, tag=a.tag)
+    o2, lse2 = L.fwd_mx(qz, tag=a.tag)
     torch.cuda.synchronize()
     res["det"] = torch.equal(o1, o2) and torch.equal(lse1, lse2)
     res["finite"] = bool(torch.isfinite(o1.float()).all().item() and torch.isfinite(lse1).all().item())
