@@ -215,3 +215,10 @@ XCD_MAP 1 (k-th workgroup of XCD c takes q block nqb - 1 - k % nqb of bh = c + 8
 (dkdv: 11 per step -> 3 per wave, tensor_wait<3>; dq: 7 per tile -> 2 per wave, the block prologue 7 -> 2 per wave;
 descriptor constants formed once, NULL descriptors past the end). No spills (749 / 910 VGPRs). Toy..mid pass with
 b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 3.020 -> 2.132 ms** (bf16 HK 1.98).
+- b3 epilogues through LDS (OSTAGE 1): dK / dV / dQ rows as bf16 into the idle ring, one TDM store each (dK wave 0,
+  dV wave 1, dQ wave 0; rows >= S clipped by the descriptor, no exec change). dkdv 1.281 -> 1.139 ms, dq 0.798 ->
+  0.736, **b3 backward 1.922 ms** (bf16 HK 1.97). b4 (= b2 + the same order / TDM split, no staging): dv 0.508 + dk
+  0.800 + dq 0.800 = 2.19 (b3 at that point 2.14): the dV / dK split does not pay yet.
+- LDS micro (`scratch_mx/micro/gen_lds.py`, ATT): with 4 waves loading, a ds_load costs ~6.2 cycles per wave whatever
+  its width (b128 / b64): the instruction count, not the bytes, is the limit (~245 B/cycle/CU for b128). k_dkdv_mx
+  issues 243 per 128-row step (~1500 of its 3700 cycles), the forward ~120 per tile (~750 of 2233).

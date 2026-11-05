@@ -98,7 +98,7 @@ def one(name, tag):
 
 
 for tag in a.tags.split(","):
-    if tag.startswith("2"):
+    if tag[:1] in ("2", "4"):
         arms["dv" + tag] = one("k_dv_mx", tag)
         arms["dk" + tag] = one("k_dk_mx", tag)
     else:

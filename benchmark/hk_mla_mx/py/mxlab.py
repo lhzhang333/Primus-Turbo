@@ -49,7 +49,7 @@ EXPERT_P = EXPERT + ["-mllvm", "-greedy-regclass-priority-trumps-globalness"]
 def recipe_of(tag, kind="fwd"):
     """The operand recipe a build tag expects: "m4" (Q8 pre-scaled to log2 units, scale layout R2) for forward rungs m4 /
     m5 (tags 4*, 5*, 6*) and backward rungs b1 / b2 (tags 1*, 2*), else "r1"."""
-    return "m4" if tag[:1] in (("4", "5", "6") if kind == "fwd" else ("1", "2", "3")) else "r1"
+    return "m4" if tag[:1] in (("4", "5", "6") if kind == "fwd" else ("1", "2", "3", "4")) else "r1"
 
 
 def split_tag(tag):
@@ -765,7 +765,7 @@ def bwd_mx(qz, bz, lse, scale=SCALE, tag=""):
     args = [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"], bz["dots"],
             bz["q8t"], bz["qts"], lse, bz["delta"], dk, dv, float(scale), s, h, b, dk.stride(0), dk.stride(1),
             dv.stride(0), dv.stride(1)]  # fmt: skip
-    if tag.startswith("2"):
+    if tag[:1] in ("2", "4"):  # b2 / b4: dV and dK as two kernels
         _launch("k_dv_mx", (-(-s // 256), h, b), args, tag)
         _launch("k_dk_mx", (-(-s // 256), h, b), args, tag)
     else:

@@ -33,6 +33,9 @@ using namespace mx;
 #ifndef PF_KV
 #define PF_KV 0
 #endif
+#ifndef OSTAGE
+#define OSTAGE 1  // epilogues through LDS and TDM stores
+#endif
 #ifndef DQ_QB
 #define DQ_QB 1  // dq: mx_exp / exp2i dS quantization (the e8m0-bits form spills 468 B in this kernel)
 #endif
@@ -396,6 +399,50 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
     };
     for (int s = 0; s < ndiag; ++s) run(s, std::true_type{});
     for (int s = ndiag; s < nst; ++s) run(s, std::false_type{});
+#if OSTAGE
+    // ---- epilogue: dK / dV rows (lane = kv column, rows d = 8 lh + r of each d16 tile) as bf16 into LDS (the ring,
+    // idle now), then one TDM store each (wave 0: dK, 384 B rows; wave 1: dV, 256 B rows), rows >= S clipped by the
+    // descriptor's rows in bounds (no exec change; the scattered SBHD stores held their VGPRs for hundreds of cycles)
+    tensor_wait<0>();
+    bar_signal();
+    bar_wait();  // every wave is done with the ring
+    constexpr int XDK = 2 * D_QK, XDV = 2 * D_V, O_SDK = 0, O_SDV = KB * XDK;
+    static_assert(O_SDV + KB * XDV <= LDS_B, "staging");
+    {
+        const int ln = lane_now();
+        static_for<NJ>([&](auto jj) {
+            constexpr int j = jj;
+            const unsigned r = (unsigned)(KBW * wv + 16 * j + (ln & 15)), hh = (unsigned)(ln >> 4);
+            const unsigned dkr = lds0 + O_SDK + r * XDK + 16 * hh, dvr = lds0 + O_SDV + r * XDV + 16 * hh;
+            static_for<12>([&](auto dd) {
+                constexpr int d = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dk[d][j][(int)rr] * scale); });
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(dkr + 32 * d) = __builtin_bit_cast(u32x4, w);
+            });
+            static_for<8>([&](auto dd) {
+                constexpr int d = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)dv[d][j][(int)rr]; });
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(dvr + 32 * d) = __builtin_bit_cast(u32x4, w);
+            });
+        });
+    }
+    bar_signal();
+    bar_wait();
+    {
+        const unsigned rows = (unsigned)min(KB, S - kv0);
+        if (wv == 0) {
+            const unsigned long long g = (unsigned long long)(uintptr_t)(DK + (long long)b * dk_sb + (long long)kv0 * dk_ss +
+                                                                         (long long)h * D_QK);
+            tdm_store(tdm_g0(lds0 + O_SDK, g), tdm_g1(tdm_w0(0, 0, 0), rows, XDK, KB, 2ull * (unsigned long long)dk_ss));
+        } else if (wv == 1) {
+            const unsigned long long g = (unsigned long long)(uintptr_t)(DV + (long long)b * dv_sb + (long long)kv0 * dv_ss +
+                                                                         (long long)h * D_V);
+            tdm_store(tdm_g0(lds0 + O_SDV, g), tdm_g1(tdm_w0(0, 0, 0), rows, XDV, KB, 2ull * (unsigned long long)dv_ss));
+        }
+    }
+#else
     // ---- epilogue: lane = kv column, rows d = 8 lh + r of each d16 tile
     static_for<NJ>([&](auto jj) {
         constexpr int j = jj;
@@ -417,6 +464,7 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
             });
         }
     });
+#endif
     tensor_wait<0>();
 }
 
@@ -635,6 +683,34 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     for (int t = 0; t < n - 2; ++t) tile(t, std::false_type{});
     tile(n - 2, std::true_type{});
     tile(n - 1, std::true_type{});
+#if OSTAGE
+    // epilogue: dQ rows as bf16 into LDS (the ring, idle now), one TDM store of 256 x 384 B by wave 0
+    tensor_wait<0>();
+    bar_signal();
+    bar_wait();
+    constexpr int XDQ = 2 * D_QK;
+    static_assert(BMQ * XDQ <= Q_OFF_Q, "staging inside the ring");
+    {
+        const int ln = lane_now();
+        static_for<QTW>([&](auto ii) {
+            constexpr int i = ii;
+            const unsigned rowb = lds0 + (unsigned)((64 * i + 16 * wv + (ln & 15)) * XDQ + 16 * (ln >> 4));
+            static_for<12>([&](auto dd) {
+                constexpr int dt = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dq[dt][i][(int)rr] * scale); });
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(rowb + 32 * dt) = __builtin_bit_cast(u32x4, w);
+            });
+        });
+    }
+    bar_signal();
+    bar_wait();
+    if (wv == 0) {
+        const unsigned long long g = (unsigned long long)(uintptr_t)(DQ + (long long)b * dq_sb + (long long)q0 * dq_ss +
+                                                                     (long long)h * D_QK);
+        tdm_store(tdm_g0(lds0, g), tdm_g1(tdm_w0(0, 0, 0), BMQ, XDQ, BMQ, 2ull * (unsigned long long)dq_ss));
+    }
+#else
     static_for<QTW>([&](auto ii) {
         constexpr int i = ii;
         const int q = q0 + 64 * i + 16 * wv + lr;
@@ -646,5 +722,6 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
             *(u32x4 *)(dqr + 16 * dt + 8 * lh) = __builtin_bit_cast(u32x4, w);
         });
     });
+#endif
     tensor_wait<0>();
 }
