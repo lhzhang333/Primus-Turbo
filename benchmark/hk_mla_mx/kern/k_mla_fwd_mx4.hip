@@ -96,6 +96,11 @@ MX_INLINE uint32_t pin(uint32_t x) {  // keep x in a VGPR as computed here (no r
     asm volatile("" : "+v"(x));
     return x;
 }
+MX_INLINE int lane_now() {  // the lane id, read at each call (not hoisted: no long-lived per-lane offsets in v0..v255)
+    int l;
+    asm volatile("v_mbcnt_lo_u32_b32 %0, -1, 0" : "=v"(l));
+    return l;
+}
 MX_INLINE KAddr kaddr(uint32_t stage_base, int lr, int lh) {
     return {pin(stage_base + (unsigned)(lr * XK + 64 * lh)), pin(stage_base + (unsigned)(lr * XK + 128 + 32 * lh)),
             pin(stage_base + (unsigned)(K_B + lr * 8 + 4 * lh))};
@@ -161,15 +166,15 @@ MX_INLINE void pv_w(f32x8 (&o)[NDT], f32x8 &os, const VFrag &v, i32x16 pb, const
 // rescale decision and (branch) the rescale; 5..12 P of kv16 tile C - 5 (8 exp2, one pk8 conversion)
 template <int C, bool DIAG>
 MX_INLINE void sm_chunk(SmState &st, f32x8 (&s)[NKV], float &m, f32x8 &mt, f32x8 (&o)[NDT], f32x8 &os, i32x16 &pb,
-                        int kvrow0, int qrow, bool first) {
+                        int thr, bool first) {
     if constexpr (C < 4) {
         float a = -__builtin_inff();
         static_for<2>([&](auto uu) {
             constexpr int j = 2 * C + uu;
             if constexpr (DIAG) {
-                static_for<8>([&](auto rr) {
+                static_for<8>([&](auto rr) {  // kv > q iff 16 j + r > thr = q - kv row 0 of the lane half
                     constexpr int r = rr;
-                    s[j][r] = (kvrow0 + 16 * j + r > qrow) ? -__builtin_inff() : s[j][r];
+                    s[j][r] = (16 * j + r > thr) ? -__builtin_inff() : s[j][r];
                 });
             }
             static_for<8>([&](auto rr) { a = __builtin_fmaxf(a, s[j][(int)rr]); });
@@ -274,9 +279,13 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
     bar_signal();
     bar_wait();  // B_0
 
-    const unsigned qrow0 = (unsigned)(16 * wv + lr);
-    const QAddr qa = {pin(lds0 + Q_OFF + qrow0 * XK + 64 * lh), pin(lds0 + Q_OFF + qrow0 * XK + 128 + 32 * lh),
-                      pin(lds0 + QS_OFF + qrow0 * 8 + 4 * lh)};
+    // Q addresses, formed where used (a QAddr living across the loop gets spilled in the diagonal tiles)
+    auto qaddr = [&]() __attribute__((always_inline)) {
+        const int ln = lane_now();
+        const unsigned row = (unsigned)(16 * wv + (ln & 15)), hh = (unsigned)(ln >> 4);
+        return QAddr{pin(lds0 + Q_OFF + row * XK + 64 * hh), pin(lds0 + Q_OFF + row * XK + 128 + 32 * hh),
+                     pin(lds0 + QS_OFF + row * 8 + 4 * hh)};
+    };
     f32x8 o[QT][NDT], os[QT], mt[QT];
     float m[QT];
     static_for<QT>([&](auto ii) {
@@ -298,14 +307,17 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
     f32x8 sa[NKV], sb[NKV];
     i32x16 pa, pbb;
     QFrag qf[2];
-    load_q<0>(qf[0], qa);
-    load_q<1>(qf[1], qa);
+    {
+        const QAddr qa = qaddr();
+        load_q<0>(qf[0], qa);
+        load_q<1>(qf[1], qa);
+    }
     static_for<16>([&](auto ww) { qk_w<(int)ww>(sa, kf, qf[0], mt[0]); });
     fence();
 
     // tile t: on entry sa = S''(q0) of tile t, qf[1] = Q(q1), kf = K(t). Slot 3 computes QK(q0) of tile t + 1 (not
     // LAST).
-    auto tile = [&](int t, auto diag_c, auto last_c) __attribute__((always_inline)) {
+    auto tile = [&](int t, const QAddr &qa, auto diag_c, auto last_c) __attribute__((always_inline)) {
         constexpr bool DIAG = decltype(diag_c)::value, LAST = decltype(last_c)::value;
         const bool first = t == 0;
         const VAddr va = vaddr(stage(t), lr, lh, lane);
@@ -358,7 +370,7 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
                 static_for<NCHUNK>([&](auto cc) {
                     constexpr int c = cc;
                     if constexpr (c * NSTEP / NCHUNK == k) {
-                        sm_chunk<c, DIAG>(sm, scur, m[i], mt[i], o[i], os[i], pcur, kvrow0, qr_i, first);
+                        sm_chunk<c, DIAG>(sm, scur, m[i], mt[i], o[i], os[i], pcur, qr_i - kvrow0, first);
                         fence();
                     }
                 });
@@ -369,9 +381,12 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
         static_for<NDT + 1>([&](auto ww) { pv_w<(int)ww>(o[QT - 1], os[QT - 1], vf, pbb, ones); });
         fence();
     };
-    for (int t = 0; t < n - 2; ++t) tile(t, std::false_type{}, std::false_type{});
-    tile(n - 2, std::true_type{}, std::false_type{});
-    tile(n - 1, std::true_type{}, std::true_type{});
+    {
+        const QAddr qa = qaddr();  // lives across the loop (no address VALU between its WMMAs)
+        for (int t = 0; t < n - 2; ++t) tile(t, qa, std::false_type{}, std::false_type{});
+    }
+    tile(n - 2, qaddr(), std::true_type{}, std::false_type{});  // fresh per diagonal tile: no spill there
+    tile(n - 1, qaddr(), std::true_type{}, std::true_type{});
 
     static_for<QT>([&](auto ii) {
         constexpr int i = ii;
