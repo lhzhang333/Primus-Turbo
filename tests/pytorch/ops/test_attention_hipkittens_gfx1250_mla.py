@@ -97,8 +97,21 @@ def test_impl_settings(monkeypatch, pass_, setting, expected):
 
 
 _ACCEPTED = {
-    "fwd": [(2, 4096, 4096, 128), (1, 4096, 4096, 256), (1, 256, 256, 2), (1, 640, 640, 4), (1, 64, 64, 2)],
-    "bwd": [(2, 4096, 4096, 128), (1, 4096, 4096, 256), (1, 256, 256, 2), (1, 256, 384, 2)],
+    "fwd": [
+        (2, 4096, 4096, 128),
+        (1, 4096, 4096, 256),
+        (2, 4096, 4096, 96),  # Kimi K3 MBS 2
+        (1, 256, 256, 2),
+        (1, 640, 640, 4),
+        (1, 64, 64, 2),
+    ],
+    "bwd": [
+        (2, 4096, 4096, 128),
+        (1, 4096, 4096, 256),
+        (2, 4096, 4096, 96),
+        (1, 256, 256, 2),
+        (1, 256, 384, 2),
+    ],
 }
 _REFUSED = {
     "fwd": [
@@ -220,6 +233,7 @@ def test_limits():
     ("dims", "cus", "npw"),
     [
         ((1, 4096, 256), 256, 256),  # DeepSeek-V3 MBS 2, SBHD folded
+        ((1, 4096, 192), 256, 256),  # Kimi K3 MBS 2 (96 heads), SBHD folded
         ((2, 4096, 128), 256, 256),  # the same, BSHD
         ((1, 1024, 128), 256, 256),
         ((1, 4096, 128), 128, 128),  # a part with 128 CUs
@@ -452,15 +466,13 @@ def test_zero_ticket_touches_only_the_counter():
     assert torch.equal(after[:lo], before[:lo]) and torch.equal(after[hi:], before[hi:])
 
 
-def test_max_scratch_bytes_setting(monkeypatch):
+def test_max_scratch_bytes_setting():
     bwd = _hk("bwd")
-    for text, want in (("", None), ("2.2e9", 2_200_000_000), ("4096", 4096)):
-        monkeypatch.setenv(bwd.MAX_SCRATCH_BYTES_ENV, text)
-        assert bwd._bytes_setting(bwd.MAX_SCRATCH_BYTES_ENV) == want
+    for text, want in (("", None), (None, None), ("2.2e9", 2_200_000_000), ("4096", 4096)):
+        assert bwd._bytes_setting(bwd.MAX_SCRATCH_BYTES_ENV, text) == want
     for text in ("0", "-1", "lots", "inf", "nan"):
-        monkeypatch.setenv(bwd.MAX_SCRATCH_BYTES_ENV, text)
         with pytest.raises(ValueError, match="positive byte count"):
-            bwd._bytes_setting(bwd.MAX_SCRATCH_BYTES_ENV)
+            bwd._bytes_setting(bwd.MAX_SCRATCH_BYTES_ENV, text)
 
 
 # ---------------------------------------------------------------------------
@@ -683,8 +695,8 @@ def _kernel_inputs(b, s, h, seed=0):
 @needs_hk_fwd
 @pytest.mark.parametrize(
     "dims",
-    [(1, 64, 2), (1, 256, 2), (2, 256, 2), (1, 640, 4), (1, 1024, 128), (1, 4096, 256)],
-    ids=["s64", "toy", "b2", "s640_partial_block", "persistent", "dsv3_mbs2_folded"],
+    [(1, 64, 2), (1, 256, 2), (2, 256, 2), (1, 640, 4), (1, 1024, 128), (1, 4096, 256), (2, 4096, 96)],
+    ids=["s64", "toy", "b2", "s640_partial_block", "persistent", "dsv3_mbs2_folded", "kimi_k3_mbs2"],
 )
 def test_hk_fwd_bitwise_equals_flydsl(dims):
     """out and lse bitwise equal to the FlyDSL forward's, every element written (outputs NaN-filled first), and a
@@ -739,8 +751,9 @@ def _run_hk_bwd(monkeypatch, q, k, v, dout):
         ((2, 256, 256, 2), "sbhd"),
         ((1, 256, 384, 2), "sbhd"),
         ((1, 640, 640, 4), "bshd"),
+        ((2, 1024, 1024, 96), "sbhd"),
     ],
-    ids=["toy", "toy_folded", "rect", "s640"],
+    ids=["toy", "toy_folded", "rect", "s640", "kimi_k3_heads"],
 )
 def test_hk_bwd_matches_reference_and_flydsl(monkeypatch, dims, layout):
     """The HIP backward matches the fp32 reference, is bitwise deterministic, and every gradient's SNR is within
