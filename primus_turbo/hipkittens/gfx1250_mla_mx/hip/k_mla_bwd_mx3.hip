@@ -4,6 +4,10 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
+// k_mla_bwd_mx3.hip -- rung b3 = b1 + XCD-local workgroup order (the blocks of one (b, h) on one XCD: dispatch sends
+// linear id L to XCD L % 8, so its L2 serves their shared operand stream) + the TDM ops of a step / tile spread over
+// the four waves (LLVM waits for tensorcnt <= 10 before every TDM op; b1 put all 11 / 7 on wave 0, waves 1..3 NULL).
+// b1's notes follow.
 // k_mla_bwd_mx1.hip -- rung b1 of the MXFP8 MLA backward (k_mla_bwd_mx.hip = b0: the operand layouts, the math and the
 // quantization of P / dS are documented there). Changes:
 //  - operand recipe m4 (the forward rung m4's): Q8 rows quantized from q * scale * log2(e), so S' = Q8 . K8 is in log2
@@ -28,6 +32,9 @@ using namespace mx;
 #endif
 #ifndef PF_KV
 #define PF_KV 0
+#endif
+#ifndef OSTAGE
+#define OSTAGE 1  // epilogues through LDS and TDM stores
 #endif
 #ifndef DQ_QB
 #define DQ_QB 1  // dq: mx_exp / exp2i dS quantization (the e8m0-bits form spills 468 B in this kernel)
@@ -98,6 +105,27 @@ MX_INLINE DsQ quant_pair(const f32x8 &x0, const f32x8 &x1) {
     const float sc = e8m0_scale(byte);
     return {byte, cvt8_e4m3(x0, sc), cvt8_e4m3(x1, sc)};
 }
+// XCD-local order: the k-th workgroup of XCD c (k = L >> 3, L the linear id) takes block slot k % nblk of
+// bh = c + 8 (k / nblk); B H % 8 != 0: the plain order
+struct BlockOf {
+    int slot, h, b;
+};
+MX_INLINE BlockOf xcd_block(int nblk, int H, int B) {
+    if ((B * H) % 8 == 0) {
+        const int L = (int)blockIdx.x + nblk * ((int)blockIdx.y + H * (int)blockIdx.z);
+        const int k = L >> 3;
+        const int bhx = (L & 7) + 8 * (k / nblk);
+        return {k % nblk, bhx % H, bhx / H};
+    }
+    return {(int)blockIdx.x, (int)blockIdx.y, (int)blockIdx.z};
+}
+// one TDM op of a ring: LDS offset in the stage, global base and bytes per row (step) / tile, group 1
+struct TdmOp {
+    unsigned lds;
+    unsigned long long base, mult;
+    i32x8 g1;
+    int on;
+};
 }  // namespace
 
 // =====================================================================================================================
@@ -185,7 +213,8 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
     const int wv = wave_id(tid);
     const int lane = tid & 31, lr = lane & 15, lh = lane >> 4;
     const int cnt0 = wv == 0 ? 1 : 0;
-    const int kb = (int)blockIdx.x, h = (int)blockIdx.y, b = (int)blockIdx.z;
+    const BlockOf blk = xcd_block((S + KB - 1) / KB, H, B);
+    const int kb = blk.slot, h = blk.h, b = blk.b;
     const int kv0 = kb * KB;
     const int qs0 = (kv0 / QS_) * QS_;  // the first step: the 128-row q block holding kv0
     const int nst = (S - qs0) / QS_;
@@ -210,33 +239,36 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
         vsc[j] = *(const int *)(VSR + row * 4);
     });
 
+    // the step's 11 TDM ops, 3 per wave: [Q^T, QS, LSE], [Q nope, dO scales, delta], [dO, Q rope, -], [dO^T, dO^T
+    // scales, Q^T scales] (global address = base + q0 * mult)
+    auto dk_op = [&](int k) -> TdmOp {
+        const unsigned long long bS = bh * (unsigned long long)S, bS128 = bh * (unsigned long long)(S / 128);
+        switch (k) {
+        case 0: return {O_Q, (unsigned long long)(uintptr_t)Q8 + bS * D_QK, D_QK, tdm_g1(W0_KN, QS_, 128, QS_, D_QK), 1};
+        case 1: return {O_Q + 128, (unsigned long long)(uintptr_t)Q8 + bS * D_QK + 128, D_QK, tdm_g1(W0_KR, QS_, 64, QS_, D_QK), 1};
+        case 2: return {O_QS, (unsigned long long)(uintptr_t)QS + bS * 8, 8, tdm_g1(W0_S, QS_, 8, QS_, 8), 1};
+        case 3: return {O_DO, (unsigned long long)(uintptr_t)DO8 + bS * D_V, D_V, tdm_g1(W0_128, QS_, 128, QS_, D_V), 1};
+        case 4: return {O_DOS, (unsigned long long)(uintptr_t)DOS + bS * 4, 4, tdm_g1(W0_S, QS_, 4, QS_, 4), 1};
+        case 5: return {O_DOT, (unsigned long long)(uintptr_t)DO8T + bh * D_V * S, 1, tdm_g1(W0_128, D_V, 128, D_V, (unsigned long long)S), 1};
+        case 6: return {O_DOTS, (unsigned long long)(uintptr_t)DOTS + bS128 * D_V * 4, 4, tdm_g1(W0_S, D_V, 4, D_V, 4), 1};
+        case 7: return {O_QT, (unsigned long long)(uintptr_t)Q8T + bh * D_QK * S, 1, tdm_g1(W0_128, D_QK, 128, D_QK, (unsigned long long)S), 1};
+        case 8: return {O_QTS, (unsigned long long)(uintptr_t)QTS + bS128 * D_QK * 4, 6, tdm_g1(W0_S, D_QK, 4, D_QK, 4), 1};
+        case 9: return {O_LSE, (unsigned long long)(uintptr_t)(LSE2 + bS), 4, tdm_g1(W0_S, 1, 512, 1, 512), 1};
+        case 10: return {O_DEL, (unsigned long long)(uintptr_t)(DELTA + bS), 4, tdm_g1(W0_S, 1, 512, 1, 512), 1};
+        default: return {0, 0, 0, tdm_g1(W0_S, 1, 4, 1, 4), 0};
+        }
+    };
+    constexpr int TDM_PER_STEP = 3;
+    const TdmOp op0 = dk_op(wv == 0 ? 7 : wv == 1 ? 0 : wv == 2 ? 3 : 5);
+    const TdmOp op1 = dk_op(wv == 0 ? 2 : wv == 1 ? 4 : wv == 2 ? 1 : 6);
+    const TdmOp op2 = dk_op(wv == 0 ? 9 : wv == 1 ? 10 : wv == 2 ? 11 : 8);
     auto issue_step = [&](int s) {
         const bool real = s < nst;
-        const int ss = real ? s : nst - 1;
-        const unsigned rq = real ? QS_ : 1, rd = real ? D_V : 1, rdq = real ? D_QK : 1;
-        const unsigned long long q0 = (unsigned long long)(qs0 + ss * QS_);
+        const unsigned long long q0 = (unsigned long long)(qs0 + (real ? s : nst - 1) * QS_);
         const unsigned st = lds0 + (unsigned)((s % NSTG) * STG_B);
-        const unsigned long long qrow = bh * S + q0;
-        const unsigned long long qt = q0 / 128;
-        tdm_load(tdm_g0(st + O_Q, (unsigned long long)(uintptr_t)Q8 + qrow * D_QK, cnt0),
-                 tdm_g1(W0_KN, rq, 128, QS_, D_QK));
-        tdm_load(tdm_g0(st + O_Q + 128, (unsigned long long)(uintptr_t)Q8 + qrow * D_QK + 128, cnt0),
-                 tdm_g1(W0_KR, rq, 64, QS_, D_QK));
-        tdm_load(tdm_g0(st + O_QS, (unsigned long long)(uintptr_t)QS + qrow * 8, cnt0), tdm_g1(W0_S, rq, 8, QS_, 8));
-        tdm_load(tdm_g0(st + O_DO, (unsigned long long)(uintptr_t)DO8 + qrow * D_V, cnt0),
-                 tdm_g1(W0_128, rq, 128, QS_, D_V));
-        tdm_load(tdm_g0(st + O_DOS, (unsigned long long)(uintptr_t)DOS + qrow * 4, cnt0), tdm_g1(W0_S, rq, 4, QS_, 4));
-        tdm_load(tdm_g0(st + O_DOT, (unsigned long long)(uintptr_t)DO8T + bh * D_V * S + q0, cnt0),
-                 tdm_g1(W0_128, rd, 128, D_V, (unsigned long long)S));
-        tdm_load(tdm_g0(st + O_DOTS, (unsigned long long)(uintptr_t)DOTS + ((bh * (S / 128) + qt) * D_V) * 4, cnt0),
-                 tdm_g1(W0_S, rd, 4, D_V, 4));
-        tdm_load(tdm_g0(st + O_QT, (unsigned long long)(uintptr_t)Q8T + bh * D_QK * S + q0, cnt0),
-                 tdm_g1(W0_128, rdq, 128, D_QK, (unsigned long long)S));
-        tdm_load(tdm_g0(st + O_QTS, (unsigned long long)(uintptr_t)QTS + ((bh * (S / 128) + qt) * D_QK) * 4, cnt0),
-                 tdm_g1(W0_S, rdq, 4, D_QK, 4));
-        tdm_load(tdm_g0(st + O_LSE, (unsigned long long)(uintptr_t)(LSE2 + qrow), cnt0), tdm_g1(W0_S, 1, 512, 1, 512));
-        tdm_load(tdm_g0(st + O_DEL, (unsigned long long)(uintptr_t)(DELTA + qrow), cnt0),
-                 tdm_g1(W0_S, 1, 512, 1, 512));
+        tdm_load(tdm_g0(st + op0.lds, op0.base + q0 * op0.mult, real ? op0.on : 0), op0.g1);
+        tdm_load(tdm_g0(st + op1.lds, op1.base + q0 * op1.mult, real ? op1.on : 0), op1.g1);
+        tdm_load(tdm_g0(st + op2.lds, op2.base + q0 * op2.mult, real ? op2.on : 0), op2.g1);
     };
     issue_step(0);
     issue_step(1);
@@ -345,7 +377,7 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
     // two instantiations inside one loop: it costs the register allocator ~100 VGPRs)
     const int ndiag = min((kv0 + KB - qs0 + QS_ - 1) / QS_, nst);
     auto run = [&](int s, auto diag_c) __attribute__((always_inline)) {
-        tensor_wait<11>();  // this wave's step s landed (step s + 1 in flight)
+        tensor_wait<TDM_PER_STEP>();  // this wave's step s landed (step s + 1 in flight)
         bar_signal();
         bar_wait();         // step s visible; every wave is done with step s - 1
         issue_step(s + 2);  // into the stage of step s - 1
@@ -367,6 +399,50 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
     };
     for (int s = 0; s < ndiag; ++s) run(s, std::true_type{});
     for (int s = ndiag; s < nst; ++s) run(s, std::false_type{});
+#if OSTAGE
+    // ---- epilogue: dK / dV rows (lane = kv column, rows d = 8 lh + r of each d16 tile) as bf16 into LDS (the ring,
+    // idle now), then one TDM store each (wave 0: dK, 384 B rows; wave 1: dV, 256 B rows), rows >= S clipped by the
+    // descriptor's rows in bounds (no exec change; the scattered SBHD stores held their VGPRs for hundreds of cycles)
+    tensor_wait<0>();
+    bar_signal();
+    bar_wait();  // every wave is done with the ring
+    constexpr int XDK = 2 * D_QK, XDV = 2 * D_V, O_SDK = 0, O_SDV = KB * XDK;
+    static_assert(O_SDV + KB * XDV <= LDS_B, "staging");
+    {
+        const int ln = lane_now();
+        static_for<NJ>([&](auto jj) {
+            constexpr int j = jj;
+            const unsigned r = (unsigned)(KBW * wv + 16 * j + (ln & 15)), hh = (unsigned)(ln >> 4);
+            const unsigned dkr = lds0 + O_SDK + r * XDK + 16 * hh, dvr = lds0 + O_SDV + r * XDV + 16 * hh;
+            static_for<12>([&](auto dd) {
+                constexpr int d = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dk[d][j][(int)rr] * scale); });
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(dkr + 32 * d) = __builtin_bit_cast(u32x4, w);
+            });
+            static_for<8>([&](auto dd) {
+                constexpr int d = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)dv[d][j][(int)rr]; });
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(dvr + 32 * d) = __builtin_bit_cast(u32x4, w);
+            });
+        });
+    }
+    bar_signal();
+    bar_wait();
+    {
+        const unsigned rows = (unsigned)min(KB, S - kv0);
+        if (wv == 0) {
+            const unsigned long long g = (unsigned long long)(uintptr_t)(DK + (long long)b * dk_sb + (long long)kv0 * dk_ss +
+                                                                         (long long)h * D_QK);
+            tdm_store(tdm_g0(lds0 + O_SDK, g), tdm_g1(tdm_w0(0, 0, 0), rows, XDK, KB, 2ull * (unsigned long long)dk_ss));
+        } else if (wv == 1) {
+            const unsigned long long g = (unsigned long long)(uintptr_t)(DV + (long long)b * dv_sb + (long long)kv0 * dv_ss +
+                                                                         (long long)h * D_V);
+            tdm_store(tdm_g0(lds0 + O_SDV, g), tdm_g1(tdm_w0(0, 0, 0), rows, XDV, KB, 2ull * (unsigned long long)dv_ss));
+        }
+    }
+#else
     // ---- epilogue: lane = kv column, rows d = 8 lh + r of each d16 tile
     static_for<NJ>([&](auto jj) {
         constexpr int j = jj;
@@ -388,6 +464,7 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
             });
         }
     });
+#endif
     tensor_wait<0>();
 }
 
@@ -442,48 +519,58 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     const int lane = tid & 31, lr = lane & 15, lh = lane >> 4;
     const int cnt0 = wv == 0 ? 1 : 0;
     const int nqb = S / BMQ;
-    const int qb = nqb - 1 - (int)blockIdx.x;
-    const int h = (int)blockIdx.y, b = (int)blockIdx.z;
+    const BlockOf blk = xcd_block(nqb, H, B);
+    const int qb = nqb - 1 - blk.slot;
+    const int h = blk.h, b = blk.b;
     const int q0 = qb * BMQ;
     const int n = (q0 + BMQ) / NBK;
     const unsigned long long bh = (unsigned long long)b * H + h;
     const float c2 = scale * LOG2E;
 
+    // the tile's 7 TDM ops, 2 per wave: [K^T, KS], [K nope, VS], [V, K^T scales], [K rope, -] (base + tile * mult)
+    auto dq_op = [&](int k) -> TdmOp {
+        const unsigned long long bS = bh * (unsigned long long)S, bS128 = bh * (unsigned long long)(S / 128);
+        switch (k) {
+        case 0: return {Q_O_K, (unsigned long long)(uintptr_t)K8 + bS * D_QK, (unsigned long long)NBK * D_QK, tdm_g1(W0_KN, NBK, 128, NBK, D_QK), 1};
+        case 1: return {Q_O_K + 128, (unsigned long long)(uintptr_t)K8 + bS * D_QK + 128, (unsigned long long)NBK * D_QK, tdm_g1(W0_KR, NBK, 64, NBK, D_QK), 1};
+        case 2: return {Q_O_KS, (unsigned long long)(uintptr_t)KS + bS * 8, (unsigned long long)NBK * 8, tdm_g1(W0_S, NBK, 8, NBK, 8), 1};
+        case 3: return {Q_O_V, (unsigned long long)(uintptr_t)V8 + bS * D_V, (unsigned long long)NBK * D_V, tdm_g1(W0_128, NBK, 128, NBK, D_V), 1};
+        case 4: return {Q_O_VS, (unsigned long long)(uintptr_t)VSR + bS * 4, (unsigned long long)NBK * 4, tdm_g1(W0_S, NBK, 4, NBK, 4), 1};
+        case 5: return {Q_O_KT, (unsigned long long)(uintptr_t)K8T + bh * D_QK * S, NBK, tdm_g1(W0_128, D_QK, 128, D_QK, (unsigned long long)S), 1};
+        case 6: return {Q_O_KTS, (unsigned long long)(uintptr_t)KTS + bS128 * D_QK * 4, (unsigned long long)D_QK * 4, tdm_g1(W0_S, D_QK, 4, D_QK, 4), 1};
+        default: return {0, 0, 0, tdm_g1(W0_S, 1, 4, 1, 4), 0};
+        }
+    };
+    constexpr int TDM_PER_TILE = 2;
+    const TdmOp top0 = dq_op(wv == 0 ? 5 : wv == 1 ? 0 : wv == 2 ? 3 : 1);
+    const TdmOp top1 = dq_op(wv == 0 ? 2 : wv == 1 ? 4 : wv == 2 ? 6 : 7);
     auto issue_tile = [&](int t) {
         const bool real = t < n;
-        const int tt = real ? t : n - 1;
-        const unsigned rk = real ? NBK : 1, rdq = real ? D_QK : 1;
+        const unsigned long long tt = (unsigned long long)(real ? t : n - 1);
         const unsigned st = lds0 + (unsigned)((t % Q_NSTG) * Q_STG);
-        const unsigned long long krow = bh * S + (unsigned long long)tt * NBK;
-        tdm_load(tdm_g0(st + Q_O_K, (unsigned long long)(uintptr_t)K8 + krow * D_QK, cnt0), tdm_g1(W0_KN, rk, 128, NBK, D_QK));
-        tdm_load(tdm_g0(st + Q_O_K + 128, (unsigned long long)(uintptr_t)K8 + krow * D_QK + 128, cnt0),
-                 tdm_g1(W0_KR, rk, 64, NBK, D_QK));
-        tdm_load(tdm_g0(st + Q_O_KS, (unsigned long long)(uintptr_t)KS + krow * 8, cnt0), tdm_g1(W0_S, rk, 8, NBK, 8));
-        tdm_load(tdm_g0(st + Q_O_V, (unsigned long long)(uintptr_t)V8 + krow * D_V, cnt0),
-                 tdm_g1(W0_128, rk, 128, NBK, D_V));
-        tdm_load(tdm_g0(st + Q_O_VS, (unsigned long long)(uintptr_t)VSR + krow * 4, cnt0), tdm_g1(W0_S, rk, 4, NBK, 4));
-        tdm_load(tdm_g0(st + Q_O_KT, (unsigned long long)(uintptr_t)K8T + bh * D_QK * S + (unsigned long long)tt * NBK, cnt0),
-                 tdm_g1(W0_128, rdq, 128, D_QK, (unsigned long long)S));
-        tdm_load(tdm_g0(st + Q_O_KTS, (unsigned long long)(uintptr_t)KTS + ((bh * (S / 128) + tt) * D_QK) * 4, cnt0),
-                 tdm_g1(W0_S, rdq, 4, D_QK, 4));
+        tdm_load(tdm_g0(st + top0.lds, top0.base + tt * top0.mult, real ? top0.on : 0), top0.g1);
+        tdm_load(tdm_g0(st + top1.lds, top1.base + tt * top1.mult, real ? top1.on : 0), top1.g1);
     };
-    // prologue: the block's Q8 / QS / DO8 / DOS / LSE / DELTA (waves 1..3 and 0 share the 6 ops), tiles 0, 1
+    // prologue: the block's Q8 / QS / DO8 / DOS / LSE / DELTA, two ops per wave: [Q nope, LSE], [Q rope, DELTA],
+    // [QS, DO8], [DOS, -]
     {
         const unsigned long long qrow = bh * S + q0;
-        tdm_load(tdm_g0(lds0 + Q_OFF_Q, (unsigned long long)(uintptr_t)Q8 + qrow * D_QK, wv == 1 ? 1 : 0),
-                 tdm_g1(W0_KN, BMQ, 128, BMQ, D_QK));
-        tdm_load(tdm_g0(lds0 + Q_OFF_Q + 128, (unsigned long long)(uintptr_t)Q8 + qrow * D_QK + 128, wv == 2 ? 1 : 0),
-                 tdm_g1(W0_KR, BMQ, 64, BMQ, D_QK));
-        tdm_load(tdm_g0(lds0 + Q_OFF_QS, (unsigned long long)(uintptr_t)QS + qrow * 8, wv == 3 ? 1 : 0),
-                 tdm_g1(W0_S, BMQ, 8, BMQ, 8));
-        tdm_load(tdm_g0(lds0 + Q_OFF_DO, (unsigned long long)(uintptr_t)DO8 + qrow * D_V, wv == 1 ? 1 : 0),
-                 tdm_g1(W0_128, BMQ, 128, BMQ, D_V));
-        tdm_load(tdm_g0(lds0 + Q_OFF_DOS, (unsigned long long)(uintptr_t)DOS + qrow * 4, wv == 2 ? 1 : 0),
-                 tdm_g1(W0_S, BMQ, 4, BMQ, 4));
-        tdm_load(tdm_g0(lds0 + Q_OFF_LSE, (unsigned long long)(uintptr_t)(LSE2 + qrow), wv == 3 ? 1 : 0),
-                 tdm_g1(W0_S, 1, 1024, 1, 1024));
-        tdm_load(tdm_g0(lds0 + Q_OFF_DEL, (unsigned long long)(uintptr_t)(DELTA + qrow), wv == 3 ? 1 : 0),
-                 tdm_g1(W0_S, 1, 1024, 1, 1024));
+        const unsigned lds_a = wv == 0 ? Q_OFF_Q : wv == 1 ? Q_OFF_Q + 128 : wv == 2 ? Q_OFF_QS : Q_OFF_DOS;
+        const unsigned long long ga_a = wv == 0 ? (unsigned long long)(uintptr_t)Q8 + qrow * D_QK
+                                        : wv == 1 ? (unsigned long long)(uintptr_t)Q8 + qrow * D_QK + 128
+                                        : wv == 2 ? (unsigned long long)(uintptr_t)QS + qrow * 8
+                                                  : (unsigned long long)(uintptr_t)DOS + qrow * 4;
+        const i32x8 g1a = wv == 0 ? tdm_g1(W0_KN, BMQ, 128, BMQ, D_QK)
+                          : wv == 1 ? tdm_g1(W0_KR, BMQ, 64, BMQ, D_QK)
+                          : wv == 2 ? tdm_g1(W0_S, BMQ, 8, BMQ, 8)
+                                    : tdm_g1(W0_S, BMQ, 4, BMQ, 4);
+        tdm_load(tdm_g0(lds0 + lds_a, ga_a), g1a);
+        const unsigned lds_b = wv == 0 ? Q_OFF_LSE : wv == 1 ? Q_OFF_DEL : Q_OFF_DO;
+        const unsigned long long ga_b = wv == 0 ? (unsigned long long)(uintptr_t)(LSE2 + qrow)
+                                        : wv == 1 ? (unsigned long long)(uintptr_t)(DELTA + qrow)
+                                                  : (unsigned long long)(uintptr_t)DO8 + qrow * D_V;
+        const i32x8 g1b = wv <= 1 ? tdm_g1(W0_S, 1, 1024, 1, 1024) : tdm_g1(W0_128, BMQ, 128, BMQ, D_V);
+        tdm_load(tdm_g0(lds0 + lds_b, ga_b, wv <= 2 ? 1 : 0), g1b);
     }
     issue_tile(0);
     issue_tile(1);
@@ -514,7 +601,7 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     auto tile = [&](int t, auto diag_c) __attribute__((always_inline)) {
         constexpr bool DIAG = decltype(diag_c)::value;
         if (t > 0) {
-            tensor_wait<7>();  // tile t landed (t + 1 in flight)
+            tensor_wait<TDM_PER_TILE>();  // tile t landed (t + 1 in flight)
             bar_signal();
             bar_wait();        // tile t visible; every wave is done with tile t - 1
         }
@@ -596,6 +683,34 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     for (int t = 0; t < n - 2; ++t) tile(t, std::false_type{});
     tile(n - 2, std::true_type{});
     tile(n - 1, std::true_type{});
+#if OSTAGE
+    // epilogue: dQ rows as bf16 into LDS (the ring, idle now), one TDM store of 256 x 384 B by wave 0
+    tensor_wait<0>();
+    bar_signal();
+    bar_wait();
+    constexpr int XDQ = 2 * D_QK;
+    static_assert(BMQ * XDQ <= Q_OFF_Q, "staging inside the ring");
+    {
+        const int ln = lane_now();
+        static_for<QTW>([&](auto ii) {
+            constexpr int i = ii;
+            const unsigned rowb = lds0 + (unsigned)((64 * i + 16 * wv + (ln & 15)) * XDQ + 16 * (ln >> 4));
+            static_for<12>([&](auto dd) {
+                constexpr int dt = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dq[dt][i][(int)rr] * scale); });
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(rowb + 32 * dt) = __builtin_bit_cast(u32x4, w);
+            });
+        });
+    }
+    bar_signal();
+    bar_wait();
+    if (wv == 0) {
+        const unsigned long long g = (unsigned long long)(uintptr_t)(DQ + (long long)b * dq_sb + (long long)q0 * dq_ss +
+                                                                     (long long)h * D_QK);
+        tdm_store(tdm_g0(lds0, g), tdm_g1(tdm_w0(0, 0, 0), BMQ, XDQ, BMQ, 2ull * (unsigned long long)dq_ss));
+    }
+#else
     static_for<QTW>([&](auto ii) {
         constexpr int i = ii;
         const int q = q0 + 64 * i + 16 * wv + lr;
@@ -607,5 +722,6 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
             *(u32x4 *)(dqr + 16 * dt + 8 * lh) = __builtin_bit_cast(u32x4, w);
         });
     });
+#endif
     tensor_wait<0>();
 }

@@ -14,7 +14,11 @@ q * softmax_scale * log2(e), so the kernels' logits are in log2 units. Q / K row
 ([s0..s3, 0, 0, s4, s5]): the kernels run rope as a WMMA over d 64..191 with d 64..127 silenced. P is quantized in the
 kernels with fixed scales; dS along the reduction dim of dK (q) and of dQ (kv).
 
-Kernels: forward rung m4 (``k_mla_fwd_mx4.hip``), backward rung b1 (``k_mla_bwd_mx1.hip``: k_dkdv_mx, k_dq_mx),
+Kernels: forward rung m6 (``k_mla_fwd_mx6.hip``: branch-free softmax with per-lane integer shifts, O accumulated against
+a fixed per-row reference through the PV WMMAs' E8M0 B scale; the first tile's exp2 runs unshifted, so the centred
+logits of a row's first 128 keys must stay under 126 in log2 units, i.e. 87 nats), backward rung b3
+(``k_mla_bwd_mx3.hip``: k_dkdv_mx, k_dq_mx); all in XCD-local workgroup order with the TDM ops spread over the waves
+and the outputs written through LDS by TDM stores (benchmark/hk_mla_mx/LOG.md, 2026-11-05 (b)),
 quantization ``k_mxq.hip`` (kbar; rows + cols of a tensor in one read). With ``for_mx_bwd`` the forward quantizes
 q / k / v once for both passes: rows for itself, cols for the backward. ``saved`` = (lse of the centred logits, q8, qs,
 k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr), and the backward quantizes only dout (rows + cols + delta). Without it
@@ -45,7 +49,7 @@ D_QK, D_V = 192, 128
 KBAR_STRIDE = 16
 LOG2E = 1.4426950408889634
 HIP = Path(__file__).resolve().parent / "hip"
-SOURCES = ("k_mxq.hip", "k_mla_fwd_mx4.hip", "k_mla_bwd_mx1.hip")
+SOURCES = ("k_mxq.hip", "k_mla_fwd_mx6.hip", "k_mla_bwd_mx3.hip")
 # expert scheduling mode (the compiler places the dependency waits, as every bf16 HK kernel) and register classes
 # before globalness (DS addresses and WMMA scale operands must be in v0..v255)
 FLAGS = ("-x", "hip", "--offload-arch=gfx1250", "--cuda-device-only", "--no-gpu-bundle-output", "-O3", "-std=c++20",
@@ -83,7 +87,7 @@ KERNELS = {
     "k_mxq_rc192": ("k_mxq.hip", 256, _RC_ARGS),
     "k_mxq_rc128": ("k_mxq.hip", 256, _RC_ARGS),
     "k_mla_fwd_mx": (
-        "k_mla_fwd_mx4.hip",
+        "k_mla_fwd_mx6.hip",
         128,
         (
             ("Q8", "ptr"),
@@ -103,7 +107,7 @@ KERNELS = {
         ),
     ),  # fmt: skip
     "k_dkdv_mx": (
-        "k_mla_bwd_mx1.hip",
+        "k_mla_bwd_mx3.hip",
         128,
         (
             ("Q8", "ptr"),
@@ -133,7 +137,7 @@ KERNELS = {
         ),
     ),  # fmt: skip
     "k_dq_mx": (
-        "k_mla_bwd_mx1.hip",
+        "k_mla_bwd_mx3.hip",
         128,
         (
             ("Q8", "ptr"),
