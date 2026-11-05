@@ -77,6 +77,24 @@ MX_INLINE f32x8 wmma_mx(i32x16 a, i32x16 b, f32x8 c, int sa, int sb) {
                                                             false);
 }
 
+// the same with a C modifier: MODC 1 = -C (D = A B - C), 2 = |C|
+template <int SA, int SB, int MODC>
+MX_INLINE f32x8 wmma_mxc(i32x16 a, i32x16 b, f32x8 c, int sa, int sb) {
+    return __builtin_amdgcn_wmma_scale_f32_16x16x128_f8f6f4(0, a, 0, b, (short)MODC, c, SA, 0, sa, SB, 0, sb, false,
+                                                            false);
+}
+
+// ---- mx_exp on the bits: the E8M0 byte (mx_exp + 127) of amax >= 0, and its scale 2^(byte - 127) as a float
+// (byte 0: 2^-127, subnormal). ef = IEEE exponent field, f = mantissa: mx_exp = ef - 135 + (f > 0x600000).
+MX_INLINE int e8m0_byte(float amax) {
+    const int byte = (int)((__builtin_bit_cast(unsigned, amax) + 0x1FFFFFu) >> 23) - 8;
+    return byte < 0 ? 0 : byte;
+}
+MX_INLINE float e8m0_scale(int byte) {
+    const unsigned u = (unsigned)byte << 23;
+    return __builtin_bit_cast(float, u > 0x400000u ? u : 0x400000u);
+}
+
 // ---- LDS
 MX_INLINE uint32_t lds_addr(const void *p) { return (uint32_t)(uintptr_t)p; }
 MX_INLINE const lds_u8 *lds_ptr(uint32_t a) { return (const lds_u8 *)(uintptr_t)a; }

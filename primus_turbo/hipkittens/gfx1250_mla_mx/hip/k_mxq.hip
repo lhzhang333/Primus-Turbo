@@ -14,9 +14,12 @@
 //   k_mxq_cols128   X [b, s, h, 128] -> X8T [b, h, 128, s] (s MX-interleaved per 128), XTS [b, h, s / 128, 128, 4]
 //                   (per s tile: d-major, the 4 blocks of 32 s); V (forward) and dO (backward), along s
 //   k_mxq_cols192   the same for 192 columns (Q, K along s: the backward's dK / dQ operands)
+//   k_mxq_rc192/128 rows + cols of a tensor in one pass (one read): the forward's and the backward's operands at once
 // Row kernels' mode: bit 0 subtract kbar (K), bit 1 aux[row] = x . kbar (Q: the lse correction), bit 2 aux[row] =
 // x . Y[row] (dO: delta = rowsum(dO * O)), bit 3 also write the dequantized values as bf16 XD [b, s, h, D]
-// (contiguous) for a bf16 consumer of the same operand. Col kernels' mode: bit 0 subtract kbar.
+// (contiguous) for a bf16 consumer of the same operand, bit 4 (D = 192) scale layout R2: [s0..s3, 0, 0, s4, s5] (the
+// rope WMMA over d 64..191: E8M0 0 = 2^-127 silences d 64..127), bit 5 quantize x * pre (after the aux dots; Q:
+// pre = softmax scale * log2(e), the logits in log2 units). Col kernels' mode: bit 0 subtract kbar.
 // Inputs: any b / s / h strides (elements), the d axis contiguous and 16-byte aligned.
 #include "mx_common.h"
 
@@ -86,7 +89,7 @@ __device__ __forceinline__ void rows_body(const bf16 *__restrict__ X, unsigned c
                                           unsigned char *__restrict__ XS, const float *__restrict__ kbar,
                                           const bf16 *__restrict__ Y, float *__restrict__ aux, bf16 *__restrict__ XD,
                                           int B, int S, int H, long long sb, long long ss, long long sh, long long yb,
-                                          long long ys, long long yh, int mode) {
+                                          long long ys, long long yh, int mode, float pre) {
     constexpr int NBLK = D / 32;           // 6 or 4
     constexpr int LPR = D == 192 ? 8 : 4;  // lanes per row
     constexpr int RS = D == 192 ? 8 : 4;   // scale bytes per row
@@ -127,13 +130,16 @@ __device__ __forceinline__ void rows_body(const bf16 *__restrict__ X, unsigned c
                     static_for<8>([&](auto e) { dot += v[(int)i][(int)e] * y[(int)e]; });
                 });
             }
+            if (mode & 32) {
+                static_for<4>([&](auto i) { v[(int)i] = v[(int)i] * pre; });
+            }
             const Block blk = quant_block(v);
             unsigned char *dst = X8 + row * D;
             if (D == 128 || j < 4)
                 store_block<128>(dst, j, blk.q[0], blk.q[1], blk.q[2], blk.q[3]);
             else
                 store_block<64>(dst + 128, j - 4, blk.q[0], blk.q[1], blk.q[2], blk.q[3]);
-            XS[row * RS + j] = (unsigned char)(blk.e + 127);
+            XS[row * RS + ((D == 192 && (mode & 16) && j >= 4) ? j + 2 : j)] = (unsigned char)(blk.e + 127);
             if (mode & 8) {
                 f32x8 dq[4];
                 dequant_block(blk, dq);
@@ -141,7 +147,8 @@ __device__ __forceinline__ void rows_body(const bf16 *__restrict__ X, unsigned c
                 static_for<4>([&](auto i) { *(u32x4 *)(xd + 8 * (int)i) = f32_to_bf8(dq[(int)i]); });
             }
         } else if (j < RS) {
-            XS[row * RS + j] = 127;  // pad scales (the rope WMMA's zero half)
+            // pad scales: 127 = 2^0 for the rope WMMA's zero half (layout R1), 0 = 2^-127 silences d 64..127 (R2)
+            XS[row * RS + ((mode & 16) ? j - 2 : j)] = (mode & 16) ? 0 : 127;
         }
         if (mode & 6) {
             static_for<LPR == 8 ? 3 : 2>([&](auto k) { dot += __shfl_xor(dot, 1 << (int)k, LPR); });
@@ -194,6 +201,102 @@ __device__ __forceinline__ void cols_body(const bf16 *__restrict__ X, unsigned c
         xs[4] = (unsigned char)(b1.e + 127);
     }
 }
+
+// rows + cols of one 128-row (s) tile in one pass (the tile read once): the rows kernel's outputs (X8 / XS / aux, mode
+// bits 0..5 as k_mxq_rows) from the LDS tile, then the cols kernel's (X8T / XTS: kbar subtracted when mode & 1, never
+// pre-scaled). 256 threads; LDS: the bf16 tile + kbar.
+template <int D>
+__device__ __forceinline__ void rc_body(const bf16 *__restrict__ X, unsigned char *__restrict__ X8,
+                                        unsigned char *__restrict__ XS, unsigned char *__restrict__ X8T,
+                                        unsigned char *__restrict__ XTS, const float *__restrict__ kbar,
+                                        const bf16 *__restrict__ Y, float *__restrict__ aux, int S, int H, long long sb,
+                                        long long ss, long long sh, long long yb, long long ys, long long yh, int mode,
+                                        float pre, unsigned char *tile, float *kb_lds) {
+    constexpr int XP = D * 2 + 16;
+    constexpr int TPR = D / 8;
+    constexpr int NT = 256;
+    constexpr int NBLK = D / 32;
+    constexpr int LPR = D == 192 ? 8 : 4;
+    constexpr int RS = D == 192 ? 8 : 4;
+    constexpr int RPP = NT / LPR;  // rows per pass
+    const int kt = blockIdx.x, h = blockIdx.y, b = blockIdx.z, t = threadIdx.x;
+    const long long bh = (long long)b * H + h;
+    const bf16 *src = X + b * sb + (long long)(kt * 128) * ss + h * sh;
+    for (int i = t; i < 128 * TPR; i += NT) {
+        const int r = i / TPR, c = (i % TPR) * 8;
+        *(u32x4 *)(tile + r * XP + 2 * c) = *(const u32x4 *)(src + (long long)r * ss + c);
+    }
+    if (mode & 3) {
+        for (int i = t; i < D; i += NT) kb_lds[i] = kbar[bh * D + i];
+    }
+    __syncthreads();
+    // ---- rows: LPR lanes per row (lane j < NBLK: block j of 32), RPP rows per pass
+    const int j = t % LPR;
+    for (int r0 = 0; r0 < 128; r0 += RPP) {
+        const int r = r0 + t / LPR;
+        const long long row = bh * S + (long long)kt * 128 + r;
+        float dot = 0.f;
+        if (j < NBLK) {
+            f32x8 v[4];
+            static_for<4>([&](auto i) {
+                v[(int)i] = bf8_to_f32(*(const u32x4 *)(tile + r * XP + 2 * (32 * j + 8 * (int)i)));
+            });
+            if (mode & 1) {
+                static_for<4>([&](auto i) {
+                    static_for<8>([&](auto e) { v[(int)i][(int)e] -= kb_lds[32 * j + 8 * (int)i + (int)e]; });
+                });
+            } else if (mode & 2) {
+                static_for<4>([&](auto i) {
+                    static_for<8>([&](auto e) { dot += v[(int)i][(int)e] * kb_lds[32 * j + 8 * (int)i + (int)e]; });
+                });
+            }
+            if (mode & 4) {
+                const bf16 *yp = Y + b * yb + (long long)(kt * 128 + r) * ys + h * yh + 32 * j;
+                static_for<4>([&](auto i) {
+                    const f32x8 y = bf8_to_f32(*(const u32x4 *)(yp + 8 * (int)i));
+                    static_for<8>([&](auto e) { dot += v[(int)i][(int)e] * y[(int)e]; });
+                });
+            }
+            if (mode & 32) {
+                static_for<4>([&](auto i) { v[(int)i] = v[(int)i] * pre; });
+            }
+            const Block blk = quant_block(v);
+            unsigned char *dst = X8 + row * D;
+            if (D == 128 || j < 4)
+                store_block<128>(dst, j, blk.q[0], blk.q[1], blk.q[2], blk.q[3]);
+            else
+                store_block<64>(dst + 128, j - 4, blk.q[0], blk.q[1], blk.q[2], blk.q[3]);
+            XS[row * RS + ((D == 192 && (mode & 16) && j >= 4) ? j + 2 : j)] = (unsigned char)(blk.e + 127);
+        } else if (j < RS) {
+            XS[row * RS + ((mode & 16) ? j - 2 : j)] = (mode & 16) ? 0 : 127;
+        }
+        if (mode & 6) {
+            static_for<LPR == 8 ? 3 : 2>([&](auto k) { dot += __shfl_xor(dot, 1 << (int)k, LPR); });
+            if (j == 0) aux[row] = dot;
+        }
+    }
+    // ---- cols: task = (2 consecutive d, block jb of 32 s)
+    for (int task = t; task < (D / 2) * 4; task += NT) {
+        const int dp = task % (D / 2), jb = task / (D / 2), d0 = 2 * dp;
+        const float kb0 = (mode & 1) ? kb_lds[d0] : 0.f, kb1 = (mode & 1) ? kb_lds[d0 + 1] : 0.f;
+        f32x8 v0[4], v1[4];
+        static_for<4>([&](auto i) {
+            static_for<8>([&](auto e) {
+                const int r = 32 * jb + 8 * (int)i + (int)e;
+                const uint32_t w = *(const uint32_t *)(tile + r * XP + 2 * d0);
+                v0[(int)i][(int)e] = __builtin_bit_cast(float, w << 16) - kb0;
+                v1[(int)i][(int)e] = __builtin_bit_cast(float, w & 0xFFFF0000u) - kb1;
+            });
+        });
+        const Block b0 = quant_block(v0), b1 = quant_block(v1);
+        unsigned char *dst = X8T + (bh * D + d0) * S + kt * 128;
+        store_block<128>(dst, jb, b0.q[0], b0.q[1], b0.q[2], b0.q[3]);
+        store_block<128>(dst + S, jb, b1.q[0], b1.q[1], b1.q[2], b1.q[3]);
+        unsigned char *xs = XTS + ((bh * (S / 128) + kt) * D + d0) * 4 + jb;
+        xs[0] = (unsigned char)(b0.e + 127);
+        xs[4] = (unsigned char)(b1.e + 127);
+    }
+}
 }  // namespace
 
 // grid (B * H), block 768 = 24 column groups of 8 d x 32 row groups. The mean of every stride-th row: any constant
@@ -225,8 +328,8 @@ extern "C" __global__ __launch_bounds__(768) void k_mxq_kbar(const bf16 *__restr
         const bf16 *__restrict__ X, unsigned char *__restrict__ X8, unsigned char *__restrict__ XS,                  \
         const float *__restrict__ kbar, const bf16 *__restrict__ Y, float *__restrict__ aux, bf16 *__restrict__ XD, \
         int B, int S, int H, long long sb, long long ss, long long sh, long long yb, long long ys, long long yh,     \
-        int mode) {                                                                                                  \
-        rows_body<D>(X, X8, XS, kbar, Y, aux, XD, B, S, H, sb, ss, sh, yb, ys, yh, mode);                            \
+        int mode, float pre) {                                                                                       \
+        rows_body<D>(X, X8, XS, kbar, Y, aux, XD, B, S, H, sb, ss, sh, yb, ys, yh, mode, pre);                       \
     }
 ROWS_KERNEL(192)
 ROWS_KERNEL(128)
@@ -240,3 +343,17 @@ ROWS_KERNEL(128)
     }
 COLS_KERNEL(128)
 COLS_KERNEL(192)
+
+// rows + cols in one pass: grid (S / 128, H, B), 256 threads (rc_body)
+#define RC_KERNEL(D)                                                                                                 \
+    extern "C" __global__ __launch_bounds__(256) void k_mxq_rc##D(                                                   \
+        const bf16 *__restrict__ X, unsigned char *__restrict__ X8, unsigned char *__restrict__ XS,                  \
+        unsigned char *__restrict__ X8T, unsigned char *__restrict__ XTS, const float *__restrict__ kbar,            \
+        const bf16 *__restrict__ Y, float *__restrict__ aux, int S, int H, long long sb, long long ss, long long sh, \
+        long long yb, long long ys, long long yh, int mode, float pre) {                                             \
+        __shared__ __attribute__((aligned(16))) unsigned char tile[128 * (D * 2 + 16)];                              \
+        __shared__ float kb_lds[D];                                                                                  \
+        rc_body<D>(X, X8, XS, X8T, XTS, kbar, Y, aux, S, H, sb, ss, sh, yb, ys, yh, mode, pre, tile, kb_lds);        \
+    }
+RC_KERNEL(192)
+RC_KERNEL(128)

@@ -84,30 +84,37 @@ def test_mx_shape_rules(dims, causal, match):
 
 
 def _stub_mx_kernels(monkeypatch, calls):
-    """Stand-ins for the MX ops on CPU tensors: the fp32 reference, and the MX operands as placeholders."""
+    """Stand-ins for the MX ops on CPU tensors: the fp32 reference; the saved MX operands carry q / k / v in the q8 / k8
+    / v8 slots (placeholders elsewhere) so the backward stand-in can compute the reference gradients."""
+
+    def placeholders(q, k, v, lse):
+        z = torch.zeros(1)
+        return (lse.clone(), q, z, k, z, z, z, z, z, z, v, z)
+
+    def ref_out(q, k, v, softmax_scale):
+        out, lse, *_ = _reference(q, k, v, torch.zeros(*q.shape[:3], D_V), softmax_scale)
+        return out.to(q.dtype), lse
 
     def fwd(q, k, v, softmax_scale):
         calls.append(("hk_mx_fwd", tuple(q.shape)))
-        out, lse, *_ = _reference(q, k, v, torch.zeros(*q.shape[:3], D_V), softmax_scale)
-        b, _, h, _ = q.shape
-        return (
-            out.to(q.dtype),
-            lse,
-            lse.clone(),
-            *(torch.zeros(1) for _ in range(4)),
-            torch.zeros(b, h, D_QK),
-        )
+        return ref_out(q, k, v, softmax_scale)
 
-    def prepare(q, k, lse, softmax_scale):
+    def fwd_train(q, k, v, softmax_scale):
+        calls.append(("hk_mx_fwd_train", tuple(q.shape)))
+        out, lse = ref_out(q, k, v, softmax_scale)
+        return (out, lse, *placeholders(q, k, v, lse))
+
+    def prepare(q, k, v, lse, softmax_scale):
         calls.append(("hk_mx_prepare", tuple(q.shape)))
-        return (lse.clone(), *(torch.zeros(1) for _ in range(5)))
+        return placeholders(q, k, v, lse)
 
-    def bwd(dout, q, k, v, out, lse_c, q8, qs, k8, ks, kbar, softmax_scale):
-        calls.append(("hk_mx_bwd", tuple(q.shape)))
-        return tuple(g.to(q.dtype) for g in _reference(q, k, v, dout, softmax_scale)[2:])
+    def bwd(dout, out, lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr, softmax_scale):
+        calls.append(("hk_mx_bwd", tuple(q8.shape)))
+        return tuple(g.to(q8.dtype) for g in _reference(q8, k8, v8, dout, softmax_scale)[2:])
 
     monkeypatch.setattr(mla_impl, "_hk_mx_unavailable_reason", lambda: None)
     monkeypatch.setattr(mla_impl, "_forward_hk_mx_op", fwd)
+    monkeypatch.setattr(mla_impl, "_forward_hk_mx_train_op", fwd_train)
     monkeypatch.setattr(mla_impl, "_prepare_bwd_hk_mx_op", prepare)
     monkeypatch.setattr(mla_impl, "_backward_hk_mx_op", bwd)
 
@@ -119,7 +126,7 @@ _FOLDED = (1, 256, 4, D_QK)  # the bf16 kernels: b > 1 SBHD folded into the head
 @pytest.mark.parametrize(
     ("seqlen", "fwd", "bwd", "expected"),
     [
-        (256, "hk_mx", "hk_mx", [("hk_mx_fwd", _CALLER), ("hk_mx_bwd", _CALLER)]),
+        (256, "hk_mx", "hk_mx", [("hk_mx_fwd_train", _CALLER), ("hk_mx_bwd", _CALLER)]),
         (256, "hk_mx", "hk", [("hk_mx_fwd", _CALLER), ("hk_bwd", _FOLDED)]),
         (256, "hk_mx", "flydsl", [("hk_mx_fwd", _CALLER), ("flydsl_bwd", _FOLDED)]),
         (256, "hk", "hk_mx", [("hk_fwd", _FOLDED), ("hk_mx_prepare", _FOLDED), ("hk_mx_bwd", _FOLDED)]),
@@ -134,9 +141,9 @@ _FOLDED = (1, 256, 4, D_QK)  # the bf16 kernels: b > 1 SBHD folded into the head
     ],
 )
 def test_routes_and_falls_back(monkeypatch, seqlen, fwd, bwd, expected):
-    """Each pass takes its own setting; an hk_mx forward hands any backward its tensors (in the bf16 kernels'
-    layout for those), an hk_mx backward after a bf16 forward quantizes the forward's q / k first, and a pass hk_mx
-    cannot take runs as hk would."""
+    """Each pass takes its own setting. An hk_mx forward for an hk_mx backward saves the MX operands of both passes
+    (no bf16 q / k / v); for a bf16 backward it saves what a bf16 forward would (kernel layout). An hk_mx backward after
+    a bf16 forward quantizes the forward's q / k / v first. A pass hk_mx cannot take runs as hk would."""
     _on_gfx1250(monkeypatch)
     _settings(monkeypatch, fwd, bwd)
     calls = []

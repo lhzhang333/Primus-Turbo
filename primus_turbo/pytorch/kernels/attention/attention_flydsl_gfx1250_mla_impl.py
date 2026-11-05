@@ -234,55 +234,65 @@ def _forward_hk_op_fake(q, k, v, softmax_scale, causal):
     return _forward_op_fake(q, k, v, softmax_scale, causal)
 
 
-_MX_SAVED = Tuple[(torch.Tensor,) * 6]  # lse of the centred logits, q8, qs, k8, ks, kbar
+# the MX backward's operands (gfx1250_mla_mx.mx): lse of the centred logits, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts,
+# v8, vsr
+_N_MX_SAVED = 12
+_MX_SAVED = Tuple[(torch.Tensor,) * _N_MX_SAVED]
 
 
 @_eager_custom_op("primus_turbo::flash_attn_hk_mx_gfx1250_mla_forward")
 def _forward_hk_mx_op(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float
-) -> Tuple[(torch.Tensor,) * 8]:
-    return _hk_mx().attn_fwd(q, k, v, softmax_scale)
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _hk_mx().attn_fwd(q, k, v, softmax_scale, for_mx_bwd=False)
+
+
+@_eager_custom_op("primus_turbo::flash_attn_hk_mx_gfx1250_mla_forward_train")
+def _forward_hk_mx_train_op(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float
+) -> Tuple[(torch.Tensor,) * (2 + _N_MX_SAVED)]:
+    return _hk_mx().attn_fwd(q, k, v, softmax_scale, for_mx_bwd=True)
 
 
 def _mx_saved_fake(q):
     b, sq, h, _ = q.shape
-    u8 = torch.uint8
-    lse = q.new_empty((b, h, sq), dtype=torch.float32)
-    return (
-        lse,
-        q.new_empty((b, h, sq, D_QK), dtype=u8),
-        q.new_empty((b, h, sq, 8), dtype=u8),
-        q.new_empty((b, h, sq, D_QK), dtype=u8),
-        q.new_empty((b, h, sq, 8), dtype=u8),
-        q.new_empty((b, h, D_QK), dtype=torch.float32),
-    )
+    u8, f32 = torch.uint8, torch.float32
+    rows = lambda d: q.new_empty((b, h, sq, d), dtype=u8)  # noqa: E731
+    cols = lambda d: (q.new_empty((b, h, d, sq), dtype=u8), q.new_empty((b, h, sq // 128, d, 4), dtype=u8))  # noqa: E731
+    return (q.new_empty((b, h, sq), dtype=f32), rows(D_QK), rows(8), rows(D_QK), rows(8),
+            q.new_empty((b, h, D_QK), dtype=f32), *cols(D_QK), *cols(D_QK), rows(D_V), rows(4))  # fmt: skip
+
+
+def _mx_out_fake(q):
+    b, sq, h, _ = q.shape
+    return q.new_empty((sq, b, h, D_V)).transpose(0, 1), q.new_empty((b, h, sq), dtype=torch.float32)
 
 
 @_forward_hk_mx_op.register_fake
 def _forward_hk_mx_op_fake(q, k, v, softmax_scale):
-    b, sq, h, _ = q.shape
-    out = q.new_empty((sq, b, h, D_V)).transpose(0, 1)
-    return (out, q.new_empty((b, h, sq), dtype=torch.float32), *_mx_saved_fake(q))
+    return _mx_out_fake(q)
+
+
+@_forward_hk_mx_train_op.register_fake
+def _forward_hk_mx_train_op_fake(q, k, v, softmax_scale):
+    return (*_mx_out_fake(q), *_mx_saved_fake(q))
 
 
 @_eager_custom_op("primus_turbo::flash_attn_hk_mx_gfx1250_mla_prepare_backward")
 def _prepare_bwd_hk_mx_op(
-    q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor, softmax_scale: float
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lse: torch.Tensor, softmax_scale: float
 ) -> _MX_SAVED:
-    return _hk_mx().prepare_bwd(q, k, lse, softmax_scale)
+    return _hk_mx().prepare_bwd(q, k, v, lse, softmax_scale)
 
 
 @_prepare_bwd_hk_mx_op.register_fake
-def _prepare_bwd_hk_mx_op_fake(q, k, lse, softmax_scale):
+def _prepare_bwd_hk_mx_op_fake(q, k, v, lse, softmax_scale):
     return _mx_saved_fake(q)
 
 
 @_eager_custom_op("primus_turbo::flash_attn_hk_mx_gfx1250_mla_backward")
 def _backward_hk_mx_op(
     dout: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
     out: torch.Tensor,
     lse_c: torch.Tensor,
     q8: torch.Tensor,
@@ -290,15 +300,25 @@ def _backward_hk_mx_op(
     k8: torch.Tensor,
     ks: torch.Tensor,
     kbar: torch.Tensor,
+    q8t: torch.Tensor,
+    qts: torch.Tensor,
+    k8t: torch.Tensor,
+    kts: torch.Tensor,
+    v8: torch.Tensor,
+    vsr: torch.Tensor,
     softmax_scale: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _hk_mx().attn_bwd(dout, q, k, v, out, lse_c, q8, qs, k8, ks, kbar, softmax_scale)
+    return _hk_mx().attn_bwd(
+        dout, out, lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr, softmax_scale
+    )
 
 
 @_backward_hk_mx_op.register_fake
-def _backward_hk_mx_op_fake(dout, q, k, v, out, lse_c, q8, qs, k8, ks, kbar, softmax_scale):
-    b, sq, h, _ = q.shape
-    return tuple(q.new_empty((sq, b, h, d)).transpose(0, 1) for d in (D_QK, D_QK, D_V))
+def _backward_hk_mx_op_fake(
+    dout, out, lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr, softmax_scale
+):
+    b, h, sq, _ = q8.shape
+    return tuple(q8.new_empty((sq, b, h, d), dtype=torch.bfloat16).transpose(0, 1) for d in (D_QK, D_QK, D_V))
 
 
 @_eager_custom_op("primus_turbo::flash_attn_flydsl_gfx1250_mla_backward")
@@ -363,19 +383,25 @@ def flash_attn_flydsl_gfx1250_mla_forward_impl(q, k, v, softmax_scale=None, caus
     """Returns (out [b, sq, h, 128], lse [b, h, sq] fp32 natural log, saved).
 
     ``saved`` is what the backward impl takes after dout: the kernel-layout (q, k, v, out, lse), out and lse
-    views of its last two; after an ``hk_mx`` forward, the caller's q / k / v, out, lse and the MX operands.
-    ``mla_fwd_impl()`` picks the kernels.
+    views of its last two. An ``hk_mx`` forward for an ``hk_mx`` backward saves (None, None, None, out, lse, *the MX
+    operands of both passes, quantized once): no bf16 q / k / v. ``mla_fwd_impl()`` picks the kernels.
     """
     b, sq, h, _ = q.shape
     impl = mla_fwd_impl()
+    fold = b > 1 and q.transpose(0, 1).is_contiguous()
     if impl == "hk_mx":
         reason = hk_mx_mla_unsupported_reason(q, k, v, bool(causal))
         if reason is None:
-            out, lse, *mx_saved = _forward_hk_mx_op(q, k, v, _scale(softmax_scale))
-            return out, lse, (q, k, v, out, lse, *mx_saved)
+            scale = _scale(softmax_scale)
+            if mla_bwd_impl() == "hk_mx":
+                out, lse, *mx_saved = _forward_hk_mx_train_op(q, k, v, scale)
+                return out, lse, (None, None, None, out, lse, *mx_saved)
+            out, lse = _forward_hk_mx_op(q, k, v, scale)
+            # a bf16 backward takes what a bf16 forward would have saved: the kernel-layout tensors
+            qk, kk, vk, ok = (_to_kernel_layout(t, fold) for t in (q, k, v, out))
+            return out, lse, (qk, kk, vk, ok, lse.reshape(qk.shape[0], qk.shape[2], sq))
         _warn_hk_fallback(MLA_FWD_IMPL_ENV, "forward", reason, "hk_mx", "hk")
         impl = "hk"
-    fold = b > 1 and q.transpose(0, 1).is_contiguous()
     qk, kk, vk = (_to_kernel_layout(t, fold) for t in (q, k, v))
     forward = _forward_op
     if impl == "hk":
@@ -396,24 +422,19 @@ def flash_attn_flydsl_gfx1250_mla_backward_impl(
     Returns (dq, dk, dv) shaped like the forward's q/k/v. ``mla_bwd_impl()`` picks the kernels.
     """
     batch = dout.shape[0]
+    scale = _scale(softmax_scale)
+    if mx_saved:  # an hk_mx forward made the operands (and checked the shapes)
+        return _backward_hk_mx_op(dout, out, *mx_saved, scale)
     impl = mla_bwd_impl()
     if impl == "hk_mx":
         reason = hk_mx_mla_unsupported_reason(q, k, v, bool(causal))
-        if reason is None:
-            scale = _scale(softmax_scale)
-            fold = q.shape[0] != batch  # a bf16 forward folded the batch into the heads
-            if not mx_saved:
-                mx_saved = _prepare_bwd_hk_mx_op(q, k, lse, scale)
-            grads = _backward_hk_mx_op(
-                _to_kernel_layout(dout, True) if fold else dout, q, k, v, out, *mx_saved, scale
-            )
+        if reason is None:  # after a bf16 forward: quantize its kernel-layout q / k / v
+            fold = q.shape[0] != batch
+            mx_saved = _prepare_bwd_hk_mx_op(q, k, v, lse, scale)
+            grads = _backward_hk_mx_op(_to_kernel_layout(dout, True) if fold else dout, out, *mx_saved, scale)
             return tuple(_from_kernel_layout(g, batch) for g in grads)
         _warn_hk_fallback(MLA_BWD_IMPL_ENV, "backward", reason, "hk_mx", "hk")
         impl = "hk"
-    if mx_saved:  # an hk_mx forward: its caller-layout tensors in the bf16 kernels' layout
-        fold = batch > 1 and q.transpose(0, 1).is_contiguous()
-        q, k, v, out = (_to_kernel_layout(t, fold) for t in (q, k, v, out))
-        lse = lse.reshape(q.shape[0], q.shape[2], q.shape[1])
     fold = q.shape[0] != batch  # the forward folded the batch into the heads
     backward = _backward_op
     if impl == "hk":
