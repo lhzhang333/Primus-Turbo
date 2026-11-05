@@ -209,3 +209,9 @@ XCD_MAP 1 (k-th workgroup of XCD c takes q block nqb - 1 - k % nqb of bh = c + 8
   (`scratch_mx/probe/tst.hip`): the TDM store does not honour LDS padding (rows after the first come out wrong), so
   the staging rows are unpadded (the ds_stores of 16 rows at one column conflict; still far cheaper). **m6xp 0.441 /
   0.447 ms**.
+
+**Backward rung b3** (`kern/k_mla_bwd_mx3.hip` = b1 + the forward's two fixes): XCD-local workgroup order in k_dkdv_mx
+(kv blocks of a (b, h) on one XCD, longest first) and k_dq_mx (as the forward), and the TDM ops spread over the waves
+(dkdv: 11 per step -> 3 per wave, tensor_wait<3>; dq: 7 per tile -> 2 per wave, the block prologue 7 -> 2 per wave;
+descriptor constants formed once, NULL descriptors past the end). No spills (749 / 910 VGPRs). Toy..mid pass with
+b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 3.020 -> 2.132 ms** (bf16 HK 1.98).

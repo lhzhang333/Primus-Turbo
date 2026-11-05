@@ -49,7 +49,7 @@ EXPERT_P = EXPERT + ["-mllvm", "-greedy-regclass-priority-trumps-globalness"]
 def recipe_of(tag, kind="fwd"):
     """The operand recipe a build tag expects: "m4" (Q8 pre-scaled to log2 units, scale layout R2) for forward rungs m4 /
     m5 (tags 4*, 5*, 6*) and backward rungs b1 / b2 (tags 1*, 2*), else "r1"."""
-    return "m4" if tag[:1] in (("4", "5", "6") if kind == "fwd" else ("1", "2")) else "r1"
+    return "m4" if tag[:1] in (("4", "5", "6") if kind == "fwd" else ("1", "2", "3")) else "r1"
 
 
 def split_tag(tag):
