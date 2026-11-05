@@ -4,6 +4,8 @@
  * See LICENSE for license information.
  **************************************************************************************************/
 
+// k_mla_bwd_mx5.hip -- rung b5 = b3 with the dK / dV kernel software-pipelined across steps (see k_dkdv_mx below;
+// k_dq_mx as b3). b3's notes follow.
 // k_mla_bwd_mx3.hip -- rung b3 = b1 + XCD-local workgroup order (the blocks of one (b, h) on one XCD: dispatch sends
 // linear id L to XCD L % 8, so its L2 serves their shared operand stream) + the TDM ops of a step / tile spread over
 // the four waves (LLVM waits for tensorcnt <= 10 before every TDM op; b1 put all 11 / 7 on wave 0, waves 1..3 NULL).
@@ -25,11 +27,7 @@
 
 using namespace mx;
 
-// software prefetch of the next fragment set (registers permitting): q16 tiles (dkdv), kv16 pairs (dq), dV / dK / dQ
-// A fragments
-#ifndef PF_Q
-#define PF_Q 1
-#endif
+// dq (b3's kernel): software prefetch of the kv16 pairs, partial prologue wait, epilogue through LDS
 #ifndef PF_KV
 #define PF_KV 1
 #endif
@@ -45,8 +43,24 @@ using namespace mx;
 #ifndef DQ_QB
 #define DQ_QB 1  // dq: mx_exp / exp2i dS quantization (the e8m0-bits form spills 468 B in this kernel)
 #endif
-#ifndef PF_A
-#define PF_A 2
+#ifndef DQ_KEEP
+// keep the fragments the previous WMMAs read alive past the next loads (the register allocator does not model the
+// write-after-read wait of a load into registers an in-flight WMMA reads, ~37-47 cycles): bit 0 the dQ phase's K^T
+// fragments (dq 0.624 -> 0.598 ms), bit 1 the K / V pairs (112 spills)
+#define DQ_KEEP 1
+#endif
+#ifndef DQ_KVMID
+#define DQ_KVMID 0  // pair m + 1's K / V loads after q tile DQ_KVMID - 1 of pair m behind a fence (slower: 0.611..0.649)
+#endif
+// dkdv (b5)
+#ifndef KEEP_WAR
+#define KEEP_WAR 1  // bit 0: keep the previous slot's dV / dK A fragments alive past the next loads (as DQ_KEEP)
+#endif
+#ifndef LTDT_G
+#define LTDT_G 0  // 1: lse / delta C tuples by buffer loads LTDT_D tiles ahead (slower: 1.000 / 0.978 / 0.962 ms, D 2 / 3 / 4)
+#endif
+#ifndef LTDT_D
+#define LTDT_D 2
 #endif
 
 namespace {
@@ -135,35 +149,42 @@ struct TdmOp {
 }  // namespace
 
 // =====================================================================================================================
-// k_dkdv_mx: grid (ceil(S / 192), H, B), 4 waves; wave w owns kv rows kv0 + 48 w .. + 47 (kv16 tiles j = 0..2), whose
-// K8 / V8 rows are the resident B operands of S = Q K^T and dP = dO V^T. Steps of 128 q rows from the 128-row block
-// holding kv0 to S - 128 through a 3-stage TDM ring (wave 0 issues 11 ops per step).
+// k_dkdv_mx (b5): grid (S / 128, H, B), 4 waves; wave w owns kv rows kv0 + 32 w .. + 31 (kv16 tiles j = 0, 1), whose
+// K8 / V8 rows are the resident B operands of S = Q K^T and dP = dO V^T. Steps of 128 q rows from kv0's block to S - 128.
+// Cross-step pipeline: the eight q16-tile slots of step s also issue the dV / dK WMMAs of step s - 1 (its P / dS kept in
+// registers): b3 ran each step's 20 A-fragment groups (dO^T, Q^T: 100 LDS loads per wave) after its q16 tiles, all four
+// waves at once, LDS-bandwidth bound (~40-cycle waits per group). The LDS ring is split into a q part (Q / dO rows,
+// scales, lse, delta: read in step s) and an A part (dO^T, Q^T, scales: read in step s + 1), 3 stages each; TDM round r =
+// the q part of step r + the A part of step r - 1, issued at the start of step r - 2 (round 0, 1 before the loop).
 // =====================================================================================================================
 namespace {
 constexpr int QS_ = 128;
 constexpr int NQT = QS_ / 16;
-#ifndef NJ_DKDV
-#define NJ_DKDV 2
-#endif
-constexpr int NJ = NJ_DKDV;  // kv16 tiles per wave
+constexpr int NJ = 2;         // kv16 tiles per wave
 constexpr int KBW = 16 * NJ;  // kv rows per wave
 constexpr int KB = 4 * KBW;   // per workgroup
+static_assert(KB == QS_, "b5: step 0 is the only step crossing the diagonal");
+// q part of a stage
 constexpr int O_Q = 0;
-constexpr int O_QS = O_Q + QS_ * XK;
-constexpr int O_DO = O_QS + QS_ * 8;
-constexpr int O_DOS = O_DO + QS_ * X128;
-constexpr int O_DOT = O_DOS + QS_ * 4;
-constexpr int O_DOTS = O_DOT + D_V * X128;
-constexpr int O_QT = O_DOTS + D_V * 4;
-constexpr int O_QTS = O_QT + D_QK * X128;
-constexpr int O_LSE = O_QTS + D_QK * 4;
-constexpr int O_DEL = O_LSE + QS_ * 4;
-constexpr int STG_B = O_DEL + QS_ * 4;
+constexpr int O_QS = O_Q + QS_ * XK;      // 26624
+constexpr int O_DO = O_QS + QS_ * 8;      // 27648
+constexpr int O_DOS = O_DO + QS_ * X128;  // 46080
+constexpr int O_LSE = O_DOS + QS_ * 4;    // 46592
+constexpr int O_DEL = O_LSE + QS_ * 4;    // 47104
+constexpr int QSTG = O_DEL + QS_ * 4;     // 47616
+// A part
+constexpr int O_DOT = 0;
+constexpr int O_DOTS = O_DOT + D_V * X128;  // 18432
+constexpr int O_QT = O_DOTS + D_V * 4;      // 18944
+constexpr int O_QTS = O_QT + D_QK * X128;   // 46592
+constexpr int ASTG = O_QTS + D_QK * 4;      // 47360
 constexpr int NSTG = 3;
-constexpr int LDS_B = NSTG * STG_B;
+constexpr int ARING = NSTG * QSTG;          // 142848
+constexpr int LDS_B = ARING + NSTG * ASTG;  // 284928
 static_assert(LDS_B <= 327680, "LDS");
+static_assert(QSTG % 128 == 0 && ASTG % 128 == 0, "TDM alignment");
 
-// per-step LDS addresses (stage base + this lane's offset); fragments add immediate offsets
+// per-step LDS addresses (q fields: the q stage of step s; A fields: the A stage of step s - 1)
 struct StepAddr {
     uint32_t qn, qr, qs, dO, dos, lse, del, dot, dots, qt, qts;
 };
@@ -181,18 +202,20 @@ MX_INLINE QTile load_qtile(const StepAddr &a) {
     QTile t;
     t.qx = frag24(lds_b128(pqn, oq), lds_b128(pqn, oq + 16), lds_b128(pqn, oq + 32), lds_b128(pqn, oq + 48),
                   lds_b128(pqr, oq), lds_b128(pqr, oq + 16));
-    t.qsc = (int)lds_b32(lds_ptr(a.qs), QT * 16 * 8);
     t.dox = cat4(lds_b128(pdo, od), lds_b128(pdo, od + 16), lds_b128(pdo, od + 32), lds_b128(pdo, od + 48));
+    t.qsc = (int)lds_b32(lds_ptr(a.qs), QT * 16 * 8);
     t.dsc = (int)lds_b32(lds_ptr(a.dos), QT * 16 * 4);
+#if !LTDT_G
     t.lt = f8(lds_b128(lds_ptr(a.lse), QT * 64), lds_b128(lds_ptr(a.lse), QT * 64 + 16));
     t.dt = f8(lds_b128(lds_ptr(a.del), QT * 64), lds_b128(lds_ptr(a.del), QT * 64 + 16));
+#endif
     return t;
 }
 struct AFrag {
     i32x16 x;
     int s;
 };
-template <int D, int OFF>
+template <int D>
 MX_INLINE AFrag load_afrag(uint32_t base, uint32_t sbase) {
     const lds_u8 *p = lds_ptr(base);
     constexpr int o = D * 16 * X128;
@@ -200,6 +223,15 @@ MX_INLINE AFrag load_afrag(uint32_t base, uint32_t sbase) {
             (int)lds_b32(lds_ptr(sbase), (D / 2) * 128)};
 }
 MX_INLINE void fence() { __builtin_amdgcn_sched_barrier(0); }
+// an empty use: x stays in its registers up to here, so loads issued before it cannot be given those registers while
+// WMMAs that read x may still be in flight (the register allocator does not model the ~37-cycle write-after-read wait)
+template <typename T>
+MX_INLINE void keep(const T &x) {
+    asm volatile("" ::"v"(x));
+}
+// dV / dK groups (A fragment g: dO^T d16 tile g < 8, Q^T d16 tile g - 8) of slot k: gs(k) .. gs(k + 1) - 1
+__host__ __device__ constexpr int gs(int k) { return k <= 0 ? 0 : k <= 4 ? 3 * k : 12 + 2 * (k - 4); }
+static_assert(gs(NQT) == 20, "groups");
 }  // namespace
 
 extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
@@ -218,16 +250,15 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
     const int tid = (int)__builtin_amdgcn_workitem_id_x();
     const int wv = wave_id(tid);
     const int lane = tid & 31, lr = lane & 15, lh = lane >> 4;
-    const int cnt0 = wv == 0 ? 1 : 0;
     const BlockOf blk = xcd_block((S + KB - 1) / KB, H, B);
     const int kb = blk.slot, h = blk.h, b = blk.b;
     const int kv0 = kb * KB;
-    const int qs0 = (kv0 / QS_) * QS_;  // the first step: the 128-row q block holding kv0
+    const int qs0 = kv0;  // KB == QS_
     const int nst = (S - qs0) / QS_;
     const unsigned long long bh = (unsigned long long)b * H + h;
     const int kvw = kv0 + KBW * wv;  // this wave's first kv row
 
-    // ---- resident B operands: the wave's K / V rows (rows >= S clamped: computed, never stored)
+    // ---- resident B operands: the wave's K / V rows
     i32x32 kx[NJ];
     i32x16 vb[NJ];
     int ksc[NJ], vsc[NJ];
@@ -245,8 +276,8 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
         vsc[j] = *(const int *)(VSR + row * 4);
     });
 
-    // the step's 11 TDM ops, 3 per wave: [Q^T, QS, LSE], [Q nope, dO scales, delta], [dO, Q rope, -], [dO^T, dO^T
-    // scales, Q^T scales] (global address = base + q0 * mult)
+    // the 11 TDM ops of a round, 3 per wave: [Q^T, QS, LSE], [Q nope, dO scales, delta], [dO, Q rope, -], [dO^T, dO^T
+    // scales, Q^T scales] (global address = base + q0 * mult; ops 5..8 are the A part)
     auto dk_op = [&](int k) -> TdmOp {
         const unsigned long long bS = bh * (unsigned long long)S, bS128 = bh * (unsigned long long)(S / 128);
         switch (k) {
@@ -264,57 +295,136 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
         default: return {0, 0, 0, tdm_g1(W0_S, 1, 4, 1, 4), 0};
         }
     };
-    constexpr int TDM_PER_STEP = 3;
-    const TdmOp op0 = dk_op(wv == 0 ? 7 : wv == 1 ? 0 : wv == 2 ? 3 : 5);
-    const TdmOp op1 = dk_op(wv == 0 ? 2 : wv == 1 ? 4 : wv == 2 ? 1 : 6);
-    const TdmOp op2 = dk_op(wv == 0 ? 9 : wv == 1 ? 10 : wv == 2 ? 11 : 8);
-    auto issue_step = [&](int s) {
-        const bool real = s < nst;
-        const unsigned long long q0 = (unsigned long long)(qs0 + (real ? s : nst - 1) * QS_);
-        const unsigned st = lds0 + (unsigned)((s % NSTG) * STG_B);
-        tdm_load(tdm_g0(st + op0.lds, op0.base + q0 * op0.mult, real ? op0.on : 0), op0.g1);
-        tdm_load(tdm_g0(st + op1.lds, op1.base + q0 * op1.mult, real ? op1.on : 0), op1.g1);
-        tdm_load(tdm_g0(st + op2.lds, op2.base + q0 * op2.mult, real ? op2.on : 0), op2.g1);
+    constexpr int TDM_PER_ROUND = 3;
+    const int k0 = wv == 0 ? 7 : wv == 1 ? 0 : wv == 2 ? 3 : 5;
+    const int k1 = wv == 0 ? 2 : wv == 1 ? 4 : wv == 2 ? 1 : 6;
+    const int k2 = LTDT_G ? (wv == 3 ? 8 : 11) : (wv == 0 ? 9 : wv == 1 ? 10 : wv == 2 ? 11 : 8);
+    const TdmOp op0 = dk_op(k0), op1 = dk_op(k1), op2 = dk_op(k2);
+    auto issue_one = [&](const TdmOp &op, int k, int r) __attribute__((always_inline)) {
+        const bool ap = k >= 5 && k <= 8;
+        const int si = ap ? r - 1 : r;  // the step this op loads
+        const bool real = si >= 0 && si < nst;
+        const int sc = si < 0 ? 0 : (si < nst ? si : nst - 1);
+        const unsigned long long q0 = (unsigned long long)(qs0 + sc * QS_);
+        const unsigned st = ap ? lds0 + ARING + (unsigned)(((si + NSTG) % NSTG) * ASTG) : lds0 + (unsigned)((si % NSTG) * QSTG);
+        tdm_load(tdm_g0(st + op.lds, op.base + q0 * op.mult, real ? op.on : 0), op.g1);
     };
-    issue_step(0);
-    issue_step(1);
+    auto issue_round = [&](int r) __attribute__((always_inline)) {
+        issue_one(op0, k0, r);
+        issue_one(op1, k1, r);
+        issue_one(op2, k2, r);
+    };
+    issue_round(0);
+    issue_round(1);
 
     f32x8 dv[8][NJ], dk[12][NJ];
     static_for<8>([&](auto d) { static_for<NJ>([&](auto j) { dv[(int)d][(int)j] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
     static_for<12>([&](auto d) { static_for<NJ>([&](auto j) { dk[(int)d][(int)j] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
 
+    auto addr = [&](int s) __attribute__((always_inline)) -> StepAddr {
+        const unsigned sq = lds0 + (unsigned)((s % NSTG) * QSTG);
+        const unsigned sa = lds0 + ARING + (unsigned)(((s + NSTG - 1) % NSTG) * ASTG);  // the A part of step s - 1
+        const int ln = lane_now(), r16 = ln & 15, hh = ln >> 4;
+        const unsigned rq = sq + (unsigned)(r16 * XK), r1 = sq + (unsigned)(r16 * X128), ra = sa + (unsigned)(r16 * X128);
+        return {pin(rq + O_Q + 64 * hh),         pin(rq + O_Q + 128 + 32 * hh), pin(sq + O_QS + r16 * 8 + 4 * hh),
+                pin(r1 + O_DO + 64 * hh),        pin(sq + O_DOS + r16 * 4),     pin(sq + O_LSE + 32 * hh),
+                pin(sq + O_DEL + 32 * hh),       pin(ra + O_DOT + 64 * hh),     pin(sa + O_DOTS + ln * 4),
+                pin(ra + O_QT + 64 * hh),        pin(sa + O_QTS + ln * 4)};
+    };
+    auto ldA = [&](const StepAddr &a, auto gc) __attribute__((always_inline)) {
+        constexpr int g = decltype(gc)::value;
+        if constexpr (g < 8)
+            return load_afrag<g>(a.dot, a.dots);
+        else
+            return load_afrag<g - 8>(a.qt, a.qts);
+    };
+    // dV^T += dO^T P (g < 8), dK^T += Q^T dS (g >= 8) for the previous step's P / dS
+    auto group = [&](auto gc, const AFrag &af, const i32x16 (&pBo)[NJ], const i32x16 (&dsBo)[NJ],
+                     const int (&dsso)[NJ]) __attribute__((always_inline)) {
+        constexpr int g = decltype(gc)::value;
+        static_for<NJ>([&](auto jj) {
+            constexpr int j = jj;
+            if constexpr (g < 8) {
+                dv[g][j] = wmma_mx<g % 2, 0>(af.x, pBo[j], dv[g][j], af.s, PSCALE);
+            } else {
+                constexpr int e = g - 8;
+                dk[e][j] = wmma_mx<e % 2, 0>(af.x, dsBo[j], dk[e][j], af.s, dsso[j]);
+            }
+        });
+    };
 
-    // one step: the 8 q16 tiles (fragments of tile qt + 1 loaded while tile qt computes), then dV / dK (A fragment of
-    // d16 tile d + 1 loaded while d computes)
-    auto step = [&](const StepAddr &a, int q0, auto diag_c) __attribute__((always_inline)) {
-        constexpr bool DIAG = decltype(diag_c)::value;
-        // the causal mask as constant-vs-threshold compares (no per-element index registers): q < kv iff
-        // 16 qt + r < thr[j] = kv - q0 - 8 lh
+#if LTDT_G
+    // the lse / delta C tuples of q16 tile t (rows 16 t + 8 lh .. + 7 of the step at q0) straight from global memory
+    // (L2 / WGP cache: every wave reads the same 1 KB per step), LTDT_D tiles ahead through a ring carried across steps
+    struct LtDt {
+        f32x8 lt, dt;
+    };
+    // buffer loads: the (b, h) row base in the descriptor, the row offset in an SGPR, the lane's 32 B in a fixed VGPR
+    // (no per-load address math; rows past S read as 0 by the range check)
+    const __amdgpu_buffer_rsrc_t rl = __builtin_amdgcn_make_buffer_rsrc(
+        (void *)(LSE2 + bh * (unsigned long long)S), (short)0, (long)S * 4, 159744);
+    const __amdgpu_buffer_rsrc_t rd = __builtin_amdgcn_make_buffer_rsrc(
+        (void *)(DELTA + bh * (unsigned long long)S), (short)0, (long)S * 4, 159744);
+    const int voff = 32 * lh;
+    auto ld_ltdt = [&](int qrow) __attribute__((always_inline)) -> LtDt {
+        const int so = qrow * 4;
+        return {f8(__builtin_bit_cast(u32x4, __builtin_amdgcn_raw_buffer_load_b128(rl, voff, so, 0)),
+                   __builtin_bit_cast(u32x4, __builtin_amdgcn_raw_buffer_load_b128(rl, voff + 16, so, 0))),
+                f8(__builtin_bit_cast(u32x4, __builtin_amdgcn_raw_buffer_load_b128(rd, voff, so, 0)),
+                   __builtin_bit_cast(u32x4, __builtin_amdgcn_raw_buffer_load_b128(rd, voff + 16, so, 0)))};
+    };
+    LtDt ring[LTDT_D];
+    static_for<LTDT_D>([&](auto i) { ring[(int)i] = ld_ltdt(qs0 + 16 * (int)i); });
+#endif
+    // one step: q16 tile qt in slot qt (fragments of tile qt + 1 loaded at the slot's start), with the dV / dK groups
+    // gs(qt) .. gs(qt + 1) - 1 of the previous step (A fragments of slot qt + 1 loaded at the slot's start)
+    auto step = [&](const StepAddr &a, int q0, i32x16 (&pB)[NJ], i32x16 (&dsB)[NJ], int (&dss)[NJ],
+                    const i32x16 (&pBo)[NJ], const i32x16 (&dsBo)[NJ], const int (&dsso)[NJ], auto diag_c,
+                    auto prev_c) __attribute__((always_inline)) {
+        constexpr bool DIAG = decltype(diag_c)::value, PREV = decltype(prev_c)::value;
+        // the causal mask as constant-vs-threshold compares: q < kv iff 16 qt + r < thr[j] = kv - q0 - 8 lh
         int thr[NJ];
         static_for<NJ>([&](auto jj) { thr[(int)jj] = kvw + 16 * (int)jj + lr - q0 - 8 * lh; });
-        i32x16 pB[NJ], dsB[NJ];
-        int dss[NJ] = {};
         f32x8 dsprev[NJ];
-#if PF_Q
+        AFrag ab[20];
+        if constexpr (PREV)
+            static_for<gs(1)>([&](auto i) { ab[(int)i] = ldA(a, std::integral_constant<int, (int)i>{}); });
         QTile cur = load_qtile<0>(a);
-#endif
         static_for<NQT>([&](auto qq) {
             constexpr int qt = qq;
-#if PF_Q
             QTile nxt;
-            if constexpr (qt + 1 < NQT) nxt = load_qtile<qt + 1>(a);
-            fence();  // the next tile's loads ahead of this tile's math: distinct registers, no write-after-read wait
-#else
-            const QTile cur = load_qtile<qt>(a);
+            if constexpr (qt + 1 < NQT) nxt = load_qtile<(qt + 1 < NQT ? qt + 1 : 0)>(a);
+            if constexpr (PREV && qt + 1 < NQT)
+                static_for<gs(qt + 2) - gs(qt + 1)>([&](auto i) {
+                    constexpr int g = gs(qt + 1) + (int)i;
+                    ab[g] = ldA(a, std::integral_constant<int, g>{});
+                });
+#if KEEP_WAR & 1
+            if constexpr (PREV && qt >= 1)
+                static_for<gs(qt) - gs(qt - 1)>([&](auto i) {  // slot qt - 1's fragments (its WMMAs may be in flight)
+                    constexpr int g = gs(qt - 1) + (int)i;
+                    keep(ab[g].x);
+                    keep(ab[g].s);
+                });
 #endif
+#if LTDT_G
+            // tile qt's tuples from the ring; refill with tile qt + LTDT_D (of the next step past the end: clamped rows
+            // beyond the last step are read and never used)
+            const LtDt cl = ring[qt % LTDT_D];
+            ring[qt % LTDT_D] = ld_ltdt(q0 + 16 * (qt + LTDT_D));
+            const f32x8 &clt = cl.lt, &cdt = cl.dt;
+#else
+            const f32x8 &clt = cur.lt, &cdt = cur.dt;
+#endif
+            fence();
             const i32x32 &qx = cur.qx;
             const i32x16 &dox = cur.dox;
             const int qsc = cur.qsc, dsc = cur.dsc;
             static_for<NJ>([&](auto jj) {
                 constexpr int j = jj;
-                f32x8 sv = wmma_mxc<0, 0, NEG_C>(lo16(qx), lo16(kx[j]), cur.lt, qsc, ksc[j]);
+                f32x8 sv = wmma_mxc<0, 0, NEG_C>(lo16(qx), lo16(kx[j]), clt, qsc, ksc[j]);
                 sv = wmma_mx<1, 1>(mid16(qx), mid16(kx[j]), sv, qsc, ksc[j]);
-                const f32x8 dp = wmma_mxc<0, 0, NEG_C>(dox, vb[j], cur.dt, dsc, vsc[j]);
+                const f32x8 dp = wmma_mxc<0, 0, NEG_C>(dox, vb[j], cdt, dsc, vsc[j]);
                 f32x8 p, ds;
                 static_for<8>([&](auto rr) {
                     constexpr int r = rr;
@@ -337,122 +447,65 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
                     dss[j] |= z.byte << (8 * (qt / 2));
                 }
             });
+            if constexpr (PREV)
+                static_for<gs(qt + 1) - gs(qt)>([&](auto i) {
+                    constexpr int g = gs(qt) + (int)i;
+                    group(std::integral_constant<int, g>{}, ab[g], pBo, dsBo, dsso);
+                });
             fence();
-#if PF_Q
             if constexpr (qt + 1 < NQT) cur = nxt;
-#endif
         });
-        // dV^T += dO^T P (d16 tiles 0..7 of dO^T), dK^T += Q^T dS (12 of Q^T): 20 A fragments in one prefetched sequence
-#if PF_A == 2
-        // 4 buffers, loads two groups ahead and fenced before the group's WMMAs: the buffer a load overwrites was read
-        // two groups earlier (PF_A 1 let the scheduler sink the loads under the WMMAs into the registers they still read:
-        // ~36-cycle write-after-read waits, 20 per step)
-        auto ld = [&](auto dc) __attribute__((always_inline)) {
-            constexpr int d = decltype(dc)::value;
-            if constexpr (d < 8)
-                return load_afrag<d, 0>(a.dot, a.dots);
-            else
-                return load_afrag<d - 8, 1>(a.qt, a.qts);
-        };
-        AFrag ab[4];
-        ab[0] = ld(std::integral_constant<int, 0>{});
-        ab[1] = ld(std::integral_constant<int, 1>{});
-        static_for<20>([&](auto dd) {
-            constexpr int d = dd;
-            if constexpr (d + 2 < 20) ab[(d + 2) % 4] = ld(std::integral_constant<int, d + 2>{});
-            fence();
-            const AFrag &af = ab[d % 4];
-            static_for<NJ>([&](auto jj) {
-                constexpr int j = jj;
-                if constexpr (d < 8) {
-                    if constexpr (d % 2 == 0)
-                        dv[d][j] = wmma_mx<0, 0>(af.x, pB[j], dv[d][j], af.s, PSCALE);
-                    else
-                        dv[d][j] = wmma_mx<1, 0>(af.x, pB[j], dv[d][j], af.s, PSCALE);
-                } else {
-                    constexpr int e = d - 8;
-                    if constexpr (e % 2 == 0)
-                        dk[e][j] = wmma_mx<0, 0>(af.x, dsB[j], dk[e][j], af.s, dss[j]);
-                    else
-                        dk[e][j] = wmma_mx<1, 0>(af.x, dsB[j], dk[e][j], af.s, dss[j]);
-                }
-            });
-            fence();
-        });
-#else
-#if PF_A
-        AFrag af = load_afrag<0, 0>(a.dot, a.dots);
-#endif
-        static_for<20>([&](auto dd) {
-            constexpr int d = dd;
-#if PF_A
-            AFrag an;
-            if constexpr (d + 1 < 8)
-                an = load_afrag<d + 1, 0>(a.dot, a.dots);
-            else if constexpr (d + 1 < 20)
-                an = load_afrag<d + 1 - 8, 1>(a.qt, a.qts);
-#else
-            const AFrag af = d < 8 ? load_afrag<(d < 8 ? d : 0), 0>(a.dot, a.dots)
-                                   : load_afrag<(d < 8 ? 0 : d - 8), 1>(a.qt, a.qts);
-#endif
-            static_for<NJ>([&](auto jj) {
-                constexpr int j = jj;
-                if constexpr (d < 8) {
-                    if constexpr (d % 2 == 0)
-                        dv[d][j] = wmma_mx<0, 0>(af.x, pB[j], dv[d][j], af.s, PSCALE);
-                    else
-                        dv[d][j] = wmma_mx<1, 0>(af.x, pB[j], dv[d][j], af.s, PSCALE);
-                } else {
-                    constexpr int e = d - 8;
-                    if constexpr (e % 2 == 0)
-                        dk[e][j] = wmma_mx<0, 0>(af.x, dsB[j], dk[e][j], af.s, dss[j]);
-                    else
-                        dk[e][j] = wmma_mx<1, 0>(af.x, dsB[j], dk[e][j], af.s, dss[j]);
-                }
-            });
-            fence();
-#if PF_A
-            if constexpr (d + 1 < 20) af = an;
-#endif
-        });
-#endif
     };
 
-    // the steps that cross the diagonal (q0 < kv0 + 192: at most 3) run masked, in their own loop (no branch between
-    // two instantiations inside one loop: it costs the register allocator ~100 VGPRs)
-    const int ndiag = min((kv0 + KB - qs0 + QS_ - 1) / QS_, nst);
-    auto run = [&](int s, auto diag_c) __attribute__((always_inline)) {
-        tensor_wait<TDM_PER_STEP>();  // this wave's step s landed (step s + 1 in flight)
+    i32x16 pBo[NJ], dsBo[NJ];
+    int dsso[NJ];
+    auto run = [&](int s, auto diag_c, auto prev_c) __attribute__((always_inline)) {
+        tensor_wait<TDM_PER_ROUND>();  // round s landed: the q part of step s, the A part of step s - 1
         bar_signal();
-        bar_wait();         // step s visible; every wave is done with step s - 1
-        issue_step(s + 2);  // into the stage of step s - 1
-        const unsigned st = lds0 + (unsigned)((s % NSTG) * STG_B);
-        const int ln = lane_now(), r16 = ln & 15, h = ln >> 4;
-        const unsigned rq = st + (unsigned)(r16 * XK), r1 = st + (unsigned)(r16 * X128);
-        const StepAddr a = {pin(rq + O_Q + 64 * h),
-                            pin(rq + O_Q + 128 + 32 * h),
-                            pin(st + O_QS + r16 * 8 + 4 * h),
-                            pin(r1 + O_DO + 64 * h),
-                            pin(st + O_DOS + r16 * 4),
-                            pin(st + O_LSE + 32 * h),
-                            pin(st + O_DEL + 32 * h),
-                            pin(r1 + O_DOT + 64 * h),
-                            pin(st + O_DOTS + ln * 4),
-                            pin(r1 + O_QT + 64 * h),
-                            pin(st + O_QTS + ln * 4)};
-        step(a, qs0 + s * QS_, diag_c);
+        bar_wait();          // visible to every wave; every wave is done with step s - 1 (and the dV / dK of s - 2)
+        issue_round(s + 2);  // q part of step s + 2 into step s - 1's q stage, A part of s + 1 into step s - 2's A stage
+        const StepAddr a = addr(s);
+        i32x16 pB[NJ], dsB[NJ];
+        int dss[NJ] = {};
+        step(a, qs0 + s * QS_, pB, dsB, dss, pBo, dsBo, dsso, diag_c, prev_c);
+        static_for<NJ>([&](auto jj) {
+            pBo[(int)jj] = pB[(int)jj];
+            dsBo[(int)jj] = dsB[(int)jj];
+            dsso[(int)jj] = dss[(int)jj];
+        });
     };
-    for (int s = 0; s < ndiag; ++s) run(s, std::true_type{});
-    for (int s = ndiag; s < nst; ++s) run(s, std::false_type{});
-#if OSTAGE
-    // ---- epilogue: dK / dV rows (lane = kv column, rows d = 8 lh + r of each d16 tile) as bf16 into LDS (the ring,
-    // idle now), then one TDM store each (wave 0: dK, 384 B rows; wave 1: dV, 256 B rows), rows >= S clipped by the
-    // descriptor's rows in bounds (no exec change; the scattered SBHD stores held their VGPRs for hundreds of cycles)
+    run(0, std::true_type{}, std::false_type{});
+    for (int s = 1; s < nst; ++s) run(s, std::false_type{}, std::true_type{});
+
+    // ---- the dV / dK of the last step (its A part: round nst), A fragments two groups ahead
     tensor_wait<0>();
     bar_signal();
-    bar_wait();  // every wave is done with the ring
+    bar_wait();  // the last A part visible; every wave is done with the q ring
+    {
+        const StepAddr a = addr(nst);
+        constexpr int NAB = 4;
+        AFrag ab[NAB];
+        ab[0] = ldA(a, std::integral_constant<int, 0>{});
+        ab[1] = ldA(a, std::integral_constant<int, 1>{});
+        static_for<20>([&](auto dd) {
+            constexpr int d = dd;
+            if constexpr (d + 2 < 20) ab[(d + 2) % NAB] = ldA(a, std::integral_constant<int, (d + 2 < 20 ? d + 2 : 0)>{});
+#if KEEP_WAR & 1
+            if constexpr (d >= 1 && d + 2 < 20) {
+                keep(ab[(d + NAB - 1) % NAB].x);
+                keep(ab[(d + NAB - 1) % NAB].s);
+            }
+#endif
+            fence();
+            group(std::integral_constant<int, d>{}, ab[d % NAB], pBo, dsBo, dsso);
+            fence();
+        });
+    }
+
+    // ---- epilogue: dK / dV rows (lane = kv column, rows d = 8 lh + r of each d16 tile) as bf16 into LDS (the q ring,
+    // idle since the barrier above), then one TDM store each (wave 0: dK, 384 B rows; wave 1: dV, 256 B rows)
     constexpr int XDK = 2 * D_QK, XDV = 2 * D_V, O_SDK = 0, O_SDV = KB * XDK;
-    static_assert(O_SDV + KB * XDV <= LDS_B, "staging");
+    static_assert(O_SDV + KB * XDV <= ARING, "staging inside the q ring");
     {
         const int ln = lane_now();
         static_for<NJ>([&](auto jj) {
@@ -487,29 +540,6 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
             tdm_store(tdm_g0(lds0 + O_SDV, g), tdm_g1(tdm_w0(0, 0, 0), rows, XDV, KB, 2ull * (unsigned long long)dv_ss));
         }
     }
-#else
-    // ---- epilogue: lane = kv column, rows d = 8 lh + r of each d16 tile
-    static_for<NJ>([&](auto jj) {
-        constexpr int j = jj;
-        const int kv = kvw + 16 * j + lr;
-        if (kv < S) {
-            bf16 *dkr = DK + (long long)b * dk_sb + (long long)kv * dk_ss + (long long)h * D_QK;
-            bf16 *dvr = DV + (long long)b * dv_sb + (long long)kv * dv_ss + (long long)h * D_V;
-            static_for<12>([&](auto dd) {
-                constexpr int d = dd;
-                bf16x8 w;
-                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dk[d][j][(int)rr] * scale); });
-                *(u32x4 *)(dkr + 16 * d + 8 * lh) = __builtin_bit_cast(u32x4, w);
-            });
-            static_for<8>([&](auto dd) {
-                constexpr int d = dd;
-                bf16x8 w;
-                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)dv[d][j][(int)rr]; });
-                *(u32x4 *)(dvr + 16 * d + 8 * lh) = __builtin_bit_cast(u32x4, w);
-            });
-        }
-    });
-#endif
     tensor_wait<0>();
 }
 
@@ -526,6 +556,10 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
 // dS^T, dS^T of kv16 tiles 2m, 2m + 1 quantized per q column (16 values + peer) into the dQ B operand (bytes 8 j + r = kv
 // 16 j + 8 h + r) and its scale byte m; then dQ^T += K^T dS^T (12 d16 tiles, A = K8T rows).
 namespace {
+template <typename T>
+MX_INLINE void dq_keep(const T &x) {
+    asm volatile("" ::"v"(x));
+}
 constexpr int BMQ = 256;
 constexpr int QTW = 4;   // q16 tiles per wave
 constexpr int NBK = 128; // kv rows per tile
@@ -710,8 +744,25 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
         ldkv(std::integral_constant<int, 0>{}, kvb[0]);
         static_for<NKV / 2>([&](auto mm) {
             constexpr int m = mm;
-            if constexpr (m + 1 < NKV / 2) {
+            if constexpr (m + 1 < NKV / 2 && DQ_KVMID > 0) {
+                // loaded inside the q-tile loop below
+            } else if constexpr (m + 1 < NKV / 2) {
+#if DQ_KEEP & 2
+                if constexpr (m >= 1) {
+                    const KVPair old = kvb[(m + 1) % 2];  // pair m - 1: read by the previous region's WMMAs
+                    ldkv(std::integral_constant<int, m + 1>{}, kvb[(m + 1) % 2]);
+                    static_for<2>([&](auto uu) {
+                        dq_keep(old.kx[(int)uu]);
+                        dq_keep(old.va[(int)uu]);
+                        dq_keep(old.ksc[(int)uu]);
+                        dq_keep(old.vsc[(int)uu]);
+                    });
+                } else {
+                    ldkv(std::integral_constant<int, m + 1>{}, kvb[(m + 1) % 2]);
+                }
+#else
                 ldkv(std::integral_constant<int, m + 1>{}, kvb[(m + 1) % 2]);
+#endif
             } else {
                 ab[0] = lda(std::integral_constant<int, 0>{});
                 ab[1] = lda(std::integral_constant<int, 1>{});
@@ -720,6 +771,10 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
             const KVPair &kv = kvb[m % 2];
             static_for<QTW>([&](auto ii) {
                 constexpr int i = ii;
+                if constexpr (DQ_KVMID > 0 && i == DQ_KVMID && m + 1 < NKV / 2) {
+                    fence();  // pair m - 1's WMMAs are long done: the loads may take its registers
+                    ldkv(std::integral_constant<int, (m + 1 < NKV / 2 ? m + 1 : 0)>{}, kvb[(m + 1) % 2]);
+                }
                 const int thr = q0 + 64 * i + 16 * wv + lr - kv0 - 8 * lh;  // masked iff 16 j + r > thr
                 f32x8 ds[2];
                 static_for<2>([&](auto uu) {
@@ -765,6 +820,12 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
         static_for<12>([&](auto dd) {
             constexpr int dt = dd;
             if constexpr (dt + 2 < 12) ab[(dt + 2) % 4] = lda(std::integral_constant<int, dt + 2>{});
+#if DQ_KEEP & 1
+            if constexpr (dt >= 1 && dt + 2 < 12) {
+                dq_keep(ab[(dt + 3) % 4].x);  // fragment dt - 1: read by the previous group's WMMAs
+                dq_keep(ab[(dt + 3) % 4].s);
+            }
+#endif
             fence();
             const AF &af = ab[dt % 4];
             static_for<QTW>([&](auto ii) {

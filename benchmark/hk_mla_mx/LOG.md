@@ -262,3 +262,32 @@ b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 
   correct (toy..prod, the extra-shape sweep `scratch_mx/py/shapes_fwd.py`: xcd / paired / plain orders all pass), but
   either half perturbs the global register allocation (150-200 VGPR spills): 0.453 vs 0.423 ms. Kept off (DMASK 0 =
   the committed m7 code, 976 VGPRs, 1 spill).
+
+## 2026-11-05 (c): backward write-after-read waits, rung b5 (cross-step pipelined dK / dV)
+
+- b3 dkdv experiments (`kern/k_mla_bwd_mx3.hip` macros): QPIPE 1 (q16 tiles software-pipelined: S / dP WMMAs of tile
+  qt + 1 beside the VALU of tile qt) 0.979 -> 0.972 ms; with sched_group_barrier windows (QSGB, 4 patterns) 1.01-1.05;
+  QPIPE 2 (3 fragment buffers) slower. Timing probes (wrong numerics): without the per-tile lse / delta reloads -2.4%,
+  without the per-tile scale reloads -2.9%, both -6.3% (the b32 scale loads cost more per instruction than b128).
+- ATT (`py/att_tl.py` gap pairs): W -> L median 37 cycles, ~19 per step (~490 cycles / step): the dV / dK A-fragment
+  loads went into the registers the previous group's WMMAs were still reading. The 4-buffer source scheme does not
+  constrain the physical registers: a dead fragment's registers are reused at once and the allocator does not model
+  the write-after-read wait. KEEP_WAR: an empty asm use of fragment d - 1 after the loads of group d (it stays
+  allocated until then): dkdv 0.979 -> 0.947 ms, same 764 VGPRs. For QPIPE's q16 tiles (a whole QTile kept) it spills.
+  PF_AD 3 / 4 (deeper A prefetch), QFENCE2 0: within 1%.
+- **Rung b5** (`kern/k_mla_bwd_mx5.hip`): k_dkdv_mx pipelined across steps: the eight q16-tile slots of step s also
+  issue the 20 dV / dK groups of step s - 1 (3, 3, 3, 3, 2, 2, 2, 2 per slot; their A fragments loaded one slot ahead,
+  the previous slot's kept alive), P / dS of the previous step carried in registers; LDS ring split into a q part
+  (Q / dO rows, scales, lse, delta) and an A part (dO^T, Q^T, scales), 3 stages each, TDM round r = q part of step r +
+  A part of step r - 1, issued at the start of step r - 2 (two steps of lead for both). b3 ran each step's A phase
+  after its q tiles with all four waves pulling ~200 KB of A fragments at once (~40-cycle load waits per group).
+  dkdv 0.947 -> 0.909 ms (2361 cycles / step from 2598; 918 VGPRs, 1 spill in the peeled step 0). The step is now
+  issue-bound with the stalls spread: L 714, T 399, V 390, W 354, S 188, C 155 cycles / step (230 loads at ~3.1).
+- not taken: -fno-slp-vectorize (the pk_mul of dS = P dP needs operand pairs: ~120 v_mov per step; without SLP 784
+  VGPRs, 188 fewer instructions, but dkdv only 0.904 and dq slower 0.644); lse / delta by buffer loads LTDT_D tiles
+  ahead (1.000 / 0.978 / 0.962 ms for D 2 / 3 / 4: global latency).
+- dq (b5 file, b3's kernel): the same wait on the dQ phase's K^T fragments (W -> L median 47 cycles, ~10 per tile):
+  DQ_KEEP 1: dq 0.624 -> 0.598 ms (2975 cycles / tile from 3248), no extra VGPRs. Keeping the K / V pairs too: 112
+  spills; their loads moved behind a fence after q tile 1..3 of the pair: 0.611-0.649 (slower).
+- **b5 backward 1.584 ms** (b3 1.651; dkdv 0.909 + dq 0.598; bf16 HK 1.971). Toy..mid pass with b3's SNRs. Package:
+  backward b5 (hip/k_mla_bwd_mx5.hip), pytest 28 pass.

@@ -48,6 +48,32 @@ using namespace mx;
 #ifndef PF_A
 #define PF_A 2
 #endif
+#ifndef QPIPE
+#define QPIPE 0  // dkdv: software-pipelined q16 tiles (S / dP WMMAs of tile qt + 1 beside the VALU of tile qt)
+#endif
+#ifndef KEEP_WAR
+// keep a fragment the previous WMMAs read alive past the next loads (no register reuse while they may be in flight):
+// bit 0 the dV / dK A fragments (dkdv 0.979 -> 0.950 ms), bit 1 QPIPE's q16 tiles (58 more VGPRs: spills)
+#define KEEP_WAR 1
+#endif
+#ifndef PF_AD
+#define PF_AD 2  // PF_A 2: dV / dK A fragments loaded PF_AD groups ahead (PF_AD + 2 buffers)
+#endif
+#ifndef QFENCE2
+#define QFENCE2 1  // 0: no fence after a q16 tile's math (its P / dS conversion may sink under the next tile's work)
+#endif
+#ifndef QSGB
+#define QSGB 0  // QPIPE + sched_group_barrier windows per iteration: [W, QSGB_L x L, QSGB_T x T, QSGB_V x V] x 6
+#endif
+#ifndef QSGB_L
+#define QSGB_L 3
+#endif
+#ifndef QSGB_T
+#define QSGB_T 3
+#endif
+#ifndef QSGB_V
+#define QSGB_V 6
+#endif
 
 namespace {
 constexpr int D_QK = 192, D_V = 128;
@@ -181,11 +207,27 @@ MX_INLINE QTile load_qtile(const StepAddr &a) {
     QTile t;
     t.qx = frag24(lds_b128(pqn, oq), lds_b128(pqn, oq + 16), lds_b128(pqn, oq + 32), lds_b128(pqn, oq + 48),
                   lds_b128(pqr, oq), lds_b128(pqr, oq + 16));
-    t.qsc = (int)lds_b32(lds_ptr(a.qs), QT * 16 * 8);
     t.dox = cat4(lds_b128(pdo, od), lds_b128(pdo, od + 16), lds_b128(pdo, od + 32), lds_b128(pdo, od + 48));
-    t.dsc = (int)lds_b32(lds_ptr(a.dos), QT * 16 * 4);
-    t.lt = f8(lds_b128(lds_ptr(a.lse), QT * 64), lds_b128(lds_ptr(a.lse), QT * 64 + 16));
-    t.dt = f8(lds_b128(lds_ptr(a.del), QT * 64), lds_b128(lds_ptr(a.del), QT * 64 + 16));
+#if PROBE_SC  // timing probe only (wrong numerics): tile 0's scales for every tile
+    if constexpr (QT > 0) {
+        t.qsc = 0x7f7f7f7f;
+        t.dsc = 0x7f7f7f7f;
+    } else
+#endif
+    {
+        t.qsc = (int)lds_b32(lds_ptr(a.qs), QT * 16 * 8);
+        t.dsc = (int)lds_b32(lds_ptr(a.dos), QT * 16 * 4);
+    }
+#if PROBE_LTDT  // timing probe only (wrong numerics): lse / delta tuples of tile 0 only
+    if constexpr (QT > 0) {
+        t.lt = f32x8{1, 1, 1, 1, 1, 1, 1, 1};
+        t.dt = f32x8{1, 1, 1, 1, 1, 1, 1, 1};
+    } else
+#endif
+    {
+        t.lt = f8(lds_b128(lds_ptr(a.lse), QT * 64), lds_b128(lds_ptr(a.lse), QT * 64 + 16));
+        t.dt = f8(lds_b128(lds_ptr(a.del), QT * 64), lds_b128(lds_ptr(a.del), QT * 64 + 16));
+    }
     return t;
 }
 struct AFrag {
@@ -200,6 +242,20 @@ MX_INLINE AFrag load_afrag(uint32_t base, uint32_t sbase) {
             (int)lds_b32(lds_ptr(sbase), (D / 2) * 128)};
 }
 MX_INLINE void fence() { __builtin_amdgcn_sched_barrier(0); }
+// an empty use: x stays in its registers up to here, so loads issued before it cannot be given those registers while
+// WMMAs that read x may still be in flight (the register allocator does not model the ~37-cycle write-after-read wait)
+template <typename T>
+MX_INLINE void keep(const T &x) {
+    asm volatile("" ::"v"(x));
+}
+MX_INLINE void keep_qtile(const QTile &t) {
+    keep(t.qx);
+    keep(t.dox);
+    keep(t.lt);
+    keep(t.dt);
+    keep(t.qsc);
+    keep(t.dsc);
+}
 }  // namespace
 
 extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
@@ -295,6 +351,75 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
         i32x16 pB[NJ], dsB[NJ];
         int dss[NJ] = {};
         f32x8 dsprev[NJ];
+#if QPIPE
+        // iteration qt: the S / dP WMMAs of tile qt + 1 (fragments loaded an iteration earlier), the fragment loads of
+        // tile qt + 2 (into the buffer tile qt's WMMAs read, issued an iteration ago) and the softmax / dS VALU of tile
+        // qt (accumulators of the previous iteration): three independent streams for the scheduler to interleave (b3:
+        // each tile's exps waited for its own WMMAs, the loads went out in bursts)
+        constexpr int NFB = QPIPE == 2 ? 3 : 2;  // fragment buffers: QPIPE 2 loads two tiles ahead
+        QTile fb[NFB];
+        f32x8 sacc[2][NJ], pacc[2][NJ];
+        auto sdp = [&](const QTile &t, f32x8 (&sv)[NJ], f32x8 (&dp)[NJ]) __attribute__((always_inline)) {
+            static_for<NJ>([&](auto jj) {
+                constexpr int j = jj;
+                const f32x8 s0 = wmma_mxc<0, 0, NEG_C>(lo16(t.qx), lo16(kx[j]), t.lt, t.qsc, ksc[j]);
+                sv[j] = wmma_mx<1, 1>(mid16(t.qx), mid16(kx[j]), s0, t.qsc, ksc[j]);
+                dp[j] = wmma_mxc<0, 0, NEG_C>(t.dox, vb[j], t.dt, t.dsc, vsc[j]);
+            });
+        };
+        fb[0] = load_qtile<0>(a);
+        fb[1] = load_qtile<1>(a);
+        if constexpr (NFB == 3) fb[2 % NFB] = load_qtile<2>(a);
+        sdp(fb[0], sacc[0], pacc[0]);
+        fence();
+        static_for<NQT>([&](auto qq) {
+            constexpr int qt = qq;
+            if constexpr (qt + 1 < NQT) sdp(fb[(qt + 1) % NFB], sacc[(qt + 1) % 2], pacc[(qt + 1) % 2]);
+            if constexpr (qt + NFB < NQT) {
+#if KEEP_WAR & 2
+                const QTile old = fb[qt % NFB];  // tile qt: read by the previous iteration's WMMAs
+                fb[qt % NFB] = load_qtile<(qt + NFB < NQT ? qt + NFB : 0)>(a);
+                keep_qtile(old);
+#else
+                fb[qt % NFB] = load_qtile<(qt + NFB < NQT ? qt + NFB : 0)>(a);
+#endif
+            }
+            static_for<NJ>([&](auto jj) {
+                constexpr int j = jj;
+                const f32x8 &sv = sacc[qt % 2][j], &dp = pacc[qt % 2][j];
+                f32x8 p, ds;
+                static_for<8>([&](auto rr) {
+                    constexpr int r = rr;
+                    float pv = exp2_raw(sv[r]);
+                    if constexpr (DIAG) pv = (16 * qt + r < thr[j]) ? 0.f : pv;  // q < kv
+                    p[r] = pv;
+                    ds[r] = pv * dp[r];
+                });
+                const u32x2 pq = cvt8_e4m3(p, 1.0f / 256.0f);
+                pB[j][2 * qt] = (int)pq[0];
+                pB[j][2 * qt + 1] = (int)pq[1];
+                if constexpr (qt % 2 == 0) {
+                    dsprev[j] = ds;
+                } else {
+                    const DsQ z = quant_pair(dsprev[j], ds);
+                    dsB[j][2 * (qt - 1)] = (int)z.a[0];
+                    dsB[j][2 * (qt - 1) + 1] = (int)z.a[1];
+                    dsB[j][2 * qt] = (int)z.b[0];
+                    dsB[j][2 * qt + 1] = (int)z.b[1];
+                    dss[j] |= z.byte << (8 * (qt / 2));
+                }
+            });
+#if QSGB
+            static_for<6>([&](auto) {
+                __builtin_amdgcn_sched_group_barrier(0x8, 1, 0);
+                __builtin_amdgcn_sched_group_barrier(0x100, QSGB_L, 0);
+                __builtin_amdgcn_sched_group_barrier(0x400, QSGB_T, 0);
+                __builtin_amdgcn_sched_group_barrier(0x2, QSGB_V, 0);
+            });
+#endif
+            fence();
+        });
+#else
 #if PF_Q
         QTile cur = load_qtile<0>(a);
 #endif
@@ -337,11 +462,14 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
                     dss[j] |= z.byte << (8 * (qt / 2));
                 }
             });
+#if QFENCE2
             fence();
+#endif
 #if PF_Q
             if constexpr (qt + 1 < NQT) cur = nxt;
 #endif
         });
+#endif  // QPIPE
         // dV^T += dO^T P (d16 tiles 0..7 of dO^T), dK^T += Q^T dS (12 of Q^T): 20 A fragments in one prefetched sequence
 #if PF_A == 2
         // 4 buffers, loads two groups ahead and fenced before the group's WMMAs: the buffer a load overwrites was read
@@ -354,14 +482,21 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
             else
                 return load_afrag<d - 8, 1>(a.qt, a.qts);
         };
-        AFrag ab[4];
-        ab[0] = ld(std::integral_constant<int, 0>{});
-        ab[1] = ld(std::integral_constant<int, 1>{});
+        constexpr int NAB = PF_AD + 2;
+        AFrag ab[NAB];
+        static_for<PF_AD>([&](auto i) { ab[(int)i] = ld(std::integral_constant<int, (int)i>{}); });
         static_for<20>([&](auto dd) {
             constexpr int d = dd;
-            if constexpr (d + 2 < 20) ab[(d + 2) % 4] = ld(std::integral_constant<int, d + 2>{});
+            if constexpr (d + PF_AD < 20)
+                ab[(d + PF_AD) % NAB] = ld(std::integral_constant<int, (d + PF_AD < 20 ? d + PF_AD : 0)>{});
+#if KEEP_WAR & 1
+            if constexpr (d >= 1 && d + PF_AD < 20) {
+                keep(ab[(d + NAB - 1) % NAB].x);  // fragment d - 1: read by the previous group's WMMAs
+                keep(ab[(d + NAB - 1) % NAB].s);
+            }
+#endif
             fence();
-            const AFrag &af = ab[d % 4];
+            const AFrag &af = ab[d % NAB];
             static_for<NJ>([&](auto jj) {
                 constexpr int j = jj;
                 if constexpr (d < 8) {
