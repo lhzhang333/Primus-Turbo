@@ -55,6 +55,9 @@ constexpr unsigned W0_KN = tdm_w0(0, 32, 20), W0_KR = tdm_w0(0, 16, 36), W0_V = 
 #ifndef XCD_MAP
 #define XCD_MAP 1  // workgroups of one (b, h) on one XCD (dispatch: linear id L -> XCD L % 8): K / V reuse in its L2
 #endif
+#ifndef TDM_SPLIT
+#define TDM_SPLIT 1
+#endif
 #ifndef TDM_ONLY
 #define TDM_ONLY 0  // 1: only the TDM ring, its waits and the barriers (the data movement floor)
 #endif
@@ -66,6 +69,9 @@ static_assert(TAU2_X100 + 100 * PE <= 880, "P = E4M3(p 2^PE) <= 2^(TAU2 + PE) mu
 constexpr int SC_ONE = 127 * 0x01010101;   // E8M0 2^0
 constexpr int ONES = 0x38383838;           // E4M3 1.0 x 4
 constexpr int DGUARD = 48;                 // rescale O when D = m - mref exceeds this (B scale range, fp32 range)
+#ifndef GCHUNK
+#define GCHUNK 4                           // tiles between two guard checks
+#endif
 constexpr unsigned PVS0 = (unsigned)(127 - PE) * 0x01010101u;  // the B scale bytes at D = 0: 2^-PE
 
 typedef int32_t i32x32 __attribute__((ext_vector_type(32)));
@@ -86,7 +92,8 @@ struct QFrag {
 struct QState {
     f32x8 o[NDT];  // O^T accumulators (rows d), relative to mref
     f32x8 os;      // row sum (all-ones PV WMMA), relative to mref
-    f32x8 mt;      // -m in all 8 rows: the nope WMMA's C, so S'' = S' - m comes out of the WMMA
+    float m;       // the running max (log2 units); the nope WMMA's C = -m in all 8 rows (mtuple), so S'' = S' - m
+                   // comes out of the WMMA. One VGPR per q tile, the 8-VGPR tuple only while its QK runs
     float mref;    // the reference (log2 units)
     int D;         // m - mref (integer); the PV WMMAs' B scale 2^(D - PE) is formed from it per PV group (pv_scale):
                    // a long-lived scale VGPR would have to live in v0..v255 (WMMA scale operands), which spills
@@ -170,6 +177,7 @@ MX_INLINE void load_q(QFrag &q, const QAddr &a) {
 }
 
 // QK WMMA w (0..15) of a q tile: w < 8 the nope WMMA of kv16 tile w (C = -m), w >= 8 the rope WMMA of kv16 tile w - 8
+MX_INLINE f32x8 mtuple(float m) { return f32x8{-m, -m, -m, -m, -m, -m, -m, -m}; }
 template <int W>
 MX_INLINE void qk_w(f32x8 (&s)[NKV], const KFrag &k, const QFrag &q, const f32x8 &mt) {
     if constexpr (W < NKV) {
@@ -219,7 +227,7 @@ MX_INLINE float sm_lm(const float (&pm)[4]) {
     const float mx = __builtin_fmaxf(__builtin_fmaxf(pm[0], pm[1]), __builtin_fmaxf(pm[2], pm[3]));
     return __builtin_fmaxf(mx, peer(mx));
 }
-// non-first tile: d = lm > TAU2 ? ceil(lm) : 0; pscale = 2^(d - PE); D += d; m += d (mt -= d); B scale bytes
+// non-first tile: d = lm > TAU2 ? ceil(lm) : 0; pscale = 2^(d - PE); D += d; m += d
 MX_INLINE float sm_decide(QState &st, float lm, bool first = false) {
     // first (uniform; FIRST_PEEL 0): d = ceil(lm) also downwards, mref = d, D = 0 -- the exps ran unshifted, which
     // needs |S'| < 126 on the first tile (logits under 87 nats)
@@ -228,14 +236,7 @@ MX_INLINE float sm_decide(QState &st, float lm, bool first = false) {
     const int di = (int)d;
     if (first) st.mref = d;
     st.D = first ? 0 : st.D + di;
-    const f32x2 dv = {d, d};
-    static_for<4>([&](auto hh) {
-        constexpr int h2 = hh;
-        f32x2 y = {st.mt[2 * h2], st.mt[2 * h2 + 1]};
-        y = y - dv;
-        st.mt[2 * h2] = y[0];
-        st.mt[2 * h2 + 1] = y[1];
-    });
+    st.m += d;
     return __builtin_ldexpf(1.0f / (float)(1 << PE), di);
 }
 // first tile: d = ceil(lm) (lm finite: kv 0 is in every q row's first tile), S'' -= d, mref = d, D = 0
@@ -243,14 +244,8 @@ MX_INLINE void sm_first(QState &st, f32x8 (&s)[NKV], float lm) {
     const float d = __builtin_ceilf(lm);
     st.mref = d;
     st.D = 0;
+    st.m += d;
     const f32x2 dv = {d, d};
-    static_for<4>([&](auto hh) {
-        constexpr int h2 = hh;
-        f32x2 y = {st.mt[2 * h2], st.mt[2 * h2 + 1]};
-        y = y - dv;
-        st.mt[2 * h2] = y[0];
-        st.mt[2 * h2 + 1] = y[1];
-    });
     static_for<NKV>([&](auto jj) {
         static_for<4>([&](auto hh) {
             constexpr int j = jj, h2 = hh;
@@ -395,6 +390,33 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
     const unsigned long long gv = (unsigned long long)(uintptr_t)V8T + bh * D_V * S;
     const unsigned long long gvs = (unsigned long long)(uintptr_t)VS + bh * (unsigned long long)(S / NB) * VS_B;
 
+#if TDM_SPLIT
+    // the tile's 5 TDM ops spread over the waves (LLVM waits for tensorcnt <= 10 before every TDM op: with all 5 on one
+    // wave, 3 tiles in flight = 15 ops, its oldest transfers block it). Two TDM instructions per wave and tile:
+    // wave 0 K nope | -, wave 1 K rope | K scales, wave 2 V | -, wave 3 V scales | - (- = NULL descriptor). The
+    // wave's descriptor constants are formed once (no per-tile selects): op A of tile tt = base + tt * step.
+    constexpr int TDM_PER_TILE = 2;
+    const unsigned a_lds = wv == 0 ? 0u : wv == 1 ? 128u : wv == 2 ? (unsigned)(K_B + KS_B) : (unsigned)(K_B + KS_B + V_B);
+    const unsigned long long a_base = wv == 0 ? gk : wv == 1 ? gk + 128 : wv == 2 ? gv : gvs;
+    const unsigned long long a_step = wv <= 1 ? (unsigned long long)NB * D_QK : wv == 2 ? (unsigned long long)NB
+                                                                                       : (unsigned long long)VS_B;
+    const i32x8 a_g1 = tdm_g1(wv == 0 ? W0_KN : wv == 1 ? W0_KR : wv == 2 ? W0_V : W0_S, 128,
+                              wv == 0 ? 128u : wv == 1 ? 64u : wv == 2 ? 128u : 4u, 128,
+                              wv <= 1 ? (unsigned long long)D_QK : wv == 2 ? (unsigned long long)S : 4ull);
+    const i32x8 a_g1d = tdm_g1(wv == 0 ? W0_KN : wv == 1 ? W0_KR : wv == 2 ? W0_V : W0_S, 1,
+                               wv == 0 ? 128u : wv == 1 ? 64u : wv == 2 ? 128u : 4u, 128,
+                               wv <= 1 ? (unsigned long long)D_QK : wv == 2 ? (unsigned long long)S : 4ull);
+    const i32x8 b_g1 = tdm_g1(W0_S, 128, 8, NB, 8), b_g1d = tdm_g1(W0_S, 1, 8, NB, 8);
+    const int b_cnt = wv == 1 ? 1 : 0;
+    auto issue_slot = [&](int t) {
+        const bool real = t < n;
+        const int tt = real ? t : n - 1;
+        const unsigned st = lds0 + (unsigned)((t & (NSTG - 1)) * STG_B);
+        tdm_load(tdm_g0(st + a_lds, a_base + (unsigned long long)tt * a_step, 1), real ? a_g1 : a_g1d);
+        tdm_load(tdm_g0(st + K_B, gks + (unsigned long long)tt * (NB * 8), b_cnt), real ? b_g1 : b_g1d);
+    };
+#else
+    constexpr int TDM_PER_TILE = 5;
     auto issue_slot = [&](int t) {
         const bool real = t < n;
         const int tt = real ? t : n - 1;
@@ -407,6 +429,7 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
         tdm_load(tdm_g0(st + K_B + KS_B, gv + k0, cnt0), tdm_g1(W0_V, rv, 128, D_V, (unsigned long long)S));
         tdm_load(tdm_g0(st + K_B + KS_B + V_B, gvs + (unsigned long long)tt * VS_B, cnt0), tdm_g1(W0_S, rv, 4, D_V, 4));
     };
+#endif
     auto stage = [&](int t) { return lds0 + (unsigned)((t & (NSTG - 1)) * STG_B); };
 
     tdm_load(tdm_g0(lds0 + Q_OFF, gq, wv == 1 ? 1 : 0), tdm_g1(W0_KN, BM, 128, BM, D_QK));
@@ -423,7 +446,7 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
     for (int t = 0; t < n; ++t) {
         issue_slot(t + 3);
         fence();
-        tensor_wait<10>();
+        tensor_wait<2 * TDM_PER_TILE>();
         bar_signal();
         bar_wait();
         fence();
@@ -443,7 +466,8 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
         constexpr int i = ii;
         st[i].mref = 0.f;
         st[i].D = 0;
-        st[i].os = st[i].mt = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        st[i].m = 0.f;
+        st[i].os = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
         static_for<NDT>([&](auto dd) { st[i].o[(int)dd] = f32x8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}; });
     });
     const i32x16 ones = {ONES, ONES, ONES, ONES, ONES, ONES, ONES, ONES,
@@ -464,7 +488,10 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
         load_q<0>(qf[0], qa);
         load_q<1>(qf[1], qa);
     }
-    static_for<16>([&](auto ww) { qk_w<(int)ww>(sa, kf, qf[0], st[0].mt); });
+    {
+        const f32x8 mt0 = mtuple(st[0].m);
+        static_for<16>([&](auto ww) { qk_w<(int)ww>(sa, kf, qf[0], mt0); });
+    }
     fence();
 
     // tile t: on entry sa = S''(q0) of tile t, qf[1] = Q(q1), kf = K(t). Slot 3 computes QK(q0) of tile t + 1 (not
@@ -474,20 +501,10 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
                        LAST = decltype(last_c)::value;
         const VAddr va = vaddr(stage(t), lr, lh, lane);
         const KAddr ka = kaddr(stage(t + 1), lr, lh);
-        // overflow guard: the compare first, the branch after the TDM issue (its SGPR latency hidden)
-        bool need = false;
-        if constexpr (!FIRST && !NO_GUARD) {
-            const int d01 = st[0].D > st[1].D ? st[0].D : st[1].D, d23 = st[2].D > st[3].D ? st[2].D : st[3].D;
-            need = __builtin_amdgcn_ballot_w32((d01 > d23 ? d01 : d23) > DGUARD) != 0u;
-        }
         fence();
         issue_slot(t + 3);
         load_v(vf, va);
         fence();
-        if constexpr (!FIRST && !NO_GUARD) {
-            if (need) guard_rescale(st);
-            fence();
-        }
         const int kvrow0 = t * NB + 8 * lh;
         static_for<QT>([&](auto ii) {
             constexpr int i = ii;
@@ -498,7 +515,7 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
             const int qr_i = q0 + 64 * i + 16 * wv + lr;
             const int thr = qr_i - kvrow0;
             if constexpr (i == 1) {
-                tensor_wait<10>();
+                tensor_wait<2 * TDM_PER_TILE>();
                 bar_signal();  // B_{t+1}
                 fence();
             }
@@ -513,6 +530,7 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
             constexpr int NQK = (i + 1 < QT || !LAST) ? 16 : 0;
             constexpr int NW = NPV + NQK;
             constexpr int qn_mt = (i + 1) % QT;
+            const f32x8 mtn = mtuple(st[qn_mt].m);
             constexpr bool LOADQ = !(LAST && i >= 2);
             const int pvsc = pv_scale(st[i - 1 < 0 ? 0 : i - 1].D);
 #if SCHED == 0
@@ -528,7 +546,7 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
                 if constexpr (k < NPV) {
                     pv_w<k>(st[i - 1 < 0 ? 0 : i - 1], vf, pprev, pvsc, ones);
                 } else if constexpr (k < NW) {
-                    qk_w<k - NPV>(snext, kf, qf[(i + 1) % 2], st[qn_mt].mt);
+                    qk_w<k - NPV>(snext, kf, qf[(i + 1) % 2], mtn);
                 }
                 fence();
                 static_for<NCHUNK>([&](auto cc) {
@@ -547,7 +565,7 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
                 if constexpr (k < NPV) {
                     pv_w<k>(st[i - 1 < 0 ? 0 : i - 1], vf, pprev, pvsc, ones);
                 } else {
-                    qk_w<k - NPV>(snext, kf, qf[(i + 1) % 2], st[qn_mt].mt);
+                    qk_w<k - NPV>(snext, kf, qf[(i + 1) % 2], mtn);
                 }
             });
             softmax<FIRST, DIAG>(st[i], scur, pcur, thr, t == 0);
@@ -587,13 +605,24 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
     }
 #else
     {
+        // the overflow guard between chunks of GCHUNK tiles: D grows by at most the row max's rise over a chunk, so
+        // O stays finite unless the max climbs > ~56 log2 units (39 nats) within GCHUNK tiles after a check
         const QAddr qa = qaddr();
-        for (int t = 0; t < n - 2; ++t) tile(t, qa, std::false_type{}, std::false_type{}, std::false_type{});
+        for (int t0 = 0; t0 < n - 2; t0 += GCHUNK) {
+            const int t1 = t0 + GCHUNK < n - 2 ? t0 + GCHUNK : n - 2;
+            for (int t = t0; t < t1; ++t) tile(t, qa, std::false_type{}, std::false_type{}, std::false_type{});
+#if !NO_GUARD
+            const int d01 = st[0].D > st[1].D ? st[0].D : st[1].D, d23 = st[2].D > st[3].D ? st[2].D : st[3].D;
+            if (__builtin_amdgcn_ballot_w32((d01 > d23 ? d01 : d23) > DGUARD) != 0u) guard_rescale(st);
+#endif
+        }
     }
     tile(n - 2, qaddr(), std::false_type{}, std::true_type{}, std::false_type{});
 #endif
     tile(n - 1, qaddr(), std::false_type{}, std::true_type{}, std::true_type{});
 
+    // epilogue: both lane halves of a row store its lse (the same value): no exec change, which would wait for every
+    // in-flight store to read its operands (s_wait_xcnt 0, ~4k cycles per block measured)
     static_for<QT>([&](auto ii) {
         constexpr int i = ii;
         const int qr_i = q0 + 64 * i + 16 * wv + lr;
@@ -606,7 +635,7 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
             static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(st[i].o[dt][(int)rr] * inv); });
             *(u32x4 *)(orow + 16 * dt + 8 * lh) = __builtin_bit_cast(u32x4, w);
         });
-        if (lh == 0) LSE[(bh * S) + qr_i] = (st[i].mref + __builtin_log2f(l)) * LN2;
+        LSE[(bh * S) + qr_i] = (st[i].mref + __builtin_log2f(l)) * LN2;
     });
     tensor_wait<0>();
 }

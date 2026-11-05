@@ -187,3 +187,19 @@ a long-lived WMMA scale VGPR must sit in v0..v255).
 16 q blocks of a (b, h) go to 8 XCDs (dispatch L -> XCD L % 8), each XCD runs 16 (b, h) at once (~21 MB > 4 MB L2).
 XCD_MAP 1 (k-th workgroup of XCD c takes q block nqb - 1 - k % nqb of bh = c + 8 (k / nqb)): TDM-only 0.172 ms, **m6xp
 0.525 / 0.531 ms** (bf16 HK fwd 0.630). The same mapping should help the bf16 HK and the MX backward kernels.
+
+**m6 register / shell fixes** (each measured by ATT, b2 s4096 h128):
+- the 8-VGPR -m tuple per q tile replaced by one float m (the tuple formed per QK group): 1010 -> 930 VGPRs.
+- the overflow guard (rescale O when D > 48) out of the tile loop, between chunks of GCHUNK 4 tiles: a branch with
+  a big body inside the tile loop spilled the K-scale pairs (WMMA scale operands must sit in v0..v255; spill reload
+  wait ~290-390 cycles per trip). The max may rise by <= ~56 log2 units (39 nats) within 4 tiles after a check.
+- TDM: LLVM puts s_wait_tensorcnt 0xa before every TDM op (also in straight-line code: a per-wave cap of ~11 in
+  flight); with 5 ops per tile on wave 0 (waves 1-3 NULL) and 3 tiles ahead, wave 0 waited 200+ cycles per tile.
+  TDM_SPLIT: 2 TDM instructions per wave and tile (wave 0 K nope, 1 K rope + K scales, 2 V, 3 V scales), the wave's
+  descriptor constants formed once; tensor_wait<4>.
+- epilogue: the lse store by both lane halves (no exec change; each exec change waited s_wait_xcnt 0 for the
+  in-flight output stores, ~4k cycles per block).
+- result: 2548 cycles / trip (from 3056 in m4), no spill in the tile loop; **m6xp 0.475 / 0.479 ms** (bf16 HK 0.629 /
+  0.636, m4 0.704); TDM-only skeleton 0.175 ms.
+- ATT per block (m6c): only 57% of a wave's time is in the tile loop: per block ~18-22k cycles outside it (prologue:
+  initial TDM wait ~1.3k; two diagonal tiles; epilogue) plus 1-3k cycles between blocks.
