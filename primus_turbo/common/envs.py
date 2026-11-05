@@ -60,6 +60,9 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_ODC_GDA_BLOCK: int = 256
     PRIMUS_TURBO_ODC_GDA_PIPE: int = 1
     PRIMUS_TURBO_ODC_GDA_NUM_QP: int = 1
+    PRIMUS_TURBO_MLA_FWD_IMPL: str = ""
+    PRIMUS_TURBO_MLA_BWD_IMPL: str = ""
+    PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES: str = ""
 
 
 def backend_spec(name: str) -> Callable[[], str | None]:
@@ -230,6 +233,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "PT_MEGA_FP8_L2_COMBINE_CU": env_positive_int(
         "PT_MEGA_FP8_L2_COMBINE_CU", None, "the combine CU split must be a positive block count"
+    ),
+    # ================== DeepSeek-V3 MLA attention on gfx1250 ==================
+    # The MLA forward / backward implementation: "flydsl" (the default, also for unset or blank) or
+    # "hk" (the HIP kernels of primus_turbo/hipkittens/gfx1250_mla). Read once, when
+    # attention_flydsl_gfx1250_mla_impl is imported: the passes route on module constants, which
+    # torch.compile traces without a guard on the environment. Validated (case-insensitive) there.
+    "PRIMUS_TURBO_MLA_FWD_IMPL": lambda: os.getenv("PRIMUS_TURBO_MLA_FWD_IMPL", ""),
+    "PRIMUS_TURBO_MLA_BWD_IMPL": lambda: os.getenv("PRIMUS_TURBO_MLA_BWD_IMPL", ""),
+    # dS scratch budget of the "hk" MLA backward in bytes (int or float syntax, e.g. 2.2e9); unset or
+    # blank: no limit. The raw text; parsed (and rejected unless positive) by
+    # primus_turbo.hipkittens.gfx1250_mla.bwd when the first "hk" backward imports it.
+    "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES": lambda: os.getenv(
+        "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES", ""
     ),
     # ================== Read by the C++ extension ==================
     # These getters mirror the C++ parsing so Python can report the effective value; C++ reads

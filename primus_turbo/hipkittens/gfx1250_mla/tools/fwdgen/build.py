@@ -385,8 +385,9 @@ def main():
                 o.update({x: ops[x] for x in ("qk", "qb", "qv", "g1a", "g1b", "g1v", "t", "n4", "l3")})
             texts, cycles[name] = G.region_tile(L, o, k)
         else:  # FINAL_A, FINAL_A3
-            texts = G.region_final_all(L, {k: vfirst(ops[k]) for k in ("wa", "wb", "la", "lb")},
-                                       skip=3 if name == "FINAL_A3" else 0)
+            texts = G.region_final_all(
+                L, {k: vfirst(ops[k]) for k in ("wa", "wb", "la", "lb")}, skip=3 if name == "FINAL_A3" else 0
+            )
             # WMMAs of the preceding region may still be in flight: retire every VALU, then the WMMA -> VALU
             # wait states
             pre = ["\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"] + ["\tv_nop"] * 4

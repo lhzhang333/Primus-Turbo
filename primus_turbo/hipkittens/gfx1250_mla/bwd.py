@@ -32,12 +32,12 @@ backward.
 """
 
 import math
-import os
 import struct
 import threading
 
 import torch
 
+import primus_turbo.common.envs as envs
 from primus_turbo.common.logger import logger
 
 from . import hiprt, hsaco, limits
@@ -58,7 +58,7 @@ MAX_SCRATCH_BYTES_ENV = "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES"
 
 def _bytes_setting(name):
     """A positive byte count from the environment (int or float syntax, e.g. 2.2e9), or None if unset."""
-    text = os.environ.get(name, "").strip()
+    text = getattr(envs, name).strip()
     if not text:
         return None
     try:
