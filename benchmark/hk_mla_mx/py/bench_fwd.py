@@ -13,9 +13,8 @@ import json
 import statistics
 import time
 
-import torch
-
 import mxlab as L
+import torch
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--b", type=int, default=2)
@@ -39,7 +38,7 @@ def sbhd(d):
 
 
 q, k, v = sbhd(L.D_QK), sbhd(L.D_QK), sbhd(L.D_V)
-qz = L.quant_inputs(q, k, v)
+qzs = {r: L.quant_inputs(q, k, v, recipe=r) for r in sorted({L.recipe_of(t) for t in a.tags.split(",")})}
 flops = 2.0 * b * h * (s * (s + 1) / 2) * (L.D_QK + L.D_V)
 flush = torch.empty(a.flush_mb * (1 << 20), dtype=torch.uint8, device=dev)
 arms = {}
@@ -58,10 +57,10 @@ if not a.no_hk:
         arms["hk_bf16"] = hk
     except Exception as e:  # noqa: BLE001
         print("hk_bf16 unavailable:", type(e).__name__, str(e)[:200])
-arms["quant"] = lambda: L.quant_inputs(q, k, v)
+arms["quant"] = lambda: L.quant_inputs(q, k, v, recipe="m4")
 for tag in a.tags.split(","):
     out = torch.empty(s, b, h, L.D_V, device=dev, dtype=torch.bfloat16).transpose(0, 1)
-    arms["mx" + tag] = (lambda t=tag, o=out: L.fwd_mx(qz, out=o, tag=t))
+    arms["mx" + tag] = lambda t=tag, o=out: L.fwd_mx(qzs[L.recipe_of(t)], out=o, tag=t)
 
 for f in arms.values():
     f()

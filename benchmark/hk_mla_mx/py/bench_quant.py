@@ -4,9 +4,8 @@
 import argparse
 import json
 
-import torch
-
 import mxlab as L
+import torch
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--b", type=int, default=2)

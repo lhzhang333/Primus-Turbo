@@ -12,9 +12,8 @@ import argparse
 import sys
 import time
 
-import torch
-
 import mxlab as L
+import torch
 
 SHAPES = {
     "toy": dict(b=1, s=256, h=2),
@@ -58,21 +57,26 @@ for name in a.shapes.split(","):
     g = torch.Generator(device=dev).manual_seed(a.seed)
     q, k, v = make(b, s, h, g)
     center = not a.no_center
-    qz = L.quant_inputs(q, k, v, center_k=center)
+    recipe = L.recipe_of(a.tag)
+    m4 = recipe == "m4"
+    qz = L.quant_inputs(q, k, v, center_k=center, recipe=recipe)
     torch.cuda.synchronize()
     res = {}
     # --- quantization twins
     kbar_ref = k.float().mean(1).permute(0, 1, 2) if center else None  # b h d
     if center:
-        kbar_ref = k.float()[:, ::L.KBAR_STRIDE].mean(1)  # [b, h, 192]: the sampled mean
+        kbar_ref = k.float()[:, :: L.KBAR_STRIDE].mean(1)  # [b, h, 192]: the sampled mean
         res["kbar_maxrel"] = ((qz["kbar"] - kbar_ref).abs().max() / kbar_ref.abs().max()).item()
     for nm, x, kb in (("q", q, None), ("k", k, qz["kbar"] if center else None)):
-        codes, exps = L.ref_quant_qk(x, kb)
+        codes, exps = L.ref_quant_qk(x, kb, pre=L.SCALE * L.LOG2E if (m4 and nm == "q") else None)
         got = L.deinterleave_qk(qz[nm + "8"])
         res[nm + "_codes_eq"] = torch.equal(got, codes.view(torch.uint8))
         res[nm + "_codes_mism"] = int((got != codes.view(torch.uint8)).sum().item())
-        res[nm + "_exps_eq"] = torch.equal(qz[nm + "s"][..., :6].to(torch.int32) - 127, exps)
-        res[nm + "_pad_ok"] = bool((qz[nm + "s"][..., 6:] == 127).all().item())
+        xs = qz[nm + "s"]
+        res[nm + "_exps_eq"] = torch.equal(
+            (xs[..., L.R2_IDX] if m4 else xs[..., :6]).to(torch.int32) - 127, exps
+        )
+        res[nm + "_pad_ok"] = bool(((xs[..., 4:6] == 0) if m4 else (xs[..., 6:] == 127)).all().item())
     vt_codes, vt_exps = L.mx_quant_last(v.float().permute(0, 2, 3, 1))  # b h d s
     res["v_codes_eq"] = torch.equal(L.deinterleave_kv(qz["v8t"]), vt_codes.view(torch.uint8))
     vs_ref = vt_exps.reshape(b, h, L.D_V, s // 128, 4).permute(0, 1, 3, 2, 4)
@@ -86,20 +90,33 @@ for name in a.shapes.split(","):
     torch.cuda.synchronize()
     res["det"] = torch.equal(o1, o2) and torch.equal(lse1, lse2)
     res["finite"] = bool(torch.isfinite(o1.float()).all().item() and torch.isfinite(lse1).all().item())
-    qf, kf = L.deq_qk(qz["q8"], qz["qs"]), L.deq_qk(qz["k8"], qz["ks"])
+    qf, kf = L.deq_qk(qz["q8"], qz["qs"], r2=m4), L.deq_qk(qz["k8"], qz["ks"], r2=m4)
     vf = L.deq_vt(qz["v8t"], qz["vs"])
-    oe, lsee = L.emu_fwd(qf, kf, vf)
+    oe, lsee = L.emu_fwd4(qf, kf, vf) if m4 else L.emu_fwd(qf, kf, vf)
     res["o_vs_emu"] = L.snr(o1.float(), oe)
     res["lse_vs_emu"] = L.snr(lse1, lsee)
     orf, lser = L.ref_fwd(q, k, v)
     lse_true = lse1 + L.SCALE * qz["qk"] if center else lse1
     res["o_vs_ref"] = L.snr(o1.float(), orf)
     res["lse_vs_ref"] = L.snr(lse_true, lser)
-    ok = (res["q_codes_eq"] and res["k_codes_eq"] and res["v_codes_eq"] and res["q_exps_eq"] and res["k_exps_eq"]
-          and res["v_exps_eq"] and res["det"] and res["finite"] and res["o_vs_emu"] >= 40 and res["lse_vs_emu"] >= 60)
+    ok = (
+        res["q_codes_eq"]
+        and res["k_codes_eq"]
+        and res["v_codes_eq"]
+        and res["q_exps_eq"]
+        and res["k_exps_eq"]
+        and res["v_exps_eq"]
+        and res["det"]
+        and res["finite"]
+        and res["o_vs_emu"] >= 40
+        and res["lse_vs_emu"] >= 60
+    )
     ok_all &= ok
-    print(f"[{name}] b{b} s{s} h{h} {'PASS' if ok else 'FAIL'}  " +
-          " ".join(f"{k_}={(round(v_, 2) if isinstance(v_, float) else v_)}" for k_, v_ in res.items()), flush=True)
+    print(
+        f"[{name}] b{b} s{s} h{h} {'PASS' if ok else 'FAIL'}  "
+        + " ".join(f"{k_}={(round(v_, 2) if isinstance(v_, float) else v_)}" for k_, v_ in res.items()),
+        flush=True,
+    )
     if not ok and name != a.shapes.split(",")[-1]:
         print("stopping: a smaller shape failed")
         break

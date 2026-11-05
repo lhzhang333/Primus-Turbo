@@ -16,7 +16,9 @@
 //   k_mxq_cols192   the same for 192 columns (Q, K along s: the backward's dK / dQ operands)
 // Row kernels' mode: bit 0 subtract kbar (K), bit 1 aux[row] = x . kbar (Q: the lse correction), bit 2 aux[row] =
 // x . Y[row] (dO: delta = rowsum(dO * O)), bit 3 also write the dequantized values as bf16 XD [b, s, h, D]
-// (contiguous) for a bf16 consumer of the same operand. Col kernels' mode: bit 0 subtract kbar.
+// (contiguous) for a bf16 consumer of the same operand, bit 4 (D = 192) scale layout R2: [s0..s3, 0, 0, s4, s5] (the
+// rope WMMA over d 64..191: E8M0 0 = 2^-127 silences d 64..127), bit 5 quantize x * pre (after the aux dots; Q:
+// pre = softmax scale * log2(e), the logits in log2 units). Col kernels' mode: bit 0 subtract kbar.
 // Inputs: any b / s / h strides (elements), the d axis contiguous and 16-byte aligned.
 #include "mx_common.h"
 
@@ -86,7 +88,7 @@ __device__ __forceinline__ void rows_body(const bf16 *__restrict__ X, unsigned c
                                           unsigned char *__restrict__ XS, const float *__restrict__ kbar,
                                           const bf16 *__restrict__ Y, float *__restrict__ aux, bf16 *__restrict__ XD,
                                           int B, int S, int H, long long sb, long long ss, long long sh, long long yb,
-                                          long long ys, long long yh, int mode) {
+                                          long long ys, long long yh, int mode, float pre) {
     constexpr int NBLK = D / 32;           // 6 or 4
     constexpr int LPR = D == 192 ? 8 : 4;  // lanes per row
     constexpr int RS = D == 192 ? 8 : 4;   // scale bytes per row
@@ -127,13 +129,16 @@ __device__ __forceinline__ void rows_body(const bf16 *__restrict__ X, unsigned c
                     static_for<8>([&](auto e) { dot += v[(int)i][(int)e] * y[(int)e]; });
                 });
             }
+            if (mode & 32) {
+                static_for<4>([&](auto i) { v[(int)i] = v[(int)i] * pre; });
+            }
             const Block blk = quant_block(v);
             unsigned char *dst = X8 + row * D;
             if (D == 128 || j < 4)
                 store_block<128>(dst, j, blk.q[0], blk.q[1], blk.q[2], blk.q[3]);
             else
                 store_block<64>(dst + 128, j - 4, blk.q[0], blk.q[1], blk.q[2], blk.q[3]);
-            XS[row * RS + j] = (unsigned char)(blk.e + 127);
+            XS[row * RS + ((D == 192 && (mode & 16) && j >= 4) ? j + 2 : j)] = (unsigned char)(blk.e + 127);
             if (mode & 8) {
                 f32x8 dq[4];
                 dequant_block(blk, dq);
@@ -141,7 +146,8 @@ __device__ __forceinline__ void rows_body(const bf16 *__restrict__ X, unsigned c
                 static_for<4>([&](auto i) { *(u32x4 *)(xd + 8 * (int)i) = f32_to_bf8(dq[(int)i]); });
             }
         } else if (j < RS) {
-            XS[row * RS + j] = 127;  // pad scales (the rope WMMA's zero half)
+            // pad scales: 127 = 2^0 for the rope WMMA's zero half (layout R1), 0 = 2^-127 silences d 64..127 (R2)
+            XS[row * RS + ((mode & 16) ? j - 2 : j)] = (mode & 16) ? 0 : 127;
         }
         if (mode & 6) {
             static_for<LPR == 8 ? 3 : 2>([&](auto k) { dot += __shfl_xor(dot, 1 << (int)k, LPR); });
@@ -225,8 +231,8 @@ extern "C" __global__ __launch_bounds__(768) void k_mxq_kbar(const bf16 *__restr
         const bf16 *__restrict__ X, unsigned char *__restrict__ X8, unsigned char *__restrict__ XS,                  \
         const float *__restrict__ kbar, const bf16 *__restrict__ Y, float *__restrict__ aux, bf16 *__restrict__ XD, \
         int B, int S, int H, long long sb, long long ss, long long sh, long long yb, long long ys, long long yh,     \
-        int mode) {                                                                                                  \
-        rows_body<D>(X, X8, XS, kbar, Y, aux, XD, B, S, H, sb, ss, sh, yb, ys, yh, mode);                            \
+        int mode, float pre) {                                                                                       \
+        rows_body<D>(X, X8, XS, kbar, Y, aux, XD, B, S, H, sb, ss, sh, yb, ys, yh, mode, pre);                       \
     }
 ROWS_KERNEL(192)
 ROWS_KERNEL(128)

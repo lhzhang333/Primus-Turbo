@@ -84,7 +84,11 @@ def make_data(kind, g):
     do = torch.randn(b, s, h, D_V, generator=g, device=dev)
     if kind in ("outlier", "mla"):
         # a few channel outliers (massive activations): 4 nope + 2 rope channels of q / k, 4 of v, x8..x32
-        for t, chans in ((q, (3, 40, 77, 120, 130, 170)), (k, (5, 50, 90, 127, 140, 180)), (v, (7, 60, 99, 111))):
+        for t, chans in (
+            (q, (3, 40, 77, 120, 130, 170)),
+            (k, (5, 50, 90, 127, 140, 180)),
+            (v, (7, 60, 99, 111)),
+        ):
             for i, c in enumerate(chans):
                 t[..., c] *= 8.0 * (1 + i % 4)
     if kind == "kbias":  # k with per-channel offsets (the bias-like channel means of real keys), q plain
@@ -131,7 +135,7 @@ def emu(q, k, v, do, variant):
     variant = variant.replace("+ks", "")
     qk_bf = variant.startswith("qkbf")
     if qk_bf:  # q / k bf16, PV and the backward as the rest of the name ("qkbf_" + mx_fwd / mx_a / mx_b)
-        variant = variant[len("qkbf_"):]
+        variant = variant[len("qkbf_") :]
     mx = variant != "bf16"
     qf, kf, vf, dof = q.float(), k.float(), v.float(), do.float()
     if ksm:  # subtract the per-(batch, head, channel) mean of k over tokens: softmax-invariant
@@ -157,14 +161,14 @@ def emu(q, k, v, do, variant):
     lse = torch.zeros(b, h, s, device=dev)
     qi = torch.arange(s, device=dev)
     for q0 in range(0, s, TILE):
-        Q = qq[:, q0:q0 + TILE]  # b, 128, h, d
+        Q = qq[:, q0 : q0 + TILE]  # b, 128, h, d
         m = torch.full((b, h, TILE), -1e30, device=dev)
         l = torch.zeros(b, h, TILE, device=dev)
         acc = torch.zeros(b, h, TILE, D_V, device=dev)
         for k0 in range(0, q0 + TILE, TILE):
-            S = torch.einsum("bqhd,bkhd->bhqk", Q, kq[:, k0:k0 + TILE])
+            S = torch.einsum("bqhd,bkhd->bhqk", Q, kq[:, k0 : k0 + TILE])
             if k0 + TILE > q0:
-                msk = (qi[q0:q0 + TILE, None] >= qi[None, k0:k0 + TILE])
+                msk = qi[q0 : q0 + TILE, None] >= qi[None, k0 : k0 + TILE]
                 S = S.masked_fill(~msk, float("-inf"))
             lm = S.amax(-1) * c2
             need = (lm - m) > tau2
@@ -176,10 +180,10 @@ def emu(q, k, v, do, variant):
                 pv = e4m3(p / pq_scale) * pq_scale
             else:
                 pv = p.to(torch.bfloat16).float()
-            acc = acc * corr[..., None] + torch.einsum("bhqk,bkhd->bhqd", pv, vq[:, k0:k0 + TILE])
+            acc = acc * corr[..., None] + torch.einsum("bhqk,bkhd->bhqd", pv, vq[:, k0 : k0 + TILE])
             m = mn
-        o[:, q0:q0 + TILE] = (acc / l[..., None]).permute(0, 2, 1, 3)
-        lse[:, :, q0:q0 + TILE] = (m + torch.log2(l)) / LOG2E
+        o[:, q0 : q0 + TILE] = (acc / l[..., None]).permute(0, 2, 1, 3)
+        lse[:, :, q0 : q0 + TILE] = (m + torch.log2(l)) / LOG2E
     o = o.to(torch.bfloat16).float()
     if variant in ("bf16", "mx_fwd", "mx_fwdc"):
         do_r = dof
@@ -188,11 +192,11 @@ def emu(q, k, v, do, variant):
         qb, kb = qf, kf
     if variant in ("mx_a", "mx_b"):
         do_r = mx_quant(dof, -1)  # along d_v for dP
-        do_c = mx_quant(dof, 1)   # along q for dV
-        vr = mx_quant(vf, -1)     # along d_v for dP
+        do_c = mx_quant(dof, 1)  # along q for dV
+        vr = mx_quant(vf, -1)  # along d_v for dP
     if variant == "mx_b":
-        qb = mx_quant(qf, 1)      # along q for dK
-        kb = mx_quant(kf, 1)      # along kv for dQ
+        qb = mx_quant(qf, 1)  # along q for dK
+        kb = mx_quant(kf, 1)  # along kv for dQ
     elif variant == "mx_a":
         qb, kb = qf, kf
     if variant == "bf16":
@@ -204,13 +208,15 @@ def emu(q, k, v, do, variant):
     dk = torch.zeros_like(dq)
     dv = torch.zeros(b, s, h, D_V, device=dev)
     for q0 in range(0, s, TILE):
-        qs, ks = (qq, kq) if variant in ("mx_a", "mx_b", "mx_fwdc") else (qf, kf)  # mx_fwd: bf16 bwd on mx lse
-        S_all = torch.einsum("bqhd,bkhd->bhqk", qs[:, q0:q0 + TILE], ks[:, :q0 + TILE])
-        msk = qi[q0:q0 + TILE, None] >= qi[None, :q0 + TILE]
+        qs, ks = (
+            (qq, kq) if variant in ("mx_a", "mx_b", "mx_fwdc") else (qf, kf)
+        )  # mx_fwd: bf16 bwd on mx lse
+        S_all = torch.einsum("bqhd,bkhd->bhqk", qs[:, q0 : q0 + TILE], ks[:, : q0 + TILE])
+        msk = qi[q0 : q0 + TILE, None] >= qi[None, : q0 + TILE]
         S_all = S_all.masked_fill(~msk, float("-inf"))
-        P = torch.exp(S_all * SCALE - lse[:, :, q0:q0 + TILE, None])  # fp32
-        dP = torch.einsum("bqhd,bkhd->bhqk", do_r[:, q0:q0 + TILE], vr[:, :q0 + TILE])
-        dS = P * (dP - delta[:, :, q0:q0 + TILE, None])
+        P = torch.exp(S_all * SCALE - lse[:, :, q0 : q0 + TILE, None])  # fp32
+        dP = torch.einsum("bqhd,bkhd->bhqk", do_r[:, q0 : q0 + TILE], vr[:, : q0 + TILE])
+        dS = P * (dP - delta[:, :, q0 : q0 + TILE, None])
         if variant == "bf16":
             Pv, dSv = P.to(torch.bfloat16).float(), dS.to(torch.bfloat16).float()
             dSq = dSk = dSv
@@ -224,10 +230,10 @@ def emu(q, k, v, do, variant):
                 dSq = dSk = dS.to(torch.bfloat16).float()
             else:
                 dSk = mx_quant(dS, 2) if True else dS  # dK = dS^T Q: reduction over q (dim 2 of bhqk)
-                dSq = mx_quant(dS, 3)                    # dQ = dS K: reduction over kv (dim 3)
-        dv[:, :q0 + TILE] += torch.einsum("bhqk,bqhd->bkhd", Pv, do_c[:, q0:q0 + TILE])
-        dk[:, :q0 + TILE] += torch.einsum("bhqk,bqhd->bkhd", dSk, qb[:, q0:q0 + TILE]) * SCALE
-        dq[:, q0:q0 + TILE] = torch.einsum("bhqk,bkhd->bqhd", dSq, kb[:, :q0 + TILE]) * SCALE
+                dSq = mx_quant(dS, 3)  # dQ = dS K: reduction over kv (dim 3)
+        dv[:, : q0 + TILE] += torch.einsum("bhqk,bqhd->bkhd", Pv, do_c[:, q0 : q0 + TILE])
+        dk[:, : q0 + TILE] += torch.einsum("bhqk,bqhd->bkhd", dSk, qb[:, q0 : q0 + TILE]) * SCALE
+        dq[:, q0 : q0 + TILE] = torch.einsum("bhqk,bkhd->bqhd", dSq, kb[:, : q0 + TILE]) * SCALE
     return o, lse, dq, dk, dv
 
 
@@ -241,7 +247,9 @@ def s_snr(q, k):
 
 
 g = torch.Generator(device=dev).manual_seed(a.seed)
-print(f"b {a.b} s {a.s} h {a.h}  tau {a.tau} nats  P scale 2^{a.p_scale_exp}  scale rule {a.scale_rule}  rope {a.rope}")
+print(
+    f"b {a.b} s {a.s} h {a.h}  tau {a.tau} nats  P scale 2^{a.p_scale_exp}  scale rule {a.scale_rule}  rope {a.rope}"
+)
 print(f"{'data':8s} {'variant':8s} {'o':>7s} {'lse':>7s} {'dq':>7s} {'dk':>7s} {'dv':>7s}")
 for kind in a.data.split(","):
     q, k, v, do = make_data(kind, g)

@@ -15,8 +15,6 @@ Prints a summary and the maps as JSON.
 import argparse
 import hashlib
 import json
-import os
-import sys
 from collections import defaultdict
 from pathlib import Path
 

@@ -28,36 +28,157 @@ D_QK, D_NOPE, D_ROPE, D_V = 192, 128, 64, 128
 SCALE = 0.1352337788608801
 LOG2E = 1.4426950408889634
 E4M3_MAX = 448.0
-FLAGS = ["-x", "hip", "--offload-arch=gfx1250", "--cuda-device-only", "--no-gpu-bundle-output", "-O3", "-std=c++20"]
+FLAGS = [
+    "-x",
+    "hip",
+    "--offload-arch=gfx1250",
+    "--cuda-device-only",
+    "--no-gpu-bundle-output",
+    "-O3",
+    "-std=c++20",
+]
+EXPERT = [
+    "-mllvm",
+    "-amdgpu-expert-scheduling-mode",
+]  # the compiler places the dependency waits (bf16 HK: required)
+# + register classes before globalness in the greedy allocator: DS addresses and WMMA scale operands live in v0..v255
+# (no VGPR-MSB remap), and without it big kernels spill them
+EXPERT_P = EXPERT + ["-mllvm", "-greedy-regclass-priority-trumps-globalness"]
+
+
+def recipe_of(tag):
+    """The operand recipe a forward build tag expects: "m4" (Q8 pre-scaled to log2 units, scale layout R2) for rung m4
+    (tags 4*), else "r1"."""
+    return "m4" if tag.startswith("4") else "r1"
+
 
 # kernel name -> (source, block, [(arg, kind)]); offsets follow natural alignment
-_ROWS_ARGS = [("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("kbar", "ptr"), ("Y", "ptr"), ("aux", "ptr"),
-              ("XD", "ptr"), ("B", "i32"), ("S", "i32"), ("H", "i32"), ("sb", "i64"), ("ss", "i64"), ("sh", "i64"),
-              ("yb", "i64"), ("ys", "i64"), ("yh", "i64"), ("mode", "i32")]
-_COLS_ARGS = [("X", "ptr"), ("X8T", "ptr"), ("XTS", "ptr"), ("kbar", "ptr"), ("S", "i32"), ("H", "i32"),
-              ("sb", "i64"), ("ss", "i64"), ("sh", "i64"), ("mode", "i32")]
+_ROWS_ARGS = [
+    ("X", "ptr"),
+    ("X8", "ptr"),
+    ("XS", "ptr"),
+    ("kbar", "ptr"),
+    ("Y", "ptr"),
+    ("aux", "ptr"),
+    ("XD", "ptr"),
+    ("B", "i32"),
+    ("S", "i32"),
+    ("H", "i32"),
+    ("sb", "i64"),
+    ("ss", "i64"),
+    ("sh", "i64"),
+    ("yb", "i64"),
+    ("ys", "i64"),
+    ("yh", "i64"),
+    ("mode", "i32"),
+    ("pre", "f32"),
+]
+_COLS_ARGS = [
+    ("X", "ptr"),
+    ("X8T", "ptr"),
+    ("XTS", "ptr"),
+    ("kbar", "ptr"),
+    ("S", "i32"),
+    ("H", "i32"),
+    ("sb", "i64"),
+    ("ss", "i64"),
+    ("sh", "i64"),
+    ("mode", "i32"),
+]
 KERNELS = {
-    "k_mxq_kbar": ("k_mxq.hip", 768, [("K", "ptr"), ("kbar", "ptr"), ("S", "i32"), ("H", "i32"), ("sb", "i64"),
-                                       ("ss", "i64"), ("sh", "i64"), ("stride", "i32")]),
+    "k_mxq_kbar": (
+        "k_mxq.hip",
+        768,
+        [
+            ("K", "ptr"),
+            ("kbar", "ptr"),
+            ("S", "i32"),
+            ("H", "i32"),
+            ("sb", "i64"),
+            ("ss", "i64"),
+            ("sh", "i64"),
+            ("stride", "i32"),
+        ],
+    ),
     "k_mxq_rows192": ("k_mxq.hip", 256, _ROWS_ARGS),
     "k_mxq_rows128": ("k_mxq.hip", 256, _ROWS_ARGS),
     "k_mxq_cols128": ("k_mxq.hip", 256, _COLS_ARGS),
     "k_mxq_cols192": ("k_mxq.hip", 256, _COLS_ARGS),
-    "k_mla_fwd_mx": ("k_mla_fwd_mx.hip", 128, [("Q8", "ptr"), ("QS", "ptr"), ("K8", "ptr"), ("KS", "ptr"),
-                                                ("V8T", "ptr"), ("VS", "ptr"), ("O", "ptr"), ("LSE", "ptr"),
-                                                ("scale", "f32"), ("S", "i32"), ("H", "i32"), ("B", "i32"),
-                                                ("o_sb", "i64"), ("o_ss", "i64")]),
-    "k_dkdv_mx": ("k_mla_bwd_mx.hip", 128, [("Q8", "ptr"), ("QS", "ptr"), ("K8", "ptr"), ("KS", "ptr"), ("V8", "ptr"),
-                                             ("VSR", "ptr"), ("DO8", "ptr"), ("DOS", "ptr"), ("DO8T", "ptr"),
-                                             ("DOTS", "ptr"), ("Q8T", "ptr"), ("QTS", "ptr"), ("LSE", "ptr"),
-                                             ("DELTA", "ptr"), ("DK", "ptr"), ("DV", "ptr"), ("scale", "f32"),
-                                             ("S", "i32"), ("H", "i32"), ("B", "i32"), ("dk_sb", "i64"),
-                                             ("dk_ss", "i64"), ("dv_sb", "i64"), ("dv_ss", "i64")]),
-    "k_dq_mx": ("k_mla_bwd_mx.hip", 128, [("Q8", "ptr"), ("QS", "ptr"), ("K8", "ptr"), ("KS", "ptr"), ("V8", "ptr"),
-                                           ("VSR", "ptr"), ("DO8", "ptr"), ("DOS", "ptr"), ("K8T", "ptr"),
-                                           ("KTS", "ptr"), ("LSE", "ptr"), ("DELTA", "ptr"), ("DQ", "ptr"),
-                                           ("scale", "f32"), ("S", "i32"), ("H", "i32"), ("B", "i32"),
-                                           ("dq_sb", "i64"), ("dq_ss", "i64")]),
+    "k_mla_fwd_mx": (
+        "k_mla_fwd_mx.hip",
+        128,
+        [
+            ("Q8", "ptr"),
+            ("QS", "ptr"),
+            ("K8", "ptr"),
+            ("KS", "ptr"),
+            ("V8T", "ptr"),
+            ("VS", "ptr"),
+            ("O", "ptr"),
+            ("LSE", "ptr"),
+            ("scale", "f32"),
+            ("S", "i32"),
+            ("H", "i32"),
+            ("B", "i32"),
+            ("o_sb", "i64"),
+            ("o_ss", "i64"),
+        ],
+    ),
+    "k_dkdv_mx": (
+        "k_mla_bwd_mx.hip",
+        128,
+        [
+            ("Q8", "ptr"),
+            ("QS", "ptr"),
+            ("K8", "ptr"),
+            ("KS", "ptr"),
+            ("V8", "ptr"),
+            ("VSR", "ptr"),
+            ("DO8", "ptr"),
+            ("DOS", "ptr"),
+            ("DO8T", "ptr"),
+            ("DOTS", "ptr"),
+            ("Q8T", "ptr"),
+            ("QTS", "ptr"),
+            ("LSE", "ptr"),
+            ("DELTA", "ptr"),
+            ("DK", "ptr"),
+            ("DV", "ptr"),
+            ("scale", "f32"),
+            ("S", "i32"),
+            ("H", "i32"),
+            ("B", "i32"),
+            ("dk_sb", "i64"),
+            ("dk_ss", "i64"),
+            ("dv_sb", "i64"),
+            ("dv_ss", "i64"),
+        ],
+    ),
+    "k_dq_mx": (
+        "k_mla_bwd_mx.hip",
+        128,
+        [
+            ("Q8", "ptr"),
+            ("QS", "ptr"),
+            ("K8", "ptr"),
+            ("KS", "ptr"),
+            ("V8", "ptr"),
+            ("VSR", "ptr"),
+            ("DO8", "ptr"),
+            ("DOS", "ptr"),
+            ("K8T", "ptr"),
+            ("KTS", "ptr"),
+            ("LSE", "ptr"),
+            ("DELTA", "ptr"),
+            ("DQ", "ptr"),
+            ("scale", "f32"),
+            ("S", "i32"),
+            ("H", "i32"),
+            ("B", "i32"),
+            ("dq_sb", "i64"),
+            ("dq_ss", "i64"),
+        ],
+    ),
 }
 _SIZE = {"ptr": 8, "i64": 8, "f64": 8, "i32": 4, "u32": 4, "f32": 4}
 
@@ -84,14 +205,15 @@ def cxx():
     raise RuntimeError("amdclang++ not found")
 
 
-def build(sources=None, defines=(), tag=""):
-    """Compile kern sources (default: every one KERNELS uses) to BUILD/<stem><tag>.hsaco."""
+def build(sources=None, defines=(), tag="", flags=()):
+    """Compile kern sources (default: every one KERNELS uses) to BUILD/<stem><tag>.hsaco (extra compiler flags:
+    e.g. EXPERT)."""
     BUILD.mkdir(exist_ok=True)
     srcs = sorted({v[0] for v in KERNELS.values()}) if sources is None else sources
     out = {}
     for s in srcs:
         dst = BUILD / (Path(s).stem + tag + ".hsaco")
-        cmd = [cxx(), *FLAGS, *[f"-D{d}" for d in defines], "-o", str(dst), str(KERN / s)]
+        cmd = [cxx(), *FLAGS, *flags, *[f"-D{d}" for d in defines], "-o", str(dst), str(KERN / s)]
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=KERN)
         if r.returncode != 0:
             raise RuntimeError(f"build {s} failed:\n{r.stderr[-4000:]}")
@@ -133,7 +255,7 @@ def _dummy(dev):
 _DUMMY = {}
 
 
-def quant_rows(x, d, mode=0, kbar=None, y=None, want_deq=False, tag=""):
+def quant_rows(x, d, mode=0, kbar=None, y=None, want_deq=False, tag="", pre=1.0):
     """k_mxq_rows{192,128}: x [b, s, h, d] -> (x8 [b, h, s, d], xs [b, h, s, 8 | 4], aux [b, h, s] | None,
     xd [b, s, h, d] bf16 | None)."""
     b, s, h, _ = x.shape
@@ -147,9 +269,31 @@ def quant_rows(x, d, mode=0, kbar=None, y=None, want_deq=False, tag=""):
     m = mode | (8 if want_deq else 0)
     rows_per_block = 8 * 8 * (4 if d == 192 else 8)  # 8 waves x 8 row groups x rows per group
     assert s % (rows_per_block // 8) == 0
-    _launch(f"k_mxq_rows{d}", ((b * h * s + rows_per_block - 1) // rows_per_block, 1, 1),
-            [x, x8, xs, kbar if kbar is not None else _dummy(dev), yy, aux, xd, b, s, h, x.stride(0), x.stride(1),
-             x.stride(2), yy.stride(0), yy.stride(1), yy.stride(2), m], tag)
+    _launch(
+        f"k_mxq_rows{d}",
+        ((b * h * s + rows_per_block - 1) // rows_per_block, 1, 1),
+        [
+            x,
+            x8,
+            xs,
+            kbar if kbar is not None else _dummy(dev),
+            yy,
+            aux,
+            xd,
+            b,
+            s,
+            h,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            yy.stride(0),
+            yy.stride(1),
+            yy.stride(2),
+            m,
+            float(pre),
+        ],
+        tag,
+    )
     return x8, xs, (aux if mode & 6 else None), (xd if want_deq else None)
 
 
@@ -159,9 +303,23 @@ def quant_cols(x, d, kbar=None, tag=""):
     dev = x.device
     x8t = torch.empty(b, h, d, s, device=dev, dtype=torch.uint8)
     xts = torch.empty(b, h, s // 128, d, 4, device=dev, dtype=torch.uint8)
-    _launch(f"k_mxq_cols{d}", (s // 128, h, b),
-            [x, x8t, xts, kbar if kbar is not None else _dummy(dev), s, h, x.stride(0), x.stride(1), x.stride(2),
-             1 if kbar is not None else 0], tag)
+    _launch(
+        f"k_mxq_cols{d}",
+        (s // 128, h, b),
+        [
+            x,
+            x8t,
+            xts,
+            kbar if kbar is not None else _dummy(dev),
+            s,
+            h,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            1 if kbar is not None else 0,
+        ],
+        tag,
+    )
     return x8t, xts
 
 
@@ -175,18 +333,39 @@ def kbar_of(k, tag="", stride=KBAR_STRIDE):
     return kbar
 
 
-def quant_inputs(q, k, v, center_k=True, want_deq=False, tag=""):
+def quant_inputs(q, k, v, center_k=True, want_deq=False, tag="", recipe="r1", scale=SCALE):
     """q, k [b, s, h, 192], v [b, s, h, 128] bf16 (d contiguous; any b / s / h strides) -> the forward's MX operands
     (+ the dequantized q / k as bf16 [b, s, h, 192] when want_deq: the bf16 backward's consistent inputs)."""
     b, s, h, _ = q.shape
     assert s % 256 == 0 and q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
-    out = {"b": b, "s": s, "h": h, "center_k": center_k}
+    out = {"b": b, "s": s, "h": h, "center_k": center_k, "recipe": recipe}
     kbar = kbar_of(k, tag) if center_k else None
-    q8, qs, qk, qd = quant_rows(q, D_QK, mode=2 if center_k else 0, kbar=kbar, want_deq=want_deq, tag=tag)
-    k8, ks, _, kd = quant_rows(k, D_QK, mode=1 if center_k else 0, kbar=kbar, want_deq=want_deq, tag=tag)
+    m4 = recipe == "m4"  # Q8 of q * scale * log2(e) (S in log2 units), scale layout R2 for Q and K
+    q8, qs, qk, qd = quant_rows(
+        q,
+        D_QK,
+        mode=(2 if center_k else 0) | (48 if m4 else 0),
+        kbar=kbar,
+        want_deq=want_deq,
+        tag=tag,
+        pre=scale * LOG2E if m4 else 1.0,
+    )
+    k8, ks, _, kd = quant_rows(
+        k, D_QK, mode=(1 if center_k else 0) | (16 if m4 else 0), kbar=kbar, want_deq=want_deq, tag=tag
+    )
     v8t, vs = quant_cols(v, D_V, tag=tag)
-    out.update(q8=q8, qs=qs, k8=k8, ks=ks, v8t=v8t, vs=vs, kbar=kbar, qd=qd, kd=kd,
-               qk=qk if qk is not None else torch.zeros(b, h, s, device=q.device))
+    out.update(
+        q8=q8,
+        qs=qs,
+        k8=k8,
+        ks=ks,
+        v8t=v8t,
+        vs=vs,
+        kbar=kbar,
+        qd=qd,
+        kd=kd,
+        qk=qk if qk is not None else torch.zeros(b, h, s, device=q.device),
+    )
     return out
 
 
@@ -198,9 +377,27 @@ def fwd_mx(qz, scale=SCALE, out=None, tag=""):
     if out is None:
         out = torch.empty(s, b, h, D_V, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     lse = torch.empty(b, h, s, device=dev, dtype=torch.float32)
-    _launch("k_mla_fwd_mx", (s // 256, h, b),
-            [qz["q8"], qz["qs"], qz["k8"], qz["ks"], qz["v8t"], qz["vs"], out, lse, float(scale), s, h, b,
-             out.stride(0), out.stride(1)], tag)
+    _launch(
+        "k_mla_fwd_mx",
+        (s // 256, h, b),
+        [
+            qz["q8"],
+            qz["qs"],
+            qz["k8"],
+            qz["ks"],
+            qz["v8t"],
+            qz["vs"],
+            out,
+            lse,
+            float(scale),
+            s,
+            h,
+            b,
+            out.stride(0),
+            out.stride(1),
+        ],
+        tag,
+    )
     return out, lse
 
 
@@ -249,10 +446,13 @@ def deinterleave_kv(v8t):
     return v8t[..., idx]
 
 
-def deq_qk(x8, xs):
-    """Dequantize X8 / XS -> fp32 [b, h, s, 192] (logical order)."""
+R2_IDX = [0, 1, 2, 3, 6, 7]  # the 6 real scale bytes of layout R2 ([s0..s3, 0, 0, s4, s5])
+
+
+def deq_qk(x8, xs, r2=False):
+    """Dequantize X8 / XS (scale layout R1, or R2) -> fp32 [b, h, s, 192] (logical order)."""
     codes = deinterleave_qk(x8).view(torch.float8_e4m3fn).float()
-    e = xs[..., :6].to(torch.int32) - 127
+    e = (xs[..., R2_IDX] if r2 else xs[..., :6]).to(torch.int32) - 127
     sc = torch.ldexp(torch.ones_like(e, dtype=torch.float32), e)
     return (codes.reshape(*codes.shape[:-1], 6, 32) * sc[..., None]).reshape(codes.shape)
 
@@ -262,15 +462,22 @@ def deq_vt(v8t, vs):
     b, h, d, s = v8t.shape
     codes = deinterleave_kv(v8t).view(torch.float8_e4m3fn).float()  # b h d s
     e = vs.to(torch.int32) - 127  # b h (s/128) d 4
-    sc = torch.ldexp(torch.ones_like(e, dtype=torch.float32), e).permute(0, 1, 3, 2, 4).reshape(b, h, d, s // 32)
+    sc = (
+        torch.ldexp(torch.ones_like(e, dtype=torch.float32), e)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(b, h, d, s // 32)
+    )
     return (codes.reshape(b, h, d, s // 32, 32) * sc[..., None]).reshape(b, h, d, s).transpose(2, 3)
 
 
-def ref_quant_qk(x, kbar=None):
-    """Torch twin of k_mxq_qk (logical order): x [b, s, h, 192] bf16 -> codes [b, h, s, 192], exps [b, h, s, 6]."""
+def ref_quant_qk(x, kbar=None, pre=None):
+    """Torch twin of k_mxq_qk (logical order): x [b, s, h, 192] bf16 -> codes [b, h, s, 192], exps [b, h, s, 6]
+    (pre: quantize x * pre, the kernels' mode 32)."""
     xf = x.float().permute(0, 2, 1, 3)
     if kbar is not None:
         xf = xf - kbar[:, :, None, :]
+    if pre is not None:
+        xf = xf * torch.tensor(pre, dtype=torch.float32)
     return mx_quant_last(xf)
 
 
@@ -298,31 +505,77 @@ def emu_fwd(qf, kf, vf, scale=SCALE, tau=1.0, p_exp=-7, bm=256, nb=128):
     per q16 tile online softmax over 128-kv tiles with the lazy rescale, P = e4m3(p / 2^p_exp) 2^p_exp."""
     b, h, s, _ = qf.shape
     dev = qf.device
-    c2, tau2, ps = scale * LOG2E, tau * LOG2E, 2.0 ** p_exp
+    c2, tau2, ps = scale * LOG2E, tau * LOG2E, 2.0**p_exp
     o = torch.zeros(b, h, s, D_V, device=dev)
     lse = torch.zeros(b, h, s, device=dev)
     qi = torch.arange(s, device=dev)
     for q0 in range(0, s, bm):
-        Q = qf[:, :, q0:q0 + bm]  # b h 256 d
+        Q = qf[:, :, q0 : q0 + bm]  # b h 256 d
         m = torch.full((b, h, bm), -1e30, device=dev)
         l = torch.zeros(b, h, bm, device=dev)
         acc = torch.zeros(b, h, bm, D_V, device=dev)
         for k0 in range(0, q0 + bm, nb):
-            S = torch.einsum("bhqd,bhkd->bhqk", Q, kf[:, :, k0:k0 + nb])
-            msk = qi[q0:q0 + bm, None] >= qi[None, k0:k0 + nb]
+            S = torch.einsum("bhqd,bhkd->bhqk", Q, kf[:, :, k0 : k0 + nb])
+            msk = qi[q0 : q0 + bm, None] >= qi[None, k0 : k0 + nb]
             S = S.masked_fill(~msk, float("-inf"))
             lm = S.amax(-1)
             need = (lm * c2 - m) > tau2  # b h 256
-            resc = need.reshape(b, h, bm // 16, 16).any(-1, keepdim=True).expand(-1, -1, -1, 16).reshape(b, h, bm)
+            resc = (
+                need.reshape(b, h, bm // 16, 16)
+                .any(-1, keepdim=True)
+                .expand(-1, -1, -1, 16)
+                .reshape(b, h, bm)
+            )
             mn = torch.where(resc, torch.maximum(m, lm * c2), m)
             corr = torch.exp2(m - mn)
             p = torch.exp2(S * c2 - mn[..., None])
             l = corr * l + p.sum(-1)
             pq = e4m3(p / ps).float() * ps
-            acc = acc * torch.where(resc, corr, torch.ones_like(corr))[..., None] + pq @ vf[:, :, k0:k0 + nb]
+            acc = (
+                acc * torch.where(resc, corr, torch.ones_like(corr))[..., None] + pq @ vf[:, :, k0 : k0 + nb]
+            )
             m = mn
-        o[:, :, q0:q0 + bm] = acc / l[..., None]
-        lse[:, :, q0:q0 + bm] = (m + torch.log2(l)) / LOG2E
+        o[:, :, q0 : q0 + bm] = acc / l[..., None]
+        lse[:, :, q0 : q0 + bm] = (m + torch.log2(l)) / LOG2E
+    return o.permute(0, 2, 1, 3), lse
+
+
+def emu_fwd4(qf, kf, vf, tau2=1.75, p_exp=-7, bm=256, nb=128):
+    """fp32 emulation of rung m4: qf [b, h, s, 192] dequantizes Q8 of q * scale * log2(e) (S' in log2 units). Per q16
+    tile and 128-kv tile: S'' = S' - m (m from 0), lm = max S''; when any row of the q16 tile has lm > tau2 (or on
+    the first tile) every row takes d = max(lm, 0) (first: lm): S'' -= d, acc and l *= 2^-d (first: 0), m += d. P =
+    e4m3(2^S'' / 2^p_exp) 2^p_exp; l accumulates the quantized P (the all-ones PV WMMA)."""
+    b, h, s, _ = qf.shape
+    dev = qf.device
+    ps = 2.0**p_exp
+    o = torch.zeros(b, h, s, D_V, device=dev)
+    lse = torch.zeros(b, h, s, device=dev)
+    qi = torch.arange(s, device=dev)
+    for q0 in range(0, s, bm):
+        Q = qf[:, :, q0 : q0 + bm]
+        m = torch.zeros(b, h, bm, device=dev)
+        l = torch.zeros(b, h, bm, device=dev)
+        acc = torch.zeros(b, h, bm, D_V, device=dev)
+        for t, k0 in enumerate(range(0, q0 + bm, nb)):
+            S = torch.einsum("bhqd,bhkd->bhqk", Q, kf[:, :, k0 : k0 + nb]) - m[..., None]
+            msk = qi[q0 : q0 + bm, None] >= qi[None, k0 : k0 + nb]
+            S = S.masked_fill(~msk, float("-inf"))
+            lm = S.amax(-1)
+            if t == 0:
+                d = lm
+                corr = torch.zeros_like(lm)
+            else:
+                need = (lm > tau2).reshape(b, h, bm // 16, 16).any(-1, keepdim=True).expand(-1, -1, -1, 16)
+                need = need.reshape(b, h, bm)
+                d = torch.where(need, torch.clamp(lm, min=0.0), torch.zeros_like(lm))
+                corr = torch.where(need, torch.exp2(-d), torch.ones_like(lm))
+            S = S - d[..., None]
+            pq = e4m3(torch.exp2(S) / ps).float() * ps
+            l = corr * l + pq.sum(-1)
+            acc = acc * corr[..., None] + pq @ vf[:, :, k0 : k0 + nb]
+            m = m + d
+        o[:, :, q0 : q0 + bm] = acc / l[..., None]
+        lse[:, :, q0 : q0 + bm] = (m + torch.log2(l)) / LOG2E
     return o.permute(0, 2, 1, 3), lse
 
 
@@ -343,8 +596,19 @@ def quant_bwd(qz, q, k, v, o, do, tag=""):
     do8t, dots = quant_cols(do, D_V, tag=tag)
     q8t, qts = quant_cols(q, D_QK, tag=tag)
     k8t, kts = quant_cols(k, D_QK, kbar=qz["kbar"], tag=tag)
-    return dict(v8=v8, vsr=vsr, do8=do8, dos=dos, delta=delta, do8t=do8t, dots=dots, q8t=q8t, qts=qts, k8t=k8t,
-                kts=kts)
+    return dict(
+        v8=v8,
+        vsr=vsr,
+        do8=do8,
+        dos=dos,
+        delta=delta,
+        do8t=do8t,
+        dots=dots,
+        q8t=q8t,
+        qts=qts,
+        k8t=k8t,
+        kts=kts,
+    )
 
 
 def bwd_mx(qz, bz, lse, scale=SCALE, tag=""):
@@ -354,13 +618,63 @@ def bwd_mx(qz, bz, lse, scale=SCALE, tag=""):
     dq = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     dk = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     dv = torch.empty(s, b, h, D_V, device=dev, dtype=torch.bfloat16).transpose(0, 1)
-    _launch("k_dkdv_mx", (s // 128, h, b),
-            [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"],
-             bz["dots"], bz["q8t"], bz["qts"], lse, bz["delta"], dk, dv, float(scale), s, h, b, dk.stride(0),
-             dk.stride(1), dv.stride(0), dv.stride(1)], tag)
-    _launch("k_dq_mx", (s // 256, h, b),
-            [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["k8t"], bz["kts"],
-             lse, bz["delta"], dq, float(scale), s, h, b, dq.stride(0), dq.stride(1)], tag)
+    _launch(
+        "k_dkdv_mx",
+        (s // 128, h, b),
+        [
+            qz["q8"],
+            qz["qs"],
+            qz["k8"],
+            qz["ks"],
+            bz["v8"],
+            bz["vsr"],
+            bz["do8"],
+            bz["dos"],
+            bz["do8t"],
+            bz["dots"],
+            bz["q8t"],
+            bz["qts"],
+            lse,
+            bz["delta"],
+            dk,
+            dv,
+            float(scale),
+            s,
+            h,
+            b,
+            dk.stride(0),
+            dk.stride(1),
+            dv.stride(0),
+            dv.stride(1),
+        ],
+        tag,
+    )
+    _launch(
+        "k_dq_mx",
+        (s // 256, h, b),
+        [
+            qz["q8"],
+            qz["qs"],
+            qz["k8"],
+            qz["ks"],
+            bz["v8"],
+            bz["vsr"],
+            bz["do8"],
+            bz["dos"],
+            bz["k8t"],
+            bz["kts"],
+            lse,
+            bz["delta"],
+            dq,
+            float(scale),
+            s,
+            h,
+            b,
+            dq.stride(0),
+            dq.stride(1),
+        ],
+        tag,
+    )
     return dq, dk, dv
 
 
@@ -381,7 +695,11 @@ def deq_cols(x8t, xts):
     b, h, d, s = x8t.shape
     codes = deinterleave_kv(x8t).view(torch.float8_e4m3fn).float()  # b h d s
     e = xts.to(torch.int32) - 127
-    sc = torch.ldexp(torch.ones_like(e, dtype=torch.float32), e).permute(0, 1, 3, 2, 4).reshape(b, h, d, s // 32)
+    sc = (
+        torch.ldexp(torch.ones_like(e, dtype=torch.float32), e)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(b, h, d, s // 32)
+    )
     return (codes.reshape(b, h, d, s // 32, 32) * sc[..., None]).reshape(b, h, d, s).transpose(2, 3)
 
 
@@ -390,7 +708,9 @@ def mxq(x, dim):
     xm = x.movedim(dim, -1)
     codes, e = mx_quant_last(xm)
     sc = torch.ldexp(torch.ones_like(e, dtype=torch.float32), e)
-    deq = (codes.float().reshape(*codes.shape[:-1], codes.shape[-1] // 32, 32) * sc[..., None]).reshape(codes.shape)
+    deq = (codes.float().reshape(*codes.shape[:-1], codes.shape[-1] // 32, 32) * sc[..., None]).reshape(
+        codes.shape
+    )
     return deq.movedim(-1, dim)
 
 
@@ -502,5 +822,16 @@ def twin_bwd(qz, q, k, v, o, do):
     do8t, dots = twin_cols(do, 128)
     q8t, qts = twin_cols(q, 192)
     k8t, kts = twin_cols(k, 192, qz["kbar"])
-    return dict(v8=v8, vsr=vsr, do8=do8, dos=dos, delta=delta, do8t=do8t, dots=dots, q8t=q8t, qts=qts, k8t=k8t,
-                kts=kts)
+    return dict(
+        v8=v8,
+        vsr=vsr,
+        do8=do8,
+        dos=dos,
+        delta=delta,
+        do8t=do8t,
+        dots=dots,
+        q8t=q8t,
+        qts=qts,
+        k8t=k8t,
+        kts=kts,
+    )
