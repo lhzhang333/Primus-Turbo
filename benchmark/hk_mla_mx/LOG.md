@@ -340,3 +340,19 @@ copy dk / dv into the kv gradient. Fused path (`mx.mla_rope_attention(q, kv, k_p
 - **Training gate g120f** (120 iterations, same seed): bf16 HK 740.0, hk_mx 729.9 (-1.4%), **hk_mx + fused RoPE
   (mxr: Primus patch d909dab0 on local branch dev/lhz/mla_rope_fused_mx) 720.7 ms / iteration (-2.6%)**; final-window
   loss 0.0818 in all three, grad-norm ratio max 1.024; the log shows the fused path active, no fallback.
+
+## 2026-11-05 (f): forward ablations, softmax tail sinking
+
+- m7 timing ablations (`PROBE` bits, wrong results; base 0.425 ms): no exps 0.372, no max 0.392, no P conversions
+  0.380, none of the three 0.212, no PV WMMAs 0.265, no K fragment loads 0.252, no V loads 0.407 (no QK WMMAs: slower,
+  not interpretable). The costs interact: the loop is latency / dependency bound, not unit bound.
+- ATT of slot 3: from the barrier to the first WMMA ~265 cycles per tile with no WMMA: the next tile's 56 K-fragment
+  loads, then softmax(q2)'s tail (the lane max chains, the shift decision, the 8 P conversions) that PV(q2) needs.
+  LLVM sank that tail past slot 2's sched_barrier into slot 3, next to its use (sched_barrier binds the machine
+  scheduler, not the sinking passes). PIN_P 2 (an empty asm use of P(q_i) at the end of slot i): 0.425 -> 0.420 ms
+  (2 spills); pinning P + D + m spills 14 (0.441); a tree-shaped lane max (MAXTREE): no gain.
+- dkdv: the first TDM rounds before the resident K / V loads (PRO_TDM_FIRST), per-wave TDM stores of the staged rows
+  without the barrier (EPI_WAVE): neutral (0.908-0.912), off. Per workgroup ~20% of the time is outside the step loop
+  (steady state ~4.5k cycles before the first loop step incl. TDM issue stalls and the first wait, ~6k after:
+  the last A phase, staging, the store wait); only one workgroup fits a CU, so it is exposed.
+- Package per call now: forward 0.655 ms (quantization 0.210) vs bf16 HK 0.629; backward 1.646 vs 1.974.

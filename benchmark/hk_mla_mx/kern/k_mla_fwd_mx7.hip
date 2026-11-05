@@ -92,6 +92,19 @@ constexpr unsigned W0_KN = tdm_w0(0, 32, 20), W0_KR = tdm_w0(0, 16, 36), W0_V = 
 #ifndef TDM_SPLIT
 #define TDM_SPLIT 1
 #endif
+#ifndef PROBE
+// timing ablations only (wrong results): bit 0 no exps, 1 no max, 2 no P conversions, 3 no QK WMMAs, 4 no PV WMMAs,
+// 5 no K fragment loads, 6 no V fragment loads
+#define PROBE 0
+#endif
+#ifndef PIN_P
+// 1: an empty asm use of P(q_i) and its shift state at the end of slot i: LLVM sank the softmax tail (lane max ->
+// decision -> conversions, a serial chain) past the slot's sched_barrier into slot i + 1, right before PV(q_i)
+#define PIN_P 2  // 2: P only (0.419 vs 0.425 ms); 1: P + D + m (spills 14, 0.441)
+#endif
+#ifndef MAXTREE
+#define MAXTREE 0  // 1: the lane max as a shallow tree (per kv16 tile max3 pairs, then across tiles): 4 serial chains of 8
+#endif
 #ifndef TDM_ONLY
 #define TDM_ONLY 0  // 1: only the TDM ring, its waits and the barriers (the data movement floor)
 #endif
@@ -180,6 +193,7 @@ MX_INLINE VAddr vaddr(uint32_t stage_base, int lr, int lh, int lane) {
 }
 template <int J>
 MX_INLINE void load_k1(KFrag &k, const KAddr &a) {
+    if constexpr (PROBE & 32) return;
     const lds_u8 *pn = lds_ptr(a.n), *pr = lds_ptr(a.r), *ps = lds_ptr(a.s);
     constexpr int o = 16 * J * XK;
     k.x[J] = frag24(lds_b128(pn, o), lds_b128(pn, o + 16), lds_b128(pn, o + 32), lds_b128(pn, o + 48),
@@ -187,6 +201,7 @@ MX_INLINE void load_k1(KFrag &k, const KAddr &a) {
     k.sc[J] = (int)lds_b32(ps, 16 * J * 8);
 }
 MX_INLINE void load_v(VFrag &v, const VAddr &a) {
+    if constexpr (PROBE & 64) return;
     const lds_u8 *pt = lds_ptr(a.t), *ps = lds_ptr(a.s);
     static_for<NDT>([&](auto dd) {
         constexpr int o = 16 * (int)dd * XV;
@@ -214,6 +229,7 @@ MX_INLINE void load_q(QFrag &q, const QAddr &a) {
 MX_INLINE f32x8 mtuple(float m) { return f32x8{-m, -m, -m, -m, -m, -m, -m, -m}; }
 template <int W>
 MX_INLINE void qk_w(f32x8 (&s)[NKV], const KFrag &k, const QFrag &q, const f32x8 &mt) {
+    if constexpr (PROBE & 8) return;
     if constexpr (W < NKV) {
         s[W] = wmma_mx<0, 0>(lo16(k.x[W]), lo16(q.x), mt, k.sc[W], q.sc);
     } else {
@@ -223,6 +239,7 @@ MX_INLINE void qk_w(f32x8 (&s)[NKV], const KFrag &k, const QFrag &q, const f32x8
 // PV WMMA w (0..8) of a q tile: w < 8 V^T tile w, w == 8 the all-ones tile (the row sum); B scale = the lane's 2^(D-PE)
 template <int W>
 MX_INLINE void pv_w(QState &st, const VFrag &v, const i32x16 &pb, int pvs, const i32x16 &ones) {
+    if constexpr (PROBE & 16) return;
     if constexpr (W == NDT)
         st.os = wmma_mx<0, 0>(ones, pb, st.os, SC_ONE, pvs);
     else if constexpr (W % 2 == 0)
@@ -245,15 +262,29 @@ MX_INLINE void sm_mask(f32x8 (&s)[NKV], int thr) {
 // partial max of kv16 tile J into pm[J / 2] (4 partials: 2 tiles each)
 template <int J>
 MX_INLINE void sm_max(float (&pm)[4], const f32x8 (&s)[NKV]) {
+    if constexpr (PROBE & 2) {
+        pm[J / 2] = 0.f;
+        return;
+    }
+#if MAXTREE
+    // the tile's 8 values: three max3 (depth 2), merged into the pair partial (depth 3 per pair of tiles)
+    const float m0 = __builtin_fmaxf(__builtin_fmaxf(s[J][0], s[J][1]), s[J][2]);
+    const float m1 = __builtin_fmaxf(__builtin_fmaxf(s[J][3], s[J][4]), s[J][5]);
+    const float m2 = __builtin_fmaxf(s[J][6], s[J][7]);
+    const float mt = __builtin_fmaxf(__builtin_fmaxf(m0, m1), m2);
+    pm[J / 2] = (J % 2 == 0) ? mt : __builtin_fmaxf(pm[J / 2], mt);
+#else
     float a = (J % 2 == 0) ? -__builtin_inff() : pm[J / 2];
     static_for<4>([&](auto hh) {
         constexpr int h2 = hh;
         a = __builtin_fmaxf(a, __builtin_fmaxf(s[J][2 * h2], s[J][2 * h2 + 1]));
     });
     pm[J / 2] = a;
+#endif
 }
 template <int J>
 MX_INLINE void sm_exp(f32x8 (&s)[NKV]) {
+    if constexpr (PROBE & 1) return;
     static_for<8>([&](auto rr) { s[J][(int)rr] = exp2_raw(s[J][(int)rr]); });
 }
 // the lane's max over its 64 values and its peer's (the other 8 kv rows of every kv16 tile)
@@ -292,6 +323,7 @@ MX_INLINE void sm_first(QState &st, f32x8 (&s)[NKV], float lm) {
 }
 template <int J>
 MX_INLINE void sm_cvt(i32x16 &pb, const f32x8 (&s)[NKV], float pscale) {
+    if constexpr (PROBE & 4) return;
     const u32x2 q = cvt8_e4m3(s[J], pscale);
     pb[2 * J] = (int)q[0];
     pb[2 * J + 1] = (int)q[1];
@@ -623,6 +655,15 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
                 }
 #else
                 softmax<FIRST, DIAG>(st[i], scur, pcur, thr, t == 0);
+#endif
+#if PIN_P == 1
+                asm volatile("" : "+v"(pcur), "+v"(st[i].D), "+v"(st[i].m));
+#elif PIN_P == 2
+                asm volatile("" : "+v"(pcur));
+#elif PIN_P == 3
+                asm volatile("" : "+v"(st[i].D));
+#elif PIN_P == 4
+                if constexpr (i == QT - 2) asm volatile("" : "+v"(pcur), "+v"(st[i].D));  // slot 2 only (PV(q2) first in slot 3)
 #endif
                 // windows: the q loads up front, then per WMMA [VALU, TRANS, VALU, TRANS (, TRANS)]: 64 exps over the
                 // slot's WMMAs (NW 16 or 25), the 55-odd VALU two per window

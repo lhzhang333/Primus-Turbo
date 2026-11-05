@@ -56,6 +56,12 @@ using namespace mx;
 #ifndef KEEP_WAR
 #define KEEP_WAR 1  // bit 0: keep the previous slot's dV / dK A fragments alive past the next loads (as DQ_KEEP)
 #endif
+#ifndef PRO_TDM_FIRST
+#define PRO_TDM_FIRST 0  // 1: dkdv TDM rounds 0, 1 before the resident K / V loads (neutral: 0.908 vs 0.909 ms)
+#endif
+#ifndef EPI_WAVE
+#define EPI_WAVE 0  // 1: dkdv waves TDM-store their own staged rows, no barrier (neutral: 0.910 vs 0.909 ms)
+#endif
 #ifndef MIDSYNC
 // the per-step TDM wait + barrier + issue of round s + 2 between slots MIDSYNC - 1 and MIDSYNC of step s (0: at the step
 // start); slot 7 then prefetches step s + 1's tile 0 and its slot-0 A fragments, so a step starts with no barrier
@@ -266,6 +272,7 @@ __device__ __forceinline__ void dkdv_body(
     const unsigned long long bh = (unsigned long long)b * H + h;
     const int kvw = kv0 + KBW * wv;  // this wave's first kv row
 
+#if !PRO_TDM_FIRST
     // ---- resident B operands: the wave's K / V rows
     i32x32 kx[NJ];
     i32x16 vb[NJ];
@@ -284,6 +291,7 @@ __device__ __forceinline__ void dkdv_body(
         vsc[j] = *(const int *)(VSR + row * 4);
     });
 
+#endif
     // the 11 TDM ops of a round, 3 per wave: [Q^T, QS, LSE], [Q nope, dO scales, delta], [dO, Q rope, -], [dO^T, dO^T
     // scales, Q^T scales] (global address = base + q0 * mult; ops 5..8 are the A part)
     auto dk_op = [&](int k) -> TdmOp {
@@ -324,6 +332,26 @@ __device__ __forceinline__ void dkdv_body(
     };
     issue_round(0);
     issue_round(1);
+#if PRO_TDM_FIRST
+    // ---- resident B operands: the wave's K / V rows
+    i32x32 kx[NJ];
+    i32x16 vb[NJ];
+    int ksc[NJ], vsc[NJ];
+    static_for<NJ>([&](auto jj) {
+        constexpr int j = jj;
+        const int kvr = kvw + 16 * j + lr;
+        const unsigned long long row = bh * S + (unsigned long long)(kvr < S ? kvr : S - 1);
+        const unsigned char *kp = K8 + row * D_QK;
+        kx[j] = frag24(gload16(kp + 64 * lh), gload16(kp + 64 * lh + 16), gload16(kp + 64 * lh + 32),
+                       gload16(kp + 64 * lh + 48), gload16(kp + 128 + 32 * lh), gload16(kp + 128 + 32 * lh + 16));
+        ksc[j] = *(const int *)(KS + row * 8 + 4 * lh);
+        const unsigned char *vp = V8 + row * D_V;
+        vb[j] = cat4(gload16(vp + 64 * lh), gload16(vp + 64 * lh + 16), gload16(vp + 64 * lh + 32),
+                     gload16(vp + 64 * lh + 48));
+        vsc[j] = *(const int *)(VSR + row * 4);
+    });
+
+#endif
 
     f32x8 dv[8][NJ], dk[12][NJ];
     static_for<8>([&](auto d) { static_for<NJ>([&](auto j) { dv[(int)d][(int)j] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
@@ -576,6 +604,31 @@ __device__ __forceinline__ void dkdv_body(
             });
         });
     }
+#if EPI_WAVE
+    {
+        // the wave's own staged rows (KBW from row KBW wv): its ds_stores done, then its TDM stores; no barrier
+        asm volatile("s_wait_dscnt 0x0" ::: "memory");
+        const int r0 = KBW * wv, rw = min(KBW, S - kv0 - r0);
+        if (rw > 0) {
+            const unsigned rows = (unsigned)rw;
+            const long long kr = (long long)(kv0 + r0);
+            const unsigned long long gk = (unsigned long long)(uintptr_t)(DK + (long long)b * dk_sb + kr * dk_ss +
+                                                                          (long long)h * (SPLIT ? 256 : D_QK));
+            tdm_store(tdm_g0(lds0 + O_SDK + (unsigned)(r0 * XDN), gk),
+                      tdm_g1(tdm_w0(0, 0, 0), rows, XDN, KBW, 2ull * (unsigned long long)dk_ss));
+            const unsigned long long gv = (unsigned long long)(uintptr_t)(DV + (long long)b * dv_sb + kr * dv_ss +
+                                                                          (long long)h * (SPLIT ? 256 : D_V));
+            tdm_store(tdm_g0(lds0 + O_SDV + (unsigned)(r0 * XDV), gv),
+                      tdm_g1(tdm_w0(0, 0, 0), rows, XDV, KBW, 2ull * (unsigned long long)dv_ss));
+            if constexpr (SPLIT) {
+                const unsigned long long gp = (unsigned long long)(uintptr_t)(DKP + (long long)b * dkp_sb +
+                                                                              kr * dkp_ss + (long long)h * 64);
+                tdm_store(tdm_g0(lds0 + O_SDP + (unsigned)(r0 * 128), gp),
+                          tdm_g1(tdm_w0(0, 0, 0), rows, 128, KBW, 2ull * (unsigned long long)dkp_ss));
+            }
+        }
+    }
+#else
     bar_signal();
     bar_wait();
     {
@@ -601,6 +654,7 @@ __device__ __forceinline__ void dkdv_body(
             tdm_store(tdm_g0(lds0 + O_SDP, g), tdm_g1(tdm_w0(0, 0, 0), rows, 128, KB, 2ull * (unsigned long long)dkp_ss));
         }
     }
+#endif
     tensor_wait<0>();
 }
 

@@ -67,6 +67,19 @@ constexpr unsigned W0_KN = tdm_w0(0, 32, 20), W0_KR = tdm_w0(0, 16, 36), W0_V = 
 #ifndef PAIR
 #define PAIR 1
 #endif
+#ifndef DMASK
+#define DMASK 0  // 1: diagonal tiles with static mask classes, fully masked q tiles skipped (correct, but either half
+                 // perturbs the global allocation: 150-200 VGPR spills, 0.453 vs 0.423 ms)
+#endif
+#ifndef DSKIP
+#define DSKIP DMASK  // skip the fully masked q tiles of the last tile
+#endif
+#ifndef DSOFT
+#define DSOFT DMASK  // static mask classes in the diagonal softmax
+#endif
+#ifndef NO_MASK_TIMING
+#define NO_MASK_TIMING 0  // 1: timing probe only (diagonal tiles unmasked: wrong results)
+#endif
 #ifndef PRO_PARTIAL
 #define PRO_PARTIAL 1
 #endif
@@ -78,6 +91,19 @@ constexpr unsigned W0_KN = tdm_w0(0, 32, 20), W0_KR = tdm_w0(0, 16, 36), W0_V = 
 #endif
 #ifndef TDM_SPLIT
 #define TDM_SPLIT 1
+#endif
+#ifndef PROBE
+// timing ablations only (wrong results): bit 0 no exps, 1 no max, 2 no P conversions, 3 no QK WMMAs, 4 no PV WMMAs,
+// 5 no K fragment loads, 6 no V fragment loads
+#define PROBE 0
+#endif
+#ifndef PIN_P
+// 1: an empty asm use of P(q_i) and its shift state at the end of slot i: LLVM sank the softmax tail (lane max ->
+// decision -> conversions, a serial chain) past the slot's sched_barrier into slot i + 1, right before PV(q_i)
+#define PIN_P 2  // 2: P only (0.419 vs 0.425 ms); 1: P + D + m (spills 14, 0.441)
+#endif
+#ifndef MAXTREE
+#define MAXTREE 0  // 1: the lane max as a shallow tree (per kv16 tile max3 pairs, then across tiles): 4 serial chains of 8
 #endif
 #ifndef TDM_ONLY
 #define TDM_ONLY 0  // 1: only the TDM ring, its waits and the barriers (the data movement floor)
@@ -167,6 +193,7 @@ MX_INLINE VAddr vaddr(uint32_t stage_base, int lr, int lh, int lane) {
 }
 template <int J>
 MX_INLINE void load_k1(KFrag &k, const KAddr &a) {
+    if constexpr (PROBE & 32) return;
     const lds_u8 *pn = lds_ptr(a.n), *pr = lds_ptr(a.r), *ps = lds_ptr(a.s);
     constexpr int o = 16 * J * XK;
     k.x[J] = frag24(lds_b128(pn, o), lds_b128(pn, o + 16), lds_b128(pn, o + 32), lds_b128(pn, o + 48),
@@ -174,6 +201,7 @@ MX_INLINE void load_k1(KFrag &k, const KAddr &a) {
     k.sc[J] = (int)lds_b32(ps, 16 * J * 8);
 }
 MX_INLINE void load_v(VFrag &v, const VAddr &a) {
+    if constexpr (PROBE & 64) return;
     const lds_u8 *pt = lds_ptr(a.t), *ps = lds_ptr(a.s);
     static_for<NDT>([&](auto dd) {
         constexpr int o = 16 * (int)dd * XV;
@@ -201,6 +229,7 @@ MX_INLINE void load_q(QFrag &q, const QAddr &a) {
 MX_INLINE f32x8 mtuple(float m) { return f32x8{-m, -m, -m, -m, -m, -m, -m, -m}; }
 template <int W>
 MX_INLINE void qk_w(f32x8 (&s)[NKV], const KFrag &k, const QFrag &q, const f32x8 &mt) {
+    if constexpr (PROBE & 8) return;
     if constexpr (W < NKV) {
         s[W] = wmma_mx<0, 0>(lo16(k.x[W]), lo16(q.x), mt, k.sc[W], q.sc);
     } else {
@@ -210,6 +239,7 @@ MX_INLINE void qk_w(f32x8 (&s)[NKV], const KFrag &k, const QFrag &q, const f32x8
 // PV WMMA w (0..8) of a q tile: w < 8 V^T tile w, w == 8 the all-ones tile (the row sum); B scale = the lane's 2^(D-PE)
 template <int W>
 MX_INLINE void pv_w(QState &st, const VFrag &v, const i32x16 &pb, int pvs, const i32x16 &ones) {
+    if constexpr (PROBE & 16) return;
     if constexpr (W == NDT)
         st.os = wmma_mx<0, 0>(ones, pb, st.os, SC_ONE, pvs);
     else if constexpr (W % 2 == 0)
@@ -222,7 +252,7 @@ MX_INLINE void pv_w(QState &st, const VFrag &v, const i32x16 &pb, int pvs, const
 // mask (diagonal tiles): kv > q iff 16 j + r > thr
 template <int J, bool DIAG>
 MX_INLINE void sm_mask(f32x8 (&s)[NKV], int thr) {
-    if constexpr (DIAG) {
+    if constexpr (DIAG && !NO_MASK_TIMING) {
         static_for<8>([&](auto rr) {
             constexpr int r = rr;
             s[J][r] = (16 * J + r > thr) ? -__builtin_inff() : s[J][r];
@@ -232,15 +262,29 @@ MX_INLINE void sm_mask(f32x8 (&s)[NKV], int thr) {
 // partial max of kv16 tile J into pm[J / 2] (4 partials: 2 tiles each)
 template <int J>
 MX_INLINE void sm_max(float (&pm)[4], const f32x8 (&s)[NKV]) {
+    if constexpr (PROBE & 2) {
+        pm[J / 2] = 0.f;
+        return;
+    }
+#if MAXTREE
+    // the tile's 8 values: three max3 (depth 2), merged into the pair partial (depth 3 per pair of tiles)
+    const float m0 = __builtin_fmaxf(__builtin_fmaxf(s[J][0], s[J][1]), s[J][2]);
+    const float m1 = __builtin_fmaxf(__builtin_fmaxf(s[J][3], s[J][4]), s[J][5]);
+    const float m2 = __builtin_fmaxf(s[J][6], s[J][7]);
+    const float mt = __builtin_fmaxf(__builtin_fmaxf(m0, m1), m2);
+    pm[J / 2] = (J % 2 == 0) ? mt : __builtin_fmaxf(pm[J / 2], mt);
+#else
     float a = (J % 2 == 0) ? -__builtin_inff() : pm[J / 2];
     static_for<4>([&](auto hh) {
         constexpr int h2 = hh;
         a = __builtin_fmaxf(a, __builtin_fmaxf(s[J][2 * h2], s[J][2 * h2 + 1]));
     });
     pm[J / 2] = a;
+#endif
 }
 template <int J>
 MX_INLINE void sm_exp(f32x8 (&s)[NKV]) {
+    if constexpr (PROBE & 1) return;
     static_for<8>([&](auto rr) { s[J][(int)rr] = exp2_raw(s[J][(int)rr]); });
 }
 // the lane's max over its 64 values and its peer's (the other 8 kv rows of every kv16 tile)
@@ -279,12 +323,51 @@ MX_INLINE void sm_first(QState &st, f32x8 (&s)[NKV], float lm) {
 }
 template <int J>
 MX_INLINE void sm_cvt(i32x16 &pb, const f32x8 (&s)[NKV], float pscale) {
+    if constexpr (PROBE & 4) return;
     const u32x2 q = cvt8_e4m3(s[J], pscale);
     pb[2 * J] = (int)q[0];
     pb[2 * J + 1] = (int)q[1];
 }
 // the whole softmax of a q tile, in dependency order: per kv16 tile mask, max, exp; the decision; the conversions.
 // FIRST: max of all tiles first, the exact shift, then the exps.
+// diagonal tiles (DMASK): what the causal mask does to kv16 tile J of q tile I, from the static offsets. First diagonal
+// tile (kv0 = q0): q - kv0 = 64 I + 16 wv + lr (thr = that - 8 lh), second (kv0 = q0 + 128): 128 less. 0 = visible
+// (no mask), 1 = per element (the straddling tiles: depends on the wave), 2 = fully masked (P = 0: no max / exp / cvt).
+// The second tile's q tiles 0, 1 are fully masked as a whole (their QK, softmax and PV are skipped by the caller).
+template <bool DIAG, bool LASTT, int I, int J>
+constexpr int mask_kind() {
+    if constexpr (!DIAG) return 0;
+    else if constexpr (!LASTT) return I >= 2 ? 0 : (I == 0 ? (J >= 4 ? 2 : 1) : (J < 4 ? 0 : 1));
+    else return I <= 1 ? 2 : (I == 2 ? (J >= 4 ? 2 : 1) : (J < 4 ? 0 : 1));
+}
+template <bool DIAG, bool LASTT, int I>
+MX_INLINE void softmax_d(QState &st, f32x8 (&s)[NKV], i32x16 &pb, int thr, bool first) {
+    float pm[4] = {-__builtin_inff(), -__builtin_inff(), -__builtin_inff(), -__builtin_inff()};
+    static_for<NKV>([&](auto jj) {
+        constexpr int j = jj;
+        constexpr int mk = mask_kind<DIAG, LASTT, I, j>();
+        if constexpr (mk != 2) {
+            if constexpr (mk == 1) sm_mask<j, true>(s, thr);
+            float a = pm[j / 2];
+            static_for<4>([&](auto hh) {
+                constexpr int h2 = hh;
+                a = __builtin_fmaxf(a, __builtin_fmaxf(s[j][2 * h2], s[j][2 * h2 + 1]));
+            });
+            pm[j / 2] = a;
+            sm_exp<j>(s);
+        }
+    });
+    const float pscale = sm_decide(st, sm_lm(pm), first);
+    static_for<NKV>([&](auto jj) {
+        constexpr int j = jj;
+        if constexpr (mask_kind<DIAG, LASTT, I, j>() == 2) {
+            pb[2 * j] = 0;
+            pb[2 * j + 1] = 0;
+        } else {
+            sm_cvt<j>(pb, s, pscale);
+        }
+    });
+}
 template <bool FIRST, bool DIAG>
 MX_INLINE void softmax(QState &st, f32x8 (&s)[NKV], i32x16 &pb, int thr, bool first = false) {
     float pm[4];
@@ -532,8 +615,13 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
                     }
                     fence();
                 }
-                constexpr int NPV = (i >= 1) ? NDT + 1 : 0;
-                constexpr int NQK = (i + 1 < QT || !LAST) ? 16 : 0;
+                // DMASK, the second diagonal tile (LAST): q tiles 0, 1 fully masked: no softmax, no PV; no QK(q1) in slot 0
+                // (QK(q0) of this tile was skipped in the previous tile's slot 3)
+                constexpr bool SKIPQ = DSKIP && LAST && i <= 1;                 // softmax(q_i)
+                constexpr bool SKIPPV = DSKIP && LAST && i >= 1 && i - 1 <= 1;  // PV(q_{i-1})
+                constexpr bool NEXTLAST = DSKIP && DIAG && !LAST && i == QT - 1;  // QK(q0) of the last tile
+                constexpr int NPV = (i >= 1 && !SKIPPV) ? NDT + 1 : 0;
+                constexpr int NQK = ((i + 1 < QT || !LAST) && !(DSKIP && LAST && i == 0) && !NEXTLAST) ? 16 : 0;
                 constexpr int NW = NPV + NQK;
                 constexpr int qn_mt = (i + 1) % QT;
                 const f32x8 mtn = mtuple(st[qn_mt].m);
@@ -559,7 +647,24 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
                         qk_w<k - NPV>(snext, kf, qf[(i + 1) % 2], mtn);
                     }
                 });
+#if DMASK
+                if constexpr (DIAG && DSOFT) {
+                    if constexpr (!SKIPQ) softmax_d<DIAG, LAST, i>(st[i], scur, pcur, thr, t == 0);
+                } else if constexpr (!SKIPQ) {
+                    softmax<FIRST, DIAG>(st[i], scur, pcur, thr, t == 0);
+                }
+#else
                 softmax<FIRST, DIAG>(st[i], scur, pcur, thr, t == 0);
+#endif
+#if PIN_P == 1
+                asm volatile("" : "+v"(pcur), "+v"(st[i].D), "+v"(st[i].m));
+#elif PIN_P == 2
+                asm volatile("" : "+v"(pcur));
+#elif PIN_P == 3
+                asm volatile("" : "+v"(st[i].D));
+#elif PIN_P == 4
+                if constexpr (i == QT - 2) asm volatile("" : "+v"(pcur), "+v"(st[i].D));  // slot 2 only (PV(q2) first in slot 3)
+#endif
                 // windows: the q loads up front, then per WMMA [VALU, TRANS, VALU, TRANS (, TRANS)]: 64 exps over the
                 // slot's WMMAs (NW 16 or 25), the 55-odd VALU two per window
                 if constexpr (LOADQ) sgb<SG_DSR, 7>();
