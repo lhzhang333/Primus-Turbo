@@ -124,3 +124,17 @@ on the diagonal steps / tiles; dkdv 2 kv16 tiles per wave (3 spills), dq as b0 +
 **GPU session plan (when the node is back):** test_fwd --tag {3, 3x, 4xp} toy..prod; bench_fwd --build --tags
 ,x,xp,2xp,3,3x,3xp,4,4x,4xp; test_bwd --fwd-tag 4xp --tag 1xp (and b0 --tag xp); bench_bwd --build --tags
 ,x,xp,1xp; then Turbo pytest (hk_mx numerics); update the package with the winners.
+
+**Compiler bug found (clang, gfx1250 toolchain of the containers):** `__builtin_bit_cast(float, v[i])` on an
+`ext_vector_type` element ignores the index and reads element 0 (the -O3 IR shows a `<0,0,0,0,4,4,4,4>` shuffle when
+eight such casts build an f32x8 from two u32x4). It silently broke b0's dK/dV lse / delta reads and b1's C tuples
+(caught on the CPU from the ISA: a ds_load_2addr of elements 0 / 4 broadcast to 8 registers). Fix: `mx::as_f(uint32_t)`
+(value parameter). Rule: never bit_cast a vector element in place; cast whole vectors or go through a scalar.
+
+**Rung b2** (`kern/k_mla_bwd_mx2.hip`): dK/dV split into k_dv_mx (S, P, dV) and k_dk_mx (S, dP, dS, dK) with 4 kv16
+tiles per wave (b1 fused: 2, the register limit), one templated body; every LDS fragment feeds 4 WMMAs; S computed
+twice (+20% WMMAs in total) for an LDS-bound -> WMMA-bound change (model: dK/dV ~1.4x). Steady loops: dv 96 WMMA /
+144 VALU / 103 LDS; dk 144 / 664 / 171; VGPRs 489 / 1023, no spills; k_dv_mx fits 8 tiles per wave (953).
+
+GPU session script: `scratch_mx/session_gpu.sh <gpu> [first step]` (each step through g<gpu>.sh with its own timeout,
+logs in scratch_mx/logs/session_<n>.log, stops at the first failure).
