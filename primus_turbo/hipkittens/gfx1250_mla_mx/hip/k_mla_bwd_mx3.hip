@@ -33,6 +33,9 @@ using namespace mx;
 #ifndef PF_KV
 #define PF_KV 1
 #endif
+#ifndef DQ_SGB
+#define DQ_SGB 0  // 1: sched_group_barrier windows in the pair phase (measured slower: 0.703 vs 0.631 ms)
+#endif
 #ifndef OSTAGE
 #define OSTAGE 1  // epilogues through LDS and TDM stores
 #endif
@@ -739,6 +742,16 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
                 dsB[i][4 * m + 3] = (int)q1v[1];
                 dss[i] |= (e + 127) << (8 * m);
             });
+#if DQ_SGB
+            // issue windows for the pair: 24 WMMAs (S nope + rope, dP per kv16 x 4 q tiles), 64 exps, ~100 VALU: each
+            // q tile's exps behind other q tiles' WMMAs instead of right after their own (v_nop hazard fills)
+            static_for<24>([&](auto kk) {
+                __builtin_amdgcn_sched_group_barrier(0x8, 1, 0);    // WMMA
+                __builtin_amdgcn_sched_group_barrier(0x400, 2, 0);  // TRANS
+                __builtin_amdgcn_sched_group_barrier(0x2, 3, 0);    // VALU
+                if constexpr ((int)kk % 3 == 0) __builtin_amdgcn_sched_group_barrier(0x400, 1, 0);
+            });
+#endif
             fence();
         });
         // dQ^T += K^T dS^T: A = K8T rows d, K = this tile's kv

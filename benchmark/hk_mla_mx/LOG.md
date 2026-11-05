@@ -247,3 +247,9 @@ b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 
   block's Q before its tiles, then tensor_wait<4>: compute starts once Q and tile 0 landed): 0.4246 -> 0.4238 ms (noise
   level; kept). The loop: 2236 cycles / tile, still with VALU-only runs (the max3 of q_i at the slot start) and WMMA-only
   runs where the sched_group_barrier windows meet dependences.
+- dq DQ_SGB (sched_group_barrier windows [W, 2 T, 3 V] in the pair phase): 0.631 -> 0.703 ms, kept off.
+- b3 ATT (per wave): dkdv 71% in the step loop, ~16.6k cycles outside (prologue TDM issue stalls ~3.4k: the wave's
+  TDM queue is shallow and every block starts by pulling ~200 KB; staging 0.9k; final TDM-store wait 1.4k); dq 64%,
+  ~27.6k outside (prologue ~5.3k, two diagonal tiles, staging 0.85k, final store 1.8k). Pairing blocks as in m7 would
+  hide prologues and stores, but LDS is full (dq 320 KB: the second block's Q region and the first block's dQ staging
+  collide); needs an LDS plan.
