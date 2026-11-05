@@ -658,17 +658,30 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
             i32x16 va[2];
             int ksc[2], vsc[2];
         };
+        // per-lane fragment bases of this tile, formed once (pinned): every load below is base + immediate offset, no
+        // VALU address math between the WMMAs (a per-load v_add3 landed in a register the previous WMMAs still read:
+        // ~31-cycle write-after-read stall + 4 v_nop per dQ group)
+        const int ln = lane_now(), r16 = ln & 15, hh = ln >> 4;
+        const uint32_t kb_n = pin(st + Q_O_K + (unsigned)(r16 * XK + 64 * hh)),
+                       kb_r = pin(st + Q_O_K + (unsigned)(r16 * XK + 128 + 32 * hh)),
+                       kb_s = pin(st + Q_O_KS + (unsigned)(r16 * 8 + 4 * hh)),
+                       vb_t = pin(st + Q_O_V + (unsigned)(r16 * X128 + 64 * hh)),
+                       vb_s = pin(st + Q_O_VS + (unsigned)(r16 * 4)),
+                       kt_t = pin(st + Q_O_KT + (unsigned)(r16 * X128 + 64 * hh)),
+                       kt_s = pin(st + Q_O_KTS + (unsigned)(ln * 4));
         auto ldkv = [&](auto mc, KVPair &kv) __attribute__((always_inline)) {
             constexpr int m = decltype(mc)::value;
             static_for<2>([&](auto uu) {
                 constexpr int u = uu;
-                const int krow = 16 * (2 * m + u) + lr;
-                const lds_u8 *kp = lds_ptr(st + Q_O_K + (unsigned)(krow * XK));
-                kv.kx[u] = frag24(lds_b128(kp, 64 * lh), lds_b128(kp, 64 * lh + 16), lds_b128(kp, 64 * lh + 32),
-                                  lds_b128(kp, 64 * lh + 48), lds_b128(kp, 128 + 32 * lh), lds_b128(kp, 128 + 32 * lh + 16));
-                kv.ksc[u] = (int)lds_b32(lds_ptr(st + Q_O_KS), krow * 8 + 4 * lh);
-                kv.va[u] = lds_frag64(lds_ptr(st + Q_O_V + (unsigned)(krow * X128)), 64 * lh);
-                kv.vsc[u] = (int)lds_b32(lds_ptr(st + Q_O_VS), krow * 4);
+                constexpr int kr = 16 * (2 * m + u);
+                const lds_u8 *kn = lds_ptr(kb_n), *krp = lds_ptr(kb_r);
+                kv.kx[u] = frag24(lds_b128(kn, kr * XK), lds_b128(kn, kr * XK + 16), lds_b128(kn, kr * XK + 32),
+                                  lds_b128(kn, kr * XK + 48), lds_b128(krp, kr * XK), lds_b128(krp, kr * XK + 16));
+                kv.ksc[u] = (int)lds_b32(lds_ptr(kb_s), kr * 8);
+                const lds_u8 *vp = lds_ptr(vb_t);
+                kv.va[u] = cat4(lds_b128(vp, kr * X128), lds_b128(vp, kr * X128 + 16), lds_b128(vp, kr * X128 + 32),
+                                lds_b128(vp, kr * X128 + 48));
+                kv.vsc[u] = (int)lds_b32(lds_ptr(vb_s), kr * 4);
             });
         };
         struct AF {
@@ -677,8 +690,10 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
         };
         auto lda = [&](auto dc) __attribute__((always_inline)) {
             constexpr int dt = decltype(dc)::value;
-            return AF{lds_frag64(lds_ptr(st + Q_O_KT + (unsigned)((16 * dt + lr) * X128)), 64 * lh),
-                      (int)lds_b32(lds_ptr(st + Q_O_KTS), (32 * (dt / 2) + lane) * 4)};
+            const lds_u8 *tp = lds_ptr(kt_t);
+            constexpr int o = 16 * dt * X128;
+            return AF{cat4(lds_b128(tp, o), lds_b128(tp, o + 16), lds_b128(tp, o + 32), lds_b128(tp, o + 48)),
+                      (int)lds_b32(lds_ptr(kt_s), 32 * (dt / 2) * 4)};
         };
         AF ab[4];
         KVPair kvb[2];

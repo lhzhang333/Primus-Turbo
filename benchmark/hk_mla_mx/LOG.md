@@ -238,3 +238,6 @@ b1's SNRs. b2 s4096 h128: dkdv 1.903 -> 1.284 ms, dq 1.065 -> 0.799, **backward 
 - ATT of the pipelined b3: dkdv 2805 cycles / step (from 3714), now LDS-bound (240 loads at ~4.9 cycles, 39%); dq 3683
   cycles / tile. b4 with b3's pipelining and staging (NJ_DK 3: NJ 4 spills 28): dv 0.420 + dk 0.720 = 1.14 ms vs b3's
   dkdv 0.978: the S recomputation in both kernels does not pay; b3 stays.
+- dq fragment addresses pinned per tile (bases + immediate offsets): ATT showed a v_add3 per dQ group computing the next
+  K^T fragment address into a register the group's WMMAs still read (~31-cycle write-after-read stall + 4 v_nop, 12 per
+  tile). dq 0.669 -> 0.625 ms, **b3 backward 1.651 ms** (bf16 HK 1.971).
