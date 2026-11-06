@@ -673,3 +673,9 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   B = K), the dQ operand needs dS quantized along kv with lane = q: a q <-> kv transpose through LDS per step (~42 KB
   free in dk / dv) on an LDS-bound kernel (+15-20% estimated) and a bf16 rounding before the quantization (no longer
   bit-exact): not pursued.
+- **Persistent forward** (FWD_PERSIST, lab, reverted): grid (256, 1, 1), workgroup w takes the pairs w, w + 256, ..
+  (34 tiles each; ring stage offset (34 j) & 3), the next pair's tiles 0..2 issued in the current pair's last three
+  tiles and its Q in the second block's epilogue; bit-exact (also with 8 workgroups: many pairs each). Slower: 0.6170
+  / 0.6323 / 0.6305 vs 0.6119-0.6140 ms over three versions (two loops instantiated the block twice: 2x code; then
+  the per-item state live through the tile loop cost SGPRs: 58 -> 121-214 SGPR spills, the tile loop 2076 -> 2252
+  cycles / trip, more than the ~4k cycles of start-up wait it hides per pair).
