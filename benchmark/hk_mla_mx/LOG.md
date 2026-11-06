@@ -591,3 +591,10 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
 - Package (profiler, fused-RoPE fwd + bwd, b2 s4096 h128, slow GPU): GPU time per step 3.545 -> 3.435 ms:
   k_dkdv_mxr 1.405 -> 1.328, k_dq_mxr 0.913 -> 0.886, k_mla_fwd_mx 0.605 -> 0.600. pytest 30 pass, fused-RoPE test
   pass (out / dq / dkv bitwise with the unfused composition).
+- Forward **DMASK** (static mask classes for the two diagonal tiles, fully masked q tiles of the last one skipped;
+  11-05 rejected for 150-200 VGPR spills) retried on the new code: 8 spills in the LLVM build, bit-exact at five
+  shapes and the extra-shape sweep. Lab (LLVM order) 0.6442 -> 0.6292 ms; package (re-scheduled region shrinks 3074
+  -> 1908 instructions), attn_fwd per call (3 copies each): 0.9233 -> 0.8841 ms; DSKIP alone 0.9058. Under DMASK the
+  combinations (re-scheduled, 3 copies): OSKEW + QFIRST 0.8863, OSKEW 0.8933, neither 0.9114: all on. Package
+  profile: k_mla_fwd_mx 0.600 -> 0.558 ms, fused-RoPE fwd + bwd GPU time 3.435 -> 3.389 ms per step. pytest 30
+  pass, fused-RoPE test pass.

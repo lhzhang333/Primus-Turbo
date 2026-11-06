@@ -80,8 +80,9 @@ constexpr unsigned W0_KN = tdm_w0(0, 32, 20), W0_KR = tdm_w0(0, 16, 36), W0_V = 
 #define PAIR 1
 #endif
 #ifndef DMASK
-#define DMASK 0  // 1: diagonal tiles with static mask classes, fully masked q tiles skipped (correct, but either half
-                 // perturbs the global allocation: 150-200 VGPR spills, 0.453 vs 0.423 ms)
+#define DMASK 1  // diagonal tiles with static mask classes, fully masked q tiles skipped (11-05: 150-200 VGPR spills,
+                 // 0.453 vs 0.423 ms; 11-06 with the skewed O staging and the package's re-scheduling: 8 spills, attn_fwd
+                 // 0.9233 -> 0.8841 ms per call; lab LLVM order 0.6442 -> 0.6292)
 #endif
 #ifndef DSKIP
 #define DSKIP DMASK  // skip the fully masked q tiles of the last tile
