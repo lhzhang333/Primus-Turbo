@@ -65,6 +65,30 @@ using namespace mx;
 #ifndef TDM_INC
 #define TDM_INC 1  // dkdv: each wave's 3 TDM ops keep their next step, global address and LDS stage (advanced per round)
 #endif
+#ifndef DQ_ORDER
+#define DQ_ORDER 2  // dq workgroup order: 0 longest q block first per (b, h); 1 snake; 2 long halves then short halves
+#endif
+#ifndef DQ_WAIT0
+#define DQ_WAIT0 0  // dq: the per-tile TDM wait + barrier also before tile 0 (the tile loop becomes one basic block)
+#endif
+#ifndef DQ_DSTAT
+#define DQ_DSTAT 1  // dq: static mask classes on the two diagonal kv tiles (fully masked q tiles skipped, kept ones unmasked)
+#endif
+#ifndef NO_FINAL_WAIT
+#define NO_FINAL_WAIT 0  // timing probe only: dkdv ends without waiting for its TDM stores (LDS may be reused early)
+#endif
+#ifndef EPI_PAD
+#define EPI_PAD 0  // dkdv epilogue: padded staging rows, per-wave dense re-pack + TDM stores (no bank conflicts, no barrier)
+#endif
+#ifndef EPI_DIRECT
+#define EPI_DIRECT 0  // dkdv: dK / dV rows by global stores from the accumulators (no LDS staging / TDM store / waits)
+#endif
+#ifndef PIN_Q
+#define PIN_Q 0  // dkdv: bit 0 P(qt) converted in slot qt, bit 1 dS(qt - 1, qt) quantized in slot qt (empty asm defs)
+#endif
+#ifndef UNROLL2
+#define UNROLL2 0  // dkdv: two steps per loop trip, ping-pong P / dS buffers (no loop-carried copies)
+#endif
 #ifndef MIDSYNC
 // the per-step TDM wait + barrier + issue of round s + 2 between slots MIDSYNC - 1 and MIDSYNC of step s (0: at the step
 // start); slot 7 then prefetches step s + 1's tile 0 and its slot-0 A fragments, so a step starts with no barrier
@@ -534,13 +558,23 @@ __device__ __forceinline__ void dkdv_body(
                     p[r] = pv;
                     ds[r] = pv * dp[r];
                 });
+#if PIN_Q & 1
+                u32x2 pq = cvt8_e4m3(p, 1.0f / 256.0f);
+                asm volatile("" : "+v"(pq));  // P(qt) converted in its slot (LLVM sank it to the step end, next to its use)
+#else
                 const u32x2 pq = cvt8_e4m3(p, 1.0f / 256.0f);
+#endif
                 pB[j][2 * qt] = (int)pq[0];
                 pB[j][2 * qt + 1] = (int)pq[1];
                 if constexpr (qt % 2 == 0) {
                     dsprev[j] = ds;
                 } else {
+#if PIN_Q & 2
+                    DsQ z = quant_pair(dsprev[j], ds);
+                    asm volatile("" : "+v"(z.a), "+v"(z.b), "+v"(z.byte));  // dS(qt - 1, qt) quantized in its slot
+#else
                     const DsQ z = quant_pair(dsprev[j], ds);
+#endif
                     dsB[j][2 * (qt - 1)] = (int)z.a[0];
                     dsB[j][2 * (qt - 1) + 1] = (int)z.a[1];
                     dsB[j][2 * qt] = (int)z.b[0];
@@ -585,8 +619,49 @@ __device__ __forceinline__ void dkdv_body(
             dsso[(int)jj] = dss[(int)jj];
         });
     };
+#if UNROLL2
+    // two steps per loop trip with ping-pong P / dS buffers (X: even steps, Y: odd steps): no per-step copies of the
+    // loop-carried P / dS of the previous step (LLVM moved ~66 VGPRs per step through v_mov at the step end)
+    i32x16 pY[NJ], dsY[NJ];
+    int dssY[NJ];
+    auto runpp = [&](int s, auto diag_c, auto prev_c, i32x16 (&pB)[NJ], i32x16 (&dsB)[NJ], int (&dss)[NJ],
+                    const i32x16 (&pBq)[NJ], const i32x16 (&dsBq)[NJ], const int (&dssq)[NJ])
+        __attribute__((always_inline)) {
+        tensor_wait<TDM_PER_ROUND>();
+        bar_signal();
+        bar_wait();
+        issue_round(s + 2);
+        const StepAddr a = addr(s);
+        static_for<NJ>([&](auto jj) { dss[(int)jj] = 0; });
+        step(s, a, qs0 + s * QS_, pB, dsB, dss, pBq, dsBq, dssq, pre_t, pre_a, diag_c, prev_c);
+    };
+    runpp(0, std::true_type{}, std::false_type{}, pBo, dsBo, dsso, pY, dsY, dssY);  // step 0 -> X
+    {
+        int s = 1;
+        bool lastY = false;
+        if (s < nst) {
+            for (;;) {
+                runpp(s, std::false_type{}, std::true_type{}, pY, dsY, dssY, pBo, dsBo, dsso);  // X -> Y
+                if (s + 1 >= nst) {
+                    lastY = true;
+                    break;
+                }
+                runpp(s + 1, std::false_type{}, std::true_type{}, pBo, dsBo, dsso, pY, dsY, dssY);  // Y -> X
+                s += 2;
+                if (s >= nst) break;
+            }
+        }
+        if (lastY)
+            static_for<NJ>([&](auto jj) {
+                pBo[(int)jj] = pY[(int)jj];
+                dsBo[(int)jj] = dsY[(int)jj];
+                dsso[(int)jj] = dssY[(int)jj];
+            });
+    }
+#else
     run(0, std::true_type{}, std::false_type{});
     for (int s = 1; s < nst; ++s) run(s, std::false_type{}, std::true_type{});
+#endif
 
     // ---- the dV / dK of the last step (its A part: round nst), A fragments two groups ahead
     tensor_wait<0>();
@@ -613,6 +688,114 @@ __device__ __forceinline__ void dkdv_body(
         });
     }
 
+#if EPI_DIRECT
+    // ---- epilogue: dK / dV rows straight from the accumulators (lane = kv row lr of kv16 tile j, 8 bf16 = 16 B of
+    // d16 tile d at column 16 d + 8 lh): global stores, no LDS staging (16-way bank conflicts: the TDM store forbids
+    // padding), no barrier, no TDM-store wait (the stores complete after the wave ends)
+    {
+        const int ln = lane_now(), l16 = ln & 15, hh = ln >> 4;
+        static_for<NJ>([&](auto jj) {
+            constexpr int j = jj;
+            const int kvr = kvw + 16 * j + l16;
+            if (kvr < S) {
+                bf16 *pk = DK + (long long)b * dk_sb + (long long)kvr * dk_ss + (long long)h * (SPLIT ? 256 : D_QK) + 8 * hh;
+                bf16 *pv = DV + (long long)b * dv_sb + (long long)kvr * dv_ss + (long long)h * (SPLIT ? 256 : D_V) + 8 * hh;
+                bf16 *pp = SPLIT ? DKP + (long long)b * dkp_sb + (long long)kvr * dkp_ss + (long long)h * 64 + 8 * hh : pk;
+                static_for<8>([&](auto dd) {
+                    constexpr int d = dd;
+                    bf16x8 w;
+                    static_for<8>([&](auto rr) { w[(int)rr] = (bf16)dv[d][j][(int)rr]; });
+                    *(u32x4 *)(pv + 16 * d) = __builtin_bit_cast(u32x4, w);
+                });
+                static_for<12>([&](auto dd) {
+                    constexpr int d = dd;
+                    bf16x8 w;
+                    static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dk[d][j][(int)rr] * scale); });
+                    bf16 *dst = (SPLIT && d >= 8) ? pp + 16 * (d - 8) : pk + 16 * d;
+                    *(u32x4 *)dst = __builtin_bit_cast(u32x4, w);
+                });
+            }
+        });
+    }
+    return;
+#endif
+#if EPI_PAD
+    // ---- epilogue without bank conflicts: each wave stages its 32 dK / dV rows into padded rows (pitch + 16 B: the
+    // 16 rows of a ds_store hit different banks; dense rows 256 / 384 B apart put all 16 on the same banks), re-packs
+    // them densely (32 consecutive 16-byte chunks per copy: conflict-free) and TDM-stores its own rows; no barrier.
+    // Padded staging in the q ring (idle); dense dK (+ rope) after it in the q ring, dense dV in the A stage no TDM op
+    // and no final-phase read uses (step nst's: NULL past the end).
+    {
+        constexpr int XDK = 2 * D_QK, XDV = 2 * D_V;
+        constexpr int XDN = SPLIT ? 2 * 128 : XDK;
+        constexpr int PDN = XDN + 16, PDV = XDV + 16, PDP = 128 + 16;
+        constexpr int P_DK = 0, P_DV = P_DK + KB * PDN, P_DP = P_DV + KB * PDV;
+        constexpr int P_END = P_DP + (SPLIT ? KB * PDP : 0);
+        constexpr int D_DK = (P_END + 127) / 128 * 128, D_DP = D_DK + KB * XDN;
+        static_assert(D_DP + (SPLIT ? KB * 128 : 0) <= ARING, "padded staging + dense dK inside the q ring");
+        static_assert(KB * XDV <= ASTG, "dense dV inside one A stage");
+        const unsigned d_dv = (unsigned)(ARING + (nst % NSTG) * ASTG);
+        const int ln = lane_now();
+        static_for<NJ>([&](auto jj) {
+            constexpr int j = jj;
+            const unsigned r = (unsigned)(KBW * wv + 16 * j + (ln & 15)), hh = (unsigned)(ln >> 4);
+            const unsigned dkr = lds0 + P_DK + r * PDN + 16 * hh, dvr = lds0 + P_DV + r * PDV + 16 * hh;
+            const unsigned dpr = lds0 + P_DP + r * PDP + 16 * hh;
+            static_for<12>([&](auto dd) {
+                constexpr int d = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dk[d][j][(int)rr] * scale); });
+                const unsigned a = (SPLIT && d >= 8) ? dpr + 32 * (d - 8) : dkr + 32 * d;
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)a = __builtin_bit_cast(u32x4, w);
+            });
+            static_for<8>([&](auto dd) {
+                constexpr int d = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)dv[d][j][(int)rr]; });
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(dvr + 32 * d) = __builtin_bit_cast(u32x4, w);
+            });
+        });
+        // re-pack this wave's rows (KBW from row KBW wv): chunk c = row * (X / 16) + col, 32 per copy (a wave's own
+        // LDS operations complete in order: no wait between its padded stores and these loads)
+        auto repack = [&](auto xc, auto pc, unsigned src, unsigned dst) __attribute__((always_inline)) {
+            constexpr int X = decltype(xc)::value, PP = decltype(pc)::value, CPR = X / 16, NCH = KBW * CPR;
+            static_assert(NCH % 32 == 0, "whole copies");
+            const unsigned r0 = (unsigned)(KBW * wv);
+            static_for<NCH / 32>([&](auto kk) {
+                const int c = 32 * (int)kk + ln;
+                const unsigned row = r0 + (unsigned)(c / CPR), col = (unsigned)(c % CPR);
+                const u32x4 v = *(const __attribute__((address_space(3))) u32x4 *)(uintptr_t)(src + row * PP + 16 * col);
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(dst + row * X + 16 * col) = v;
+            });
+        };
+        repack(std::integral_constant<int, XDN>{}, std::integral_constant<int, PDN>{}, lds0 + P_DK, lds0 + D_DK);
+        repack(std::integral_constant<int, XDV>{}, std::integral_constant<int, PDV>{}, lds0 + P_DV, lds0 + d_dv);
+        if constexpr (SPLIT)
+            repack(std::integral_constant<int, 128>{}, std::integral_constant<int, PDP>{}, lds0 + P_DP, lds0 + D_DP);
+        asm volatile("s_wait_dscnt 0x0" ::: "memory");
+        const int r0 = KBW * wv, rw = min(KBW, S - kv0 - r0);
+        if (rw > 0) {
+            const unsigned rows = (unsigned)rw;
+            const long long kr = (long long)(kv0 + r0);
+            const unsigned long long gk = (unsigned long long)(uintptr_t)(DK + (long long)b * dk_sb + kr * dk_ss +
+                                                                          (long long)h * (SPLIT ? 256 : D_QK));
+            tdm_store(tdm_g0(lds0 + D_DK + (unsigned)(r0 * XDN), gk),
+                      tdm_g1(tdm_w0(0, 0, 0), rows, XDN, KBW, 2ull * (unsigned long long)dk_ss));
+            const unsigned long long gv = (unsigned long long)(uintptr_t)(DV + (long long)b * dv_sb + kr * dv_ss +
+                                                                          (long long)h * (SPLIT ? 256 : D_V));
+            tdm_store(tdm_g0(lds0 + d_dv + (unsigned)(r0 * XDV), gv),
+                      tdm_g1(tdm_w0(0, 0, 0), rows, XDV, KBW, 2ull * (unsigned long long)dv_ss));
+            if constexpr (SPLIT) {
+                const unsigned long long gp = (unsigned long long)(uintptr_t)(DKP + (long long)b * dkp_sb +
+                                                                              kr * dkp_ss + (long long)h * 64);
+                tdm_store(tdm_g0(lds0 + D_DP + (unsigned)(r0 * 128), gp),
+                          tdm_g1(tdm_w0(0, 0, 0), rows, 128, KBW, 2ull * (unsigned long long)dkp_ss));
+            }
+        }
+        tensor_wait<0>();
+        return;
+    }
+#endif
     // ---- epilogue: dK / dV rows (lane = kv column, rows d = 8 lh + r of each d16 tile) as bf16 into LDS (the q ring,
     // idle since the barrier above), then one TDM store each (wave 0: dK, 384 B rows; wave 1: dV, 256 B rows)
     constexpr int XDK = 2 * D_QK, XDV = 2 * D_V, O_SDK = 0, O_SDV = KB * XDK;
@@ -692,7 +875,9 @@ __device__ __forceinline__ void dkdv_body(
         }
     }
 #endif
+#if !NO_FINAL_WAIT
     tensor_wait<0>();
+#endif
 }
 
 extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
@@ -783,8 +968,32 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     const int cnt0 = wv == 0 ? 1 : 0;
     const int nqb = S / BMQ;
     const BlockOf blk = xcd_block(nqb, H, B);
+#if DQ_ORDER == 1
+    // snake: (b, h) groups alternate longest-first / shortest-first (the k-th workgroup of an XCD: group k / nqb)
+    const int grp = (int)((blockIdx.x + nqb * (blockIdx.y + H * blockIdx.z)) >> 3) / nqb;
+    const int qb = (grp & 1) ? blk.slot : nqb - 1 - blk.slot;
+#elif DQ_ORDER == 2
+    // two passes per XCD: every (b, h)'s long half (q blocks nqb - 1 .. nqb / 2) first, then the short halves (the
+    // dispatch tail made of short workgroups; each (b, h)'s K / V read in both passes)
+    int qb, h, b;
+    if ((B * H) % 8 == 0 && nqb % 2 == 0) {
+        const int L = (int)(blockIdx.x + nqb * (blockIdx.y + H * blockIdx.z)), k = L >> 3, xc = L & 7;
+        const int nbx = B * H / 8, half = nqb / 2, k1 = k % (nbx * half);
+        const int bhx = xc + 8 * (k1 / half), sl = k1 % half;
+        qb = k < nbx * half ? nqb - 1 - sl : half - 1 - sl;
+        h = bhx % H;
+        b = bhx / H;
+    } else {
+        qb = nqb - 1 - blk.slot;
+        h = blk.h;
+        b = blk.b;
+    }
+#else
     const int qb = nqb - 1 - blk.slot;
+#endif
+#if DQ_ORDER != 2
     const int h = blk.h, b = blk.b;
+#endif
     const int q0 = qb * BMQ;
     const int n = (q0 + BMQ) / NBK;
     const unsigned long long bh = (unsigned long long)b * H + h;
@@ -866,8 +1075,11 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     });
 
     auto tile = [&](int t, auto diag_c) __attribute__((always_inline)) {
-        constexpr bool DIAG = decltype(diag_c)::value;
-        if (t > 0) {
+        // DC 0: below the diagonal; 1: kv tile n - 2 (q tiles i < 2 masked, i >= 2 fully kept); 2: kv tile n - 1 (q tiles
+        // i < 2 fully masked: skipped with DQ_DSTAT, i >= 2 masked). Without DQ_DSTAT every q tile of DC 1 / 2 is masked
+        constexpr int DC = (int)decltype(diag_c)::value;
+        constexpr bool DIAG = DC != 0;
+        if (DQ_WAIT0 || t > 0) {  // DQ_WAIT0: also at t = 0 (tile 0 landed already: one extra barrier; one-block loop)
             tensor_wait<TDM_PER_TILE>();  // tile t landed (t + 1 in flight)
             bar_signal();
             bar_wait();        // tile t visible; every wave is done with tile t - 1
@@ -959,6 +1171,9 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
                     fence();  // pair m - 1's WMMAs are long done: the loads may take its registers
                     ldkv(std::integral_constant<int, (m + 1 < NKV / 2 ? m + 1 : 0)>{}, kvb[(m + 1) % 2]);
                 }
+                constexpr bool SKIPQ = DQ_DSTAT && DC == 2 && i < 2;
+                constexpr bool MASKQ = DQ_DSTAT ? ((DC == 1 && i < 2) || (DC == 2 && i >= 2)) : DIAG;
+                if constexpr (!SKIPQ) {
                 const int thr = q0 + 64 * i + 16 * wv + lr - kv0 - 8 * lh;  // masked iff 16 j + r > thr
                 f32x8 ds[2];
                 static_for<2>([&](auto uu) {
@@ -970,7 +1185,7 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
                     static_for<8>([&](auto rr) {
                         constexpr int r = rr;
                         float pv = exp2_raw(sv[r]);
-                        if constexpr (DIAG) pv = (16 * j + r > thr) ? 0.f : pv;
+                        if constexpr (MASKQ) pv = (16 * j + r > thr) ? 0.f : pv;
                         ds[u][r] = pv * dp[r];
                     });
                 });
@@ -987,6 +1202,7 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
                 dsB[i][4 * m + 2] = (int)q1v[0];
                 dsB[i][4 * m + 3] = (int)q1v[1];
                 dss[i] |= (e + 127) << (8 * m);
+                }
             });
 #if DQ_SGB
             // issue windows for the pair: 24 WMMAs (S nope + rope, dP per kv16 x 4 q tiles), 64 exps, ~100 VALU: each
@@ -1014,7 +1230,8 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
             const AF &af = ab[dt % 4];
             static_for<QTW>([&](auto ii) {
                 constexpr int i = ii;
-                if constexpr (dt % 2 == 0)
+                if constexpr (DQ_DSTAT && DC == 2 && i < 2) {
+                } else if constexpr (dt % 2 == 0)
                     dq[dt][i] = wmma_mx<0, 0>(af.x, dsB[i], dq[dt][i], af.s, dss[i]);
                 else
                     dq[dt][i] = wmma_mx<1, 0>(af.x, dsB[i], dq[dt][i], af.s, dss[i]);
@@ -1093,9 +1310,9 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
         });
 #endif
     };
-    for (int t = 0; t < n - 2; ++t) tile(t, std::false_type{});
-    tile(n - 2, std::true_type{});
-    tile(n - 1, std::true_type{});
+    for (int t = 0; t < n - 2; ++t) tile(t, std::integral_constant<int, 0>{});
+    tile(n - 2, std::integral_constant<int, 1>{});
+    tile(n - 1, std::integral_constant<int, 2>{});
 #if OSTAGE
     // epilogue: dQ rows as bf16 into LDS (the ring, idle now), one TDM store of 256 x 384 B by wave 0
     tensor_wait<0>();

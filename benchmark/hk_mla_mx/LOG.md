@@ -534,3 +534,8 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   TDM-stores its own rows, no barrier: bit-exact with b5 (five shapes), dkdv 1.392 vs 1.382 ms (+0.7%). With
   NO_FINAL_WAIT and EPI_WAVE also neutral, the epilogue's ATT costs (~2k staging + ~1.3k drain per wave) are not what
   bounds the kernel.
+- Training gate g120h (all of today's package changes, slow GPU): bf16 HK 1001.6, hk_mx + fused RoPE 991.0 ms /
+  iteration (-1.06%; this morning's g120g -0.67%), final-window loss 0.0818 both, grad-norm ratio max 1.025.
+- dq DQ_ORDER 2 (per XCD every (b, h)'s long half of q blocks first, then the short halves: the dispatch tail made of
+  short workgroups; each (b, h)'s K / V read in both passes): 0.896 -> 0.889 ms; with DQ_DSTAT 0.881 (-1.7%),
+  bit-exact with b5 at five shapes. Both on in the package; pytest 30 pass, fused-RoPE test pass.

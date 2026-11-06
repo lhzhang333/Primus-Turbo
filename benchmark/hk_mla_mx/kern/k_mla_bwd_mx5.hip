@@ -66,13 +66,13 @@ using namespace mx;
 #define TDM_INC 1  // dkdv: each wave's 3 TDM ops keep their next step, global address and LDS stage (advanced per round)
 #endif
 #ifndef DQ_ORDER
-#define DQ_ORDER 0  // dq workgroup order: 0 longest q block first per (b, h); 1 snake across (b, h) groups
+#define DQ_ORDER 2  // dq workgroup order: 0 longest q block first per (b, h); 1 snake; 2 long halves then short halves
 #endif
 #ifndef DQ_WAIT0
 #define DQ_WAIT0 0  // dq: the per-tile TDM wait + barrier also before tile 0 (the tile loop becomes one basic block)
 #endif
 #ifndef DQ_DSTAT
-#define DQ_DSTAT 0  // dq: static mask classes on the two diagonal kv tiles (fully masked q tiles skipped, kept ones unmasked)
+#define DQ_DSTAT 1  // dq: static mask classes on the two diagonal kv tiles (fully masked q tiles skipped, kept ones unmasked)
 #endif
 #ifndef NO_FINAL_WAIT
 #define NO_FINAL_WAIT 0  // timing probe only: dkdv ends without waiting for its TDM stores (LDS may be reused early)
@@ -972,10 +972,28 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     // snake: (b, h) groups alternate longest-first / shortest-first (the k-th workgroup of an XCD: group k / nqb)
     const int grp = (int)((blockIdx.x + nqb * (blockIdx.y + H * blockIdx.z)) >> 3) / nqb;
     const int qb = (grp & 1) ? blk.slot : nqb - 1 - blk.slot;
+#elif DQ_ORDER == 2
+    // two passes per XCD: every (b, h)'s long half (q blocks nqb - 1 .. nqb / 2) first, then the short halves (the
+    // dispatch tail made of short workgroups; each (b, h)'s K / V read in both passes)
+    int qb, h, b;
+    if ((B * H) % 8 == 0 && nqb % 2 == 0) {
+        const int L = (int)(blockIdx.x + nqb * (blockIdx.y + H * blockIdx.z)), k = L >> 3, xc = L & 7;
+        const int nbx = B * H / 8, half = nqb / 2, k1 = k % (nbx * half);
+        const int bhx = xc + 8 * (k1 / half), sl = k1 % half;
+        qb = k < nbx * half ? nqb - 1 - sl : half - 1 - sl;
+        h = bhx % H;
+        b = bhx / H;
+    } else {
+        qb = nqb - 1 - blk.slot;
+        h = blk.h;
+        b = blk.b;
+    }
 #else
     const int qb = nqb - 1 - blk.slot;
 #endif
+#if DQ_ORDER != 2
     const int h = blk.h, b = blk.b;
+#endif
     const int q0 = qb * BMQ;
     const int n = (q0 + BMQ) / NBK;
     const unsigned long long bh = (unsigned long long)b * H + h;
