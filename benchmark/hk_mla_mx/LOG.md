@@ -542,3 +542,5 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
 - dkdv DKDV_ORDER 2 (the same two-pass order: every (b, h)'s kv blocks 0 .. 15 first, then 16 .. 31): 1.389 -> 1.377
   ms (-0.8%), bit-exact. Package (on): pytest 30 pass, fused-RoPE test pass; per call forward 0.894, backward 2.410
   (bf16 HK 0.863 / 2.429 in the same run).
+- The pass orders generalized (DKDV_ORDER / DQ_ORDER = number of passes): dkdv 2 / 4 / 8 passes 1.377 / 1.377 / 1.384,
+  dq 0.881 / 0.875 / 0.880 ms (all bit-exact). Package: dkdv 2, dq 4 passes; pytest 30 pass, fused-RoPE test pass.

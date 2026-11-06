@@ -69,7 +69,7 @@ using namespace mx;
 #define DKDV_ORDER 2  // dkdv workgroup order: 0 XCD-local (b, h) at a time, kv block 0 first; 2 long halves then short halves
 #endif
 #ifndef DQ_ORDER
-#define DQ_ORDER 2  // dq workgroup order: 0 longest q block first per (b, h); 1 snake; 2 long halves then short halves
+#define DQ_ORDER 4  // dq workgroup order: 0 longest q block first per (b, h); 1 snake; n >= 2: n passes, longest parts first
 #endif
 #ifndef DQ_WAIT0
 #define DQ_WAIT0 0  // dq: the per-tile TDM wait + barrier also before tile 0 (the tile loop becomes one basic block)
@@ -295,17 +295,17 @@ __device__ __forceinline__ void dkdv_body(
     const int wv = wave_id(tid);
     const int lane = tid & 31, lr = lane & 15, lh = lane >> 4;
     const BlockOf blk = xcd_block((S + KB - 1) / KB, H, B);
-#if DKDV_ORDER == 2
-    // two passes per XCD: every (b, h)'s long half of kv blocks (0 .. nkb / 2 - 1: the most steps) first, then the
-    // short halves (the dispatch tail made of short workgroups)
+#if DKDV_ORDER >= 2
+    // DKDV_ORDER passes per XCD: every (b, h)'s first part of kv blocks (the most steps) first, then the next parts
+    // (the dispatch tail made of short workgroups)
     int kb, h, b;
     {
         const int nkb = (S + KB - 1) / KB;
-        if ((B * H) % 8 == 0 && nkb % 2 == 0) {
+        if ((B * H) % 8 == 0 && nkb % DKDV_ORDER == 0) {
             const int L = (int)(blockIdx.x + nkb * (blockIdx.y + H * blockIdx.z)), k = L >> 3, xc = L & 7;
-            const int nbx = B * H / 8, half = nkb / 2, k1 = k % (nbx * half);
-            const int bhx = xc + 8 * (k1 / half), sl = k1 % half;
-            kb = k < nbx * half ? sl : half + sl;
+            const int nbx = B * H / 8, part = nkb / DKDV_ORDER, pass = k / (nbx * part), k1 = k % (nbx * part);
+            const int bhx = xc + 8 * (k1 / part), sl = k1 % part;
+            kb = pass * part + sl;
             h = bhx % H;
             b = bhx / H;
         } else {
@@ -996,15 +996,15 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     // snake: (b, h) groups alternate longest-first / shortest-first (the k-th workgroup of an XCD: group k / nqb)
     const int grp = (int)((blockIdx.x + nqb * (blockIdx.y + H * blockIdx.z)) >> 3) / nqb;
     const int qb = (grp & 1) ? blk.slot : nqb - 1 - blk.slot;
-#elif DQ_ORDER == 2
-    // two passes per XCD: every (b, h)'s long half (q blocks nqb - 1 .. nqb / 2) first, then the short halves (the
-    // dispatch tail made of short workgroups; each (b, h)'s K / V read in both passes)
+#elif DQ_ORDER >= 2
+    // DQ_ORDER passes per XCD: every (b, h)'s longest part of q blocks first, then the next parts (the dispatch tail
+    // made of short workgroups; each (b, h)'s K / V read in every pass)
     int qb, h, b;
-    if ((B * H) % 8 == 0 && nqb % 2 == 0) {
+    if ((B * H) % 8 == 0 && nqb % DQ_ORDER == 0) {
         const int L = (int)(blockIdx.x + nqb * (blockIdx.y + H * blockIdx.z)), k = L >> 3, xc = L & 7;
-        const int nbx = B * H / 8, half = nqb / 2, k1 = k % (nbx * half);
-        const int bhx = xc + 8 * (k1 / half), sl = k1 % half;
-        qb = k < nbx * half ? nqb - 1 - sl : half - 1 - sl;
+        const int nbx = B * H / 8, part = nqb / DQ_ORDER, pass = k / (nbx * part), k1 = k % (nbx * part);
+        const int bhx = xc + 8 * (k1 / part), sl = k1 % part;
+        qb = nqb - 1 - (pass * part + sl);
         h = bhx % H;
         b = bhx / H;
     } else {
@@ -1015,7 +1015,7 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
 #else
     const int qb = nqb - 1 - blk.slot;
 #endif
-#if DQ_ORDER != 2
+#if DQ_ORDER < 2
     const int h = blk.h, b = blk.b;
 #endif
     const int q0 = qb * BMQ;
