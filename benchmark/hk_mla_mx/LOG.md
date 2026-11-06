@@ -619,3 +619,9 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
 - Pitfall: timing probes numbered >= 2 in k_mxq also skip the XS / X8T / XTS TDM stores (`RCT_PROBE < 2` guards):
   probes 5..8 of this work looked 20-45% faster only because they wrote no outputs (`scratch_mx/py/x8t_check.py`
   fills the outputs with 0xAB and checks they were written).
+- **Quantization: padded tile rows** (RC_TPAD, default): the rows phase's 16-byte reads of dense 256 / 384-byte bf16
+  rows hit 4 bank groups (8 / 10-way, modelled). rct128: 272-byte rows (TDM load pad 16 B per 256 B: 2-way), v 0.0497
+  -> 0.0465, dO 0.0877 -> 0.0854 ms; rctr192: 400-byte rows (the rope gap 128 -> 144 B), k -1%, q same. rct192 with 16
+  B after every 512 B of its stream (384 is no power of two; the TDM pads by the stream, verified bit-exact): 4-way but
+  q +5%, k +3% (address math): left dense. Bit-exact. Package: k_mxq_rct128 0.131 -> 0.126 ms (two calls), fused-RoPE
+  fwd + bwd 3.341 ms per step. pytest 30 pass, fused-RoPE test pass.

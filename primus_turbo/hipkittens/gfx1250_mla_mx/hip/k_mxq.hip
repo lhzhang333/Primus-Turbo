@@ -42,6 +42,12 @@
                     // e) whose bases step by D / 16 rows + 16 B: a cols store's 32 lanes (consecutive dp) hit 16 bank
                     // groups (2-way) instead of one (32-way); 16 2-D TDM stores (global row stride 16 rows), two per wave
 #endif
+#ifndef RC_TPAD
+#define RC_TPAD 1  // rct128 / rctr192: the bf16 tile's LDS rows padded so the rows phase's 16-byte reads spread over the
+                   // banks (dense 256 / 384-byte rows: 8 / 10-way): rct128 272-byte rows (2-way, v -7%), rctr192 400-byte
+                   // rows (4-way, k -1%); the cols phase's reads stay conflict-free. rct192 stays dense (padding 16 B per
+                   // 512 B of its stream, 384 being no power of two: 4-way but q +5%, k +3% from the address math)
+#endif
 #ifndef RC_FAST
 #define RC_FAST 1  // tree reductions (amax, row dots) and the kbar slice in registers (rc_tile)
 #endif
@@ -49,6 +55,19 @@
 using namespace mx;
 
 namespace {
+// the bf16 tile in LDS: rows of TXR bytes, and (TPSH > 0) 16 B after every 2^TPSH bytes of the TDM stream (RC_TPAD)
+template <int TXR, int TPSH> __device__ __forceinline__ int tile_at(int r, int b) {
+    const int x = r * TXR + b;
+    if constexpr (TPSH > 0)
+        return x + 16 * (x >> TPSH);
+    else
+        return x;
+}
+// rct: the tile's row pitch, stream pad shift and bytes (D 192: stream padding, 384 is no power of two; D 128: padded rows)
+template <int D> constexpr int RCT_TXR = RC_TPAD && D == 128 ? 272 : 2 * D;
+template <int D> constexpr int RCT_TPSH = 0;  // (D 192 stream padding: 9; slower, see RC_TPAD)
+template <int D> constexpr int RCT_TB = RCT_TPSH<D> ? 128 * 2 * D + 16 * ((128 * 2 * D) >> RCT_TPSH<D>) : 128 * RCT_TXR<D>;
+constexpr int RCTR_TXR = RC_TPAD ? 400 : 384;  // rctr192: 256 nope bytes + the 128-byte rope gap (+ 16)
 // RC_XSKEW: the column codes' staging region stride, and the staging row of column d (region 8 e + dp % 8, its row dp / 8)
 template <int D> constexpr int XRS = D / 16 * 128 + 16;
 template <int D> constexpr int X8T_B = RC_XSKEW ? 16 * XRS<D> : D * 128;  // staging bytes
@@ -373,7 +392,7 @@ __device__ __forceinline__ void rc_body(const bf16 *__restrict__ X, unsigned cha
 
 // rows + cols of one bf16 tile in LDS (unpadded rows of D * 2 bytes) into LDS staging: x8 rows (128 x D), xs (128 x RS),
 // x8t (D x 128), xts (D x 4); NT threads
-template <int D, int NT, bool XSK = false>
+template <int D, int NT, bool XSK = false, int TXR = 2 * D, int TPSH = 0>
 __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char *x8, unsigned char *xs,
                                         unsigned char *x8t, unsigned char *xts, const float *kb_lds,
                                         const bf16 *__restrict__ Y, float *__restrict__ aux, int b, int h, int kt,
@@ -412,14 +431,14 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
 #if RC_BF16
         if ((mode & 39) == 0) {
             u32x4 w[4];
-            static_for<4>([&](auto i) { w[(int)i] = *(const u32x4 *)(tile + r * XR + 2 * (32 * jj + 8 * (int)i)); });
+            static_for<4>([&](auto i) { w[(int)i] = *(const u32x4 *)(tile + tile_at<TXR, TPSH>(r, 2 * (32 * jj + 8 * (int)i))); });
             blk = quant_block_bf16(w);
         } else
 #endif
         {
             f32x8 v[4];
             static_for<4>([&](auto i) {
-                v[(int)i] = bf8_to_f32(*(const u32x4 *)(tile + r * XR + 2 * (32 * jj + 8 * (int)i)));
+                v[(int)i] = bf8_to_f32(*(const u32x4 *)(tile + tile_at<TXR, TPSH>(r, 2 * (32 * jj + 8 * (int)i))));
             });
             float pd[4] = {0.f, 0.f, 0.f, 0.f};
             if (mode & 1) {
@@ -469,7 +488,7 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
 #if RC_BF16
         if (j < NBLK && (mode & 39) == 0) {  // no kbar, no Y dots, no pre: bf16 codes
             u32x4 w[4];
-            static_for<4>([&](auto i) { w[(int)i] = *(const u32x4 *)(tile + r * XR + 2 * (32 * j + 8 * (int)i)); });
+            static_for<4>([&](auto i) { w[(int)i] = *(const u32x4 *)(tile + tile_at<TXR, TPSH>(r, 2 * (32 * j + 8 * (int)i))); });
             const Block blk = quant_block_bf16(w);
             unsigned char *dst = x8 + r * D;
             if (D == 128 || j < 4)
@@ -482,7 +501,7 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
         if (j < NBLK) {
             f32x8 v[4];
             static_for<4>([&](auto i) {
-                v[(int)i] = bf8_to_f32(*(const u32x4 *)(tile + r * XR + 2 * (32 * j + 8 * (int)i)));
+                v[(int)i] = bf8_to_f32(*(const u32x4 *)(tile + tile_at<TXR, TPSH>(r, 2 * (32 * j + 8 * (int)i))));
             });
 #if RC_FAST
             // four partial dots (8-long chains) instead of one 32-long chain
@@ -557,8 +576,8 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
                 static_for<4>([&](auto kk) {
                     constexpr int i = ii, k = kk;
                     const int r = 32 * jb + 8 * i + 2 * k;
-                    const uint32_t wa = *(const uint32_t *)(tile + r * XR + 2 * d0);
-                    const uint32_t wb = *(const uint32_t *)(tile + (r + 1) * XR + 2 * d0);
+                    const uint32_t wa = *(const uint32_t *)(tile + tile_at<TXR, TPSH>(r, 2 * d0));
+                    const uint32_t wb = *(const uint32_t *)(tile + tile_at<TXR, TPSH>(r + 1, 2 * d0));
                     c0[i][k] = __builtin_amdgcn_perm(wb, wa, 0x05040100u);
                     c1[i][k] = __builtin_amdgcn_perm(wb, wa, 0x07060302u);
                 });
@@ -579,7 +598,7 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
         static_for<4>([&](auto i) {
             static_for<8>([&](auto e) {
                 const int r = 32 * jb + 8 * (int)i + (int)e;
-                const uint32_t w = *(const uint32_t *)(tile + r * XR + 2 * d0);
+                const uint32_t w = *(const uint32_t *)(tile + tile_at<TXR, TPSH>(r, 2 * d0));
                 v0[(int)i][(int)e] = __builtin_bit_cast(float, w << 16) - kb0;
                 v1[(int)i][(int)e] = __builtin_bit_cast(float, w & 0xFFFF0000u) - kb1;
             });
@@ -617,12 +636,13 @@ __device__ __forceinline__ void rct_body(const bf16 *__restrict__ X, unsigned ch
                                          long long sb, long long ss, long long sh, long long yb, long long ys,
                                          long long yh, int mode, float pre, unsigned char *smem) {
     constexpr int XR = D * 2;  // bf16 row bytes (unpadded)
+    constexpr int TXR = RCT_TXR<D>, TPSH = RCT_TPSH<D>;  // the tile in LDS (RC_TPAD)
     constexpr int NT = 256;
     constexpr int NBLK = D / 32;
     constexpr int LPR = D == 192 ? 8 : 4;
     constexpr int RS = D == 192 ? 8 : 4;
     constexpr int RPP = NT / LPR;
-    constexpr int O_X8 = 128 * XR, O_XS = O_X8 + (RC_X8G ? 0 : 128 * D), O_X8T = O_XS + 128 * RS,
+    constexpr int O_X8 = RCT_TB<D>, O_XS = O_X8 + (RC_X8G ? 0 : 128 * D), O_X8T = O_XS + 128 * RS,
                   O_XTS = O_X8T + X8T_B<D>, O_KB = O_XTS + D * 4;
     const int kt = blockIdx.x, h = blockIdx.y, b = blockIdx.z, t = threadIdx.x;
     const int wv = __builtin_amdgcn_readfirstlane(t >> 5);
@@ -631,7 +651,8 @@ __device__ __forceinline__ void rct_body(const bf16 *__restrict__ X, unsigned ch
     constexpr unsigned W0 = tdm_w0(0, 0, 0);
     if (wv == 0 && RCT_PROBE < 2) {
         const unsigned long long ga = (unsigned long long)(uintptr_t)(X + b * sb + (long long)(kt * 128) * ss + h * sh);
-        tdm_load(tdm_g0(lds0, ga), tdm_g1(W0, 128, XR, 128, 2ull * (unsigned long long)ss));
+        constexpr unsigned WL = RCT_TXR<D> != 2 * D ? tdm_w0(0, 64, (RCT_TXR<D> - 2 * D) / 4) : W0;  // RC_TPAD rows
+        tdm_load(tdm_g0(lds0, ga), tdm_g1(WL, 128, XR, 128, 2ull * (unsigned long long)ss));
     }
     float *kb_lds = (float *)(smem + O_KB);
     if (mode & 3) {
@@ -640,7 +661,7 @@ __device__ __forceinline__ void rct_body(const bf16 *__restrict__ X, unsigned ch
     if (wv == 0) tensor_wait<0>();
     __syncthreads();
 #if RCT_PROBE != 1  // timing probes: 1 = no compute (TDM traffic only), 2 = no TDM (compute only)
-    rc_tile<D, NT, RC_XSKEW>(smem, RC_X8G ? X8 + (bh * S + (long long)kt * 128) * D : smem + O_X8, smem + O_XS, smem + O_X8T,
+    rc_tile<D, NT, RC_XSKEW, TXR, TPSH>(smem, RC_X8G ? X8 + (bh * S + (long long)kt * 128) * D : smem + O_X8, smem + O_XS, smem + O_X8T,
                    smem + O_XTS, kb_lds, Y, aux, b, h, kt, bh, S, yb, ys, yh, mode, pre);
 #endif
     __syncthreads();
@@ -759,7 +780,7 @@ __device__ __forceinline__ void rctr_body(const bf16 *__restrict__ X, unsigned c
                                           long long sh, const bf16 *__restrict__ PE, long long pb, long long ps,
                                           long long ph, const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN,
                                           int mode, float pre, unsigned char *smem) {
-    constexpr int D = 192, XR = D * 2, NT = 256, RS = 8;
+    constexpr int D = 192, XR = RCTR_TXR, NT = 256, RS = 8;  // XR: the tile's LDS row pitch (RC_TPAD 400)
     constexpr int O_X8 = 128 * XR, O_XS = O_X8 + (RC_X8G ? 0 : 128 * D), O_X8T = O_XS + 128 * RS,
                   O_XTS = O_X8T + X8T_B<D>, O_KB = O_XTS + D * 4,
                   O_PE = O_X8T;  // pe side buffer (128 x 128 B) in the X8T staging, written only in the cols phase
@@ -769,7 +790,7 @@ __device__ __forceinline__ void rctr_body(const bf16 *__restrict__ X, unsigned c
     const unsigned lds0 = (unsigned)(uintptr_t)smem;
     if (wv == 0) {
         const unsigned long long gx = (unsigned long long)(uintptr_t)(X + b * sb + (long long)(kt * 128) * ss + h * sh);
-        tdm_load(tdm_g0(lds0, gx), tdm_g1(tdm_w0(0, 64, 32), 128, 256, 128, 2ull * (unsigned long long)ss));
+        tdm_load(tdm_g0(lds0, gx), tdm_g1(tdm_w0(0, 64, (XR - 256) / 4), 128, 256, 128, 2ull * (unsigned long long)ss));
         const unsigned long long gp = (unsigned long long)(uintptr_t)(PE + b * pb + (long long)(kt * 128) * ps + h * ph);
         tdm_load(tdm_g0(lds0 + O_PE, gp), tdm_g1(tdm_w0(0, 0, 0), 128, 128, 128, 2ull * (unsigned long long)ps));
     }
@@ -791,7 +812,7 @@ __device__ __forceinline__ void rctr_body(const bf16 *__restrict__ X, unsigned c
         *(u32x4 *)(smem + r * XR + 2 * (160 + 8 * m)) = hi;
     }
     __syncthreads();
-    rc_tile<D, NT, RC_XSKEW>(smem, RC_X8G ? X8 + (bh * S + (long long)kt * 128) * D : smem + O_X8, smem + O_XS, smem + O_X8T,
+    rc_tile<D, NT, RC_XSKEW, XR, 0>(smem, RC_X8G ? X8 + (bh * S + (long long)kt * 128) * D : smem + O_X8, smem + O_XS, smem + O_X8T,
                    smem + O_XTS, kb_lds, nullptr, aux, b, h, kt, bh, S, 0, 0, 0, mode & ~4, pre);
     __syncthreads();
     if (RC_XSKEW)
@@ -824,7 +845,7 @@ extern "C" __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(
     float *__restrict__ aux, int S, int H, long long sb, long long ss, long long sh, const bf16 *__restrict__ PE,
     long long pb, long long ps, long long ph, const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN, int mode,
     float pre) {
-    __shared__ __attribute__((aligned(1024))) unsigned char smem[128 * 384 + (RC_X8G ? 0 : 128 * 192) + 128 * 8 +
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[128 * RCTR_TXR + (RC_X8G ? 0 : 128 * 192) + 128 * 8 +
                                                                  X8T_B<192> + 192 * 4 + 192 * 4];
     rctr_body(X, X8, XS, X8T, XTS, kbar, aux, S, H, sb, ss, sh, PE, pb, ps, ph, COS, SIN, mode, pre, smem);
 }
@@ -1023,7 +1044,7 @@ RC_KERNEL(128)
         unsigned char *__restrict__ X8T, unsigned char *__restrict__ XTS, const float *__restrict__ kbar,            \
         const bf16 *__restrict__ Y, float *__restrict__ aux, int S, int H, long long sb, long long ss, long long sh, \
         long long yb, long long ys, long long yh, int mode, float pre) {                                             \
-        __shared__ __attribute__((aligned(1024))) unsigned char smem[128 * D * 2 + (RC_X8G ? 0 : 128 * D) + 128 * 8 + X8T_B<D> + \
+        __shared__ __attribute__((aligned(1024))) unsigned char smem[RCT_TB<D> + (RC_X8G ? 0 : 128 * D) + 128 * 8 + X8T_B<D> + \
                                                                      D * 4 + D * 4];                                 \
         rct_body<D>(X, X8, XS, X8T, XTS, kbar, Y, aux, S, H, sb, ss, sh, yb, ys, yh, mode, pre, smem);               \
     }
