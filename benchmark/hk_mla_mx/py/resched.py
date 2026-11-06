@@ -383,6 +383,7 @@ WIN_OK = (2, 3, 6, 7)  # issue offsets of non-WMMA instructions inside a WMMA's 
 PRIO = "height"
 RNG_KEY, RNG_JIT = [], 0.0
 TRANS_OCC = 2
+CVT_OCC, CVT_NOWIN = 1, False
 DS_GAP = 2  # DS instructions back to back: ~2.1-2.4 cycles apart (ATT)
 
 
@@ -403,6 +404,7 @@ class Machine:
         self.last_kind, self.last_t = None, -100
         self.msb_cost = msb_cost
         self.nmsb = 0
+        self.valu_free = 0
 
     def tokens(self, t):
         return min(self.lds_burst, self.lds_tokens + (t - self.lds_t) / self.lds_gap)
@@ -424,6 +426,11 @@ class Machine:
                 continue
             if k == "TRANS" and t < self.trans_free:
                 t = self.trans_free
+            if k in ("VALU", "TRANS") and t < self.valu_free:
+                t = self.valu_free
+            if CVT_NOWIN and k == "VALU" and n.x.mn.startswith("v_cvt_scalef32_pk8") and 0 <= t - self.xdl_start < 8:
+                t = self.xdl_start + 8
+                continue
             if k in ("DS_LD", "DS_ST"):
                 if self.last_kind in ("DS_LD", "DS_ST") and t < self.last_t + DS_GAP:
                     t = self.last_t + DS_GAP
@@ -443,6 +450,8 @@ class Machine:
             self.xdl_start = t
         if k == "TRANS":
             self.trans_free = t + TRANS_OCC
+        if k == "VALU" and n.x.mn.startswith("v_cvt_scalef32_pk8"):
+            self.valu_free = t + CVT_OCC
         if k in ("DS_LD", "DS_ST"):
             self.lds_tokens, self.lds_t = self.tokens(t) - 1, t
         if n.req and self.switch(n):
@@ -723,6 +732,8 @@ def main():
     ap.add_argument("--win", default="2,3,6,7", help="issue offsets of non-WMMA instructions in a WMMA window")
     ap.add_argument("--ds-gap", type=int, default=2)
     ap.add_argument("--trans-occ", type=int, default=2)
+    ap.add_argument("--cvt-occ", type=int, default=1, help="cycles a v_cvt_scalef32_pk8 blocks the next VALU / TRANS")
+    ap.add_argument("--cvt-nowin", action="store_true", help="no v_cvt_scalef32_pk8 inside a WMMA window")
     ap.add_argument("--coalesce", action="store_true", help="remove copies (the producer writes the destination)")
     ap.add_argument("--prio", default="height", choices=("height", "orig", "ready", "rand"))
     ap.add_argument("--seed", type=int, default=0)
@@ -732,11 +743,12 @@ def main():
     ap.add_argument("--lat-ds", type=int, default=96)
     a = ap.parse_args()
     LAT_RAW["DS_LD"] = a.lat_ds
-    global PRIO, WIN_OK, DS_GAP, TRANS_OCC, RNG_KEY, RNG_JIT
+    global PRIO, WIN_OK, DS_GAP, TRANS_OCC, RNG_KEY, RNG_JIT, CVT_OCC, CVT_NOWIN
     PRIO = a.prio
     WIN_OK = tuple(int(x) for x in a.win.split(",") if x)
     DS_GAP = a.ds_gap
     TRANS_OCC = a.trans_occ
+    CVT_OCC, CVT_NOWIN = a.cvt_occ, a.cvt_nowin
     import random
     _r = random.Random(a.seed)
     RNG_KEY = [_r.random() for _ in range(20000)]

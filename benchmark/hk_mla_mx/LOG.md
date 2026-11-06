@@ -521,3 +521,11 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   source): asm_resched's machine model lacked the s_set_vgpr_msb switch rule (>= 4 cycles after a DS instruction, >= 3
   after a WMMA). With it the package object runs 0.6002 ms (lab 0.6005, LLVM 0.6575), toy..prod pass. Package per
   call: forward 0.900 ms (1.004 this morning, -10.4%; bf16 HK 0.862), fused-RoPE forward 0.970, backward 2.452.
+- `v_cvt_scalef32_pk8_fp8_{f32,bf16}` use only the exponent of the f32 scale operand (x / 2^floor(log2 scale), GPU
+  test `scratch_mx/bt/cvtscale.py`): q's pre-scale cannot be folded into the conversion.
+- Converter occupancy rules in the scheduler model (`--cvt-occ`, `--cvt-nowin`; ATT: a pk8 conversion blocks the
+  next VALU / TRANS ~4 cycles, LDS / WMMA issue right after): 0.5999-0.6156 vs 0.6005 ms: no gain.
+- dq workgroup order snake (DQ_ORDER 1: (b, h) groups alternate longest / shortest first): 0.917 vs 0.896 ms.
+- RC_KBF16 (lab, off): kbar rounded to bf16 values, k - kbar by v_pk_add_bf16 and the bf16 MX path in rows and cols:
+  codes equal MX(bf16(k - bf16(kbar))) (rows / cols, `scratch_mx/py/kbf16_check.py`), but only k -2.5..2.8% (fused-RoPE
+  k 0.1096 -> 0.1065): not worth a new quantization semantics.

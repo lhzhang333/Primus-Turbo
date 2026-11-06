@@ -65,6 +65,9 @@ using namespace mx;
 #ifndef TDM_INC
 #define TDM_INC 1  // dkdv: each wave's 3 TDM ops keep their next step, global address and LDS stage (advanced per round)
 #endif
+#ifndef DQ_ORDER
+#define DQ_ORDER 0  // dq workgroup order: 0 longest q block first per (b, h); 1 snake across (b, h) groups
+#endif
 #ifndef DQ_WAIT0
 #define DQ_WAIT0 0  // dq: the per-tile TDM wait + barrier also before tile 0 (the tile loop becomes one basic block)
 #endif
@@ -885,7 +888,13 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     const int cnt0 = wv == 0 ? 1 : 0;
     const int nqb = S / BMQ;
     const BlockOf blk = xcd_block(nqb, H, B);
+#if DQ_ORDER == 1
+    // snake: (b, h) groups alternate longest-first / shortest-first (the k-th workgroup of an XCD: group k / nqb)
+    const int grp = (int)((blockIdx.x + nqb * (blockIdx.y + H * blockIdx.z)) >> 3) / nqb;
+    const int qb = (grp & 1) ? blk.slot : nqb - 1 - blk.slot;
+#else
     const int qb = nqb - 1 - blk.slot;
+#endif
     const int h = blk.h, b = blk.b;
     const int q0 = qb * BMQ;
     const int n = (q0 + BMQ) / NBK;

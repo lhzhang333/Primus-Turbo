@@ -37,11 +37,24 @@
 #ifndef RC_NODIV
 #define RC_NODIV 1  // rc_tile: branch-free rows phase (pad lanes recompute a block; only the code stores masked)
 #endif
+#ifndef RC_KBF16
+#define RC_KBF16 0  // k centring in bf16: kbar rounded to bf16 values (every consumer: k rows / cols, q . kbar), k - kbar
+                    // by v_pk_add_bf16 (RNE to bf16) and the bf16 MX path (not bit-exact with the fp32 subtraction)
+#endif
 #ifndef RC_FAST
 #define RC_FAST 1  // tree reductions (amax, row dots) and the kbar slice in registers (rc_tile)
 #endif
 
 using namespace mx;
+
+__device__ __forceinline__ float kbar_out(float x) { return RC_KBF16 ? (float)(bf16)x : x; }
+typedef __bf16 bf16x2k __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ unsigned pk_sub_bf16(unsigned x, unsigned k) {
+    return __builtin_bit_cast(unsigned, __builtin_bit_cast(bf16x2k, x) - __builtin_bit_cast(bf16x2k, k));
+}
+__device__ __forceinline__ unsigned bf16_pair(float a, float b) {
+    return (unsigned)__builtin_bit_cast(unsigned short, (bf16)a) | ((unsigned)__builtin_bit_cast(unsigned short, (bf16)b) << 16);
+}
 
 namespace {
 // store 32 converted values of one MX block j (logical k 32 j .. 32 j + 31 of a chunk of CH = 128 or 64 elements) to
@@ -394,9 +407,19 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
         float dot = 0.f;
         Block blk;
 #if RC_BF16
-        if ((mode & 39) == 0) {
+        if ((mode & 39) == 0 || (RC_KBF16 && (mode & 39) == 1)) {
             u32x4 w[4];
             static_for<4>([&](auto i) { w[(int)i] = *(const u32x4 *)(tile + r * XR + 2 * (32 * jj + 8 * (int)i)); });
+#if RC_KBF16
+            if (mode & 1) {  // k - kbar in bf16 (kbar holds bf16 values)
+                static_for<4>([&](auto i) {
+                    static_for<4>([&](auto e) {
+                        constexpr int ii = i, ee = e;
+                        w[ii][ee] = pk_sub_bf16(w[ii][ee], bf16_pair(kbr[ii][2 * ee], kbr[ii][2 * ee + 1]));
+                    });
+                });
+            }
+#endif
             blk = quant_block_bf16(w);
         } else
 #endif
@@ -533,7 +556,7 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
 #endif
     // ---- cols: task = (2 consecutive d, block jb of 32 s)
 #if RC_BF16
-    if ((mode & 1) == 0) {  // no kbar: the two columns' bf16 pairs (rows 2 k, 2 k + 1) by v_perm, bf16 codes
+    if ((mode & 1) == 0 || RC_KBF16) {  // the two columns' bf16 pairs (rows 2 k, 2 k + 1) by v_perm, bf16 codes
         for (int task = t; task < (RCT_PROBE == 4 ? 0 : (D / 2) * 4); task += NT) {
             const int dp = task % (D / 2), jb = task / (D / 2), d0 = 2 * dp;
             u32x4 c0[4], c1[4];
@@ -547,6 +570,17 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
                     c1[i][k] = __builtin_amdgcn_perm(wb, wa, 0x07060302u);
                 });
             });
+#if RC_KBF16
+            if (mode & 1) {  // k - kbar[d] in bf16 for each column
+                const unsigned k0 = bf16_pair(kb_lds[d0], kb_lds[d0]), k1 = bf16_pair(kb_lds[d0 + 1], kb_lds[d0 + 1]);
+                static_for<4>([&](auto ii) {
+                    static_for<4>([&](auto kk) {
+                        c0[(int)ii][(int)kk] = pk_sub_bf16(c0[(int)ii][(int)kk], k0);
+                        c1[(int)ii][(int)kk] = pk_sub_bf16(c1[(int)ii][(int)kk], k1);
+                    });
+                });
+            }
+#endif
             const Block b0 = quant_block_bf16(c0), b1 = quant_block_bf16(c1);
             unsigned char *dst = x8t + d0 * 128;
             store_block<128>(dst, jb, b0.q[0], b0.q[1], b0.q[2], b0.q[3]);
@@ -917,7 +951,7 @@ extern "C" __global__ __launch_bounds__(768) void k_mxq_kbar_rope(const bf16 *__
     if (t < D) {
         float sum = 0.f;
         for (int g = 0; g < 32; ++g) sum += part[g][t];
-        kbar[(long long)bh * D + t] = sum / (float)((S + stride - 1) / stride);
+        kbar[(long long)bh * D + t] = kbar_out(sum / (float)((S + stride - 1) / stride));
     }
 }
 
@@ -958,7 +992,7 @@ extern "C" __global__ __launch_bounds__(768) void k_mxq_kbar(const bf16 *__restr
     if (t < D) {
         float sum = 0.f;
         for (int g = 0; g < 32; ++g) sum += part[g][t];  // fixed order: deterministic
-        kbar[(long long)bh * D + t] = sum / (float)((S + stride - 1) / stride);
+        kbar[(long long)bh * D + t] = kbar_out(sum / (float)((S + stride - 1) / stride));
     }
 }
 
