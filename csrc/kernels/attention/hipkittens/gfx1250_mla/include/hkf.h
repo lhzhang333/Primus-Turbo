@@ -69,15 +69,8 @@ HKF_INLINE bf16x8 lds_load_b128(const lds_u8 *p, int off) {
 HKF_INLINE bf16x8 lds_tr16(const lds_u8 *p, int off) {
     return __builtin_amdgcn_ds_load_tr16_b128_v8bf16((lds_bf16x8 *) (p + off));
 }
-// epilogue staging (ds_store_b128 / _b32, ds_load_b128 / _b64), base + immediate offset
-HKF_INLINE lds_u8w *lds_wptr(uint32_t a) {
-    return (lds_u8w *) (uintptr_t) a;
-}
 HKF_INLINE void lds_store_b128(lds_u8w *p, int off, u32x4 v) {
     *(lds_u32x4 *) (p + off) = v;
-}
-HKF_INLINE void lds_store_b32(lds_u8w *p, int off, uint32_t v) {
-    *(lds_u32 *) (p + off) = v;
 }
 HKF_INLINE u32x4 lds_load_u32x4(const lds_u8 *p, int off) {
     return *(const lds_u32x4 *) (p + off);
@@ -157,12 +150,6 @@ HKF_INLINE int wave_id(int tid) {
 // exp2 as a bare v_exp_f32 (without llvm.exp2.f32's denormal-range scaling)
 HKF_INLINE float exp2_raw(float x) {
     return __builtin_amdgcn_exp2f(x);
-}
-// the value of lane l ^ 16 (v_permlanex16_b32 with FlyDSL's selects)
-HKF_INLINE float peer(float x) {
-    const unsigned u = __builtin_bit_cast(unsigned, x);
-    const unsigned v = __builtin_amdgcn_permlanex16(u, u, 0x76543210u, 0xFEDCBA98u, false, false);
-    return __builtin_bit_cast(float, v);
 }
 
 } // namespace hkf

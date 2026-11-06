@@ -21,7 +21,7 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "generator": "tools/fwdgen/build.py",
+      "generator": "tools/hkgen.py",
       "hsaco_sha256": "c29ac43ff14eed04d201fb458c0064ce5771ed25678e262524e4a48dfe364553"
     },
     "k_delta": {
@@ -39,10 +39,9 @@
         "-mllvm",
         "-amdgpu-enable-delay-alu=false",
         "-mllvm",
-        "-greedy-regclass-priority-trumps-globalness",
-        "-DHKGEN=1"
+        "-greedy-regclass-priority-trumps-globalness"
       ],
-      "generator": "tools/bwdgen/build.py",
+      "generator": "tools/hkgen.py",
       "hsaco_sha256": "abeea38ec402459872df2c8640f5249e817d9df31d5b40326903426d20bbffbe"
     },
     "k_dqds_c": {

@@ -554,6 +554,142 @@ def test_build_reproduces_the_pinned_code_objects(tmp_path):
     assert hsaco.unavailable_reason(hsaco.FWD_KERNELS + hsaco.BWD_KERNELS, tmp_path) is None
 
 
+def _tools():
+    """The generator modules of tools/ (standard library only): asm, fwd, bwd."""
+    import sys
+
+    sys.path.insert(0, str(KERNEL_DIR / "tools"))
+    try:
+        import asm
+        import bwd
+        import fwd
+    finally:
+        sys.path.pop(0)
+    return asm, fwd, bwd
+
+
+# sha256 of the regions the generators emit for the markers of the compiled shells (their operands and register bases
+# copied below): a change of any generated instruction changes a code object, so it needs new pins and these digests
+_REGION_DIGESTS = {
+    "fwd": "658cf17e390a1ba4e62b4670a64e611424ff3569c475a2265ddf083d148ec084",
+    3: "f452cd5e8be5a8b846729e98e664f5eea222248aa3de8665f8f4929eebc24632",
+    2: "988da5d4bb45dcbe338fec0f847efa7c6409784750a7f02a962f98f7cbbe56a2",
+}
+
+
+def test_generators_emit_the_pinned_regions():
+    """The forward's regions and both backward block heights, on the production register plan. Runs anywhere: the
+    generators are pure Python."""
+    _, fwd, bwd = _tools()
+
+    def digest(regions):
+        h = hashlib.sha256()
+        for i in sorted(regions):
+            h.update("\n".join(regions[i]).encode() + b"\0")
+        return h.hexdigest()
+
+    tile = {"kb": "v5", "vb": "v6", "c2": "s34"}
+    slot = {"qk": "s[28:31]", "qb": "s[52:55]", "qv": "s[56:59]", "g1a": "s[44:51]", "g1b": "s[20:27]"}
+    fin = {"wa": "v4", "wb": "v5", "la": "v6", "lb": "v7"}
+    marks = [("INIT", {"qa": "v4", "qb": "v5", "c2": "s34"}, 0)]
+    marks.append(("TILE_C", dict(tile, **slot, g1v="s[36:43]", t="s19", n4="s2", l3="s3"), 1))
+    marks += [(f"TILE_D{k}", dict(tile, dl="v7"), 2 + k) for k in range(4)]
+    marks += [("FINAL_A", fin, 6), ("FINAL_A3", fin, 7)]
+    fwd.RESC_LABELS[0] = 0
+    scalars = {"s2", "s3", "s19", "s34"} | {f"s{i}" for i in range(20, 32)}
+    assert digest(fwd.regions(marks, scalars, 38)) == _REGION_DIGESTS["fwd"]
+    ops = {
+        "INIT": {
+            "lk": "v0",
+            "lv": "v2",
+            "kg": "s[10:11]",
+            "vg": "s[8:9]",
+            "hkv": "s28",
+            "kvl": "s12",
+            "c1": "s36",
+            "sc": "s24",
+        },
+        "LOOP": {
+            "lq": "v0",
+            "lv": "v3",
+            "ltv": "v4",
+            "ltk": "v5",
+            "nlv": "v1",
+            "vds": "v2",
+            "dl": "v6",
+            "tdm": "s[0:15]",
+            "sc": "s[36:43]",
+            "rc": "s[20:23]",
+            "rnl": "s[44:47]",
+            "rnd": "s[24:27]",
+            "rds": "s[16:19]",
+        },
+        "FINAL": {
+            "ev": "v0",
+            "ek": "v1",
+            "rv": "v2",
+            "rk": "v3",
+            "gv": "v4",
+            "gk": "v5",
+            "sov": "s8",
+            "sok": "s9",
+            "rsv": "s10",
+            "rsk": "s11",
+            "rdv": "s[0:3]",
+            "rdk": "s[4:7]",
+        },
+    }
+    for nkv in (3, 2):
+        by = {name: (dict(o), line) for line, (name, o) in enumerate(ops.items())}
+        assert digest(bwd.regions(nkv, by, 16)) == _REGION_DIGESTS[nkv], nkv
+
+
+@pytest.mark.parametrize(
+    "texts, derived",
+    [
+        # a VALU reading a WMMA's D: 4 wait states
+        (
+            ["v_wmma_f32_16x16x32_bf16 v[0:7], v[8:15], v[16:23], v[0:7]", "v_add_f32_e32 v24, v0, v1"],
+            ["v_nop"] * 4,
+        ),
+        # a VALU reading a TRANS result right after it: 1
+        (["v_exp_f32_e32 v1, v2", "v_add_f32_e32 v3, v1, v4"], ["v_nop"]),
+        # the use of an LDS load: its counter
+        (["ds_load_b128 v[0:3], v8", "v_add_f32_e32 v4, v0, v1"], ["s_wait_dscnt 0x0"]),
+        # a load into an operand of a WMMA in flight: va_vdst
+        (
+            ["v_wmma_f32_16x16x32_bf16 v[0:7], v[8:15], v[16:23], v[0:7]", "ds_load_b128 v[8:11], v30"],
+            ["s_wait_alu depctr_va_vdst(0)"],
+        ),
+        # the barrier's release with an LDS read in flight
+        (["ds_load_b128 v[0:3], v8", "s_barrier_signal -1"], ["s_wait_dscnt 0x0"]),
+        # a write of a scalar an in-flight TDM op still reads (XCNT)
+        (["tensor_load_to_lds s[40:43], s[48:55]", "s_mov_b32 s41, 0"], ["s_wait_xcnt 0x0"]),
+        # independent instructions: nothing
+        (["v_wmma_f32_16x16x32_bf16 v[0:7], v[8:15], v[16:23], v[0:7]", "v_add_f32_e32 v24, v30, v31"], []),
+    ],
+)
+def test_emitter_adds_the_expert_mode_waits(texts, derived):
+    """tools/asm.py adds the waits and wait states of expert scheduling mode that an instruction order implies."""
+    asm, _, _ = _tools()
+    lines, _ = asm.emit(texts, asm.Flow([asm.State()], [asm.XState(False)], [[]]))
+    assert [x.strip() for x in lines if x.strip() not in texts] == derived
+
+
+def test_emitter_sets_the_vgpr_msb_mode():
+    """An operand in VGPR block b (v256 b and up) needs mode b in its s_set_vgpr_msb field (src0, src1, src2, dst at
+    bits 0, 2, 4, 6; the old mode in bits 8..15); a block ends in mode 0."""
+    asm, _, _ = _tools()
+    lines, _ = asm.emit(
+        ["v_add_f32_e32 v1 /*v257*/, v2, v3 /*v515*/"], asm.Flow([asm.State()], [asm.XState(False)], [[]])
+    )
+    assert [x.split(";")[0].strip() for x in lines] == [
+        "s_set_vgpr_msb 0x48",
+        "v_add_f32_e32 v1 /*v257*/, v2, v3 /*v515*/",
+        "s_set_vgpr_msb 0x4800",
+    ]
+
+
 def test_build_never_fails_and_installs_only_pinned_code_objects(monkeypatch, tmp_path):
     """Pinned code objects are kept, an unpinned one is removed, and a compiler that is missing, not the pinned
     toolchain, or emits other bytes leaves the build failed without raising or installing anything."""

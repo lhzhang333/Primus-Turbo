@@ -4,56 +4,31 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""fwdgen -- the generated regions of the HK MLA forward kernel ``k_mla_fwd``.
+"""fwd -- the generated regions of the MLA forward kernel k_mla_fwd (src/k_mla_fwd.hip is the marker shell).
 
-The shell (``src/k_mla_fwd.hip``) carries inline-asm
-markers; build.py compiles it, reads the registers LLVM gave each marker operand and asks this module for
-every region:
+  INIT     per q block: m, d, O, the constants, the Q fragments of the wave's four q tiles (resident for the block)
+           and the state that makes the first prefix a no-op
+  TILE_C   a 64-kv tile below the diagonal; it also issues ring slot t + 3 (tdm_nodes)
+  TILE_Dk  diagonal tile k = 0..3: q tiles below k skipped, the causal mask on q tile k
+  FINAL_A  the last tile's prefix, then out = bf16(O / d) and lse of the four q tiles into the staging slots;
+           FINAL_A3 after TILE_D3 (its prefix skips q tiles 0..2)
 
-  INIT     once per q block: m = fp32(-1e30), d = 0, O = 0, the (c, c) pair, copies of the Q fragment bases,
-           the Q fragments of all four q tiles (resident for the whole block: the tiles read no Q) and the
-           state that makes the first tile's prefix a no-op
-  TILE_C   a 64-kv tile below the diagonal (no mask); it also issues ring slot t + 3, tile t + 3's TDM ops (tdm_nodes)
-  TILE_Dk  diagonal tile k = 0..3 (Sq == Skv): q tiles below k skipped, the causal mask on q tile k only
-  FINAL_A  the prefix of the last tile, then per q tile i: inv = d > 0 ? 1 / d : 0 (LLVM's IEEE division
-           sequence), out = bf16(O inv), lse = (m + log2 d) ln 2 (LLVM's log2 expansion), and their ds_stores
-           into this wave's staging slots; one schedule, so the four q tiles' math and stores overlap
-  FINAL_A3 FINAL_A after TILE_D3, whose prefix skips q tiles 0..2 (see below)
+The math is FlyDSL's forward op for op, so out / lse are bitwise FlyDSL's: per q tile, S = Q K^T over 6 k-steps from
++0, the mask (-inf), lm = the row max (any tree: max is exact), the rescale vote fma(lm, c, -m) > log2(e) over the
+wave, m' = max(m, c lm) if it fires, corr = exp2(m - m'), p = exp2(fma(s, c, -m')), FlyDSL's 3-ary sum tree,
+d = fma(corr, d, sum), O = O corr + bf16(p) V; c = scale log2(e).
 
-A wave owns four 16-row q tiles; c = scale log2 e. The math is FlyDSL's forward, op for op: the QK WMMA chains
-over k-steps 0..5 from +0; [mask: s = -inf where kv > q]; lm = max over the lane's 32 values (any tree: max is
-exact), lm = max(lm, peer(lm)); need = fma(lm, c, -m) > fp32(log2 e); ballot over the wave;
-m' = any ? max(m, fp32(c lm)) : m; corr = exp2(m - m'); p = exp2(fma(s, c, -m')); P = bf16_rne(p); FlyDSL's
-3-ary sum tree over the lane's 32 p (kv16 tile major, then the 8 rows), packed over the q tile pairs (0, 1)
-and (2, 3); d = fma(corr, d, ls + peer(ls)); O *= corr (when m moved: corr is exactly 1 otherwise);
-O += P V as WMMA chains over the two 32-kv halves.
+The TILE regions are software-pipelined across tiles: the prefix of region t finishes tile t - 1 (the softmax of q
+tiles 2, 3, then the PV WMMAs of all four), the body reads tile t's K / V, runs QK of the four q tiles and the softmax
+of q tiles 0, 1; every q tile keeps its sequence of operations, so no result bit changes. O *= corr runs under a
+wave-uniform branch per q-tile pair (a RESC node), only when m moved: corr is exactly 1 otherwise.
 
-The TILE regions are software-pipelined across tiles. The region of tile t opens with a prefix that finishes
-tile t - 1: the softmax of q tiles 2, 3 (their masked scores are live in S(2), S(3)), their sum tree and
-O *= corr, then the PV WMMAs of all four q tiles (P(0), P(1) come from region t - 1). Its body reads the
-tile's K / V fragments and runs QK(0..3), the full softmax of q tiles 0, 1 (P in place of their scores)
-with their sum tree, and only the mask of q tiles 2, 3. The K reads issued at the region start thus land
-while the prefix's 64 WMMAs and its softmax run, and the softmax VALU spreads over the whole region.
-Every q tile keeps its sequence of operations: the pipelining changes no result bit. A body that skips q
-tile i leaves the next prefix a no-op for it, as INIT does for the first prefix: P(i) = 0 for i < 2,
-S(i) = -inf for i >= 2 (corr = 1, p = +0, d = fma(1, d, +0), O += V * 0). The prefix after a diagonal tile
-leaves out what is a no-op there: TILE_D2's prefix the PVs of q tile 0 (skipped by TILE_D1), TILE_D3's those of
-q tiles 0, 1, FINAL_A3's (the region after TILE_D3) those of q tiles 0..2 and the softmax of q tile 2. A block
-ending before TILE_D3 ends with the full FINAL_A, so TILE_D1 / D2 still zero the P of the q tile they skip.
-
-O *= corr runs only when m moved, under a wave-uniform branch per q-tile pair -- (2, 3) in the prefix, (0, 1) in
-the body -- taken when either q tile's m moved (FlyDSL's _rescale_if per q tile; the other one's corr is then
-exactly 1, and x * 1.0 is x): no result bit changes. The pair's s_or_b32 sets scc, the scheduler may issue it
-ahead of the branch; the branch and the conditional block are one node (RESC), and build.py splits the region
-there into blocks. A q tile without its pair partner in a region (q tile 1 in TILE_D1's body, q tile 3 in
-FINAL_A3's prefix) has a branch of its own.
-
-Program order (the order of the node lists) is the semantics: the scheduler reorders only along the dependence
-graph (RAW / WAR / WAW on every VGPR, SGPR, scc, vcc) and the added order edges. The output is real
-instructions (and the RESC pseudo-lines build.py expands); asmkit.emit derives s_set_vgpr_msb, the expert-mode
-waits and the hazard v_nops."""
+The node lists' program order is the semantics: schedule() reorders along the dependence graph on a cycle model of
+one wave; asm.emit_block adds s_set_vgpr_msb, the expert-mode waits and the hazard v_nops."""
 
 import re
+
+import asm as A
 
 LOG2E = 0x3FB8AA3B  # fp32(log2 e): the rescale threshold
 NEG_INF = 0xFF800000
@@ -178,9 +153,6 @@ class Layout:
         """bf16 P^T (B operand) of q tile i, kv half kt: in place of S(i, 2 kt) once the exps have read it."""
         return self.S(i, 2 * kt)
 
-    def all_regs(self):
-        return set(range(self.base, self.end0)) | set(range(256, 1024))
-
 
 # ------------------------------------------------------------------------------------------------------------
 # instruction nodes and the dependence graph
@@ -226,27 +198,6 @@ def _sregs(op):
     return out
 
 
-def _split_ops(s):
-    out, cur, depth, i = [], "", 0, 0
-    while i < len(s):
-        if s.startswith("/*", i):
-            j = s.index("*/", i)
-            cur += s[i : j + 2]
-            i = j + 2
-            continue
-        c = s[i]
-        depth += (c in "[(") - (c in "])")
-        if c == "," and depth == 0:
-            out.append(cur.strip())
-            cur = ""
-        else:
-            cur += c
-        i += 1
-    if cur.strip():
-        out.append(cur.strip())
-    return out
-
-
 def mk(text, kind, tag=""):
     """A node with the registers its text defines and uses. Covers the forms the regions schedule: ds_load
     (vdst, vaddr), ds_store (vaddr, data), s_mov / s_cmp / s_cselect, tensor_load_to_lds (reads its two
@@ -270,7 +221,7 @@ def mk(text, kind, tag=""):
         n.suses = {sany}
         return n
     mn, _, rest = text.strip().partition(" ")
-    ops = _split_ops(rest)
+    ops = A.split_operands(rest)
     if mn.startswith("ds_load"):
         n.vdefs, n.vuses = set(_vregs(ops[0])), set(_vregs(ops[1]))
     elif mn.startswith("ds_store"):  # address, data: uses only
@@ -926,3 +877,82 @@ def region_final_all(L, ops, skip=0):
         add(f"ds_store_b32 {vr(lbase)}, {vr(sv)} offset:{(i & 1) * 4 * SQT_B}", "DSST", tag)
     order, _ = schedule(build_dag(nodes))
     return [nd.text for nd in order]
+
+
+# ------------------------------------------------------------------------------------------------------------
+# the regions of the compiled shell
+# ------------------------------------------------------------------------------------------------------------
+MARKERS = ("INIT", "TILE_C", *(f"TILE_D{k}" for k in range(4)), "FINAL_A", "FINAL_A3")
+RESC_LABELS = [0]  # unique labels of the RESC blocks across the regions
+
+
+def emit_region(texts, scalars, L):
+    """asm.emit on one region, entered with anything in flight and XCNT holding every scalar the shell references.
+    A RESC pseudo-line splits it: the block before ends in s_cmp + s_cbranch over the conditional O *= corr block,
+    the block after is entered from both."""
+    segs, cur = [], []
+    for x in texts:
+        if x.startswith("HKRESC"):
+            segs.append((cur, x))
+            cur = []
+        else:
+            cur.append(x)
+    flow = A.Flow([A.State(unknown=True)], [A.XState(False, scalars)], [[]])
+    out, lead = [], []
+    for tx, rline in segs:
+        label = f".LHKR{RESC_LABELS[0]}"
+        RESC_LABELS[0] += 1
+        head, body, lab = resc_block(L, rline, label)
+        lines, ex_a = A.emit(tx + head, flow)
+        lines_b, ex_b = A.emit(body, ex_a)
+        out += lead + lines + lines_b
+        lead = [lab]
+        flow = A.Flow.join([ex_a, ex_b])
+    return out + lead + A.emit(cur, flow)[0]
+
+
+def regions(marks, scalars, base):
+    """{marker line: region lines} of the markers [(name, operands, line)], the generated code at and above VGPR base;
+    scalars: the scalar registers the shell's code references (in flight in the XCNT sense at every region entry)."""
+    L = Layout(base)
+    out = {}
+    for name, ops, i in marks:
+        pre, post = [], []
+        if name == "INIT":
+            texts = region_init(L, {"qa": A.vfirst(ops["qa"]), "qb": A.vfirst(ops["qb"]), "c2": ops["c2"]})
+        elif name.startswith("TILE"):
+            if not re.fullmatch(r"s\d+", ops["c2"]) or ops["c2"] in CLOBBERED:
+                raise RuntimeError(f"{name}: c2 operand {ops['c2']!r} is not a plain, unclobbered SGPR")
+            o = {"kb": A.vfirst(ops["kb"]), "vb": A.vfirst(ops["vb"]), "c2": ops["c2"]}
+            k = None
+            if name.startswith("TILE_D"):
+                k, o["dl"] = int(name[-1]), A.vfirst(ops["dl"])
+            else:  # TILE_C: its ring slot's descriptors and the advance's scalars
+                o.update({x: ops[x] for x in ("qk", "qb", "qv", "g1a", "g1b", "g1v", "t", "n4", "l3")})
+            texts = region_tile(L, o, k)[0]
+        else:
+            skip = 3 if name == "FINAL_A3" else 0
+            texts = region_final_all(L, {k: A.vfirst(ops[k]) for k in ("wa", "wb", "la", "lb")}, skip)
+            # the preceding region's WMMAs may be in flight; after it the shell reads the staging back and rewrites
+            # the address VGPRs
+            pre = ["\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"] + ["\tv_nop"] * 4
+            post = ["\ts_wait_dscnt 0x0", "\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"]
+        out[i] = pre + emit_region(texts, scalars, L) + post
+    return out
+
+
+def generate(shell):
+    """{marker line: region lines} for the compiled shell's lines. The generated code lives at and above 1 + the
+    highest VGPR the shell's code or a marker operand references."""
+    marks = A.markers(shell)
+    if sorted(m[0] for m in marks) != sorted(MARKERS):
+        raise RuntimeError(f"markers {[m[0] for m in marks]}, want {list(MARKERS)}")
+    hi, scalars = -1, set()
+    for x in A.parse(shell):
+        if x.mn and x.cls not in ("LABEL", "DIR"):
+            hi = max([hi, *x.defs, *x.uses])
+            sd, su = A.sgpr_defs_uses(x)
+            scalars |= set(sd) | set(su)
+    RESC_LABELS[0] = 0
+    base = max([hi + 1] + [A.vend(v) for _, ops, _ in marks for v in ops.values() if v[0] == "v"])
+    return regions(marks, scalars, base)

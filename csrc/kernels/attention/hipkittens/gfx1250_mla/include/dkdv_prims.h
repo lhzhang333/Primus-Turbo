@@ -97,12 +97,6 @@ HK1_INLINE __amdgpu_buffer_rsrc_t rsrc64(const void *base, int64_t nbytes) {
     return __builtin_amdgcn_make_buffer_rsrc(const_cast<void *>(base), (short) 0, (long) nbytes,
                                              RSRC_FLAGS);
 }
-HK1_INLINE bf16x8 buf_load_b128(__amdgpu_buffer_rsrc_t r, int voff, int soff) {
-    return __builtin_bit_cast(bf16x8, __builtin_amdgcn_raw_buffer_load_b128(r, voff, soff, 0));
-}
-HK1_INLINE f32x4 buf_load_f32x4(__amdgpu_buffer_rsrc_t r, int voff, int soff) {
-    return __builtin_bit_cast(f32x4, __builtin_amdgcn_raw_buffer_load_b128(r, voff, soff, 0));
-}
 HK1_INLINE void buf_store_b128(bf16x8 v, __amdgpu_buffer_rsrc_t r, int voff, int soff) {
     __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(u32x4, v), r, voff, soff, 0);
 }
@@ -122,9 +116,6 @@ template <int N> HK1_INLINE void tensor_wait() {
 template <int MASK> HK1_INLINE void sched_barrier() {
     __builtin_amdgcn_sched_barrier(MASK);
 }
-template <int MASK, int N, int ID> HK1_INLINE void sched_group_barrier() {
-    __builtin_amdgcn_sched_group_barrier(MASK, N, ID);
-}
 // workgroup barrier for LDS: release fence on LDS only (s_wait_dscnt 0: this wave's DS ops retired;
 // in-flight global loads and TDM ops are not waited for), s_barrier_signal -1 / s_barrier_wait -1,
 // acquire fence. Memory orders as their C11 values (__ATOMIC_ACQUIRE, __ATOMIC_RELEASE).
@@ -132,17 +123,6 @@ inline constexpr int MO_ACQUIRE = 2, MO_RELEASE = 3;
 HK1_INLINE void      lds_barrier() {
     __builtin_amdgcn_fence(MO_RELEASE, "workgroup", "local");
     __builtin_amdgcn_s_barrier_signal(-1);
-    __builtin_amdgcn_s_barrier_wait(-1);
-    __builtin_amdgcn_fence(MO_ACQUIRE, "workgroup", "local");
-}
-// split form of lds_barrier(): arrive = release fence (s_wait_dscnt 0) + s_barrier_signal -1;
-// wait = s_barrier_wait -1 + acquire fence. Work placed between the two (pinned with
-// sched_barrier<0>) overlaps the other wave's arrival.
-HK1_INLINE void lds_arrive() {
-    __builtin_amdgcn_fence(MO_RELEASE, "workgroup", "local");
-    __builtin_amdgcn_s_barrier_signal(-1);
-}
-HK1_INLINE void lds_wait() {
     __builtin_amdgcn_s_barrier_wait(-1);
     __builtin_amdgcn_fence(MO_ACQUIRE, "workgroup", "local");
 }

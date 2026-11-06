@@ -67,21 +67,18 @@ byte-identical in any directory.
 removed, and another compiler builds nothing; a missing code object sends its pass to FlyDSL, and a failed build never
 fails the install.
 
-**Generated kernels.** `k_mla_fwd` and `k_dkdv96ds` are marker shells: the HIP source keeps the workgroup set-up, the
-TDM descriptors and the uniform control flow, and inline-asm markers (`; HKGEN <region>`) stand where the per-tile
-work goes. Their manifest `generator` (`tools/fwdgen`, `tools/bwdgen`, on `tools/asmkit`) compiles the shell and
-generates those regions: software-pipelined WMMA / LDS / softmax schedules on a static register plan, with
-`s_set_vgpr_msb`, the expert-mode dependency waits and the hazard `v_nop`s derived from the instruction stream. It checks
-them against the shell (VGPR writes only above every VGPR the shell references, SGPR writes only in the declared
-clobbers, no open hazard on any path), assembles the kernel with the driver's own assembler and linker and compares the
-code object with the intended instructions; `hsaco.py` installs it when it is the pinned one. A generator run takes a
-few seconds of CPU; `tools/<generator>/build.py --out DIR --cxx CXX` keeps its `.s`. Without the generator's switch
-(`-DHKGEN_REF=1` / `-DHKGEN=0`) the same source compiles the per-tile work in HIP.
+**Generated kernels.** `k_mla_fwd` and `k_dkdv96ds` are marker shells: the HIP source keeps the workgroup set-up,
+the TDM descriptors and the uniform control flow, and inline-asm markers (`; HKGEN <region>`) stand where the per-tile
+work goes. Their manifest `generator`, `tools/hkgen.py`, compiles the shell, generates those regions (`tools/fwd.py`,
+`tools/bwd.py`: software-pipelined WMMA / LDS / softmax schedules on a static register plan) and lets `tools/asm.py`
+add what the order implies in expert scheduling mode (`s_set_vgpr_msb`, the dependency waits, the hazard `v_nop`s), then
+assembles the spliced `.s` with the driver's own assembler and linker. A generator run takes a few seconds of CPU;
+`python3 tools/hkgen.py <kernel> --out DIR --cxx CXX` keeps the `.s`.
 
 ## Changing a kernel
 
 1. Edit `src/`, `include/` or `tools/`, or a kernel's flags in `manifest.json` (for a new compiler, set `toolchain` to
-   its `--version` line first).
+   its `--version` line first). The pins cover the shells' compiled instructions too.
 2. `hsaco.py --force` reports the sha256 of every code object that changed. Set it as the kernel's `hsaco_sha256` in
    `manifest.json` and in `_MLA_KERNELS` of `attention_hipkittens_impl.py` (with its block size and argument layout if
    the interface changed); `hsaco.py --force --strict` must then pass.

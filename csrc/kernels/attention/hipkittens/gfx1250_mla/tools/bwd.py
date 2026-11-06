@@ -4,44 +4,29 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""bwdgen -- the generated regions of k_dkdv96ds (HK MLA backward: dK, dV and the dS^T scratch).
-
-The shell (src/k_dkdv96ds.hip, -DHKGEN=1) keeps the workgroup set-up, the first two TDM tiles and the barriers
-before and after the tile loop, and marks three regions per block height (nkv = 3: the 96-row blocks, nkv = 2: the
-64-row tail; 16 nkv kv rows per wave). build.py reads the registers LLVM gave the marker operands; this module returns
-the instructions of every region:
+"""bwd -- the generated regions of k_dkdv96ds (MLA backward: dK, dV and the dS^T scratch; src/k_dkdv96ds.hip is the
+marker shell). Per block height nkv (3: the 96-row kv blocks, 2: the 64-row tail; 16 nkv kv rows per wave):
 
   INIT   (c1, c1), (1 / scale, 1 / scale); the wave's K / V rows by TDM into its LDS staging area, the accumulators
-         cleared while they are in flight, then the K / V B-operand fragments read from there
-  LOOP   tile 0's hh0 S / dP operands and NL / ND, then every query tile k = 0 .. N-1 (the first n_mask diagonal:
-         causal mask on, the dS^T stores of unattended blocks dropped) in a loop unrolled by the depth of the Q / dO
-         TDM ring (3 stages, tile k in stage k mod 3, prefetch distance 2). One tile:
-           TDM of tile k+2
-           S = Q K^T and dP = dO V^T of hh0 (dt outer, operands loaded during the previous tile); hh1's operands
-             streamed into the tuples hh0's WMMAs release; S / dP of hh1 (kh-major)
-           softmax / dS in packed f32, bf16 P / dS written straight into the dV / dK B operands
-           dV^T += dO^T P, dK^T += Q^T dS (transposed A operands by ds_load_tr16_b128)
-           the dS^T stores of tile k, NL / ND of tile k+1, the scalars of tile k+1
-           s_wait_tensorcnt 3 + s_barrier_signal after the last LDS read of stage k, s_barrier_wait, then tile k+1's
-             hh0 operands from its stage
-  FINAL  dV * (1 / scale) and dK to bf16 row-major images in LDS (the shell's epi_images layout), whole-line
-         readback and global stores, software-pipelined
+         cleared meanwhile, then the K / V B-operand fragments
+  LOOP   tile 0's hh0 operands and NL / ND, then every query tile k (the first n_mask diagonal: causal mask on, the
+         dS^T stores of unattended blocks dropped) in a loop unrolled by the depth of the Q / dO TDM ring (3 stages):
+         the TDM of tile k + 2; S = Q K^T and dP = dO V^T (hh0's operands loaded during the previous tile, hh1's
+         streamed into the tuples hh0's WMMAs release); softmax / dS in packed f32, straight into the bf16 dV / dK B
+         operands; dV^T += dO^T P, dK^T += Q^T dS (A operands by ds_load_tr16_b128); the dS^T stores, NL / ND of
+         tile k + 1, the ring barrier after the last LDS read of stage k, the next tile's scalars and hh0 operands
+  FINAL  dV / scale and dK to bf16 row-major images in LDS, whole-line readback and global stores
 
-Indices: a query tile is 32 queries in two halves hh of 16; a wave's kv rows are NKV sub-tiles kh of 16; dt is a WMMA
-k-step (32 columns of D), d a 16-column output tile of dV^T / dK^T.
-
-Numerics: NL = log2(scale) - log2(e) lse and ND = -delta are k_delta's per-query constants. S chains over dt ascending from +0, dP chains from ND; exp2(c1 S + NL) with c1 = scale log2(e) is
-scale * P, so dS = P dP takes one multiply (scale included) and FINAL scales dV by 1 / scale. Packed f32 fma / mul,
-exp2, RNE bf16 conversions; every dV / dK accumulator takes one WMMA per tile, in tile order.
-
-The node lists of a tile are in program order, which is the semantics; schedule_slot reorders them along the
-dependence graph (asmkit's parser: RAW / WAR / WAW on VGPRs, SGPRs, scc, vcc) plus order edges for the ring barrier
-and the XCNT spacing. The output is real instructions only: asmkit.emit adds s_set_vgpr_msb, the expert-mode waits
-and the hazard v_nops."""
+A query tile is 32 queries in halves hh of 16; a wave's kv rows are nkv sub-tiles kh of 16. Numerics: k_delta's row
+constants NL = log2(scale) - log2(e) lse and ND = -delta; S chains from +0 and dP from ND, so exp2(c1 S + NL) is
+scale * P, dS = P dP takes one multiply (scale included) and FINAL scales dV by 1 / scale; c1 = scale log2(e). Every
+accumulator takes one WMMA per tile, in tile order. schedule_slot() orders a tile around its in-order WMMA stream on a
+cycle model; asm.emit_block adds s_set_vgpr_msb, the expert-mode waits and the hazard v_nops."""
 
 import re
 
-from asmkit.emit import make_item
+import asm as A
+from asm import make_item
 
 NKV = 3  # kv sub-tiles of 16 rows per wave (set_nkv)
 NDT_QK, NDT_V = 6, 4  # WMMA k-steps of S = Q K^T (D_QK 192) and dP = dO V^T (D_V 128)
@@ -52,7 +37,7 @@ QDO_B = 32 * (XV + XK)  # one ring stage
 DEPTH = 3  # ring stages
 # dS^T stores (dslayout v2): dwords 4..7 of a dS operand (queries 16..31) go 512 B after dwords 0..3
 DS_ST_B = 512
-NEG = "0xff61b1e6"  # fp32 -3e38 (K1_NEG): a masked logit, exp2 -> +0
+NEG = "0xff61b1e6"  # fp32 -3e38: a masked logit, exp2 -> +0
 # the three TDM ops of a ring stage: 0 dO (V in INIT), 1 Q (K) cols [0, 128), 2 Q (K) cols [128, 192); word 0 of
 # their group-1 descriptors (k1_tdm_w0: 2-B elements, LDS row padding), tile columns, tile rows per wave
 TDM_W0 = (0x07510000, 0x47510000, 0x87110000)
@@ -436,7 +421,7 @@ def region_init(L, ops):
 # --------------------------------------------------------------------------------------------------------------
 def sdp_loads(L, qbase, vbase, hh, stage):
     """[((Q / D, dt, u), text)] of the 20 ds_load_b128 of hh half's S / dP A operands from ring stage `stage`
-    (k1_rd_const offsets from the lane bases qbase / vbase, the stage offset in the immediate)."""
+    (offsets from the lane bases qbase / vbase, the stage offset in the immediate)."""
     out = []
     so = stage * QDO_B
     for dt in range(NDT_QK):
@@ -450,7 +435,7 @@ def sdp_loads(L, qbase, vbase, hh, stage):
 
 
 def nl_loads(L, ops):
-    """The 8 buffer_load_b128 of a tile's NL / ND quads (k1_nl_sconst offsets, soffset ops['nls'])."""
+    """The 8 buffer_load_b128 of a tile's NL / ND quads (constant offsets, soffset ops['nls'])."""
     out = []
     for e in range(8):
         r = ops["rnl"] if (e % 4) // 2 == 0 else ops["rnd"]
@@ -805,3 +790,121 @@ def region_final(L, ops):
     while ready or flight:
         advance(final=True)
     return text
+
+
+# --------------------------------------------------------------------------------------------------------------
+# the regions of the compiled shell
+# --------------------------------------------------------------------------------------------------------------
+# region tail: the shell's code after a region may rewrite the SGPRs (XCNT) and VGPRs (vm_vsrc) an in-flight memory
+# op of the region still reads
+POST = ["\ts_wait_xcnt 0x0", "\ts_wait_alu depctr_vm_vsrc(0)"]
+
+
+def shell_span(ins, bl, init_i, final_i):
+    """The highest VGPR the shell's code references on a CFG path from the INIT marker (line init_i) to FINAL
+    (final_i): the generated state lives above it from INIT to FINAL."""
+    block_of = {i: b for b, (s, e, _) in enumerate(bl) for i in range(s, e + 1)}
+    hi, seen = -1, set()
+    work = [(block_of[init_i], init_i + 1)]
+    while work:
+        b, start = work.pop()
+        _, e, succ = bl[b]
+        for i in range(start, e + 1):
+            if i == final_i:
+                break
+            if ins[i].mn:
+                hi = max([hi] + ins[i].defs + ins[i].uses)
+        else:
+            for t in succ:
+                if t not in seen:
+                    seen.add(t)
+                    work.append((t, bl[t][0]))
+    return hi
+
+
+def with_unknown(fl, regs):
+    """fl after unknown shell code: VALU writes in flight on regs, unknown XCNT sources."""
+    fl = fl.copy()
+    for st in fl.sts:
+        st.valu.append(A.Rec("UNK", [], sorted(regs), False, 0))
+    for x in fl.xs:
+        x.unknown = True
+    return fl
+
+
+def tail(fl):
+    """fl after the region tail POST."""
+    fl = fl.copy()
+    for x in fl.xs:
+        x.unknown, x.regs = False, set()
+    for st in fl.sts:
+        A.apply_vm(st, 0)
+    return fl
+
+
+def regions(nkv, by, base):
+    """{marker line: region lines} of block height nkv, the generated state at and above VGPR base; by = {region:
+    (operands, marker line)} of its INIT, LOOP and FINAL markers."""
+    set_nkv(nkv)
+    L = Layout(base)
+    shell_regs = set(range(base))
+    lines = {}
+    entry = A.Flow([A.State(unknown=True)], [A.XState(True)], [[]])
+    lines["INIT"], fl = A.emit(region_init(L, by["INIT"][0]), entry)
+    exit_init = tail(fl)
+    # LOOP: its prologue RB, then the loop's blocks to a fixed point of their entry flows
+    lp = f".LHKG{nkv}"
+    t_rb, blocks, _ = region_loop(L, by["LOOP"][0], lp)
+    lines["RB"], exit_rb = A.emit(t_rb, with_unknown(exit_init, shell_regs))
+    items = {name: [make_item("\t" + t) for t in texts] for name, _, texts, _ in blocks}
+    preds = {name: [] for name, *_ in blocks}
+    for name, _, _, succ in blocks:
+        for t in succ:
+            if t != "X":
+                preds[t].append(name)
+    preds["H0"].append("RB")
+    exits, sig = {"RB": exit_rb}, {}
+    for _ in range(96):
+        changed = False
+        for name in preds:
+            flows = [exits[p] for p in preds[name] if p in exits]
+            if not flows:
+                continue
+            fl_in = A.Flow.join(flows)
+            if sig.get(name) == fl_in.sig():
+                continue
+            sig[name] = fl_in.sig()
+            lines[name], exits[name] = A.emit_block(items[name], fl_in)
+            changed = True
+        if not changed:
+            break
+    else:
+        raise RuntimeError(f"nkv={nkv}: the LOOP entry states did not converge")
+    loop = list(lines["RB"])
+    for name, label, _, _ in blocks:
+        loop += [f"{label}:"] + lines[name]
+    loop.append(f"{lp}_X:")
+    # FINAL: after INIT (no tile) or a loop exit, through shell code
+    fl = A.Flow.join([exit_init] + [tail(exits[n]) for n, _, _, succ in blocks if "X" in succ])
+    lines["FINAL"], _ = A.emit(region_final(L, by["FINAL"][0]), with_unknown(fl, shell_regs))
+    lines["LOOP"] = loop
+    return {by[n][1]: lines[n] + POST for n in ("INIT", "LOOP", "FINAL")}
+
+
+def generate(shell):
+    """{marker line: region lines} for the compiled shell's lines (the INIT, LOOP and FINAL markers of each block
+    height nkv)."""
+    sets = {}
+    for name, ops, i in A.markers(shell):
+        sets.setdefault(int(ops.pop("nkv")), {})[name] = (ops, i)
+    if any(sorted(by) != ["FINAL", "INIT", "LOOP"] for by in sets.values()):
+        raise RuntimeError(f"markers {sets}: want INIT, LOOP and FINAL per block height")
+    ins = A.parse(shell)
+    bl = A.blocks(ins)
+    out = {}
+    for nkv in sorted(sets, reverse=True):
+        by = sets[nkv]
+        base = shell_span(ins, bl, by["INIT"][1], by["FINAL"][1]) + 1
+        base = max([base] + [A.vend(v) for ops, _ in by.values() for v in ops.values() if v.startswith("v")])
+        out.update(regions(nkv, by, base))
+    return out

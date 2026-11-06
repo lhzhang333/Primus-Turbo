@@ -7,8 +7,8 @@
 """Build the gfx1250 MLA attention code objects into ``primus_turbo/lib/hk_gfx1250_mla/<kernel>.hsaco``.
 
 Each kernel is one device-only code object compiled from ``src/`` with exactly ``manifest.json``'s flags (not the
-csrc extension's); a kernel with a ``generator`` (``tools/fwdgen``, ``tools/bwdgen``) is that generator's output: it
-compiles the kernel's marker shell, generates the per-tile code and assembles the result. The manifest pins every code
+csrc extension's); a kernel with a ``generator`` (``tools/hkgen.py``) is its output: it compiles the kernel's marker
+shell, generates the per-tile code and assembles the result. The manifest pins every code
 object's sha256 for its ``toolchain``: only a code object with the pinned bytes is installed, and one that is not (an
 older build) is removed. ``-cuid=<kernel>`` makes the build byte-identical in any directory.
 
@@ -96,7 +96,7 @@ def compile_kernel(cxx: str, name: str, out_path: Path) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         obj = Path(tmp) / f"{name}.hsaco"
         if "generator" in k:
-            cmd = [sys.executable, str(HIP_DIR / k["generator"]), "--out", tmp, "--cxx", cxx]
+            cmd = [sys.executable, str(HIP_DIR / k["generator"]), name, "--out", tmp, "--cxx", cxx]
         else:
             cmd = compile_command(cxx, name, obj)
         r = subprocess.run(cmd, cwd=HIP_DIR, capture_output=True, text=True)
