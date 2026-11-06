@@ -126,6 +126,99 @@ def body_items(ins, a, b):
     return items
 
 
+# ------------------------------------------------------------------------------------------------- copy coalescing
+def vtok(lo, n):
+    """LLVM's operand text of VGPRs lo .. lo + n - 1 (the low-bank name, the true registers in a comment above v255)."""
+    hi = lo + n - 1
+    if lo // 256 != hi // 256:
+        return None
+    if n == 1:
+        return f"v{lo}" if lo < 256 else f"v{lo % 256} /*v{lo}*/"
+    return f"v[{lo}:{hi}]" if lo < 256 else f"v[{lo % 256}:{hi % 256}] /*v[{lo}:{hi}]*/"
+
+
+def remake(it, text):
+    n0 = EM.make_item(text)
+    n = RItem()
+    for k in EM.Item.__slots__:
+        setattr(n, k, getattr(n0, k))
+    n.pos = it.pos
+    return n
+
+
+def coalesce(items, log):
+    """Remove v_mov_b32 / v_mov_b64 copies whose source the body defines with one instruction X (all of X's VGPR defs,
+    no other reader of the source, the destination untouched between X and the copy): X writes the destination."""
+    removed = 0
+    while True:
+        n = len(items)
+        uses = collections.defaultdict(list)
+        defs = collections.defaultdict(list)
+        for k, it in enumerate(items):
+            for r in it.vuses:
+                uses[r].append(k)
+            for r in it.vdefs:
+                defs[r].append(k)
+        done = None
+        for m, it in enumerate(items):
+            mn = it.x.mn
+            if mn not in ("v_mov_b32_e32", "v_mov_b64_e32") or it.x.rmw or len(it.x.ops) != 2:
+                continue
+            src, dst = sorted(set(it.vuses)), sorted(set(it.vdefs))
+            if not src or len(src) != len(dst) or it.suses or "::" in mn:
+                continue
+            if isa.regs_of(isa.first_tok(it.x.ops[1])) != src or isa.regs_of(isa.first_tok(it.x.ops[0])) != dst:
+                continue  # modifiers / constants
+            ks = [max([k for k in defs[r] if k < m], default=-1) for r in src]
+            x = ks[0]
+            if x < 0 or any(k != x for k in ks):
+                continue
+            X = items[x]
+            if sorted(set(X.vdefs)) != src or X.x.rmw or X.kind not in ("VALU", "TRANS", "DS_LD") or "::" in X.x.mn:
+                continue
+            if isa.regs_of(isa.first_tok(X.x.ops[0])) != src:
+                continue
+            # the source: read only by the copy until its next def; not read across the back edge
+            bad = False
+            for r in src:
+                nd = min([k for k in defs[r] if k > m], default=None)
+                for u in uses[r]:
+                    if u == m or u <= x:
+                        if u <= x and nd is None and u < min(defs[r]):  # read before its first def: a carried value
+                            bad = True
+                        continue
+                    if nd is None or u <= nd:
+                        bad = True
+                if nd is None and any(u < min(defs[r]) for u in uses[r]):
+                    bad = True
+            # the destination: neither read nor written strictly between X and the copy
+            for r in dst:
+                if any(x < k < m for k in uses[r]) or any(x < k < m for k in defs[r]):
+                    bad = True
+            tok = vtok(dst[0], len(dst))
+            if bad or tok is None or dst != list(range(dst[0], dst[0] + len(dst))):
+                continue
+            code = isa.strip_comment(X.text)
+            if code.rstrip() != X.text.rstrip() and "/*" not in X.text:
+                continue
+            ops = list(X.x.ops)
+            first = isa.first_tok(ops[0])
+            ops[0] = tok + ops[0][len(first):]
+            new_text = "\t" + X.x.mn + " " + ", ".join(ops)
+            done = (x, m, remake(X, new_text))
+            break
+        if done is None:
+            break
+        x, m, nx = done
+        items[x] = nx
+        del items[m]
+        removed += 1
+    for k, it in enumerate(items):
+        it.pos = k
+    log(f"  coalesce: removed {removed} copies")
+    return items
+
+
 # ------------------------------------------------------------------------------------------------- dependence graph
 # result latency (cycles from issue until a dependent instruction can issue without waiting)
 LAT_RAW = {"WMMA": 16, "TRANS": 6, "VALU": 3, "DS_LD": 96, "VM_LD": 600, "SALU": 1, "TDM": 1, "OTHER": 1}
@@ -572,6 +665,7 @@ def main():
     ap.add_argument("--window", type=int, default=None, help="list mode: look ahead at most this many items")
     ap.add_argument("--msb-pref", type=float, default=1.0)
     ap.add_argument("--analyze", action="store_true")
+    ap.add_argument("--coalesce", action="store_true", help="remove copies (the producer writes the destination)")
     ap.add_argument("--prio", default="height", choices=("height", "orig", "ready"))
     ap.add_argument("--calib", default="", help="ATT ui dir of the identity build: compare the model with it")
     ap.add_argument("--drop", default="", help="timing probe (wrong results): MN:K drops every K-th item of mnemonic MN")
@@ -598,6 +692,8 @@ def main():
     for kn in a.kernels.split(","):
         la, lb = main_loop(ins, kn)
         items = body_items(ins, la, lb)
+        if a.coalesce:
+            items = coalesce(items, log)
         for spec in filter(None, a.drop.split(",")):
             mn, k = spec.split(":")
             k, c, keep = int(k), 0, []

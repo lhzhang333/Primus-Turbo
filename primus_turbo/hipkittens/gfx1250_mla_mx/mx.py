@@ -41,11 +41,14 @@ import os
 import subprocess
 import tempfile
 import threading
+import warnings
 from pathlib import Path
 
 import torch
 
+from primus_turbo.common import envs
 from primus_turbo.hipkittens.gfx1250_mla import hiprt
+from primus_turbo.hipkittens.gfx1250_mla_mx import asm_resched
 
 D_QK, D_V = 192, 128
 D_NOPE = 128  # q / k columns before the rope part
@@ -62,6 +65,11 @@ FLAGS = ("-x", "hip", "--offload-arch=gfx1250", "--cuda-device-only", "--no-gpu-
 # per-source extra flags: the quantization kernels without VOPD (LLVM re-materialized a VOPD constant into an SGPR
 # before every dual op: k -7%, the others -1..2%)
 SRC_FLAGS = {"k_mxq.hip": ("-mllvm", "-amdgpu-enable-vopd=0")}
+# main loops re-scheduled after register allocation (asm_resched: a list schedule of LLVM's loop body, emitted through
+# gfx1250_mla's asmkit, verified against the code object): the forward's tile loop, -7% (bit-exact). The dK / dV loop
+# is LDS-bound and slower re-scheduled: LLVM's order. PRIMUS_TURBO_MLA_MX_RESCHED=0: plain builds; on any failure
+# the source is built plainly (a warning)
+RESCHED = {"k_mla_fwd_mx7.hip": ("k_mla_fwd_mx",)}
 DKDV_KV_ROWS = 128  # kv rows per k_dkdv_mx workgroup (4 waves x 2 kv16 tiles)
 
 _ROWS_ARGS = (("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("kbar", "ptr"), ("Y", "ptr"), ("aux", "ptr"),
@@ -206,6 +214,10 @@ def _meta(name):
     return {"block": block, "kernarg_size": off, "args": out}
 
 
+def _resched_on():
+    return bool(envs.PRIMUS_TURBO_MLA_MX_RESCHED) and asm_resched.available()
+
+
 @functools.lru_cache(maxsize=None)
 def _build_dir():
     h = hashlib.sha256()
@@ -214,6 +226,11 @@ def _build_dir():
         h.update((HIP / f).read_bytes())
     h.update(" ".join(FLAGS).encode())
     h.update(repr(sorted(SRC_FLAGS.items())).encode())
+    if _resched_on():
+        h.update(repr(sorted(RESCHED.items())).encode())
+        for f in (Path(__file__).with_name("asm_resched.py"), *sorted(asm_resched._ASMKIT.glob("*.py"))):
+            if f.is_file():
+                h.update(f.read_bytes())
     for root in (
         Path(os.path.expanduser("~")) / ".cache",
         Path(tempfile.gettempdir()) / f"primus_turbo_{os.getuid()}",
@@ -240,6 +257,15 @@ def _code_object(src):
         raise RuntimeError("gfx1250_mla_mx: no amdclang++ to build the MXFP8 MLA kernels")
     with open(d / ".lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)  # one builder per cache directory (e.g. the ranks of a node)
+        if not out.is_file() and src in RESCHED and _resched_on():
+            tmp = out.with_suffix(f".{os.getpid()}.tmp")
+            try:
+                with tempfile.TemporaryDirectory(prefix="mx_resched_") as td:
+                    asm_resched.build(cxx, HIP / src, tmp, [*FLAGS, *SRC_FLAGS.get(src, ())], RESCHED[src], HIP, td)
+                os.replace(tmp, out)
+            except Exception as e:  # noqa: BLE001 - any failure: the plain build below
+                tmp.unlink(missing_ok=True)
+                warnings.warn(f"gfx1250_mla_mx: re-scheduling {src} failed ({str(e)[:300]}); plain build")
         if not out.is_file():
             tmp = out.with_suffix(f".{os.getpid()}.tmp")
             r = subprocess.run(

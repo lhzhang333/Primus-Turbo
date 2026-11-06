@@ -586,6 +586,8 @@ if __name__ == "__main__":
                 "hipkittens/gfx1250_mla/manifest.json",
                 "hipkittens/gfx1250_mla/bin/*.hsaco",
                 "hipkittens/gfx1250_mla/hip/**/*",
+                "hipkittens/gfx1250_mla/tools/asmkit/*.py",
+                "hipkittens/gfx1250_mla_mx/hip/*",
             ]
         },
         ext_modules=ext_modules,

@@ -442,3 +442,30 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   dout quantization 0.097 -> 0.089; pytest 30 pass, fused-RoPE package test pass.
 - dq DQ_DSTAT (lab, off): static mask classes on the two diagonal kv tiles (kv tile n - 1: q tiles i < 2 fully masked
   -> skipped incl. their dQ WMMAs; kv tile n - 2: q tiles i >= 2 kept without the mask): correct, dq 0.895 -> 0.888.
+- b6 (persistent dK / dV) without SLP: 804 (nested) / 883 VGPRs, no low-bank spills, bit-exact with b5 at five shapes,
+  but still slower (1.79 / 1.74 vs 1.39 ms). ATT: the steady-state step is ~3230 cycles (b5 ~2290): with its own 80 KB
+  staging area the A ring has 2 stages, so round g carries the A part of step g, needed at step g + 1 (one step of
+  lead instead of b5's two): the TDM latency is exposed every step. Needs ~45 KB more LDS than exists; parked.
+- Forward without SLP: 958 VGPRs + 8 spills, 0.721 vs 0.656 ms; DMASK + no SLP (936 VGPRs, no spill, correct): 0.666.
+- 64-row quantization tiles (128 threads, ~49 KB LDS: twice the workgroups per CU): 30-50% slower (the cols' 32-byte
+  TDM rows and the per-workgroup fixed work); reverted.
+- resched `--coalesce` (a copy whose source one instruction defines is removed, that instruction writing the copy's
+  destination): only 2 of the dkdv loop's 195 copies qualify; the rest re-shape tuples (exp results feeding the cvt
+  8-tuple and the pk_mul pairs, WMMA / pk_mul / cvt outputs split across tuples): a register re-allocation, and the
+  no-SLP build (no such copies) is not faster anyway.
+
+## 2026-11-06 (d): the forward's tile loop re-scheduled after register allocation (package)
+
+- `py/resched.py` on the forward (k_mla_fwd_mx's tile loop: one block, 786 real instructions: 100 W, 256 T, 266 V,
+  114 L): every list schedule passes toy..prod and is faster than LLVM's order, unlike dK / dV (LDS-bound: LLVM's
+  order stays, `--prio ready` 1.44-1.50 vs 1.386 ms). Forward (slow GPU, same run): LLVM 0.658-0.660, identity
+  re-emission 0.652, height 0.646-0.649, orig 0.632-0.641, **first-ready-first (`--prio ready`) 0.610-0.618**;
+  assumed LDS latency 24 / 32 / 48 cycles 0.6105 / 0.6094 / 0.6101 (96: 0.617), LDS gap 6 / burst 4 best (gap 10 /
+  burst 2: 0.646).
+- Package: `asm_resched.py` (the schedule + asmkit emission + per-kernel verify_obj, asmkit loaded from
+  gfx1250_mla/tools by path), `mx.RESCHED = {"k_mla_fwd_mx7.hip": ("k_mla_fwd_mx",)}`: the forward source is
+  compiled with -amdgpu-enable-vopd=0 -save-temps, its tile loop re-scheduled (first-ready-first, LDS latency 32), the
+  code object assembled with the driver's commands and checked against the intended .s; any failure -> the plain
+  build + a warning; `PRIMUS_TURBO_MLA_MX_RESCHED=0` (common.envs) turns it off; the cache key covers asm_resched and
+  asmkit. setup.py now ships gfx1250_mla_mx/hip and asmkit. pytest 30 pass, fused-RoPE package test bit-exact.
+  Package forward per call, alternating A / B: 0.9544 vs 0.9835 ms (-3.0%; medians of 3 runs each).

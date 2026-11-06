@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_MLA_FWD_IMPL: str = ""
     PRIMUS_TURBO_MLA_BWD_IMPL: str = ""
     PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES: str = ""
+    PRIMUS_TURBO_MLA_MX_RESCHED: bool = True
 
 
 def backend_spec(name: str) -> Callable[[], str | None]:
@@ -247,6 +248,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES": lambda: os.getenv(
         "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES", ""
     ),
+    # The MXFP8 MLA kernels (primus_turbo/hipkittens/gfx1250_mla_mx): "0" builds the forward kernel without the
+    # post-register-allocation re-scheduling of its tile loop (asm_resched); anything else, or unset: re-scheduled.
+    "PRIMUS_TURBO_MLA_MX_RESCHED": lambda: os.getenv("PRIMUS_TURBO_MLA_MX_RESCHED", "1").strip() != "0",
     # ================== Read by the C++ extension ==================
     # These getters mirror the C++ parsing so Python can report the effective value; C++ reads
     # the variable itself and caches it once per process.
