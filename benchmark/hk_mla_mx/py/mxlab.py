@@ -27,6 +27,7 @@ from primus_turbo.hipkittens.gfx1250_mla import hiprt  # noqa: E402
 D_QK, D_NOPE, D_ROPE, D_V = 192, 128, 64, 128
 SCALE = 0.1352337788608801
 LOG2E = 1.4426950408889634
+LN2 = 0.6931471805599453
 E4M3_MAX = 448.0
 FLAGS = [
     "-x",
@@ -530,6 +531,8 @@ def fwd_mx(qz, scale=SCALE, out=None, tag=""):
         ],
         tag,
     )
+    if tag[:1] == "7":  # rung m7 writes log2 units (11-06): natural as the other rungs
+        lse = lse * LN2
     return out, lse
 
 

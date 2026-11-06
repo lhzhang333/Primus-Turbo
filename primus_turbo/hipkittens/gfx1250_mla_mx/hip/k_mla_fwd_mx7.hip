@@ -745,7 +745,7 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
             constexpr int i = ii;
             const int qr_i = q0 + 64 * i + 16 * wv + lr;
             const float l = st[i].os[0];
-            LSE[(bh * S) + qr_i] = (st[i].mref + __builtin_log2f(l)) * LN2;
+            LSE[(bh * S) + qr_i] = st[i].mref + __builtin_log2f(l);  // log2 units (the backward's; x LN2: natural)
         });
         static_for<QT>([&](auto ii) {
             constexpr int i = ii;

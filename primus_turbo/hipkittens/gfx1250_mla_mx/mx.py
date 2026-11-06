@@ -22,8 +22,9 @@ TDM ops spread over the waves
 and the outputs written through LDS by TDM stores (benchmark/hk_mla_mx/LOG.md, 2026-11-05 (b)),
 quantization ``k_mxq.hip`` (kbar; rows + cols of a tensor in one read: ``k_mxq_rct``, the tile in and the four
 outputs out by TDM). With ``for_mx_bwd`` the forward quantizes
-q / k / v once for both passes: rows for itself, cols for the backward. ``saved`` = (lse of the centred logits, q8, qs,
-k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr), and the backward quantizes only dout (rows + cols + delta). Without it
+q / k / v once for both passes: rows for itself, cols for the backward. ``saved`` = (lse2: the log2 of the centred
+logits' sums (the kernels' units), q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr), and the backward quantizes only
+dout (rows + cols + delta). Without it
 the forward makes only its own operands and returns ``saved = ()``. ``prepare_bwd`` makes ``saved`` from a bf16
 forward's q / k / v / lse.
 
@@ -55,6 +56,7 @@ D_QK, D_V = 192, 128
 D_NOPE = 128  # q / k columns before the rope part
 KBAR_STRIDE = 16
 LOG2E = 1.4426950408889634
+LN2 = 0.6931471805599453
 HIP = Path(__file__).resolve().parent / "hip"
 SOURCES = ("k_mxq.hip", "k_mla_fwd_mx7.hip", "k_mla_bwd_mx5.hip")
 # expert scheduling mode (the compiler places the dependency waits, as every bf16 HK kernel), register classes
@@ -453,37 +455,35 @@ def attn_fwd(q, k, v, softmax_scale, for_mx_bwd=True):
         q, k, v, softmax_scale, for_mx_bwd
     )
     out = torch.empty(s, b, h, D_V, device=q.device, dtype=torch.bfloat16).transpose(0, 1)
-    lse_c = torch.empty(b, h, s, device=q.device, dtype=torch.float32)
+    lse2 = torch.empty(b, h, s, device=q.device, dtype=torch.float32)  # log2 units of the centred logits (the kernel's)
     nqb = s // 256
     paired = nqb % 2 == 0 and (b * h) % 8 == 0  # the kernel's pair_mode(): q blocks nqb - 1 - p and p per workgroup
     _launch(
         "k_mla_fwd_mx",
         (nqb // 2 if paired else nqb, h, b),
-        [q8, qs, k8, ks, v8t, vs, out, lse_c, float(softmax_scale), s, h, b, out.stride(0), out.stride(1)],
+        [q8, qs, k8, ks, v8t, vs, out, lse2, float(softmax_scale), s, h, b, out.stride(0), out.stride(1)],
     )
-    lse = torch.add(
-        lse_c, qk, alpha=float(softmax_scale)
-    )  # the true logits: q . k = q . (k - kbar) + q . kbar
+    # natural log of the true logits: q . k = q . (k - kbar) + q . kbar
+    lse = torch.add(lse2 * LN2, qk, alpha=float(softmax_scale))
     if not for_mx_bwd:
         return (out, lse)
-    return (out, lse, lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr)
+    return (out, lse, lse2, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr)
 
 
 def prepare_bwd(q, k, v, lse, softmax_scale):
     """A bf16 forward's q / k / v / lse -> the backward's saved operands (as attn_fwd's)."""
     q8, qs, qk, k8, ks, _, _, kbar, q8t, qts, k8t, kts, v8, vsr = _quant_qkv(q, k, v, softmax_scale, True)
-    lse_c = torch.add(lse.float(), qk.view(lse.shape), alpha=-float(softmax_scale))
-    return (lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr)
+    lse2 = torch.add(lse.float(), qk.view(lse.shape), alpha=-float(softmax_scale)) * LOG2E
+    return (lse2, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr)
 
 
-def attn_bwd(dout, out, lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr, softmax_scale):
+def attn_bwd(dout, out, lse2, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr, softmax_scale):
     """dq, dk [b, s, h, 192], dv [b, s, h, 128] bf16 from dout [b, s, h, 128], the forward's out and saved operands."""
     b, h, s, _ = q8.shape
     dev = q8.device
     if dout.stride(-1) != 1 or dout.data_ptr() % 16:
         dout = dout.contiguous()
     do8, dos, delta, do8t, dots = quant_rc(dout, D_V, mode=MODE_DO, y=out)
-    lse2 = lse_c * LOG2E
     dq = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     dk = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     dv = torch.empty(s, b, h, D_V, device=dev, dtype=torch.bfloat16).transpose(0, 1)
@@ -549,7 +549,7 @@ def quant_rope(x, pe, pe_head_stride, cos, sin, mode=0, kbar=None, pre=1.0):
     return x8, xs, aux, x8t, xts
 
 
-def attn_fwd_rope(q, kv, kpe, cos, sin, softmax_scale):
+def attn_fwd_rope(q, kv, kpe, cos, sin, softmax_scale, need_lse=True):
     """q [b, s, h, 192] (d 128..191 before RoPE), kv [b, s, h, 256] ([k nope | v]), kpe [b, s, 1, 64] (before RoPE,
     shared by the heads), cos / sin [>= s, 64] bf16 -> (out [b, s, h, 128] bf16 (BSHD view of SBHD storage), lse [b, h,
     s], *saved for attn_bwd_rope)."""
@@ -560,16 +560,16 @@ def attn_fwd_rope(q, kv, kpe, cos, sin, softmax_scale):
     k8, ks, _, k8t, kts = quant_rope(kv, kpe, 0, cos, sin, mode=MODE_K, kbar=kbar)
     v8, vsr, _, v8t, vs = quant_rc(kv[..., D_NOPE:], D_V)
     out = torch.empty(s, b, h, D_V, device=q.device, dtype=torch.bfloat16).transpose(0, 1)
-    lse_c = torch.empty(b, h, s, device=q.device, dtype=torch.float32)
+    lse2 = torch.empty(b, h, s, device=q.device, dtype=torch.float32)  # log2 units of the centred logits
     nqb = s // 256
     paired = nqb % 2 == 0 and (b * h) % 8 == 0
     _launch("k_mla_fwd_mx", (nqb // 2 if paired else nqb, h, b),
-            [q8, qs, k8, ks, v8t, vs, out, lse_c, float(softmax_scale), s, h, b, out.stride(0), out.stride(1)])
-    lse = torch.add(lse_c, qk, alpha=float(softmax_scale))
-    return (out, lse, lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr)
+            [q8, qs, k8, ks, v8t, vs, out, lse2, float(softmax_scale), s, h, b, out.stride(0), out.stride(1)])
+    lse = torch.add(lse2 * LN2, qk, alpha=float(softmax_scale)) if need_lse else None
+    return (out, lse, lse2, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr)
 
 
-def attn_bwd_rope(dout, out, lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr, cos, sin, softmax_scale):
+def attn_bwd_rope(dout, out, lse2, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr, cos, sin, softmax_scale):
     """-> (dq [b, s, h, 192] (the gradient of q before RoPE), dkv [b, s, h, 256], dkpe [b, s, 64]), BSHD views of SBHD
     storage."""
     b, h, s, _ = q8.shape
@@ -577,7 +577,6 @@ def attn_bwd_rope(dout, out, lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8
     if dout.stride(-1) != 1 or dout.data_ptr() % 16:
         dout = dout.contiguous()
     do8, dos, delta, do8t, dots = quant_rc(dout, D_V, mode=MODE_DO, y=out)
-    lse2 = lse_c * LOG2E
     dq = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     dkv = torch.empty(s, b, h, 256, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     dkph = torch.empty(s, b, h, 64, device=dev, dtype=torch.bfloat16).transpose(0, 1)
@@ -601,7 +600,8 @@ class _MLARopeAttention(torch.autograd.Function):
     def forward(ctx, q, kv, kpe, cos, sin, softmax_scale):
         qb, kvb, kpeb = q.transpose(0, 1), kv.transpose(0, 1), kpe.transpose(0, 1)
         cos2, sin2 = cos.reshape(-1, 64), sin.reshape(-1, 64)
-        res = attn_fwd_rope(qb, kvb, kpeb.reshape(kpeb.shape[0], kpeb.shape[1], 1, 64), cos2, sin2, softmax_scale)
+        res = attn_fwd_rope(qb, kvb, kpeb.reshape(kpeb.shape[0], kpeb.shape[1], 1, 64), cos2, sin2, softmax_scale,
+                            need_lse=False)
         out = res[0]
         ctx.save_for_backward(out, cos2, sin2, *res[2:])
         ctx.softmax_scale = softmax_scale

@@ -654,3 +654,11 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   K^T stage is recycled at the start of t + 1 with the 3-stage ring): not possible without an LDS / register re-plan.
   The |dS| max as a max3 tree (DQ_AMTREE, lab): same v_max count (LLVM already formed max3), 1 spill, 0.8957 vs
   0.8610 ms: dropped.
+- **lse in log2 units**: the forward kernel writes lse2 = m + log2(l) (it multiplied by LN2, and the backward's first
+  op multiplied by LOG2E again); `saved[0]` is lse2, attn_bwd / attn_bwd_rope use it directly, attn_fwd forms the
+  API lse (natural, + q . kbar) as before (bit-identical), the fused-RoPE autograd path skips it (`need_lse`). Two
+  elementwise kernels fewer per fused-RoPE step (3 us each + a ~3.4 us gap); the fused and unfused paths still match
+  bitwise (rope test), pytest 30 pass, extra-shape sweep pass. The lab's fwd_mx returns natural units as before.
+- From ~10:20 UTC the GPU runs every kernel 5-7% slower than at 10:15 (same clocks 1.30 GHz, no throttle flags, no
+  other process; forward 0.551 -> 0.590, dkdv 1.328 -> 1.384-1.395, dq 0.86 -> 0.97 ms per call): compare within one
+  run only.

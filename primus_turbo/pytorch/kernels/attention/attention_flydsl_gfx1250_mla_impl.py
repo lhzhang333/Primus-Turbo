@@ -234,8 +234,8 @@ def _forward_hk_op_fake(q, k, v, softmax_scale, causal):
     return _forward_op_fake(q, k, v, softmax_scale, causal)
 
 
-# the MX backward's operands (gfx1250_mla_mx.mx): lse of the centred logits, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts,
-# v8, vsr
+# the MX backward's operands (gfx1250_mla_mx.mx): lse2 (log2 units) of the centred logits, q8, qs, k8, ks, kbar, q8t,
+# qts, k8t, kts, v8, vsr
 _N_MX_SAVED = 12
 _MX_SAVED = Tuple[(torch.Tensor,) * _N_MX_SAVED]
 
