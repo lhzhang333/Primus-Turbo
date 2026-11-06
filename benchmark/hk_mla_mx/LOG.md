@@ -679,3 +679,6 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   / 0.6323 / 0.6305 vs 0.6119-0.6140 ms over three versions (two loops instantiated the block twice: 2x code; then
   the per-item state live through the tile loop cost SGPRs: 58 -> 121-214 SGPR spills, the tile loop 2076 -> 2252
   cycles / trip, more than the ~4k cycles of start-up wait it hides per pair).
+- The q quantization's row dots q . kbar (mode 2, the aux) only form the API lse: the fused-RoPE autograd path
+  (need_lse False) quantizes q with mode 48: same codes / scales, 116.2 -> 104.7 us per call (-10%). pytest 30 pass,
+  fused-RoPE test pass.

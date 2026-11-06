@@ -556,7 +556,9 @@ def attn_fwd_rope(q, kv, kpe, cos, sin, softmax_scale, need_lse=True):
     b, s, h, _ = q.shape
     pre = float(softmax_scale) * LOG2E
     kbar = kbar_rope(kv, kpe, cos, sin)
-    q8, qs, qk, q8t, qts = quant_rope(q, q[..., D_NOPE:], q.stride(2), cos, sin, mode=MODE_Q, kbar=kbar, pre=pre)
+    # q . kbar (the aux of mode 2) only forms the API lse: without need_lse the q quantization skips the row dots
+    mode_q = MODE_Q if need_lse else MODE_Q & ~2
+    q8, qs, qk, q8t, qts = quant_rope(q, q[..., D_NOPE:], q.stride(2), cos, sin, mode=mode_q, kbar=kbar, pre=pre)
     k8, ks, _, k8t, kts = quant_rope(kv, kpe, 0, cos, sin, mode=MODE_K, kbar=kbar)
     v8, vsr, _, v8t, vs = quant_rc(kv[..., D_NOPE:], D_V)
     out = torch.empty(s, b, h, D_V, device=q.device, dtype=torch.bfloat16).transpose(0, 1)
