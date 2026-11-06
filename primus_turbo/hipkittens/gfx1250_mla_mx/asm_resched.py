@@ -126,6 +126,15 @@ def _derived(T, x):
     return False
 
 
+class _RItem:
+    """asmkit's Item with a __dict__ (req: the s_set_vgpr_msb fields it needs)."""
+
+    __slots__ = ("text", "x", "kind", "vdefs", "vuses", "sdefs", "suses", "pos", "req")
+
+    def __repr__(self):
+        return f"I{self.pos}:{self.x.mn}"
+
+
 def _items(T, ins, a, b):
     items = []
     for j in range(a + 1, b + 1):
@@ -134,7 +143,10 @@ def _items(T, ins, a, b):
             continue
         if "::" in x.mn or x.mn == "s_nop":
             raise RuntimeError(f"unsupported in the loop: {x.text.strip()}")
-        n = T.EM.make_item(x.text)
+        n0 = T.EM.make_item(x.text)
+        n = _RItem()
+        for k in T.EM.Item.__slots__:
+            setattr(n, k, getattr(n0, k))
         err = T.isa.coverage_errors(n.x)
         if err:
             raise RuntimeError(f"coverage {err}: {x.text.strip()}")
@@ -222,13 +234,23 @@ def _dag(T, items):
     return succ
 
 
+FIELDS = ("src0", "src1", "src2", "dst")
+
+
 class _Machine:
+    """Per-wave issue model (see the module doc); an instruction that needs another s_set_vgpr_msb mode issues >= 4
+    cycles after an LDS instruction and >= 3 after a WMMA (the switch waits until they read their operands)."""
+
     def __init__(self, lds_gap, lds_burst):
         self.xdl = -100
         self.trans_free = 0
         self.lds_gap, self.lds_burst = lds_gap, lds_burst
         self.tok, self.tok_t = float(lds_burst), -100
         self.last_kind, self.last_t = None, -100
+        self.mode = {f: 0 for f in FIELDS}
+
+    def switch(self, n):
+        return any(self.mode[f] != v for f, v in n.req.items())
 
     def tokens(self, t):
         return min(self.lds_burst, self.tok + (t - self.tok_t) / self.lds_gap)
@@ -249,6 +271,11 @@ class _Machine:
                     t = self.last_t + DS_GAP
                 if self.tokens(t) < 1:
                     t = max(t, int(self.tok_t + (1 - self.tok) * self.lds_gap + 0.999))
+            if n.req and self.switch(n):
+                if self.last_kind in ("DS_LD", "DS_ST") and t < self.last_t + 4:
+                    t = self.last_t + 4
+                elif self.last_kind == "WMMA" and t < self.last_t + 3:
+                    t = self.last_t + 3
             if t == t0:
                 return t
 
@@ -259,6 +286,10 @@ class _Machine:
             self.trans_free = t + 2
         if n.kind in ("DS_LD", "DS_ST"):
             self.tok, self.tok_t = self.tokens(t) - 1, t
+        if n.req and self.switch(n):
+            self.mode.update(n.req)
+        if n.kind == "BR":
+            self.mode = {f: 0 for f in FIELDS}
         self.last_kind, self.last_t = n.kind, t
 
 
@@ -423,9 +454,16 @@ def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, r
     ins = T.isa.parse(lines)
     fmap = _fmap(T, ins)
     edits, info = [], {}
+    req_of = _msb_required(T)
+
+    def with_req(items):
+        for it in items:
+            it.req = {} if it.kind == "BR" else req_of(it.x, fmap)
+        return items
+
     for kn in kernels:
         la, lb = _main_loop(T, ins, kn)
-        items = _items(T, ins, la, lb)
+        items = with_req(_items(T, ins, la, lb))
         if items[-1].kind != "BR":
             raise RuntimeError("the loop body does not end with its branch")
         order = _schedule(items, _dag(T, items), lds_gap, lds_burst)
@@ -440,7 +478,7 @@ def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, r
             rg = _largest_block(T, ins, kn, (la, lb))
             if rg is not None and rg[2] >= 500:
                 ra, rb, _ = rg
-                items = _items(T, ins, ra, rb)
+                items = with_req(_items(T, ins, ra, rb))
                 tail = items.pop() if items and items[-1].kind == "BR" else None
                 order = _schedule(items, _dag(T, items), lds_gap, lds_burst)
                 new_items = sgpr_waits([items[i] for i in order])
