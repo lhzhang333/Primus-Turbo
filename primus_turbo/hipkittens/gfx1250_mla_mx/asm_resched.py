@@ -50,6 +50,7 @@ def available():
     return (_ASMKIT / "emit.py").is_file()
 
 
+SDST_RE = re.compile(r"v_(add|sub|subrev)_co(_ci)?_u32_e64$|v_div_scale_f(32|64)$|v_mad_(u|i)64_(u|i)32")
 DERIVED_CNT = {"dscnt", "loadcnt", "storecnt", "xcnt"}
 DRAIN = ["\ts_wait_loadcnt 0x0", "\ts_wait_storecnt 0x0", "\ts_wait_dscnt 0x0", "\ts_wait_xcnt 0x0",
          "\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"] + ["\tv_nop"] * 5  # fmt: skip
@@ -88,6 +89,30 @@ def _main_loop(T, ins, kernel):
     return best[0], best[1]
 
 
+def _largest_block(T, ins, kernel, skip):
+    """(first line, last line) of the kernel's largest straight-line block with WMMAs outside the lines skip: a label,
+    then no label or branch but its last instruction (the peeled tiles + epilogue of the forward)."""
+    k0 = next(i for i, x in enumerate(ins) if x.label == kernel)
+    k1 = next(i for i in range(k0, len(ins)) if ins[i].text.strip().startswith(".Lfunc_end"))
+    best = None
+    i = k0
+    while i < k1:
+        if ins[i].cls != "LABEL":
+            i += 1
+            continue
+        a, b = i, i + 1
+        while b < k1 and ins[b].cls != "LABEL" and not ins[b].mn.startswith(("s_cbranch", "s_branch", "s_endpgm")):
+            b += 1
+        if b < k1 and ins[b].cls == "LABEL":
+            b -= 1
+        n = sum(1 for j in range(a, b + 1) if ins[j].mn)
+        nw = sum(1 for j in range(a, b + 1) if ins[j].cls == "XDL")
+        if nw and not (skip[0] <= a <= skip[1]) and (best is None or n > best[2]):
+            best = (a, b, n)
+        i = b + 1
+    return best
+
+
 def _derived(T, x):
     if x.cls in ("MSB", "VNOP", "CLAUSE", "DELAY"):
         return True
@@ -115,8 +140,6 @@ def _items(T, ins, a, b):
             raise RuntimeError(f"coverage {err}: {x.text.strip()}")
         n.pos = len(items)
         items.append(n)
-    if items[-1].kind != "BR":
-        raise RuntimeError("the body does not end with its branch")
     return items
 
 
@@ -272,6 +295,37 @@ def _schedule(items, succ, lds_gap, lds_burst):
     return order
 
 
+def sgpr_waits(items, carried_valu=()):
+    """Prefix s_wait_alu depctr_va_sdst(0) / depctr_va_vcc(0) to every SALU / branch / memory item that reads an SGPR (vcc)
+    whose last def in the order is a VALU (asmkit does not derive these waits). carried_valu: SGPRs whose last def is a
+    VALU on entry (a loop's previous iteration)."""
+    last_valu = {r: True for r in carried_valu}
+    for it in items:
+        if it.kind in ("SALU", "BR", "DS_LD", "DS_ST", "VM_LD", "VM_ST", "TDM", "OTHER"):
+            need = sorted(r for r in it.suses if r != "exec" and last_valu.get(r))
+            if need:
+                f = "va_vcc" if all(r in ("vcc", "vcc_hi") for r in need) else "va_sdst"
+                it.text = f"\ts_wait_alu depctr_{f}(0)\n" + it.text
+                for r in list(last_valu):
+                    last_valu[r] = False  # the wait completes every VALU
+        for r in it.sdefs:
+            last_valu[r] = it.x.cls in ("CSMACC", "DPMACC", "TRANS", "XDL")
+    return items
+
+
+def loop_carried_valu_sgprs(items):
+    """SGPRs read before their first def in the body whose last def in the body is a VALU."""
+    first_def, last_def, early = {}, {}, set()
+    for k, it in enumerate(items):
+        for r in it.suses:
+            if r not in first_def:
+                early.add(r)
+        for r in it.sdefs:
+            first_def.setdefault(r, k)
+            last_def[r] = k
+    return [r for r in early if r in last_def and items[last_def[r]].x.cls in ("CSMACC", "DPMACC", "TRANS", "XDL")]
+
+
 def _fmap(T, ins):
     fmap = T.EM.learn_msb_map(ins)
     for x in ins:
@@ -279,6 +333,10 @@ def _fmap(T, ins):
             for p in (4, 5):
                 if not fmap.get((x.mn, p)):
                     fmap[(x.mn, p)] = {"-"}  # WMMA scale operands: not remapped (v0..v255)
+        if x.cls in ("FLAT", "VMEM"):  # by operand position: loads vdst dst, vaddr src0; stores vaddr src0, vdata src1
+            for q in range(min(2, len(x.ops))):
+                if T.isa.regs_of(T.isa.first_tok(x.ops[q])):
+                    fmap[(x.mn, q)] = ({"dst"} if q == 0 else {"src0"}) if "_load" in x.mn else ({"src0"} if q == 0 else {"src1"})
         if x.cls == "DS":
             if x.mn.startswith(("ds_load", "ds_read")):
                 fmap[(x.mn, 0)], fmap[(x.mn, 1)] = {"dst"}, {"src0"}
@@ -305,6 +363,8 @@ def _msb_required(T):
                 raise RuntimeError(f"no MSB field for {x.mn} operand {p}: {x.text.strip()}")
             if len(fs) > 1 and x.cls in ("XDL", "CSMACC", "DPMACC", "TRANS"):
                 dflt = ("dst", "src0", "src1", "src2")[p] if p < 4 else None
+                if SDST_RE.match(x.mn):  # VOP3 with an SGPR dst after the VGPR dst: vdst, sdst, src0, src1, src2
+                    dflt = ("dst", None, "src0", "src1", "src2")[p] if p < 5 else None
                 if dflt in fs:
                     fs = {dflt}
             if len(fs) > 1:
@@ -347,7 +407,7 @@ def _verify(T, new, objdump, tmp):
     return bad
 
 
-def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0):
+def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, regions=True):
     """Compile src (flags + no VOPD + save-temps) into out with the main loop of each kernel re-scheduled; raises on any
     failure (the caller falls back to the plain build). Returns {kernel: (items, LLVM lines, emitted lines)}."""
     T = _Tools()
@@ -366,13 +426,28 @@ def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0):
     for kn in kernels:
         la, lb = _main_loop(T, ins, kn)
         items = _items(T, ins, la, lb)
+        if items[-1].kind != "BR":
+            raise RuntimeError("the loop body does not end with its branch")
         order = _schedule(items, _dag(T, items), lds_gap, lds_burst)
         label = ins[la].label
         new_items = [items[i] for i in order]
+        sgpr_waits(new_items, loop_carried_valu_sgprs(new_items))
         new_items[-1].text = new_items[-1].text.replace(label, label + "_rs")
         body = _emit_loop(T, new_items, fmap)
-        info[kn] = (len(items), lb - la, len(body))
+        info[kn] = [(len(items), len(body))]
         edits.append((la, lb, [lines[la]] + DRAIN + [label + "_rs:"] + body + DRAIN))
+        if regions:  # the largest straight-line block with WMMAs (the forward: peeled diagonal tiles + epilogue)
+            rg = _largest_block(T, ins, kn, (la, lb))
+            if rg is not None and rg[2] >= 500:
+                ra, rb, _ = rg
+                items = _items(T, ins, ra, rb)
+                tail = items.pop() if items and items[-1].kind == "BR" else None
+                order = _schedule(items, _dag(T, items), lds_gap, lds_burst)
+                new_items = sgpr_waits([items[i] for i in order])
+                entry = T.EM.Flow([T.E.State(unknown=False)], [T.EM.XState(False)], [[T.EM._NOP] * 5])
+                body, _ = T.EM.emit_block(new_items, entry, fmap, VA_RULE)
+                info[kn].append((len(items), len(body)))
+                edits.append((ra, rb, [lines[ra]] + DRAIN + body + DRAIN + ([tail.text] if tail else [])))
     new = list(lines)
     for la, lb, nl in sorted(edits, reverse=True):
         new[la : lb + 1] = nl

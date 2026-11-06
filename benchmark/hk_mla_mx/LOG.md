@@ -472,3 +472,16 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
 - asmkit va_vdst rule of the emitted loop: LLVM's 0.6099, `llvm_war_xdl` (the bf16 HK backward generator's) 0.6063,
   the per-class bound `class` 0.6022 ms (all toy..prod pass). Package: `llvm_war_xdl` (validated on hardware by the
   bf16 generator; `class` is only asmkit's model). pytest 30 pass, fused-RoPE test bit-exact.
+- dq with a one-block tile loop (DQ_WAIT0: the per-tile wait + barrier also before tile 0, lab, off) re-scheduled:
+  identity 0.903, ready 0.943, orig 0.968, height 0.904 vs LLVM 0.896 ms: LDS-heavy like dK / dV, LLVM's order stays.
+- Forward model knobs (WMMA co-issue offsets, DS gap, TRANS occupancy): the package settings are on the plateau
+  (0.6056-0.6059 ms); all offsets 0.614, TRANS 1 / 3 cycles 0.621 / 0.622.
+- ATT: the forward tile loop 2052 -> 1768 cycles / tile (exp / VALU now alternate); outside the loop: per workgroup
+  ~5-8k prologue (TDM queue + first data) and per block ~11-13k for the peeled diagonal tiles + epilogue: one
+  straight-line block of ~2940 instructions (184 WMMA, 520 exp, ~1050 mask compares / selects).
+- That block re-scheduled too (resched `--region`; package: the kernel's largest straight-line block with WMMAs
+  besides the loop): 0.6059 -> 0.6007 ms (LLVM 0.659: -8.9% in all). Fixes on the way (caught by verify_obj): memory
+  operand msb fields by position (scratch_store's data is operand 1 when the address is `off`), VOP3 with an SGPR dst
+  (v_div_scale, carries) shift their source fields; asmkit derives no va_sdst / va_vcc waits, so a SALU / memory
+  reader of an SGPR last written by a VALU gets an explicit `s_wait_alu depctr_va_sdst(0)` (one in the region).
+  Package: pytest 30 pass, fused-RoPE test bit-exact; forward per call A / B 0.9675 vs 0.9915 ms (medians of 3).

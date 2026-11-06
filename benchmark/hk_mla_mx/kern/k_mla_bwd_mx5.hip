@@ -65,6 +65,9 @@ using namespace mx;
 #ifndef TDM_INC
 #define TDM_INC 1  // dkdv: each wave's 3 TDM ops keep their next step, global address and LDS stage (advanced per round)
 #endif
+#ifndef DQ_WAIT0
+#define DQ_WAIT0 0  // dq: the per-tile TDM wait + barrier also before tile 0 (the tile loop becomes one basic block)
+#endif
 #ifndef DQ_DSTAT
 #define DQ_DSTAT 0  // dq: static mask classes on the two diagonal kv tiles (fully masked q tiles skipped, kept ones unmasked)
 #endif
@@ -969,7 +972,7 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
         // i < 2 fully masked: skipped with DQ_DSTAT, i >= 2 masked). Without DQ_DSTAT every q tile of DC 1 / 2 is masked
         constexpr int DC = (int)decltype(diag_c)::value;
         constexpr bool DIAG = DC != 0;
-        if (t > 0) {
+        if (DQ_WAIT0 || t > 0) {  // DQ_WAIT0: also at t = 0 (tile 0 landed already: one extra barrier; one-block loop)
             tensor_wait<TDM_PER_TILE>();  // tile t landed (t + 1 in flight)
             bar_signal();
             bar_wait();        // tile t visible; every wave is done with tile t - 1

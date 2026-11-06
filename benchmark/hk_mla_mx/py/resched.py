@@ -38,6 +38,7 @@ from asmkit import verify_obj as VO  # noqa: E402
 FLAGS = ["-x", "hip", "--offload-arch=gfx1250", "--cuda-device-only", "--no-gpu-bundle-output", "-O3", "-std=c++20",
          "-mllvm", "-amdgpu-expert-scheduling-mode", "-mllvm", "-greedy-regclass-priority-trumps-globalness",
          "-mllvm", "-misched=gcn-max-ilp", "-mllvm", "-amdgpu-enable-vopd=0"]
+SDST_RE = re.compile(r"v_(add|sub|subrev)_co(_ci)?_u32_e64$|v_div_scale_f(32|64)$|v_mad_(u|i)64_(u|i)32")
 DERIVED_CNT = {"dscnt", "loadcnt", "storecnt", "xcnt"}
 DRAIN = ["\ts_wait_loadcnt 0x0", "\ts_wait_storecnt 0x0", "\ts_wait_dscnt 0x0", "\ts_wait_xcnt 0x0",
          "\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"] + ["\tv_nop"] * 5
@@ -84,6 +85,19 @@ def main_loop(ins, kernel):
     return best[0], best[1]
 
 
+def region_block(ins, kernel, label):
+    """(label line, last line) of the basic block starting at label inside kernel (no other label / branch inside but
+    its last instruction)."""
+    k0 = next(i for i, x in enumerate(ins) if x.label == kernel)
+    a = next(i for i in range(k0, len(ins)) if ins[i].label == label)
+    b = a + 1
+    while b < len(ins) and ins[b].cls != "LABEL" and not ins[b].mn.startswith(("s_cbranch", "s_branch", "s_endpgm")):
+        b += 1
+    if ins[b].cls == "LABEL":
+        b -= 1
+    return a, b
+
+
 def is_derived(x):
     if x.cls in ("MSB", "VNOP", "CLAUSE", "DELAY"):
         return True
@@ -121,8 +135,6 @@ def body_items(ins, a, b):
             raise RuntimeError(f"coverage {err}: {x.text.strip()}")
         n.pos = len(items)
         items.append(n)
-    if items[-1].kind != "BR":
-        raise RuntimeError("the body does not end with its branch")
     return items
 
 
@@ -369,6 +381,7 @@ def rec_mii(items, succ, carried):
 # ------------------------------------------------------------------------------------------------- list scheduler
 WIN_OK = (2, 3, 6, 7)  # issue offsets of non-WMMA instructions inside a WMMA's 8-cycle window
 PRIO = "height"
+TRANS_OCC = 2
 DS_GAP = 2  # DS instructions back to back: ~2.1-2.4 cycles apart (ATT)
 
 
@@ -428,7 +441,7 @@ class Machine:
         if k == "WMMA":
             self.xdl_start = t
         if k == "TRANS":
-            self.trans_free = t + 2
+            self.trans_free = t + TRANS_OCC
         if k in ("DS_LD", "DS_ST"):
             self.lds_tokens, self.lds_t = self.tokens(t) - 1, t
         if n.req and self.switch(n):
@@ -574,6 +587,37 @@ def model_cycles(items, succ, order, lds_gap=6.0, lds_burst=4.0, msb_cost=True):
     return t, m.nmsb
 
 
+def sgpr_waits(items, carried_valu=()):
+    """Prefix s_wait_alu depctr_va_sdst(0) / depctr_va_vcc(0) to every SALU / branch / memory item that reads an SGPR (vcc)
+    whose last def in the order is a VALU (asmkit does not derive these waits). carried_valu: SGPRs whose last def is a
+    VALU on entry (a loop's previous iteration)."""
+    last_valu = {r: True for r in carried_valu}
+    for it in items:
+        if it.kind in ("SALU", "BR", "DS_LD", "DS_ST", "VM_LD", "VM_ST", "TDM", "OTHER"):
+            need = sorted(r for r in it.suses if r != "exec" and last_valu.get(r))
+            if need:
+                f = "va_vcc" if all(r in ("vcc", "vcc_hi") for r in need) else "va_sdst"
+                it.text = f"\ts_wait_alu depctr_{f}(0)\n" + it.text
+                for r in list(last_valu):
+                    last_valu[r] = False  # the wait completes every VALU
+        for r in it.sdefs:
+            last_valu[r] = it.x.cls in ("CSMACC", "DPMACC", "TRANS", "XDL")
+    return items
+
+
+def loop_carried_valu_sgprs(items):
+    """SGPRs read before their first def in the body whose last def in the body is a VALU."""
+    first_def, last_def, early = {}, {}, set()
+    for k, it in enumerate(items):
+        for r in it.suses:
+            if r not in first_def:
+                early.add(r)
+        for r in it.sdefs:
+            first_def.setdefault(r, k)
+            last_def[r] = k
+    return [r for r in early if r in last_def and items[last_def[r]].x.cls in ("CSMACC", "DPMACC", "TRANS", "XDL")]
+
+
 # ------------------------------------------------------------------------------------------------- emission
 def emit_loop(items, fmap, rule, log):
     entry0 = EM.Flow([E.State(unknown=False)], [EM.XState(False)], [[EM._NOP] * 5])
@@ -601,6 +645,8 @@ def msb_required(x, fmap):
             raise RuntimeError(f"no MSB field for {x.mn} operand {p}: {x.text.strip()}")
         if len(fs) > 1 and x.cls in ("XDL", "CSMACC", "DPMACC", "TRANS"):
             dflt = ("dst", "src0", "src1", "src2")[p] if p < 4 else None
+            if SDST_RE.match(x.mn):  # VOP3 with an SGPR dst after the VGPR dst: vdst, sdst, src0, src1, src2
+                dflt = ("dst", None, "src0", "src1", "src2")[p] if p < 5 else None
             if dflt in fs:
                 fs = {dflt}
         if len(fs) > 1:
@@ -621,6 +667,10 @@ def ds_fields(fmap, ins):
             for p in (4, 5):
                 if not fmap.get((x.mn, p)):
                     fmap[(x.mn, p)] = {"-"}
+        if x.cls in ("FLAT", "VMEM"):  # by operand position: loads vdst dst, vaddr src0; stores vaddr src0, vdata src1
+            for q in range(min(2, len(x.ops))):
+                if isa.regs_of(isa.first_tok(x.ops[q])):
+                    fmap[(x.mn, q)] = ({"dst"} if q == 0 else {"src0"}) if "_load" in x.mn else ({"src0"} if q == 0 else {"src1"})
         if x.cls == "DS":
             if x.mn.startswith(("ds_load", "ds_read")):
                 fmap[(x.mn, 0)], fmap[(x.mn, 1)] = {"dst"}, {"src0"}
@@ -665,6 +715,11 @@ def main():
     ap.add_argument("--window", type=int, default=None, help="list mode: look ahead at most this many items")
     ap.add_argument("--msb-pref", type=float, default=1.0)
     ap.add_argument("--analyze", action="store_true")
+    ap.add_argument("--region", default="", help="also schedule these straight-line blocks (labels, comma list)")
+    ap.add_argument("--region-only", action="store_true", help="only the regions, not the main loop")
+    ap.add_argument("--win", default="2,3,6,7", help="issue offsets of non-WMMA instructions in a WMMA window")
+    ap.add_argument("--ds-gap", type=int, default=2)
+    ap.add_argument("--trans-occ", type=int, default=2)
     ap.add_argument("--coalesce", action="store_true", help="remove copies (the producer writes the destination)")
     ap.add_argument("--prio", default="height", choices=("height", "orig", "ready"))
     ap.add_argument("--calib", default="", help="ATT ui dir of the identity build: compare the model with it")
@@ -672,8 +727,11 @@ def main():
     ap.add_argument("--lat-ds", type=int, default=96)
     a = ap.parse_args()
     LAT_RAW["DS_LD"] = a.lat_ds
-    global PRIO
+    global PRIO, WIN_OK, DS_GAP, TRANS_OCC
     PRIO = a.prio
+    WIN_OK = tuple(int(x) for x in a.win.split(",") if x)
+    DS_GAP = a.ds_gap
+    TRANS_OCC = a.trans_occ
     out = BUILD / "rs" / a.tag
     out.mkdir(parents=True, exist_ok=True)
     rep = {"args": vars(a), "kernels": {}}
@@ -689,9 +747,20 @@ def main():
     ins = isa.parse(lines)
     fmap = ds_fields(EM.learn_msb_map(ins), ins)
     edits = []  # (a, b, new lines)
-    for kn in a.kernels.split(","):
-        la, lb = main_loop(ins, kn)
+    jobs = [(kn, None) for kn in a.kernels.split(",") if not a.region_only]
+    jobs += [(kn, lab) for kn in a.kernels.split(",") for lab in filter(None, a.region.split(","))]
+    for kn, region in jobs:
+        a.cur_region = region
+        if region:
+            la, lb = region_block(ins, kn, region)
+        else:
+            la, lb = main_loop(ins, kn)
         items = body_items(ins, la, lb)
+        tail_br = None
+        if region and items and items[-1].kind == "BR":
+            tail_br = items.pop()  # emitted after the exit drain
+        elif not region and items[-1].kind != "BR":
+            raise RuntimeError("the body does not end with its branch")
         if a.coalesce:
             items = coalesce(items, log)
         for spec in filter(None, a.drop.split(",")):
@@ -754,9 +823,14 @@ def main():
         log(f"{kn}: loop lines {la}..{lb}, {len(items)} items {dict(kinds)}; model cycles LLVM order {c0} (msb {m0}), new {c1} (msb {m1})")
         label = ins[la].label
         new_items = [items[i] for i in order]
-        br = new_items[-1]
-        br.text = br.text.replace(label, label + "_rs")
-        body = emit_loop(new_items, fmap, a.rule, log)
+        sgpr_waits(new_items, () if region else loop_carried_valu_sgprs(new_items))
+        if region:
+            entry = EM.Flow([E.State(unknown=False)], [EM.XState(False)], [[EM._NOP] * 5])
+            body, _ = EM.emit_block(new_items, entry, fmap, a.rule)
+        else:
+            br = new_items[-1]
+            br.text = br.text.replace(label, label + "_rs")
+            body = emit_loop(new_items, fmap, a.rule, log)
         nmsb = sum(1 for l in body if "s_set_vgpr_msb" in l)
         nwait = sum(1 for l in body if l.strip().startswith("s_wait_alu") or l.strip().startswith(("s_wait_dscnt", "s_wait_loadcnt", "s_wait_xcnt")))
         nnop = sum(1 for l in body if l.strip() == "v_nop")
@@ -766,7 +840,10 @@ def main():
             f"wait_alu {lm['WAIT_ALU']}, v_nop {lm['VNOP']}, lines {len(llvm_body)})")
         rep["kernels"][kn] = {"loop": [la, lb], "items": len(items), "model_llvm": c0, "model_new": c1,
                               "emitted": len(body), "msb": nmsb, "waits": nwait, "nops": nnop}
-        edits.append((la, lb, [lines[la]] + DRAIN + [label + "_rs:"] + body + DRAIN))
+        if region:
+            edits.append((la, lb, [lines[la]] + DRAIN + body + DRAIN + ([tail_br.text] if tail_br else [])))
+        else:
+            edits.append((la, lb, [lines[la]] + DRAIN + [label + "_rs:"] + body + DRAIN))
     new = list(lines)
     for la, lb, nl in sorted(edits, reverse=True):
         new[la : lb + 1] = nl
