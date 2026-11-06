@@ -494,3 +494,10 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
 - dq tail: on a traced SIMD 6% idle at the end of the dispatch (dkdv 0.1%): per XCD the last (b, h) pair's long q
   blocks finish last. m7-style pairing (q blocks i and 15 - i per workgroup: 34 tiles each) would remove it, but the
   dQ staging (96 KB) does not fit next to the next block's ring and Q / dO region (LDS full): parked.
+- **RC_X8G** (`k_mxq.hip`, default): the row codes stored to global straight from the lanes (each lane's two 16-byte
+  halves of an MX block; 8 lanes cover a row's 192 bytes: coalesced), no X8 staging and no X8 TDM store: LDS 101 ->
+  77 KB (D 192), 4 workgroups per CU, with the register targets at 8 waves per SIMD (RCT_WPE192 / RCTR_WPE; rctr192
+  at 128 VGPRs spills 2). Bit-exact. rct: q 0.1216 -> 0.1102, k 0.1166 -> 0.1057, v 0.0711 -> 0.0641, dO 0.0968 ->
+  0.0950; fused RoPE: q 0.1432 -> 0.1404, k 0.1304 -> 0.1157. Package per call: forward 0.97 -> 0.93 ms (quantization
+  0.310 -> 0.283), dout quantization 0.089 -> 0.086; fused-RoPE forward 1.0047 ms (1.0827 this morning). pytest 30
+  pass, fused-RoPE test bit-exact.

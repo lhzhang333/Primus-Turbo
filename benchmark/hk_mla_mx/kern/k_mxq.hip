@@ -30,6 +30,10 @@
 #define RC_BF16 1  // rc_tile: bf16-native MX blocks where no fp32 pre-processing is needed (rows without kbar / pre, cols
                    // without kbar): |x| max on packed bf16 bits, v_cvt_scalef32_pk8_fp8_bf16 (bit-exact with the f32 path)
 #endif
+#ifndef RC_X8G
+#define RC_X8G 1  // rct / rctr: the row codes stored to global straight from the lanes (no X8 staging / TDM store: LDS
+                  // 101 -> 77 KB for D 192, 4 workgroups per CU)
+#endif
 #ifndef RC_FAST
 #define RC_FAST 1  // tree reductions (amax, row dots) and the kbar slice in registers (rc_tile)
 #endif
@@ -521,8 +525,8 @@ __device__ __forceinline__ void rct_body(const bf16 *__restrict__ X, unsigned ch
     constexpr int LPR = D == 192 ? 8 : 4;
     constexpr int RS = D == 192 ? 8 : 4;
     constexpr int RPP = NT / LPR;
-    constexpr int O_X8 = 128 * XR, O_XS = O_X8 + 128 * D, O_X8T = O_XS + 128 * RS, O_XTS = O_X8T + D * 128,
-                  O_KB = O_XTS + D * 4;
+    constexpr int O_X8 = 128 * XR, O_XS = O_X8 + (RC_X8G ? 0 : 128 * D), O_X8T = O_XS + 128 * RS,
+                  O_XTS = O_X8T + D * 128, O_KB = O_XTS + D * 4;
     const int kt = blockIdx.x, h = blockIdx.y, b = blockIdx.z, t = threadIdx.x;
     const int wv = __builtin_amdgcn_readfirstlane(t >> 5);
     const long long bh = (long long)b * H + h;
@@ -539,13 +543,14 @@ __device__ __forceinline__ void rct_body(const bf16 *__restrict__ X, unsigned ch
     if (wv == 0) tensor_wait<0>();
     __syncthreads();
 #if RCT_PROBE != 1  // timing probes: 1 = no compute (TDM traffic only), 2 = no TDM (compute only)
-    rc_tile<D, NT>(smem, smem + O_X8, smem + O_XS, smem + O_X8T, smem + O_XTS, kb_lds, Y, aux, b, h, kt, bh, S, yb, ys,
-                   yh, mode, pre);
+    rc_tile<D, NT>(smem, RC_X8G ? X8 + (bh * S + (long long)kt * 128) * D : smem + O_X8, smem + O_XS, smem + O_X8T,
+                   smem + O_XTS, kb_lds, Y, aux, b, h, kt, bh, S, yb, ys, yh, mode, pre);
 #endif
     __syncthreads();
     if (wv == 0 && RCT_PROBE < 2) {
         const long long row0 = bh * S + (long long)kt * 128;
-        tdm_store(tdm_g0(lds0 + O_X8, (unsigned long long)(uintptr_t)(X8 + row0 * D)), tdm_g1(W0, 128, D, 128, D));
+        if (!RC_X8G)
+            tdm_store(tdm_g0(lds0 + O_X8, (unsigned long long)(uintptr_t)(X8 + row0 * D)), tdm_g1(W0, 128, D, 128, D));
         tdm_store(tdm_g0(lds0 + O_XS, (unsigned long long)(uintptr_t)(XS + row0 * RS)),
                   tdm_g1(W0, 1, 128 * RS, 1, 128 * RS));
         tdm_store(tdm_g0(lds0 + O_X8T, (unsigned long long)(uintptr_t)(X8T + (bh * D) * S + (long long)kt * 128)),
@@ -655,8 +660,8 @@ __device__ __forceinline__ void rctr_body(const bf16 *__restrict__ X, unsigned c
                                           long long ph, const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN,
                                           int mode, float pre, unsigned char *smem) {
     constexpr int D = 192, XR = D * 2, NT = 256, RS = 8;
-    constexpr int O_X8 = 128 * XR, O_XS = O_X8 + 128 * D, O_X8T = O_XS + 128 * RS, O_XTS = O_X8T + D * 128,
-                  O_KB = O_XTS + D * 4,
+    constexpr int O_X8 = 128 * XR, O_XS = O_X8 + (RC_X8G ? 0 : 128 * D), O_X8T = O_XS + 128 * RS,
+                  O_XTS = O_X8T + D * 128, O_KB = O_XTS + D * 4,
                   O_PE = O_X8T;  // pe side buffer (128 x 128 B) in the X8T staging, written only in the cols phase
     const int kt = blockIdx.x, h = blockIdx.y, b = blockIdx.z, t = threadIdx.x;
     const int wv = __builtin_amdgcn_readfirstlane(t >> 5);
@@ -686,13 +691,14 @@ __device__ __forceinline__ void rctr_body(const bf16 *__restrict__ X, unsigned c
         *(u32x4 *)(smem + r * XR + 2 * (160 + 8 * m)) = hi;
     }
     __syncthreads();
-    rc_tile<D, NT>(smem, smem + O_X8, smem + O_XS, smem + O_X8T, smem + O_XTS, kb_lds, nullptr, aux, b, h, kt, bh, S,
-                   0, 0, 0, mode & ~4, pre);
+    rc_tile<D, NT>(smem, RC_X8G ? X8 + (bh * S + (long long)kt * 128) * D : smem + O_X8, smem + O_XS, smem + O_X8T,
+                   smem + O_XTS, kb_lds, nullptr, aux, b, h, kt, bh, S, 0, 0, 0, mode & ~4, pre);
     __syncthreads();
     if (wv == 0) {
         constexpr unsigned W0 = tdm_w0(0, 0, 0);
         const long long row0 = bh * S + (long long)kt * 128;
-        tdm_store(tdm_g0(lds0 + O_X8, (unsigned long long)(uintptr_t)(X8 + row0 * D)), tdm_g1(W0, 128, D, 128, D));
+        if (!RC_X8G)
+            tdm_store(tdm_g0(lds0 + O_X8, (unsigned long long)(uintptr_t)(X8 + row0 * D)), tdm_g1(W0, 128, D, 128, D));
         tdm_store(tdm_g0(lds0 + O_XS, (unsigned long long)(uintptr_t)(XS + row0 * RS)),
                   tdm_g1(W0, 1, 128 * RS, 1, 128 * RS));
         tdm_store(tdm_g0(lds0 + O_X8T, (unsigned long long)(uintptr_t)(X8T + (bh * D) * S + (long long)kt * 128)),
@@ -706,14 +712,17 @@ __device__ __forceinline__ void rctr_body(const bf16 *__restrict__ X, unsigned c
 
 // k_mxq_rctr192: rows + cols of [X nope | rope(PE)] in one pass (q: PE = X + 128; k: X = kv, PE = k_pe, ph = 0); grid
 // (S / 128, H, B), 256 threads
-extern "C" __global__ __launch_bounds__(256) void k_mxq_rctr192(
+#ifndef RCTR_WPE
+#define RCTR_WPE (RC_X8G ? 8 : 6)  // as RCT_WPE192 (LDS 77 KB with RC_X8G: 4 workgroups per CU)
+#endif
+extern "C" __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(RCTR_WPE))) void k_mxq_rctr192(
     const bf16 *__restrict__ X, unsigned char *__restrict__ X8, unsigned char *__restrict__ XS,
     unsigned char *__restrict__ X8T, unsigned char *__restrict__ XTS, const float *__restrict__ kbar,
     float *__restrict__ aux, int S, int H, long long sb, long long ss, long long sh, const bf16 *__restrict__ PE,
     long long pb, long long ps, long long ph, const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN, int mode,
     float pre) {
-    __shared__ __attribute__((aligned(1024))) unsigned char smem[128 * 384 + 128 * 192 + 128 * 8 + 192 * 128 + 192 * 4 +
-                                                                 192 * 4];
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[128 * 384 + (RC_X8G ? 0 : 128 * 192) + 128 * 8 +
+                                                                 192 * 128 + 192 * 4 + 192 * 4];
     rctr_body(X, X8, XS, X8T, XTS, kbar, aux, S, H, sb, ss, sh, PE, pb, ps, ph, COS, SIN, mode, pre, smem);
 }
 
@@ -921,7 +930,7 @@ RC_KERNEL(128)
 
 // rows + cols in one pass through TDM: grid (S / 128, H, B), 256 threads (rct_body); LDS 101 KB (D 192) / 67 KB
 #ifndef RCT_WPE192
-#define RCT_WPE192 6  // waves per EU the register allocation targets (LDS allows 3 workgroups of 8 waves per CU)
+#define RCT_WPE192 (RC_X8G ? 8 : 6)  // waves per EU the register allocation targets (LDS: 4 / 3 workgroups per CU)
 #endif
 #ifndef RCT_WPE128
 #define RCT_WPE128 8  // 4 workgroups per CU
@@ -933,7 +942,7 @@ RC_KERNEL(128)
         unsigned char *__restrict__ X8T, unsigned char *__restrict__ XTS, const float *__restrict__ kbar,            \
         const bf16 *__restrict__ Y, float *__restrict__ aux, int S, int H, long long sb, long long ss, long long sh, \
         long long yb, long long ys, long long yh, int mode, float pre) {                                             \
-        __shared__ __attribute__((aligned(1024))) unsigned char smem[128 * D * 2 + 128 * D + 128 * 8 + D * 128 +    \
+        __shared__ __attribute__((aligned(1024))) unsigned char smem[128 * D * 2 + (RC_X8G ? 0 : 128 * D) + 128 * 8 + D * 128 + \
                                                                      D * 4 + D * 4];                                 \
         rct_body<D>(X, X8, XS, X8T, XTS, kbar, Y, aux, S, H, sb, ss, sh, yb, ys, yh, mode, pre, smem);               \
     }
