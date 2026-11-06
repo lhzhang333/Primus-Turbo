@@ -627,3 +627,7 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   fwd + bwd 3.341 ms per step. pytest 30 pass, fused-RoPE test pass.
 - rctr192 **RC_RPRE** (default): each thread's cos / sin rows for the two rotation items loaded before the tile's TDM
   wait (their latency under the load): q 0.1203 -> 0.1172, k 0.0921 -> 0.0897 ms, bit-exact, no extra VGPRs (105).
+- Forward re-schedule with an msb preference (tie-break to an instruction needing no s_set_vgpr_msb switch; or + 1
+  cycle per switch): the loop's emitted lines 1328 -> 1135 / 1016, but attn_fwd 0.8761 -> 0.8986 / 0.9229 ms (3
+  copies): the W / T / V interleaving matters more than the switches (T <-> V switches fill the TRANS unit's idle
+  slot; ATT: T -> V with a switch 1.70 cycles vs T -> T 1.77). Not taken.
