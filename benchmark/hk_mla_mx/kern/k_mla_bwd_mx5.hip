@@ -77,7 +77,8 @@ using namespace mx;
 #define DQ_ORDER 4  // dq workgroup order: 0 longest q block first per (b, h); 1 snake; n >= 2: n passes, longest parts first
 #endif
 #ifndef DQ_WAIT0
-#define DQ_WAIT0 0  // dq: the per-tile TDM wait + barrier also before tile 0 (the tile loop becomes one basic block)
+#define DQ_WAIT0 1  // k_dq_mx (not k_dq_mxr): the per-tile TDM wait + barrier also before tile 0 (the tile loop becomes one
+                    // basic block; 11-06 with the skewed staging: k_dq_mx 0.8570 vs 0.8653 ms, k_dq_mxr 0.8770 vs 0.8717)
 #endif
 #ifndef DQ_DSTAT
 #define DQ_DSTAT 1  // dq: static mask classes on the two diagonal kv tiles (fully masked q tiles skipped, kept ones unmasked)
@@ -1166,7 +1167,7 @@ __device__ __forceinline__ void dq_body(
         // i < 2 fully masked: skipped with DQ_DSTAT, i >= 2 masked). Without DQ_DSTAT every q tile of DC 1 / 2 is masked
         constexpr int DC = (int)decltype(diag_c)::value;
         constexpr bool DIAG = DC != 0;
-        if (DQ_WAIT0 || t > 0) {  // DQ_WAIT0: also at t = 0 (tile 0 landed already: one extra barrier; one-block loop)
+        if ((DQ_WAIT0 && !ROPE) || t > 0) {  // DQ_WAIT0: also at t = 0 (tile 0 landed already: one extra barrier; one-block loop)
             tensor_wait<TDM_PER_TILE>();  // tile t landed (t + 1 in flight)
             bar_signal();
             bar_wait();        // tile t visible; every wave is done with tile t - 1

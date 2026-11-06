@@ -603,3 +603,7 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   guard's margin), **QKFIRST 0** 0.8801 (four copies: 0.8770 vs 0.8839; LLVM order 0.6057 vs 0.6226 ms): QKFIRST off.
   Package: k_mla_fwd_mx 0.551 ms, fused-RoPE fwd + bwd 3.377 ms per step. pytest 30 pass, fused-RoPE test pass,
   extra-shape sweep pass.
+- Backward option sweep (bit-exact, same run): dkdv base 1.3263 ms, PF_KV 0 1.3265, DQ_WAIT0 1.3283,
+  DQ_PRO_PARTIAL 0 1.3286, MS_PA 0 1.3291, KEEP_WAR 0 1.3344, PRO_TDM_FIRST 1.3401, TDM_INC 0 1.3476: dkdv stays.
+  dq: **DQ_WAIT0** (the one-block tile loop) k_dq_mx 0.8570 vs 0.8653 ms but k_dq_mxr 0.8770 vs 0.8717: on for
+  k_dq_mx only (k_dq_mxr 0.8696 vs 0.8702 after); PF_KV 0 1.172 (!). pytest 30 pass, fused-RoPE test pass.
