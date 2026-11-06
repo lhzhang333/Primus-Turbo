@@ -97,7 +97,8 @@ constexpr unsigned W0_KN = tdm_w0(0, 32, 20), W0_KR = tdm_w0(0, 16, 36), W0_V = 
 #define PRO_PARTIAL 1
 #endif
 #ifndef QKFIRST
-#define QKFIRST 1
+#define QKFIRST 0  // 1: slots 1, 2 issue QK(q_{i+1}) before PV(q_{i-1}) (11-05: 0.432 -> 0.426 ms; 11-06 with DMASK / OSKEW
+                   // slower: LLVM order 0.6057 vs 0.6226, re-scheduled attn_fwd 0.8770 vs 0.8839 ms)
 #endif
 #ifndef XCD_MAP
 #define XCD_MAP 1  // workgroups of one (b, h) on one XCD (dispatch: linear id L -> XCD L % 8): K / V reuse in its L2

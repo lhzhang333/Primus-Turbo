@@ -598,3 +598,8 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   combinations (re-scheduled, 3 copies): OSKEW + QFIRST 0.8863, OSKEW 0.8933, neither 0.9114: all on. Package
   profile: k_mla_fwd_mx 0.600 -> 0.558 ms, fused-RoPE fwd + bwd GPU time 3.435 -> 3.389 ms per step. pytest 30
   pass, fused-RoPE test pass.
+- Forward option sweep under the package's re-scheduling (two copies each, attn_fwd per call): base 0.8867,
+  SCHED 0 0.8881, MAXTREE 0.8932, PRO_PARTIAL 0 0.8866, TDM_SPLIT 0 0.8868, GCHUNK 8 0.8839 (not taken: the overflow
+  guard's margin), **QKFIRST 0** 0.8801 (four copies: 0.8770 vs 0.8839; LLVM order 0.6057 vs 0.6226 ms): QKFIRST off.
+  Package: k_mla_fwd_mx 0.551 ms, fused-RoPE fwd + bwd 3.377 ms per step. pytest 30 pass, fused-RoPE test pass,
+  extra-shape sweep pass.
