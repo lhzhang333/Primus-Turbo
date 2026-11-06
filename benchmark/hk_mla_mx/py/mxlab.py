@@ -49,7 +49,7 @@ EXPERT_P = EXPERT + ["-mllvm", "-greedy-regclass-priority-trumps-globalness"]
 def recipe_of(tag, kind="fwd"):
     """The operand recipe a build tag expects: "m4" (Q8 pre-scaled to log2 units, scale layout R2) for forward rungs m4 /
     m5 (tags 4*, 5*, 6*) and backward rungs b1 / b2 (tags 1*, 2*), else "r1"."""
-    return "m4" if tag[:1] in (("4", "5", "6", "7") if kind == "fwd" else ("1", "2", "3", "4", "5")) else "r1"
+    return "m4" if tag[:1] in (("4", "5", "6", "7") if kind == "fwd" else ("1", "2", "3", "4", "5", "6")) else "r1"
 
 
 def split_tag(tag):
@@ -819,6 +819,13 @@ def quant_bwd(qz, q, k, v, o, do, tag=""):
     )
 
 
+def dkdv_persistent_grid(b, s, h, cus=256):
+    """b6's k_dkdv_mx grid: 8 x (workgroups per XCD), one per CU at most, over (B H / 8) x (S / 256) items per XCD."""
+    assert (s // 128) % 2 == 0 and (b * h) % 8 == 0, "b6 needs S / 128 even and B H % 8 == 0"
+    items = (b * h // 8) * (s // 256)
+    return 8 * min(cus // 8, items)
+
+
 def bwd_mx(qz, bz, lse, scale=SCALE, tag=""):
     """dq, dk [b, s, h, 192], dv [b, s, h, 128] bf16 (BSHD views of SBHD storage) from the MX operands. Rungs b1 / b2
     (tags 1*, 2*) take the m4 recipe's operands and the lse in log2 units; b2 runs dV and dK as two kernels
@@ -837,6 +844,8 @@ def bwd_mx(qz, bz, lse, scale=SCALE, tag=""):
     if tag[:1] in ("2", "4"):  # b2 / b4: dV and dK as two kernels (kv rows per workgroup: 64 NJ_DV, 64 NJ_DK)
         _launch("k_dv_mx", (-(-s // 256), h, b), args, tag)
         _launch("k_dk_mx", (-(-s // (192 if tag[:1] == "4" else 256)), h, b), args, tag)
+    elif tag[:1] == "6":  # b6: persistent k_dkdv_mx (S / 128 even, B H % 8 == 0)
+        _launch("k_dkdv_mx", (dkdv_persistent_grid(b, s, h), 1, 1), args, tag)
     else:
         _launch("k_dkdv_mx", (s // 128, h, b), args, tag)
     _launch("k_dq_mx", (s // 256, h, b),

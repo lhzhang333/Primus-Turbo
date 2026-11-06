@@ -369,3 +369,24 @@ fused RoPE 720.7 ms / iteration, same loss. Next: (1) TDM_INC into the package; 
 (~20%: needs a persistent / paired design with an LDS plan for the 80 KB staging) and dq (~10%); (3) generated asm
 schedules (port tools/asmkit + fwdgen / bwdgen to the MX kernels): the loops are 1.6-1.8x their issue floors;
 (4) the fused-RoPE quantization kernels (q 0.096, k 0.091 ms vs ~0.055 memory floor).
+
+## 2026-11-06: persistent dK / dV (b6, negative), TDM_INC into the package
+
+GPU note: this morning the GPU runs ~1.5x slower than on 11-05 for every kernel (b5 dkdv 1.386 vs 0.903 ms, dq 0.93
+vs 0.60; gfx clocks ~1300 MHz at the idle reading, 256 CUs present; another session is probing clocks). Only A / B
+comparisons within one run are meaningful today.
+
+- Package: b5 with TDM_INC (incremental TDM descriptors); pytest 30 pass, fused-RoPE package test pass.
+- **b6** (`kern/k_mla_bwd_mx6.hip`, lab only): k_dkdv_mx persistent (grid 8 x workgroups per XCD, one per CU;
+  workgroup x + 8 i takes items i, i + NW/8 .. of XCD x; item = ((b, h), pair p) -> kv blocks p and S/128 - 1 - p, S/128 + 1
+  steps per item; q ring 3 stages, A ring 2 stages (round g = A part of step g + q part of step g + 2), an 80 KB staging
+  area of its own: 319.5 KB). Bit-exact with b5 at five shapes (`scratch_mx/py/b6_test.py`), but slower every way:
+  - one loop with the masked first step (+ the previous block's last dV / dK) and the normal step as two
+    instantiations: 154 spills, 2.01 vs 1.39 ms (b5);
+  - one step instantiation with a runtime diagonal mask (uniform branch per q16 tile): 881 VGPRs, 1 spill, but ~195
+    SALU and 38 branches per step (TDM cursors, mask conditions with VALU -> SALU dependences): 1.72 ms;
+  - nested loops (per block: the masked first step, the step loop, the last dV / dK, the epilogue; TDM rounds running
+    on across blocks): 32 spills, two 16-VGPR tuples stored and reloaded every step in the low bank (v0..v255, where
+    the DS addresses and WMMA scale operands must be): 2.25 ms. Allocator flags (no regclass priority, split-spill
+    size, no misched) do not help.
+  The persistent structure needs more low-bank registers than b5 leaves; parked (would need hand-assigned registers).

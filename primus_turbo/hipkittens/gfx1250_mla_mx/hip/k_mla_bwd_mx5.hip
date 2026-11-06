@@ -62,6 +62,9 @@ using namespace mx;
 #ifndef EPI_WAVE
 #define EPI_WAVE 0  // 1: dkdv waves TDM-store their own staged rows, no barrier (neutral: 0.910 vs 0.909 ms)
 #endif
+#ifndef TDM_INC
+#define TDM_INC 1  // dkdv: each wave's 3 TDM ops keep their next step, global address and LDS stage (advanced per round)
+#endif
 #ifndef MIDSYNC
 // the per-step TDM wait + barrier + issue of round s + 2 between slots MIDSYNC - 1 and MIDSYNC of step s (0: at the step
 // start); slot 7 then prefetches step s + 1's tile 0 and its slot-0 A fragments, so a step starts with no barrier
@@ -316,6 +319,39 @@ __device__ __forceinline__ void dkdv_body(
     const int k1 = wv == 0 ? 2 : wv == 1 ? 4 : wv == 2 ? 1 : 6;
     const int k2 = LTDT_G ? (wv == 3 ? 8 : 11) : (wv == 0 ? 9 : wv == 1 ? 10 : wv == 2 ? 11 : 8);
     const TdmOp op0 = dk_op(k0), op1 = dk_op(k1), op2 = dk_op(k2);
+#if TDM_INC
+    // the op's next step si (A ops start at -1: round r loads q part r, A part r - 1), its global address (step
+    // max(si, 0), held at the last step past the end) and its LDS stage address; rounds are issued in order 0, 1, 2..
+    struct OpRun {
+        unsigned long long ga, inc;
+        unsigned lds, lbase, lstep;
+        int si;
+    };
+    auto mk_run = [&](const TdmOp &op, int k) __attribute__((always_inline)) -> OpRun {
+        const bool ap = k >= 5 && k <= 8;
+        OpRun o;
+        o.si = ap ? -1 : 0;
+        o.inc = (unsigned long long)QS_ * op.mult;
+        o.ga = op.base + (unsigned long long)qs0 * op.mult;
+        o.lbase = (ap ? lds0 + ARING : lds0) + op.lds;
+        o.lstep = ap ? (unsigned)ASTG : (unsigned)QSTG;
+        o.lds = ap ? o.lbase + 2 * o.lstep : o.lbase;  // stage (si mod 3)
+        return o;
+    };
+    OpRun run0 = mk_run(op0, k0), run1 = mk_run(op1, k1), run2 = mk_run(op2, k2);
+    auto issue_one = [&](const TdmOp &op, OpRun &o) __attribute__((always_inline)) {
+        const bool real = o.si >= 0 && o.si < nst;
+        tdm_load(tdm_g0(o.lds, o.ga, real ? op.on : 0), op.g1);
+        o.ga = (o.si >= 0 && o.si + 1 < nst) ? o.ga + o.inc : o.ga;
+        o.lds = o.lds == o.lbase + 2 * o.lstep ? o.lbase : o.lds + o.lstep;
+        o.si += 1;
+    };
+    auto issue_round = [&](int) __attribute__((always_inline)) {
+        issue_one(op0, run0);
+        issue_one(op1, run1);
+        issue_one(op2, run2);
+    };
+#else
     auto issue_one = [&](const TdmOp &op, int k, int r) __attribute__((always_inline)) {
         const bool ap = k >= 5 && k <= 8;
         const int si = ap ? r - 1 : r;  // the step this op loads
@@ -330,6 +366,7 @@ __device__ __forceinline__ void dkdv_body(
         issue_one(op1, k1, r);
         issue_one(op2, k2, r);
     };
+#endif
     issue_round(0);
     issue_round(1);
 #if PRO_TDM_FIRST
