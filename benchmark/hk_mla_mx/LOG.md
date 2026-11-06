@@ -485,3 +485,12 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   (v_div_scale, carries) shift their source fields; asmkit derives no va_sdst / va_vcc waits, so a SALU / memory
   reader of an SGPR last written by a VALU gets an explicit `s_wait_alu depctr_va_sdst(0)` (one in the region).
   Package: pytest 30 pass, fused-RoPE test bit-exact; forward per call A / B 0.9675 vs 0.9915 ms (medians of 3).
+- dq's two peeled diagonal tiles (1648 / 2115-instruction blocks: +540 / +1007 mask instructions over the loop body)
+  re-scheduled (`--region`, the loop untouched): height 0.894 vs the no-VOPD build 0.902 / LLVM with VOPD 0.8965:
+  within noise of the default build; not taken (the re-emission needs the no-VOPD build).
+- Forward schedule search: first-ready-first with seeded random tie-breaking (12 seeds, jitter 8 / 24 cycles):
+  0.626-0.636 vs 0.601 ms for the deterministic order (ties by LLVM's order): LLVM's order carries structure the model
+  does not see; the package keeps the deterministic schedule.
+- dq tail: on a traced SIMD 6% idle at the end of the dispatch (dkdv 0.1%): per XCD the last (b, h) pair's long q
+  blocks finish last. m7-style pairing (q blocks i and 15 - i per workgroup: 34 tiles each) would remove it, but the
+  dQ staging (96 KB) does not fit next to the next block's ring and Q / dO region (LDS full): parked.

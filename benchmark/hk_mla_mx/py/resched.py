@@ -381,6 +381,7 @@ def rec_mii(items, succ, carried):
 # ------------------------------------------------------------------------------------------------- list scheduler
 WIN_OK = (2, 3, 6, 7)  # issue offsets of non-WMMA instructions inside a WMMA's 8-cycle window
 PRIO = "height"
+RNG_KEY, RNG_JIT = [], 0.0
 TRANS_OCC = 2
 DS_GAP = 2  # DS instructions back to back: ~2.1-2.4 cycles apart (ATT)
 
@@ -484,8 +485,10 @@ def list_schedule(items, succ, lds_gap=6.0, lds_burst=4.0, window=None, msb_pref
                 key = (-e, h[i] - msb_pref * sw, -i)
             elif PRIO == "orig":  # LLVM's order, stalls filled with the earliest ready later item
                 key = (-e, -i - 64 * msb_pref * sw)
-            else:  # "ready": first ready first
+            elif PRIO == "ready":  # first ready first
                 key = (-e, -ready_t[i], -i)
+            else:  # "rand": first ready first, ties (same earliest cycle) broken by a seeded random order
+                key = (-e, -ready_t[i] + RNG_JIT * RNG_KEY[i], -i)
             if best is None or key > best[0]:
                 best = (key, i, e)
         _, i, e = best
@@ -721,17 +724,23 @@ def main():
     ap.add_argument("--ds-gap", type=int, default=2)
     ap.add_argument("--trans-occ", type=int, default=2)
     ap.add_argument("--coalesce", action="store_true", help="remove copies (the producer writes the destination)")
-    ap.add_argument("--prio", default="height", choices=("height", "orig", "ready"))
+    ap.add_argument("--prio", default="height", choices=("height", "orig", "ready", "rand"))
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--jitter", type=float, default=8.0, help="rand: ready-time jitter (cycles)")
     ap.add_argument("--calib", default="", help="ATT ui dir of the identity build: compare the model with it")
     ap.add_argument("--drop", default="", help="timing probe (wrong results): MN:K drops every K-th item of mnemonic MN")
     ap.add_argument("--lat-ds", type=int, default=96)
     a = ap.parse_args()
     LAT_RAW["DS_LD"] = a.lat_ds
-    global PRIO, WIN_OK, DS_GAP, TRANS_OCC
+    global PRIO, WIN_OK, DS_GAP, TRANS_OCC, RNG_KEY, RNG_JIT
     PRIO = a.prio
     WIN_OK = tuple(int(x) for x in a.win.split(",") if x)
     DS_GAP = a.ds_gap
     TRANS_OCC = a.trans_occ
+    import random
+    _r = random.Random(a.seed)
+    RNG_KEY = [_r.random() for _ in range(20000)]
+    RNG_JIT = a.jitter
     out = BUILD / "rs" / a.tag
     out.mkdir(parents=True, exist_ok=True)
     rep = {"args": vars(a), "kernels": {}}
