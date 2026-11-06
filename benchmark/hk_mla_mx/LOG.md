@@ -529,3 +529,8 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
 - RC_KBF16 (lab, off): kbar rounded to bf16 values, k - kbar by v_pk_add_bf16 and the bf16 MX path in rows and cols:
   codes equal MX(bf16(k - bf16(kbar))) (rows / cols, `scratch_mx/py/kbf16_check.py`), but only k -2.5..2.8% (fused-RoPE
   k 0.1096 -> 0.1065): not worth a new quantization semantics.
+- dkdv EPI_PAD (lab, off): the epilogue's staging rows padded (pitch + 16 B: conflict-free ds_stores), each wave
+  re-packs its 32 rows densely (32 consecutive 16-byte chunks per copy) into the idle q ring / the NULL A stage and
+  TDM-stores its own rows, no barrier: bit-exact with b5 (five shapes), dkdv 1.392 vs 1.382 ms (+0.7%). With
+  NO_FINAL_WAIT and EPI_WAVE also neutral, the epilogue's ATT costs (~2k staging + ~1.3k drain per wave) are not what
+  bounds the kernel.

@@ -77,6 +77,9 @@ using namespace mx;
 #ifndef NO_FINAL_WAIT
 #define NO_FINAL_WAIT 0  // timing probe only: dkdv ends without waiting for its TDM stores (LDS may be reused early)
 #endif
+#ifndef EPI_PAD
+#define EPI_PAD 0  // dkdv epilogue: padded staging rows, per-wave dense re-pack + TDM stores (no bank conflicts, no barrier)
+#endif
 #ifndef EPI_DIRECT
 #define EPI_DIRECT 0  // dkdv: dK / dV rows by global stores from the accumulators (no LDS staging / TDM store / waits)
 #endif
@@ -715,6 +718,83 @@ __device__ __forceinline__ void dkdv_body(
         });
     }
     return;
+#endif
+#if EPI_PAD
+    // ---- epilogue without bank conflicts: each wave stages its 32 dK / dV rows into padded rows (pitch + 16 B: the
+    // 16 rows of a ds_store hit different banks; dense rows 256 / 384 B apart put all 16 on the same banks), re-packs
+    // them densely (32 consecutive 16-byte chunks per copy: conflict-free) and TDM-stores its own rows; no barrier.
+    // Padded staging in the q ring (idle); dense dK (+ rope) after it in the q ring, dense dV in the A stage no TDM op
+    // and no final-phase read uses (step nst's: NULL past the end).
+    {
+        constexpr int XDK = 2 * D_QK, XDV = 2 * D_V;
+        constexpr int XDN = SPLIT ? 2 * 128 : XDK;
+        constexpr int PDN = XDN + 16, PDV = XDV + 16, PDP = 128 + 16;
+        constexpr int P_DK = 0, P_DV = P_DK + KB * PDN, P_DP = P_DV + KB * PDV;
+        constexpr int P_END = P_DP + (SPLIT ? KB * PDP : 0);
+        constexpr int D_DK = (P_END + 127) / 128 * 128, D_DP = D_DK + KB * XDN;
+        static_assert(D_DP + (SPLIT ? KB * 128 : 0) <= ARING, "padded staging + dense dK inside the q ring");
+        static_assert(KB * XDV <= ASTG, "dense dV inside one A stage");
+        const unsigned d_dv = (unsigned)(ARING + (nst % NSTG) * ASTG);
+        const int ln = lane_now();
+        static_for<NJ>([&](auto jj) {
+            constexpr int j = jj;
+            const unsigned r = (unsigned)(KBW * wv + 16 * j + (ln & 15)), hh = (unsigned)(ln >> 4);
+            const unsigned dkr = lds0 + P_DK + r * PDN + 16 * hh, dvr = lds0 + P_DV + r * PDV + 16 * hh;
+            const unsigned dpr = lds0 + P_DP + r * PDP + 16 * hh;
+            static_for<12>([&](auto dd) {
+                constexpr int d = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dk[d][j][(int)rr] * scale); });
+                const unsigned a = (SPLIT && d >= 8) ? dpr + 32 * (d - 8) : dkr + 32 * d;
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)a = __builtin_bit_cast(u32x4, w);
+            });
+            static_for<8>([&](auto dd) {
+                constexpr int d = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)dv[d][j][(int)rr]; });
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(dvr + 32 * d) = __builtin_bit_cast(u32x4, w);
+            });
+        });
+        // re-pack this wave's rows (KBW from row KBW wv): chunk c = row * (X / 16) + col, 32 per copy (a wave's own
+        // LDS operations complete in order: no wait between its padded stores and these loads)
+        auto repack = [&](auto xc, auto pc, unsigned src, unsigned dst) __attribute__((always_inline)) {
+            constexpr int X = decltype(xc)::value, PP = decltype(pc)::value, CPR = X / 16, NCH = KBW * CPR;
+            static_assert(NCH % 32 == 0, "whole copies");
+            const unsigned r0 = (unsigned)(KBW * wv);
+            static_for<NCH / 32>([&](auto kk) {
+                const int c = 32 * (int)kk + ln;
+                const unsigned row = r0 + (unsigned)(c / CPR), col = (unsigned)(c % CPR);
+                const u32x4 v = *(const __attribute__((address_space(3))) u32x4 *)(uintptr_t)(src + row * PP + 16 * col);
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(dst + row * X + 16 * col) = v;
+            });
+        };
+        repack(std::integral_constant<int, XDN>{}, std::integral_constant<int, PDN>{}, lds0 + P_DK, lds0 + D_DK);
+        repack(std::integral_constant<int, XDV>{}, std::integral_constant<int, PDV>{}, lds0 + P_DV, lds0 + d_dv);
+        if constexpr (SPLIT)
+            repack(std::integral_constant<int, 128>{}, std::integral_constant<int, PDP>{}, lds0 + P_DP, lds0 + D_DP);
+        asm volatile("s_wait_dscnt 0x0" ::: "memory");
+        const int r0 = KBW * wv, rw = min(KBW, S - kv0 - r0);
+        if (rw > 0) {
+            const unsigned rows = (unsigned)rw;
+            const long long kr = (long long)(kv0 + r0);
+            const unsigned long long gk = (unsigned long long)(uintptr_t)(DK + (long long)b * dk_sb + kr * dk_ss +
+                                                                          (long long)h * (SPLIT ? 256 : D_QK));
+            tdm_store(tdm_g0(lds0 + D_DK + (unsigned)(r0 * XDN), gk),
+                      tdm_g1(tdm_w0(0, 0, 0), rows, XDN, KBW, 2ull * (unsigned long long)dk_ss));
+            const unsigned long long gv = (unsigned long long)(uintptr_t)(DV + (long long)b * dv_sb + kr * dv_ss +
+                                                                          (long long)h * (SPLIT ? 256 : D_V));
+            tdm_store(tdm_g0(lds0 + d_dv + (unsigned)(r0 * XDV), gv),
+                      tdm_g1(tdm_w0(0, 0, 0), rows, XDV, KBW, 2ull * (unsigned long long)dv_ss));
+            if constexpr (SPLIT) {
+                const unsigned long long gp = (unsigned long long)(uintptr_t)(DKP + (long long)b * dkp_sb +
+                                                                              kr * dkp_ss + (long long)h * 64);
+                tdm_store(tdm_g0(lds0 + D_DP + (unsigned)(r0 * 128), gp),
+                          tdm_g1(tdm_w0(0, 0, 0), rows, 128, KBW, 2ull * (unsigned long long)dkp_ss));
+            }
+        }
+        tensor_wait<0>();
+        return;
+    }
 #endif
     // ---- epilogue: dK / dV rows (lane = kv column, rows d = 8 lh + r of each d16 tile) as bf16 into LDS (the q ring,
     // idle since the barrier above), then one TDM store each (wave 0: dK, 384 B rows; wave 1: dV, 256 B rows)
