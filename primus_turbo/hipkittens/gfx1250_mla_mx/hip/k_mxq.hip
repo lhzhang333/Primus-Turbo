@@ -34,6 +34,9 @@
 #define RC_X8G 1  // rct / rctr: the row codes stored to global straight from the lanes (no X8 staging / TDM store: LDS
                   // 101 -> 77 KB for D 192, 4 workgroups per CU)
 #endif
+#ifndef RC_NODIV
+#define RC_NODIV 1  // rc_tile: branch-free rows phase (pad lanes recompute a block; only the code stores masked)
+#endif
 #ifndef RC_FAST
 #define RC_FAST 1  // tree reductions (amax, row dots) and the kbar slice in registers (rc_tile)
 #endif
@@ -370,14 +373,78 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
     const int j = t % LPR;
 #if RC_FAST
     f32x8 kbr[4];  // the lane's kbar slice (its block j is the same in every pass)
-    if ((mode & 3) && j < NBLK) {
+    if ((mode & 3) && (RC_NODIV || j < NBLK)) {
+        const int jk = j < NBLK ? j : NBLK - 1;
         static_for<4>([&](auto i) {
-            const f32x4 k0 = *(const f32x4 *)(kb_lds + 32 * j + 8 * (int)i),
-                        k1 = *(const f32x4 *)(kb_lds + 32 * j + 8 * (int)i + 4);
+            const f32x4 k0 = *(const f32x4 *)(kb_lds + 32 * jk + 8 * (int)i),
+                        k1 = *(const f32x4 *)(kb_lds + 32 * jk + 8 * (int)i + 4);
             kbr[(int)i] = f32x8{k0[0], k0[1], k0[2], k0[3], k1[0], k1[1], k1[2], k1[3]};
         });
     }
 #endif
+#if RC_NODIV
+    // branch-free rows phase: the pad lanes (j >= NBLK, D 192) compute block NBLK - 1 again (discarded) and write the
+    // pad scale bytes; offsets by selects; only the code stores are masked (the per-lane branches cost ~2k cycles of
+    // exec handling per wave)
+    for (int r0 = 0; r0 < (RCT_PROBE == 3 ? 0 : 128); r0 += RPP) {
+        const int r = r0 + t / LPR;
+        const long long row = bh * S + (long long)kt * 128 + r;
+        const bool live = j < NBLK;
+        const int jj = live ? j : NBLK - 1;
+        float dot = 0.f;
+        Block blk;
+#if RC_BF16
+        if ((mode & 39) == 0) {
+            u32x4 w[4];
+            static_for<4>([&](auto i) { w[(int)i] = *(const u32x4 *)(tile + r * XR + 2 * (32 * jj + 8 * (int)i)); });
+            blk = quant_block_bf16(w);
+        } else
+#endif
+        {
+            f32x8 v[4];
+            static_for<4>([&](auto i) {
+                v[(int)i] = bf8_to_f32(*(const u32x4 *)(tile + r * XR + 2 * (32 * jj + 8 * (int)i)));
+            });
+            float pd[4] = {0.f, 0.f, 0.f, 0.f};
+            if (mode & 1) {
+                static_for<4>([&](auto i) { v[(int)i] = v[(int)i] - kbr[(int)i]; });
+            } else if (mode & 2) {
+                static_for<4>([&](auto i) {
+                    static_for<8>([&](auto e) { pd[(int)i] += v[(int)i][(int)e] * kbr[(int)i][(int)e]; });
+                });
+            }
+            if (mode & 4) {
+                const bf16 *yp = Y + b * yb + (long long)(kt * 128 + r) * ys + h * yh + 32 * jj;
+                static_for<4>([&](auto i) {
+                    const f32x8 y = bf8_to_f32(*(const u32x4 *)(yp + 8 * (int)i));
+                    static_for<8>([&](auto e) { pd[(int)i] += v[(int)i][(int)e] * y[(int)e]; });
+                });
+            }
+            dot = live ? (pd[0] + pd[1]) + (pd[2] + pd[3]) : 0.f;
+            if (mode & 32) {
+                static_for<4>([&](auto i) { v[(int)i] = v[(int)i] * pre; });
+            }
+            blk = quant_block(v);
+        }
+        if (j < RS) {  // every lane for D 192 / 128 (LPR == RS): the block's scale, or a pad byte
+            const int xsi = live ? ((D == 192 && (mode & 16) && j >= 4) ? j + 2 : j) : ((mode & 16) ? j - 2 : j);
+            xs[r * RS + xsi] = live ? (unsigned char)(blk.e + 127) : (unsigned char)((mode & 16) ? 0 : 127);
+        }
+        if (live) {  // block j's two 16-byte halves: chunk 128 (j < 4) or the 64-byte chunk at 128 (j >= 4)
+            unsigned char *dst = x8 + r * D;
+            const int o0 = 16 * j + ((D == 192 && j >= 4) ? 64 : 0), o1 = 16 * j + ((D == 192 && j >= 4) ? 96 : 64);
+            *(u32x4 *)(dst + o0) = u32x4{blk.q[0][0], blk.q[0][1], blk.q[2][0], blk.q[2][1]};
+            *(u32x4 *)(dst + o1) = u32x4{blk.q[1][0], blk.q[1][1], blk.q[3][0], blk.q[3][1]};
+        }
+        if (mode & 6) {
+            dot += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, dot), 0xB1, 0xF, 0xF, false));
+            dot += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, dot), 0x4E, 0xF, 0xF, false));
+            if constexpr (LPR == 8)
+                dot += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, dot), 0x164, 0xF, 0xF, false));
+            if (j == 0) aux[row] = dot;
+        }
+    }
+#else
     for (int r0 = 0; r0 < (RCT_PROBE == 3 ? 0 : 128); r0 += RPP) {  // probe 3: no rows phase
         const int r = r0 + t / LPR;
         const long long row = bh * S + (long long)kt * 128 + r;
@@ -462,6 +529,7 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
             if (j == 0) aux[row] = dot;
         }
     }
+#endif
     // ---- cols: task = (2 consecutive d, block jb of 32 s)
 #if RC_BF16
     if ((mode & 1) == 0) {  // no kbar: the two columns' bf16 pairs (rows 2 k, 2 k + 1) by v_perm, bf16 codes

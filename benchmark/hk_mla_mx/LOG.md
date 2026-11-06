@@ -501,3 +501,11 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   0.0950; fused RoPE: q 0.1432 -> 0.1404, k 0.1304 -> 0.1157. Package per call: forward 0.97 -> 0.93 ms (quantization
   0.310 -> 0.283), dout quantization 0.089 -> 0.086; fused-RoPE forward 1.0047 ms (1.0827 this morning). pytest 30
   pass, fused-RoPE test bit-exact.
+- ATT of the new k_mxq_rctr192 (4 workgroups per CU): ~16.3k cycles per wave, now instruction-bound: VALU ~8.9k,
+  SALU ~4.8k; ~2.2k of it exec handling of the rows phase (8 lanes per row, 6 live for D 192: v_cmpx /
+  s_and_saveexec / s_or / branches around each per-lane `if`), the q . kbar dots (v_pk_fma ~27 cycles each).
+- **RC_NODIV** (default): branch-free rows phase: the pad lanes recompute block NBLK - 1 (discarded) and write the pad
+  scale bytes, the code offsets by selects (j < 4: chunk 128, else the 64-byte chunk at 128), only the two global code
+  stores masked. Bit-exact. rct q 0.1102 -> 0.1029, k 0.1057 -> 0.0986 (v / dO unchanged: D 128 has no pad lanes);
+  fused RoPE q 0.1393 -> 0.1323, k 0.1158 -> 0.1095. Package per call: forward 0.930 -> 0.903 ms (quantization 0.283
+  -> 0.268); fused-RoPE forward 0.9712 ms (1.0827 this morning: -10.3%). pytest 30 pass, fused-RoPE test bit-exact.
