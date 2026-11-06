@@ -65,6 +65,9 @@ using namespace mx;
 #ifndef TDM_INC
 #define TDM_INC 1  // dkdv: each wave's 3 TDM ops keep their next step, global address and LDS stage (advanced per round)
 #endif
+#ifndef DKDV_ORDER
+#define DKDV_ORDER 2  // dkdv workgroup order: 0 XCD-local (b, h) at a time, kv block 0 first; 2 long halves then short halves
+#endif
 #ifndef DQ_ORDER
 #define DQ_ORDER 2  // dq workgroup order: 0 longest q block first per (b, h); 1 snake; 2 long halves then short halves
 #endif
@@ -292,7 +295,28 @@ __device__ __forceinline__ void dkdv_body(
     const int wv = wave_id(tid);
     const int lane = tid & 31, lr = lane & 15, lh = lane >> 4;
     const BlockOf blk = xcd_block((S + KB - 1) / KB, H, B);
+#if DKDV_ORDER == 2
+    // two passes per XCD: every (b, h)'s long half of kv blocks (0 .. nkb / 2 - 1: the most steps) first, then the
+    // short halves (the dispatch tail made of short workgroups)
+    int kb, h, b;
+    {
+        const int nkb = (S + KB - 1) / KB;
+        if ((B * H) % 8 == 0 && nkb % 2 == 0) {
+            const int L = (int)(blockIdx.x + nkb * (blockIdx.y + H * blockIdx.z)), k = L >> 3, xc = L & 7;
+            const int nbx = B * H / 8, half = nkb / 2, k1 = k % (nbx * half);
+            const int bhx = xc + 8 * (k1 / half), sl = k1 % half;
+            kb = k < nbx * half ? sl : half + sl;
+            h = bhx % H;
+            b = bhx / H;
+        } else {
+            kb = blk.slot;
+            h = blk.h;
+            b = blk.b;
+        }
+    }
+#else
     const int kb = blk.slot, h = blk.h, b = blk.b;
+#endif
     const int kv0 = kb * KB;
     const int qs0 = kv0;  // KB == QS_
     const int nst = (S - qs0) / QS_;

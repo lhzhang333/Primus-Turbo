@@ -539,3 +539,6 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
 - dq DQ_ORDER 2 (per XCD every (b, h)'s long half of q blocks first, then the short halves: the dispatch tail made of
   short workgroups; each (b, h)'s K / V read in both passes): 0.896 -> 0.889 ms; with DQ_DSTAT 0.881 (-1.7%),
   bit-exact with b5 at five shapes. Both on in the package; pytest 30 pass, fused-RoPE test pass.
+- dkdv DKDV_ORDER 2 (the same two-pass order: every (b, h)'s kv blocks 0 .. 15 first, then 16 .. 31): 1.389 -> 1.377
+  ms (-0.8%), bit-exact. Package (on): pytest 30 pass, fused-RoPE test pass; per call forward 0.894, backward 2.410
+  (bf16 HK 0.863 / 2.429 in the same run).
