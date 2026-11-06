@@ -65,6 +65,9 @@ using namespace mx;
 #ifndef TDM_INC
 #define TDM_INC 1  // dkdv: each wave's 3 TDM ops keep their next step, global address and LDS stage (advanced per round)
 #endif
+#ifndef DQ_DSTAT
+#define DQ_DSTAT 0  // dq: static mask classes on the two diagonal kv tiles (fully masked q tiles skipped, kept ones unmasked)
+#endif
 #ifndef NO_FINAL_WAIT
 #define NO_FINAL_WAIT 0  // timing probe only: dkdv ends without waiting for its TDM stores (LDS may be reused early)
 #endif
@@ -962,7 +965,10 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     });
 
     auto tile = [&](int t, auto diag_c) __attribute__((always_inline)) {
-        constexpr bool DIAG = decltype(diag_c)::value;
+        // DC 0: below the diagonal; 1: kv tile n - 2 (q tiles i < 2 masked, i >= 2 fully kept); 2: kv tile n - 1 (q tiles
+        // i < 2 fully masked: skipped with DQ_DSTAT, i >= 2 masked). Without DQ_DSTAT every q tile of DC 1 / 2 is masked
+        constexpr int DC = (int)decltype(diag_c)::value;
+        constexpr bool DIAG = DC != 0;
         if (t > 0) {
             tensor_wait<TDM_PER_TILE>();  // tile t landed (t + 1 in flight)
             bar_signal();
@@ -1055,6 +1061,9 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
                     fence();  // pair m - 1's WMMAs are long done: the loads may take its registers
                     ldkv(std::integral_constant<int, (m + 1 < NKV / 2 ? m + 1 : 0)>{}, kvb[(m + 1) % 2]);
                 }
+                constexpr bool SKIPQ = DQ_DSTAT && DC == 2 && i < 2;
+                constexpr bool MASKQ = DQ_DSTAT ? ((DC == 1 && i < 2) || (DC == 2 && i >= 2)) : DIAG;
+                if constexpr (!SKIPQ) {
                 const int thr = q0 + 64 * i + 16 * wv + lr - kv0 - 8 * lh;  // masked iff 16 j + r > thr
                 f32x8 ds[2];
                 static_for<2>([&](auto uu) {
@@ -1066,7 +1075,7 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
                     static_for<8>([&](auto rr) {
                         constexpr int r = rr;
                         float pv = exp2_raw(sv[r]);
-                        if constexpr (DIAG) pv = (16 * j + r > thr) ? 0.f : pv;
+                        if constexpr (MASKQ) pv = (16 * j + r > thr) ? 0.f : pv;
                         ds[u][r] = pv * dp[r];
                     });
                 });
@@ -1083,6 +1092,7 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
                 dsB[i][4 * m + 2] = (int)q1v[0];
                 dsB[i][4 * m + 3] = (int)q1v[1];
                 dss[i] |= (e + 127) << (8 * m);
+                }
             });
 #if DQ_SGB
             // issue windows for the pair: 24 WMMAs (S nope + rope, dP per kv16 x 4 q tiles), 64 exps, ~100 VALU: each
@@ -1110,7 +1120,8 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
             const AF &af = ab[dt % 4];
             static_for<QTW>([&](auto ii) {
                 constexpr int i = ii;
-                if constexpr (dt % 2 == 0)
+                if constexpr (DQ_DSTAT && DC == 2 && i < 2) {
+                } else if constexpr (dt % 2 == 0)
                     dq[dt][i] = wmma_mx<0, 0>(af.x, dsB[i], dq[dt][i], af.s, dss[i]);
                 else
                     dq[dt][i] = wmma_mx<1, 0>(af.x, dsB[i], dq[dt][i], af.s, dss[i]);
@@ -1189,9 +1200,9 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
         });
 #endif
     };
-    for (int t = 0; t < n - 2; ++t) tile(t, std::false_type{});
-    tile(n - 2, std::true_type{});
-    tile(n - 1, std::true_type{});
+    for (int t = 0; t < n - 2; ++t) tile(t, std::integral_constant<int, 0>{});
+    tile(n - 2, std::integral_constant<int, 1>{});
+    tile(n - 1, std::integral_constant<int, 2>{});
 #if OSTAGE
     // epilogue: dQ rows as bf16 into LDS (the ring, idle now), one TDM store of 256 x 384 B by wave 0
     tensor_wait<0>();

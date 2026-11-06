@@ -26,6 +26,10 @@
 #ifndef RCT_PROBE
 #define RCT_PROBE 0
 #endif
+#ifndef RC_BF16
+#define RC_BF16 1  // rc_tile: bf16-native MX blocks where no fp32 pre-processing is needed (rows without kbar / pre, cols
+                   // without kbar): |x| max on packed bf16 bits, v_cvt_scalef32_pk8_fp8_bf16 (bit-exact with the f32 path)
+#endif
 #ifndef RC_FAST
 #define RC_FAST 1  // tree reductions (amax, row dots) and the kbar slice in registers (rc_tile)
 #endif
@@ -101,6 +105,31 @@ __device__ __forceinline__ void dequant_block(const Block &blk, f32x8 (&out)[4])
         });
     });
 }
+
+#if RC_BF16
+typedef short i16x2 __attribute__((ext_vector_type(2)));
+// the MX block of 32 bf16 values packed in w[4] (values 8 i .. 8 i + 7 in w[i]): amax from the magnitude bits (the
+// integer order of |x| bits is the float order), the codes straight from bf16; the same codes as quant_block on f32
+__device__ __forceinline__ Block quant_block_bf16(const u32x4 (&w)[4]) {
+    auto ab = [](unsigned x) { return __builtin_bit_cast(i16x2, x & 0x7fff7fffu); };
+    i16x2 m[4];
+    static_for<4>([&](auto ii) {
+        constexpr int i = ii;
+        m[i] = __builtin_elementwise_max(__builtin_elementwise_max(ab(w[i][0]), ab(w[i][1])),
+                                         __builtin_elementwise_max(ab(w[i][2]), ab(w[i][3])));
+    });
+    const i16x2 mm = __builtin_elementwise_max(__builtin_elementwise_max(m[0], m[1]), __builtin_elementwise_max(m[2], m[3]));
+    const int mb = mm[0] > mm[1] ? (int)mm[0] : (int)mm[1];
+    const float amax = __builtin_bit_cast(float, (unsigned)mb << 16);
+    Block blk;
+    blk.e = mx_exp(amax);
+    const float sc = exp2i(blk.e);
+    static_for<4>([&](auto i) {
+        blk.q[(int)i] = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(__builtin_bit_cast(bf16x8, w[(int)i]), sc);
+    });
+    return blk;
+}
+#endif
 
 // rows kernel body: D = 192 (8 lanes per row: 6 blocks + 2 pad) or 128 (4 lanes per row). A wave owns NR * RPW
 // consecutive rows of one (b, h) (rows in X8's (b, h, s) order: contiguous stores), loading the lane's kbar slice
@@ -349,6 +378,19 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
         const int r = r0 + t / LPR;
         const long long row = bh * S + (long long)kt * 128 + r;
         float dot = 0.f;
+#if RC_BF16
+        if (j < NBLK && (mode & 39) == 0) {  // no kbar, no Y dots, no pre: bf16 codes
+            u32x4 w[4];
+            static_for<4>([&](auto i) { w[(int)i] = *(const u32x4 *)(tile + r * XR + 2 * (32 * j + 8 * (int)i)); });
+            const Block blk = quant_block_bf16(w);
+            unsigned char *dst = x8 + r * D;
+            if (D == 128 || j < 4)
+                store_block<128>(dst, j, blk.q[0], blk.q[1], blk.q[2], blk.q[3]);
+            else
+                store_block<64>(dst + 128, j - 4, blk.q[0], blk.q[1], blk.q[2], blk.q[3]);
+            xs[r * RS + ((D == 192 && (mode & 16) && j >= 4) ? j + 2 : j)] = (unsigned char)(blk.e + 127);
+        } else
+#endif
         if (j < NBLK) {
             f32x8 v[4];
             static_for<4>([&](auto i) {
@@ -417,6 +459,31 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
         }
     }
     // ---- cols: task = (2 consecutive d, block jb of 32 s)
+#if RC_BF16
+    if ((mode & 1) == 0) {  // no kbar: the two columns' bf16 pairs (rows 2 k, 2 k + 1) by v_perm, bf16 codes
+        for (int task = t; task < (RCT_PROBE == 4 ? 0 : (D / 2) * 4); task += NT) {
+            const int dp = task % (D / 2), jb = task / (D / 2), d0 = 2 * dp;
+            u32x4 c0[4], c1[4];
+            static_for<4>([&](auto ii) {
+                static_for<4>([&](auto kk) {
+                    constexpr int i = ii, k = kk;
+                    const int r = 32 * jb + 8 * i + 2 * k;
+                    const uint32_t wa = *(const uint32_t *)(tile + r * XR + 2 * d0);
+                    const uint32_t wb = *(const uint32_t *)(tile + (r + 1) * XR + 2 * d0);
+                    c0[i][k] = __builtin_amdgcn_perm(wb, wa, 0x05040100u);
+                    c1[i][k] = __builtin_amdgcn_perm(wb, wa, 0x07060302u);
+                });
+            });
+            const Block b0 = quant_block_bf16(c0), b1 = quant_block_bf16(c1);
+            unsigned char *dst = x8t + d0 * 128;
+            store_block<128>(dst, jb, b0.q[0], b0.q[1], b0.q[2], b0.q[3]);
+            store_block<128>(dst + 128, jb, b1.q[0], b1.q[1], b1.q[2], b1.q[3]);
+            xts[d0 * 4 + jb] = (unsigned char)(b0.e + 127);
+            xts[d0 * 4 + 4 + jb] = (unsigned char)(b1.e + 127);
+        }
+        return;
+    }
+#endif
     for (int task = t; task < (RCT_PROBE == 4 ? 0 : (D / 2) * 4); task += NT) {  // probe 4: no cols phase
         const int dp = task % (D / 2), jb = task / (D / 2), d0 = 2 * dp;
         const float kb0 = (mode & 1) ? kb_lds[d0] : 0.f, kb1 = (mode & 1) ? kb_lds[d0 + 1] : 0.f;

@@ -425,3 +425,20 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   drain before its barrier ~1.3k, the final TDM-store wait ~2k. Probes: no final wait (NO_FINAL_WAIT, unsafe):
   1.386 vs 1.383 (not on the critical path); dK / dV by global stores straight from the accumulators (EPI_DIRECT,
   correct): 1.71 ms (32-byte row pieces per instruction).
+
+## 2026-11-06 (c): quantization kernels: bf16-native codes, no VOPD; dq static diagonal classes
+
+- The quantization kernels slow down with the clocks (q 0.096 -> 0.143 ms on the slow GPU, Triton copy still 17.9
+  TB/s): compute-latency bound. Probes today (rct q): TDM traffic alone 0.077 ms (~10 TB/s: per workgroup load ->
+  wait -> compute -> store -> wait, 3 workgroups per CU), compute alone 0.087, both 0.124. ATT (`k_mxq_rctr192`):
+  ~13-15k cycles per wave: kbar global load ~1k, TDM load wait ~1.5-2.3k, compute ~7k, TDM stores + wait ~2-3k;
+  in the cols phase LLVM re-materializes 0xffff0000 into an SGPR before every VOPD bitop (209 s_mov_b32 / wave).
+- **RC_BF16** (`k_mxq.hip`, now default): MX blocks straight from bf16 where no fp32 pre-processing is needed (rows
+  without kbar / Y dots / pre: v; cols without kbar: q, v, dO): |x| max on the magnitude bits (v_pk_max_i16), codes by
+  `v_cvt_scalef32_pk8_fp8_bf16`, the column pairs by v_perm_b32. Bit-exact (codes, scales, aux) with the f32 path.
+  gfx1250 has no usable v_dot2_f32_bf16 builtin (needs dot12 / dot13), so dO rows keep the f32 path.
+  With `-amdgpu-enable-vopd=0` for k_mxq.hip (package `SRC_FLAGS`): lab q-rope 0.145 -> 0.142, k-rope 0.139 -> 0.129,
+  v 0.077 -> 0.071, dO 0.102 -> 0.097. Package per call: forward 1.004 -> 0.978 ms (quantization 0.326 -> 0.311),
+  dout quantization 0.097 -> 0.089; pytest 30 pass, fused-RoPE package test pass.
+- dq DQ_DSTAT (lab, off): static mask classes on the two diagonal kv tiles (kv tile n - 1: q tiles i < 2 fully masked
+  -> skipped incl. their dQ WMMAs; kv tile n - 2: q tiles i >= 2 kept without the mask): correct, dq 0.895 -> 0.888.

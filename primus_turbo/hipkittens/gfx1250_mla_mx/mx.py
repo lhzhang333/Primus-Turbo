@@ -59,6 +59,9 @@ SOURCES = ("k_mxq.hip", "k_mla_fwd_mx7.hip", "k_mla_bwd_mx5.hip")
 FLAGS = ("-x", "hip", "--offload-arch=gfx1250", "--cuda-device-only", "--no-gpu-bundle-output", "-O3", "-std=c++20",
          "-mllvm", "-amdgpu-expert-scheduling-mode", "-mllvm", "-greedy-regclass-priority-trumps-globalness",
          "-mllvm", "-misched=gcn-max-ilp")  # fmt: skip
+# per-source extra flags: the quantization kernels without VOPD (LLVM re-materialized a VOPD constant into an SGPR
+# before every dual op: k -7%, the others -1..2%)
+SRC_FLAGS = {"k_mxq.hip": ("-mllvm", "-amdgpu-enable-vopd=0")}
 DKDV_KV_ROWS = 128  # kv rows per k_dkdv_mx workgroup (4 waves x 2 kv16 tiles)
 
 _ROWS_ARGS = (("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("kbar", "ptr"), ("Y", "ptr"), ("aux", "ptr"),
@@ -210,6 +213,7 @@ def _build_dir():
         h.update(f.encode())
         h.update((HIP / f).read_bytes())
     h.update(" ".join(FLAGS).encode())
+    h.update(repr(sorted(SRC_FLAGS.items())).encode())
     for root in (
         Path(os.path.expanduser("~")) / ".cache",
         Path(tempfile.gettempdir()) / f"primus_turbo_{os.getuid()}",
@@ -239,7 +243,8 @@ def _code_object(src):
         if not out.is_file():
             tmp = out.with_suffix(f".{os.getpid()}.tmp")
             r = subprocess.run(
-                [cxx, *FLAGS, "-o", str(tmp), str(HIP / src)], capture_output=True, text=True, cwd=HIP
+                [cxx, *FLAGS, *SRC_FLAGS.get(src, ()), "-o", str(tmp), str(HIP / src)], capture_output=True, text=True,
+                cwd=HIP,
             )
             if r.returncode != 0:
                 tmp.unlink(missing_ok=True)
