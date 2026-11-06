@@ -397,3 +397,31 @@ comparisons within one run are meaningful today.
 - The slow GPU: sustained MX backward 2.436 ms / call (1.54x the 11-05 1.584); during another session's run the gfx
   clocks sit at ~1304 MHz (max 2400) at ~850 W of a 2500 W limit, no throttle / violation status active. The bf16 HK
   kernels slow by less (fwd 1.37x, bwd 1.23x) than the MX ones (fwd 1.53x, bwd 1.50x): MX is closer to clock-bound.
+
+## 2026-11-06 (b): why the dK / dV loop does not respond to scheduling
+
+Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
+- LLVM scheduling strategies: `-amdgpu-sched-strategy=coexec` (gfx1250 / gfx950 co-execution strategy): dkdv
+  1.396 vs 1.385, dq 0.961 vs 0.896, forward neutral; `-amdgpu-enable-vopd=0`: +0.7 / +0.8 / +0.3%.
+- **`py/resched.py`** (new lab tool): post-RA re-emission of an LLVM-compiled loop body (one straight-line block)
+  through asmkit (`tools/asmkit`: s_set_vgpr_msb, expert-mode waits and hazard v_nops derived for the new order,
+  fixed point over the back edge, a full drain at the loop entry / exit, per-kernel verify_obj). WMMA scale operands
+  are not remapped by s_set_vgpr_msb (field map `-`). The identity round trip (`--mode identity`) is bit-exact and
+  as fast as LLVM's build (1.398 vs 1.399). List schedules on a per-wave machine model (`--mode list`, `--prio`)
+  are correct but never faster (1.389-1.51 ms): the model (WMMA windows, TRANS rate, LDS bucket, the measured
+  s_set_vgpr_msb rule: an instruction that needs another mode issues >= 4 cycles after a DS instruction) predicts
+  the LLVM order within 5% (`--calib <ATT dir>`: 2405 vs 2284 cycles / step) but not the effect of re-ordering.
+- What the step costs (ATT, `scratch_mx/py/att_prof.py`, `att_msb.py`, `att_split.py`): ~2290 cycles / step and
+  wave; the issue is close to a sum of per-instruction costs: 227 LDS loads at ~2.3-2.4 cycles each (issued in runs;
+  dropping all 192 b128 loads as a probe: 2293 -> 1858 cycles / step, i.e. 2.3 cycles per load; kernel only -8.5%),
+  88 WMMAs that hide ~4 other instructions each, ~450 VALU + 128 exp at 1-2 cycles. LLVM sinks the dS quantization
+  of all four tile pairs (58 max3, 36 pk_mul, 18 cvt, 152 operand-forming v_mov) into the last slot: a ~550-cycle
+  VALU-only tail. `-fno-slp-vectorize` keeps it in its slots (782 VGPRs instead of 920, no tail): dkdv unchanged
+  (1.387), dq slower (0.932). Pinning the quantized values with an empty asm (PIN_Q) costs an
+  `s_wait_alu depctr_va_vdst(0)` per pin (expert mode waits before every inline asm): 2.6-4.0 ms. A ping-pong
+  2-step unroll (UNROLL2, no loop-carried P / dS copies) spills (1024 VGPRs + 756 B scratch).
+- Per workgroup ~13k cycles outside the loop (32 workgroups per CU, ~27% of the kernel): first TDM round + barrier
+  ~1.5-3k, the epilogue's bank-conflicted staging ds_stores ~2k (the TDM store forbids padding: 8-16-way), the
+  drain before its barrier ~1.3k, the final TDM-store wait ~2k. Probes: no final wait (NO_FINAL_WAIT, unsafe):
+  1.386 vs 1.383 (not on the critical path); dK / dV by global stores straight from the accumulators (EPI_DIRECT,
+  correct): 1.71 ms (32-byte row pieces per instruction).

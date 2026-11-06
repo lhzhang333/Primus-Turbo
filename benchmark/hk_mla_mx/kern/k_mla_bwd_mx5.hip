@@ -65,6 +65,18 @@ using namespace mx;
 #ifndef TDM_INC
 #define TDM_INC 1  // dkdv: each wave's 3 TDM ops keep their next step, global address and LDS stage (advanced per round)
 #endif
+#ifndef NO_FINAL_WAIT
+#define NO_FINAL_WAIT 0  // timing probe only: dkdv ends without waiting for its TDM stores (LDS may be reused early)
+#endif
+#ifndef EPI_DIRECT
+#define EPI_DIRECT 0  // dkdv: dK / dV rows by global stores from the accumulators (no LDS staging / TDM store / waits)
+#endif
+#ifndef PIN_Q
+#define PIN_Q 0  // dkdv: bit 0 P(qt) converted in slot qt, bit 1 dS(qt - 1, qt) quantized in slot qt (empty asm defs)
+#endif
+#ifndef UNROLL2
+#define UNROLL2 0  // dkdv: two steps per loop trip, ping-pong P / dS buffers (no loop-carried copies)
+#endif
 #ifndef MIDSYNC
 // the per-step TDM wait + barrier + issue of round s + 2 between slots MIDSYNC - 1 and MIDSYNC of step s (0: at the step
 // start); slot 7 then prefetches step s + 1's tile 0 and its slot-0 A fragments, so a step starts with no barrier
@@ -534,13 +546,23 @@ __device__ __forceinline__ void dkdv_body(
                     p[r] = pv;
                     ds[r] = pv * dp[r];
                 });
+#if PIN_Q & 1
+                u32x2 pq = cvt8_e4m3(p, 1.0f / 256.0f);
+                asm volatile("" : "+v"(pq));  // P(qt) converted in its slot (LLVM sank it to the step end, next to its use)
+#else
                 const u32x2 pq = cvt8_e4m3(p, 1.0f / 256.0f);
+#endif
                 pB[j][2 * qt] = (int)pq[0];
                 pB[j][2 * qt + 1] = (int)pq[1];
                 if constexpr (qt % 2 == 0) {
                     dsprev[j] = ds;
                 } else {
+#if PIN_Q & 2
+                    DsQ z = quant_pair(dsprev[j], ds);
+                    asm volatile("" : "+v"(z.a), "+v"(z.b), "+v"(z.byte));  // dS(qt - 1, qt) quantized in its slot
+#else
                     const DsQ z = quant_pair(dsprev[j], ds);
+#endif
                     dsB[j][2 * (qt - 1)] = (int)z.a[0];
                     dsB[j][2 * (qt - 1) + 1] = (int)z.a[1];
                     dsB[j][2 * qt] = (int)z.b[0];
@@ -585,8 +607,49 @@ __device__ __forceinline__ void dkdv_body(
             dsso[(int)jj] = dss[(int)jj];
         });
     };
+#if UNROLL2
+    // two steps per loop trip with ping-pong P / dS buffers (X: even steps, Y: odd steps): no per-step copies of the
+    // loop-carried P / dS of the previous step (LLVM moved ~66 VGPRs per step through v_mov at the step end)
+    i32x16 pY[NJ], dsY[NJ];
+    int dssY[NJ];
+    auto runpp = [&](int s, auto diag_c, auto prev_c, i32x16 (&pB)[NJ], i32x16 (&dsB)[NJ], int (&dss)[NJ],
+                    const i32x16 (&pBq)[NJ], const i32x16 (&dsBq)[NJ], const int (&dssq)[NJ])
+        __attribute__((always_inline)) {
+        tensor_wait<TDM_PER_ROUND>();
+        bar_signal();
+        bar_wait();
+        issue_round(s + 2);
+        const StepAddr a = addr(s);
+        static_for<NJ>([&](auto jj) { dss[(int)jj] = 0; });
+        step(s, a, qs0 + s * QS_, pB, dsB, dss, pBq, dsBq, dssq, pre_t, pre_a, diag_c, prev_c);
+    };
+    runpp(0, std::true_type{}, std::false_type{}, pBo, dsBo, dsso, pY, dsY, dssY);  // step 0 -> X
+    {
+        int s = 1;
+        bool lastY = false;
+        if (s < nst) {
+            for (;;) {
+                runpp(s, std::false_type{}, std::true_type{}, pY, dsY, dssY, pBo, dsBo, dsso);  // X -> Y
+                if (s + 1 >= nst) {
+                    lastY = true;
+                    break;
+                }
+                runpp(s + 1, std::false_type{}, std::true_type{}, pBo, dsBo, dsso, pY, dsY, dssY);  // Y -> X
+                s += 2;
+                if (s >= nst) break;
+            }
+        }
+        if (lastY)
+            static_for<NJ>([&](auto jj) {
+                pBo[(int)jj] = pY[(int)jj];
+                dsBo[(int)jj] = dsY[(int)jj];
+                dsso[(int)jj] = dssY[(int)jj];
+            });
+    }
+#else
     run(0, std::true_type{}, std::false_type{});
     for (int s = 1; s < nst; ++s) run(s, std::false_type{}, std::true_type{});
+#endif
 
     // ---- the dV / dK of the last step (its A part: round nst), A fragments two groups ahead
     tensor_wait<0>();
@@ -613,6 +676,37 @@ __device__ __forceinline__ void dkdv_body(
         });
     }
 
+#if EPI_DIRECT
+    // ---- epilogue: dK / dV rows straight from the accumulators (lane = kv row lr of kv16 tile j, 8 bf16 = 16 B of
+    // d16 tile d at column 16 d + 8 lh): global stores, no LDS staging (16-way bank conflicts: the TDM store forbids
+    // padding), no barrier, no TDM-store wait (the stores complete after the wave ends)
+    {
+        const int ln = lane_now(), l16 = ln & 15, hh = ln >> 4;
+        static_for<NJ>([&](auto jj) {
+            constexpr int j = jj;
+            const int kvr = kvw + 16 * j + l16;
+            if (kvr < S) {
+                bf16 *pk = DK + (long long)b * dk_sb + (long long)kvr * dk_ss + (long long)h * (SPLIT ? 256 : D_QK) + 8 * hh;
+                bf16 *pv = DV + (long long)b * dv_sb + (long long)kvr * dv_ss + (long long)h * (SPLIT ? 256 : D_V) + 8 * hh;
+                bf16 *pp = SPLIT ? DKP + (long long)b * dkp_sb + (long long)kvr * dkp_ss + (long long)h * 64 + 8 * hh : pk;
+                static_for<8>([&](auto dd) {
+                    constexpr int d = dd;
+                    bf16x8 w;
+                    static_for<8>([&](auto rr) { w[(int)rr] = (bf16)dv[d][j][(int)rr]; });
+                    *(u32x4 *)(pv + 16 * d) = __builtin_bit_cast(u32x4, w);
+                });
+                static_for<12>([&](auto dd) {
+                    constexpr int d = dd;
+                    bf16x8 w;
+                    static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dk[d][j][(int)rr] * scale); });
+                    bf16 *dst = (SPLIT && d >= 8) ? pp + 16 * (d - 8) : pk + 16 * d;
+                    *(u32x4 *)dst = __builtin_bit_cast(u32x4, w);
+                });
+            }
+        });
+    }
+    return;
+#endif
     // ---- epilogue: dK / dV rows (lane = kv column, rows d = 8 lh + r of each d16 tile) as bf16 into LDS (the q ring,
     // idle since the barrier above), then one TDM store each (wave 0: dK, 384 B rows; wave 1: dV, 256 B rows)
     constexpr int XDK = 2 * D_QK, XDV = 2 * D_V, O_SDK = 0, O_SDV = KB * XDK;
@@ -692,7 +786,9 @@ __device__ __forceinline__ void dkdv_body(
         }
     }
 #endif
+#if !NO_FINAL_WAIT
     tensor_wait<0>();
+#endif
 }
 
 extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
