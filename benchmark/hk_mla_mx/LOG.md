@@ -648,3 +648,9 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   loop ~2270 cycles / step x 24-26, epilogue ~2.8-3.3k: 14% outside the loop; the cold first workgroup per CU +7.7k.
   Forward trip profile (100-cycle buckets): two WMMA-free stretches per trip (~300 + ~200 cycles of softmax bursts).
   The forward's 8 VGPR spills are all in the prologue (none in the tile loop).
+- dq trip profile (ATT, k_dq_mxr, 2857 cycles / tile): per kv16 pair and q tile a VALU-only stretch (~100-200 cycles:
+  dS = P dP, its |max| and the pk8 conversions), and the 48 dQ WMMAs at the end of the trip (~400 cycles of W + L, no
+  VALU). Overlapping them needs the dQ of tile t in tile t + 1 (dS of two tiles live: +64 VGPRs over 905, and tile t's
+  K^T stage is recycled at the start of t + 1 with the 3-stage ring): not possible without an LDS / register re-plan.
+  The |dS| max as a max3 tree (DQ_AMTREE, lab): same v_max count (LLVM already formed max3), 1 spill, 0.8957 vs
+  0.8610 ms: dropped.
