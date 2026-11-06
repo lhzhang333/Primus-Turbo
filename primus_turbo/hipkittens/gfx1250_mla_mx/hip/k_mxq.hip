@@ -430,9 +430,10 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
             const int xsi = live ? ((D == 192 && (mode & 16) && j >= 4) ? j + 2 : j) : ((mode & 16) ? j - 2 : j);
             xs[r * RS + xsi] = live ? (unsigned char)(blk.e + 127) : (unsigned char)((mode & 16) ? 0 : 127);
         }
-        if (live) {  // block j's two 16-byte halves: chunk 128 (j < 4) or the 64-byte chunk at 128 (j >= 4)
+        {  // block jj's two 16-byte halves: chunk 128 (jj < 4) or the 64-byte chunk at 128 (jj >= 4); the pad lanes
+           // hold block NBLK - 1 of the row too and store the same bytes to the same place (no masked region)
             unsigned char *dst = x8 + r * D;
-            const int o0 = 16 * j + ((D == 192 && j >= 4) ? 64 : 0), o1 = 16 * j + ((D == 192 && j >= 4) ? 96 : 64);
+            const int o0 = 16 * jj + ((D == 192 && jj >= 4) ? 64 : 0), o1 = 16 * jj + ((D == 192 && jj >= 4) ? 96 : 64);
             *(u32x4 *)(dst + o0) = u32x4{blk.q[0][0], blk.q[0][1], blk.q[2][0], blk.q[2][1]};
             *(u32x4 *)(dst + o1) = u32x4{blk.q[1][0], blk.q[1][1], blk.q[3][0], blk.q[3][1]};
         }

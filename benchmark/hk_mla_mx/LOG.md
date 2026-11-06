@@ -509,3 +509,7 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   stores masked. Bit-exact. rct q 0.1102 -> 0.1029, k 0.1057 -> 0.0986 (v / dO unchanged: D 128 has no pad lanes);
   fused RoPE q 0.1393 -> 0.1323, k 0.1158 -> 0.1095. Package per call: forward 0.930 -> 0.903 ms (quantization 0.283
   -> 0.268); fused-RoPE forward 0.9712 ms (1.0827 this morning: -10.3%). pytest 30 pass, fused-RoPE test bit-exact.
+- The pad lanes (which recompute block NBLK - 1 of their row) store those same bytes to the same addresses: no masked
+  store region left in the rows phase. Codes / scales bit-exact; the fused-RoPE q kernel's aux (q . kbar) moves by
+  ~1 ulp (LLVM contracts the dot differently in the changed code; within the tests' tolerance). Fused RoPE q 0.1333 ->
+  0.1270, rct q / k -0.7 / -1%. pytest 30 pass, fused-RoPE test pass.
