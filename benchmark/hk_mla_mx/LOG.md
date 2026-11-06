@@ -563,3 +563,31 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   0.904 / 0.907 + k_rope_bwd_q 0.037 ms; backward per call 2.459 / 2.443 vs 2.469 / 2.473 ms (events 2.538 vs 2.549):
   the rope math adds ~400 VALU per wave to an epilogue nothing overlaps (one workgroup per CU). pytest 30 pass,
   fused-RoPE test pass (dq bitwise with the unfused composition).
+
+## 2026-11-06 (e): conflict-free epilogue staging (skewed regions), fused dQ RoPE
+
+- ATT of the package forward (`scratch_mx/py/att_segs.py`: a wave's timeline as loop runs and the runs outside):
+  a warm workgroup ~83k cycles, the loop ~52.5k, outside ~30k (36%): prologue ~5k, per block ~11-13k of diagonal
+  tiles + epilogue, in which the O staging's 32 ds_store_b128 per lane cost ~1.6-1.9k plus ~1.5k in the following
+  `s_wait_dscnt 0` (256-byte rows: a store's 16 rows hit one bank group, 16-way). The first workgroup per CU also
+  pays ~16k cycles of instruction-cache misses in its first diagonal region (a ~1k-cycle stall every 256 bytes of
+  code, `scratch_mx/py/att_top.py`), once per CU per launch.
+- **Skewed staging regions** (the TDM store ignores LDS padding, so a padded pitch is not possible): the staging is
+  split into 16 dense regions by row class (row % 16 = j, the lane's lr), each a plain 2-D tile, the region bases
+  stepping by rows * pitch + 16 B; one 2-D TDM store per region with a global row stride of 16 rows, spread over the
+  waves. A ds_store's 16 rows land in 16 bank groups (2-way: the minimum for 512 bytes) with no extra instruction.
+  Forward OSKEW (O, 256-byte rows): lab 0.6821 -> 0.6398 ms (-6.2%); dq DQ_SKEW (384-byte rows, 8-way before):
+  0.9006 -> 0.8723 (-3.1%; the fused-RoPE k_dq_mxr with its two 128-row halves 0.8956 -> 0.8732); dkdv EPI_SKEW (dK
+  384 / 256 + 128, dV 256-byte rows): 1.3910 -> 1.3391 (-3.7%). All bit-exact at five shapes (+ the forward's extra
+  shape sweep). (EPI_PAD's conflict-free stores lost their gain to its re-pack copies; the regions need none.)
+- Forward QFIRST (the second block's Q loads issued in the first block's epilogue ahead of the O stores: its start
+  waits for its Q only): lab 0.6420 -> 0.6260 ms. With the package's re-scheduling the forward gains less: three
+  copies of each code object interleaved (`scratch_mx/py/pkg_obj_ab.py`; identical objects differ by up to ~1%
+  between loads), attn_fwd per call: old 0.9407, OSKEW 0.9207, OSKEW + QFIRST (branch-free: NULL ops when there is no
+  second block, else the branch split the re-scheduled region) 0.9205 ms. The re-scheduled tile loop runs ~1857 vs
+  ~1762 cycles per trip with the new register allocation (same instruction mix: 100 W, 256 T, ~266 V, 114 L, ~520
+  s_set_vgpr_msb per trip), which eats half of the epilogue's gain. asm_resched is deterministic (outputs identical
+  across PYTHONHASHSEED values).
+- Package (profiler, fused-RoPE fwd + bwd, b2 s4096 h128, slow GPU): GPU time per step 3.545 -> 3.435 ms:
+  k_dkdv_mxr 1.405 -> 1.328, k_dq_mxr 0.913 -> 0.886, k_mla_fwd_mx 0.605 -> 0.600. pytest 30 pass, fused-RoPE test
+  pass (out / dq / dkv bitwise with the unfused composition).

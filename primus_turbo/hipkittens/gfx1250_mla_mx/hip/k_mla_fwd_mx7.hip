@@ -48,8 +48,20 @@ constexpr int LDS_RING_Q = QS_OFF + BM * 8;
 #endif
 constexpr int XO = 2 * D_V;                        // staging row stride (bytes): no pad (the TDM store
                                                    // ignores LDS padding: rows after the first come out wrong)
-constexpr int O_OFF = LDS_RING_Q;                  // staging: BM rows x XO
-constexpr int LDS_B = OSTAGE ? O_OFF + BM * XO : LDS_RING_Q;
+#ifndef OSKEW
+#define OSKEW 1  // the staging as 16 dense regions (block rows q with q % 16 = j: 16 rows of XO) whose bases step by
+                 // XO * 16 + 16 B: a ds_store's 16 rows hit 16 bank groups (2-way: the minimum for 512 B) instead of
+                 // one (16-way); one 2-D TDM store per region (global row stride 16 rows)
+#endif
+#ifndef QFIRST
+#define QFIRST 1  // (OSKEW) the second block's Q loads issued in the first block's epilogue ahead of its O stores: the
+                  // second block waits for its Q only, the O stores stay in flight (the next staging is after loads
+                  // issued later: in-order completion)
+#endif
+static_assert(!QFIRST || OSKEW, "QFIRST counts OSKEW's four O stores per wave");
+constexpr int O_RG = BM / 16 * XO + 16;            // OSKEW: region stride (bytes)
+constexpr int O_OFF = LDS_RING_Q;                  // staging: BM rows x XO (OSKEW: 16 regions of O_RG)
+constexpr int LDS_B = OSTAGE ? O_OFF + (OSKEW ? 16 * O_RG : BM * XO) : LDS_RING_Q;
 static_assert(LDS_B <= 327680, "LDS");
 constexpr unsigned W0_KN = tdm_w0(0, 32, 20), W0_KR = tdm_w0(0, 16, 36), W0_V = tdm_w0(0, 32, 4), W0_S = tdm_w0(0, 0, 0);
 #ifndef TAU2_X100
@@ -539,12 +551,17 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
             tensor_wait<0>();
 #endif
         } else {
+#if QFIRST
+            // second block: its Q went out in the first block's epilogue ahead of the four O stores of this wave
+            tensor_wait<4>();
+#else
             // second block: its tiles 0..2 came during the first block; its Q now (the region is free: the first
             // block's last Q read was before its last tile's B_{t+1} wait)
             tdm_load(tdm_g0(lds0 + Q_OFF, gq, wv == 1 ? 1 : 0), tdm_g1(W0_KN, BM, 128, BM, D_QK));
             tdm_load(tdm_g0(lds0 + Q_OFF + 128, gq + 128, wv == 2 ? 1 : 0), tdm_g1(W0_KR, BM, 64, BM, D_QK));
             tdm_load(tdm_g0(lds0 + QS_OFF, gqs, wv == 3 ? 1 : 0), tdm_g1(W0_S, BM, 8, BM, 8));
             tensor_wait<0>();
+#endif
         }
         bar_signal();
         bar_wait();  // B_0 of the block: its Q and tile 0 in LDS; the previous block's O store done
@@ -702,6 +719,18 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
         }
         tile(n - 2, qaddr(), std::false_type{}, std::true_type{}, std::false_type{});
         tile(n - 1, qaddr(), std::false_type{}, std::true_type{}, std::true_type{});
+#if QFIRST
+        {  // the second block's Q (its region is free since the last tile's B_{t+1} wait); NULL ops when there is none
+           // (no branch: the block stays one straight-line region)
+            const bool qn = rb == 0 && qbB >= 0;
+            const unsigned long long qrB = bh * S + (unsigned long long)(qn ? qbB : 0) * BM;
+            const unsigned long long gqB = (unsigned long long)(uintptr_t)Q8 + qrB * D_QK;
+            const unsigned long long gqsB = (unsigned long long)(uintptr_t)QS + qrB * 8;
+            tdm_load(tdm_g0(lds0 + Q_OFF, gqB, qn && wv == 1 ? 1 : 0), tdm_g1(W0_KN, BM, 128, BM, D_QK));
+            tdm_load(tdm_g0(lds0 + Q_OFF + 128, gqB + 128, qn && wv == 2 ? 1 : 0), tdm_g1(W0_KR, BM, 64, BM, D_QK));
+            tdm_load(tdm_g0(lds0 + QS_OFF, gqsB, qn && wv == 3 ? 1 : 0), tdm_g1(W0_S, BM, 8, BM, 8));
+        }
+#endif
         // epilogue: lse by plain stores (both lane halves, the same value: no exec change); O as bf16 rows into the LDS
         // staging block, then one TDM store of the block's 256 x 256 B by wave 0 (the scattered SBHD global stores held
         // their data VGPRs for hundreds of cycles each: s_wait_xcnt ~5.6k cycles per block)
@@ -716,7 +745,12 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
             const float l = st[i].os[0];
             const float inv = l > 0.f ? 1.0f / l : 0.f;
             const int ln = lane_now();
+#if OSKEW
+            // row q = 64 i + 16 wv + lr: region lr, row q / 16 = 4 i + wv of it
+            const unsigned rowb = lds0 + O_OFF + (unsigned)((ln & 15) * O_RG + (4 * i + wv) * XO + 16 * (ln >> 4));
+#else
             const unsigned rowb = lds0 + O_OFF + (unsigned)((64 * i + 16 * wv + (ln & 15)) * XO + 16 * (ln >> 4));
+#endif
             static_for<NDT>([&](auto dd) {
                 constexpr int dt = dd;
                 bf16x8 w;
@@ -726,11 +760,23 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
         });
         bar_signal();
         bar_wait();
+#if OSKEW
+        {  // wave w: regions 4 w .. 4 w + 3 (rows q0 + j + 16 m, m < 16)
+            const unsigned long long go = (unsigned long long)(uintptr_t)(O + (long long)b * o_sb + (long long)q0 * o_ss +
+                                                                         (long long)h * D_V);
+            static_for<4>([&](auto jj) {
+                const int j = 4 * wv + (int)jj;
+                tdm_store(tdm_g0(lds0 + O_OFF + (unsigned)(j * O_RG), go + (unsigned long long)j * 2ull * (unsigned long long)o_ss),
+                          tdm_g1(tdm_w0(0, 0, 0), BM / 16, 2 * D_V, BM / 16, 32ull * (unsigned long long)o_ss));
+            });
+        }
+#else
         if (wv == 0) {
             const unsigned long long go = (unsigned long long)(uintptr_t)(O + (long long)b * o_sb + (long long)q0 * o_ss +
                                                                          (long long)h * D_V);
             tdm_store(tdm_g0(lds0 + O_OFF, go), tdm_g1(tdm_w0(0, 0, 0), BM, 2 * D_V, BM, 2ull * (unsigned long long)o_ss));
         }
+#endif
     };
 
     // workgroup prologue: the first block's Q and tiles 0..2 (ring slots 0..2); the second block's Q in run_block

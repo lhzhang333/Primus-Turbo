@@ -31,6 +31,11 @@ using namespace mx;
 #ifndef PF_KV
 #define PF_KV 1
 #endif
+#ifndef DQ_SKEW
+#define DQ_SKEW 1  // dq epilogue staging as 16 dense regions (rows q % 16 = j) whose bases step by rows * 384 + 16 B: a
+                   // ds_store's 16 rows hit distinct bank groups (2-way: the minimum) instead of two (8-way); one 2-D TDM
+                   // store per region (global row stride 16 rows), spread over the waves
+#endif
 #ifndef DQ_PRO_PARTIAL
 #define DQ_PRO_PARTIAL 1
 #endif
@@ -79,6 +84,11 @@ using namespace mx;
 #endif
 #ifndef NO_FINAL_WAIT
 #define NO_FINAL_WAIT 0  // timing probe only: dkdv ends without waiting for its TDM stores (LDS may be reused early)
+#endif
+#ifndef EPI_SKEW
+#define EPI_SKEW 1  // dkdv epilogue staging as 16 dense regions per output (rows r % 16 = j: KB / 16 rows each) whose bases
+                    // step by those rows + 16 B: 2-way ds_stores instead of 8 / 16-way; a 2-D TDM store per region and
+                    // output (global row stride 16 rows), spread over the waves
 #endif
 #ifndef EPI_PAD
 #define EPI_PAD 0  // dkdv epilogue: padded staging rows, per-wave dense re-pack + TDM stores (no bank conflicts, no barrier)
@@ -826,13 +836,24 @@ __device__ __forceinline__ void dkdv_body(
     static_assert(O_SDV + KB * XDV <= ARING, "staging inside the q ring");
     // SPLIT: the nope part as 256-byte rows at O_SDK, the rope part as 128-byte rows at O_SDP (same total bytes)
     constexpr int XDN = SPLIT ? 2 * 128 : XDK, O_SDP = O_SDK + KB * 2 * 128;
+    // EPI_SKEW: region strides and bases (dK nope / full rows, dV, dK rope)
+    constexpr int RRW = KB / 16, RK = RRW * XDN + 16, RV = RRW * XDV + 16, RP = RRW * 128 + 16;
+    constexpr int S_DK = 0, S_DV = S_DK + 16 * RK, S_DP = S_DV + 16 * RV, S_END = S_DP + (SPLIT ? 16 * RP : 0);
+    static_assert(!EPI_SKEW || S_END <= ARING, "skewed staging inside the q ring");
     {
         const int ln = lane_now();
         static_for<NJ>([&](auto jj) {
             constexpr int j = jj;
             const unsigned r = (unsigned)(KBW * wv + 16 * j + (ln & 15)), hh = (unsigned)(ln >> 4);
+#if EPI_SKEW
+            // row r: region r % 16 = lr, its row r / 16
+            const unsigned rg = (unsigned)(ln & 15), rm = r >> 4;
+            const unsigned dkr = lds0 + S_DK + rg * RK + rm * XDN + 16 * hh, dvr = lds0 + S_DV + rg * RV + rm * XDV + 16 * hh;
+            const unsigned dpr = lds0 + S_DP + rg * RP + rm * 128 + 16 * hh;
+#else
             const unsigned dkr = lds0 + O_SDK + r * XDN + 16 * hh, dvr = lds0 + O_SDV + r * XDV + 16 * hh;
             const unsigned dpr = lds0 + O_SDP + r * 128 + 16 * hh;
+#endif
             static_for<12>([&](auto dd) {
                 constexpr int d = dd;
                 bf16x8 w;
@@ -871,6 +892,32 @@ __device__ __forceinline__ void dkdv_body(
                           tdm_g1(tdm_w0(0, 0, 0), rows, 128, KBW, 2ull * (unsigned long long)dkp_ss));
             }
         }
+    }
+#elif EPI_SKEW
+    bar_signal();
+    bar_wait();
+    {
+        // wave w: regions j = 4 w .. 4 w + 3 of each output: rows kv0 + j + 16 m (m < KB / 16; those past S dropped)
+        const int rows = min(KB, S - kv0);
+        static_for<4>([&](auto jj) {
+            const int j = 4 * wv + (int)jj;
+            const unsigned nr = rows > j ? (unsigned)min(RRW, (rows - j + 15) / 16) : 0u;
+            const long long kr = (long long)(kv0 + j);
+            const unsigned long long gk = (unsigned long long)(uintptr_t)(DK + (long long)b * dk_sb + kr * dk_ss +
+                                                                          (long long)h * (SPLIT ? 256 : D_QK));
+            tdm_store(tdm_g0(lds0 + S_DK + (unsigned)(j * RK), gk),
+                      tdm_g1(tdm_w0(0, 0, 0), nr, XDN, RRW, 32ull * (unsigned long long)dk_ss));
+            const unsigned long long gv = (unsigned long long)(uintptr_t)(DV + (long long)b * dv_sb + kr * dv_ss +
+                                                                          (long long)h * (SPLIT ? 256 : D_V));
+            tdm_store(tdm_g0(lds0 + S_DV + (unsigned)(j * RV), gv),
+                      tdm_g1(tdm_w0(0, 0, 0), nr, XDV, RRW, 32ull * (unsigned long long)dv_ss));
+            if constexpr (SPLIT) {
+                const unsigned long long gp = (unsigned long long)(uintptr_t)(DKP + (long long)b * dkp_sb +
+                                                                              kr * dkp_ss + (long long)h * 64);
+                tdm_store(tdm_g0(lds0 + S_DP + (unsigned)(j * RP), gp),
+                          tdm_g1(tdm_w0(0, 0, 0), nr, 128, RRW, 32ull * (unsigned long long)dkp_ss));
+            }
+        });
     }
 #else
     bar_signal();
@@ -1369,11 +1416,21 @@ __device__ __forceinline__ void dq_body(
         [[maybe_unused]] const unsigned csb = lds0 + (unsigned)((n % Q_NSTG) * Q_STG);
         [[maybe_unused]] const unsigned sth0 = lds0 + (unsigned)(((n + 1) % Q_NSTG) * Q_STG);
         [[maybe_unused]] const unsigned sth1 = lds0 + (unsigned)(((n + 2) % Q_NSTG) * Q_STG);
+        // DQ_SKEW: region stride of the 16 row classes (q % 16): 16 rows (ROPE: 8 rows of a 128-row half) + 16 B
+        constexpr unsigned RG = (ROPE ? 8 : 16) * XDQ + 16;
+        static_assert(!DQ_SKEW || (ROPE ? 16 * RG <= Q_STG : 16 * RG <= Q_OFF_Q), "skewed staging");
         auto row_b = [&](int i) -> unsigned {
-            if constexpr (ROPE)
+            if constexpr (DQ_SKEW) {
+                // row q = 64 i + 16 wv + lr (ROPE: q' = 64 (i & 1) + 16 wv + lr of half i / 2): region lr, its row q / 16
+                if constexpr (ROPE)
+                    return (i < 2 ? sth0 : sth1) + (unsigned)((ln & 15) * RG + (4 * (i & 1) + wv) * XDQ + 16 * (ln >> 4));
+                else
+                    return lds0 + (unsigned)((ln & 15) * RG + (4 * i + wv) * XDQ + 16 * (ln >> 4));
+            } else if constexpr (ROPE) {
                 return (i < 2 ? sth0 : sth1) + (unsigned)((64 * (i & 1) + 16 * wv + (ln & 15)) * XDQ + 16 * (ln >> 4));
-            else
+            } else {
                 return lds0 + (unsigned)((64 * i + 16 * wv + (ln & 15)) * XDQ + 16 * (ln >> 4));
+            }
         };
         // ROPE: the cos / sin values of the lane's rows (position q0 + 64 i + 16 wv + lr, values 8 lh + 16 j, j < 4)
         [[maybe_unused]] u32x4 rcs[ROPE ? QTW : 1][4], rsn[ROPE ? QTW : 1][4];
@@ -1430,7 +1487,18 @@ __device__ __forceinline__ void dq_body(
         bar_wait();
         const unsigned long long g = (unsigned long long)(uintptr_t)(DQ + (long long)b * dq_sb + (long long)q0 * dq_ss +
                                                                      (long long)h * D_QK);
-        if constexpr (ROPE) {
+        if constexpr (DQ_SKEW) {
+            // wave w: regions j = 4 w .. 4 w + 3 (of each half with ROPE): rows q0 (+ 128 half) + j + 16 m
+            const unsigned long long rs = 2ull * (unsigned long long)dq_ss;  // one row (bytes)
+            static_for<ROPE ? 2 : 1>([&](auto hh) {
+                const unsigned base = ROPE ? ((int)hh == 0 ? sth0 : sth1) : lds0;
+                static_for<4>([&](auto jj) {
+                    const int j = 4 * wv + (int)jj;
+                    tdm_store(tdm_g0(base + (unsigned)j * RG, g + ((unsigned long long)(128 * (int)hh) + (unsigned long long)j) * rs),
+                              tdm_g1(tdm_w0(0, 0, 0), ROPE ? 8 : 16, XDQ, ROPE ? 8 : 16, 16ull * rs));
+                });
+            });
+        } else if constexpr (ROPE) {
             if (wv < 2)
                 tdm_store(tdm_g0(wv == 0 ? sth0 : sth1, g + (unsigned long long)wv * 128ull * 2ull * (unsigned long long)dq_ss),
                           tdm_g1(tdm_w0(0, 0, 0), 128, XDQ, 128, 2ull * (unsigned long long)dq_ss));
