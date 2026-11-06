@@ -641,3 +641,10 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   4 KB of 43.9 / 47.8 KB). mx.py checks the built object (ELF symbol table vs the .text end) and rebuilds with
   PF_CODE 0 when a prefetch could pass the end. Fused-RoPE fwd + bwd 3.302 ms per step. pytest 30 pass, fused-RoPE
   test pass.
+- Training gate **g120i** (all of the above, slow GPU, 120 iterations, 1-GPU DSv3 proxy): bf16 HK 1004.7, hk_mx +
+  fused RoPE 981.9 ms / iteration (-2.27%; g120h this morning -1.06%), final-window loss 0.0818 both, grad-norm ratio
+  max 1.025.
+- dkdv ATT after the skewed staging (warm workgroups): prologue (incl. the peeled diagonal step) ~6.2-6.6k cycles,
+  loop ~2270 cycles / step x 24-26, epilogue ~2.8-3.3k: 14% outside the loop; the cold first workgroup per CU +7.7k.
+  Forward trip profile (100-cycle buckets): two WMMA-free stretches per trip (~300 + ~200 cycles of softmax bursts).
+  The forward's 8 VGPR spills are all in the prologue (none in the tile loop).
