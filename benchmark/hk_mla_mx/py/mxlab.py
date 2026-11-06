@@ -44,6 +44,8 @@ EXPERT = [
 # + register classes before globalness in the greedy allocator: DS addresses and WMMA scale operands live in v0..v255
 # (no VGPR-MSB remap), and without it big kernels spill them
 EXPERT_P = EXPERT + ["-mllvm", "-greedy-regclass-priority-trumps-globalness"]
+# xi = xp + the GCN max-ILP machine scheduler (the package's flags since 11-06: dq -3.7%, forward -2%)
+EXPERT_I = EXPERT_P + ["-mllvm", "-misched=gcn-max-ilp"]
 
 
 def recipe_of(tag, kind="fwd"):
@@ -62,7 +64,7 @@ def build_tag(kind, tag, defines=()):
     """Build kern/k_mla_<kind>_mx<rung>.hip with the tag's flags into BUILD/k_mla_<kind>_mx<tag>.hsaco (kind: fwd /
     bwd), the path kernel(name, tag) loads."""
     rung, fl = split_tag(tag)
-    flags = {"": (), "x": EXPERT, "xp": EXPERT_P}[fl]
+    flags = {"": (), "x": EXPERT, "xp": EXPERT_P, "xi": EXPERT_I}[fl]
     return build([f"k_mla_{kind}_mx{rung}.hip"], defines=defines, tag=fl, flags=flags)
 
 

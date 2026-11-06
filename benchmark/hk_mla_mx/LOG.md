@@ -390,3 +390,10 @@ comparisons within one run are meaningful today.
     the DS addresses and WMMA scale operands must be): 2.25 ms. Allocator flags (no regclass priority, split-spill
     size, no misched) do not help.
   The persistent structure needs more low-bank registers than b5 leaves; parked (would need hand-assigned registers).
+- LLVM machine scheduler `-misched=gcn-max-ilp` (lab tag `xi`, now in the package FLAGS): dq 0.930 -> 0.896 (-3.7%),
+  forward m7 0.673 -> 0.659 (-2%), dkdv and the quantization kernels neutral (same-run A / B on the slow GPU); pytest
+  30 pass, fused-RoPE package test pass. Package per call on the slow GPU: forward 1.004 (quantization 0.326), backward
+  2.463 (+0.097 quantization) vs bf16 HK 0.862 / 2.431.
+- The slow GPU: sustained MX backward 2.436 ms / call (1.54x the 11-05 1.584); during another session's run the gfx
+  clocks sit at ~1304 MHz (max 2400) at ~850 W of a 2500 W limit, no throttle / violation status active. The bf16 HK
+  kernels slow by less (fwd 1.37x, bwd 1.23x) than the MX ones (fwd 1.53x, bwd 1.50x): MX is closer to clock-bound.

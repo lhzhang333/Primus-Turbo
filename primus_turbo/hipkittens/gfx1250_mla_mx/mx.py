@@ -53,10 +53,12 @@ KBAR_STRIDE = 16
 LOG2E = 1.4426950408889634
 HIP = Path(__file__).resolve().parent / "hip"
 SOURCES = ("k_mxq.hip", "k_mla_fwd_mx7.hip", "k_mla_bwd_mx5.hip")
-# expert scheduling mode (the compiler places the dependency waits, as every bf16 HK kernel) and register classes
-# before globalness (DS addresses and WMMA scale operands must be in v0..v255)
+# expert scheduling mode (the compiler places the dependency waits, as every bf16 HK kernel), register classes
+# before globalness (DS addresses and WMMA scale operands must be in v0..v255), the GCN max-ILP machine scheduler
+# (dq -3.7%, forward -2%, the rest neutral)
 FLAGS = ("-x", "hip", "--offload-arch=gfx1250", "--cuda-device-only", "--no-gpu-bundle-output", "-O3", "-std=c++20",
-         "-mllvm", "-amdgpu-expert-scheduling-mode", "-mllvm", "-greedy-regclass-priority-trumps-globalness")  # fmt: skip
+         "-mllvm", "-amdgpu-expert-scheduling-mode", "-mllvm", "-greedy-regclass-priority-trumps-globalness",
+         "-mllvm", "-misched=gcn-max-ilp")  # fmt: skip
 DKDV_KV_ROWS = 128  # kv rows per k_dkdv_mx workgroup (4 waves x 2 kv16 tiles)
 
 _ROWS_ARGS = (("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("kbar", "ptr"), ("Y", "ptr"), ("aux", "ptr"),
