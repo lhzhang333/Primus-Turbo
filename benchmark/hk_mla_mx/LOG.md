@@ -631,3 +631,13 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   cycle per switch): the loop's emitted lines 1328 -> 1135 / 1016, but attn_fwd 0.8761 -> 0.8986 / 0.9229 ms (3
   copies): the W / T / V interleaving matters more than the switches (T <-> V switches fill the TRANS unit's idle
   slot; ATT: T -> V with a switch 1.70 cycles vs T -> T 1.77). Not taken.
+- **Code prefetch** (PF_CODE): the first workgroup per CU of each launch misses the instruction cache line by line in
+  its once-per-block regions (dq ATT: that workgroup's diagonal + epilogue 60k vs 8k cycles; forward ~16k extra).
+  `prefetch_code<NB>()` (mx_common.h: `__builtin_amdgcn_s_getpc` + NB `__builtin_amdgcn_s_prefetch_inst` of 32 lines
+  at 4 KB steps) at the kernel start. A first inline-asm version (`s_prefetch_inst_pc_rel`, 16 x 4 KB) page-faulted
+  (no-retry fault, client TCP; no reset): k_dq_mxr is the code object's last function, the range passed the end of
+  .text. Package fwd + bwd profile (two runs each): k_dq_mxr 0.8905 / 0.8825 -> 0.8618 / 0.8625 / 0.8581 ms; dkdv
+  (6 x 4 KB) 1.3261 / 1.3274 -> 1.3290 / 1.3298, forward (7 x 4 KB) 0.550 either way: on for the dq kernels only (10 x
+  4 KB of 43.9 / 47.8 KB). mx.py checks the built object (ELF symbol table vs the .text end) and rebuilds with
+  PF_CODE 0 when a prefetch could pass the end. Fused-RoPE fwd + bwd 3.302 ms per step. pytest 30 pass, fused-RoPE
+  test pass.

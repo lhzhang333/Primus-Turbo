@@ -76,6 +76,10 @@ constexpr unsigned W0_KN = tdm_w0(0, 32, 20), W0_KR = tdm_w0(0, 16, 36), W0_V = 
 #ifndef NO_GUARD
 #define NO_GUARD 0
 #endif
+#ifndef PF_CODE
+#define PF_CODE 0  // prefetch the kernel's code from the entry at the start (the cold first workgroup per CU; 11-06:
+                   // no gain in the package's fwd + bwd sequence)
+#endif
 #ifndef PAIR
 #define PAIR 1
 #endif
@@ -474,6 +478,7 @@ void k_mla_fwd_mx(const unsigned char *__restrict__ Q8, const unsigned char *__r
     __shared__ __attribute__((aligned(1024))) unsigned char smem[LDS_B];
     (void)scale;  // folded into Q8
     lock_simd();
+    if constexpr (PF_CODE) prefetch_code<7>();  // 28 KB: k_mla_fwd_mx 33.1 KB of code
     const uint32_t lds0 = lds_addr(smem);
     const int tid = (int)__builtin_amdgcn_workitem_id_x();
     const int wv = wave_id(tid);

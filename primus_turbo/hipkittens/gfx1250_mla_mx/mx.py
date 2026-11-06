@@ -38,6 +38,7 @@ import functools
 import hashlib
 import math
 import os
+import struct
 import subprocess
 import tempfile
 import threading
@@ -245,6 +246,41 @@ def _build_dir():
     raise RuntimeError("gfx1250_mla_mx: no writable cache directory for the code objects")
 
 
+# kernels whose start prefetches their own code (PF_CODE in the source): the bytes from the entry the prefetches may
+# reach (s_prefetch_inst past the code object's end page-faults); checked after the build, else rebuilt with PF_CODE 0
+PREFETCH = {"k_mla_bwd_mx5.hip": {"k_dq_mx": 45 * 1024, "k_dq_mxr": 45 * 1024}}
+
+
+def _elf_funcs(path):
+    """(the end address of the .text section, {function symbol: address}) of an ELF64 code object."""
+    b = Path(path).read_bytes()
+    (shoff,) = struct.unpack_from("<Q", b, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", b, 0x3A)
+    secs = [struct.unpack_from("<IIQQQQIIQQ", b, shoff + i * shentsize) for i in range(shnum)]
+
+    def name(off, strsec):
+        o = strsec[4] + off
+        return b[o : b.index(b"\0", o)].decode()
+
+    text_end = max((sh[3] + sh[5] for sh in secs if name(sh[0], secs[shstrndx]) == ".text"), default=0)
+    funcs = {}
+    for sh in secs:
+        if sh[1] == 2:  # SHT_SYMTAB
+            for k in range(sh[5] // 24):
+                st_name, st_info, _, _, st_value, _ = struct.unpack_from("<IBBHQQ", b, sh[4] + 24 * k)
+                if st_info & 0xF == 2:  # STT_FUNC
+                    funcs[name(st_name, secs[sh[6]])] = st_value
+    return text_end, funcs
+
+
+def _prefetch_ok(src, path):
+    need = PREFETCH.get(src)
+    if not need:
+        return True
+    text_end, funcs = _elf_funcs(path)
+    return all(k in funcs and funcs[k] + n <= text_end for k, n in need.items())
+
+
 def _code_object(src):
     d = _build_dir()
     out = d / (Path(src).stem + ".hsaco")
@@ -266,15 +302,21 @@ def _code_object(src):
             except Exception as e:  # noqa: BLE001 - any failure: the plain build below
                 tmp.unlink(missing_ok=True)
                 warnings.warn(f"gfx1250_mla_mx: re-scheduling {src} failed ({str(e)[:300]}); plain build")
-        if not out.is_file():
+        for extra in ((), ("-DPF_CODE=0",)):
+            if out.is_file():
+                break
             tmp = out.with_suffix(f".{os.getpid()}.tmp")
             r = subprocess.run(
-                [cxx, *FLAGS, *SRC_FLAGS.get(src, ()), "-o", str(tmp), str(HIP / src)], capture_output=True, text=True,
-                cwd=HIP,
+                [cxx, *FLAGS, *SRC_FLAGS.get(src, ()), *extra, "-o", str(tmp), str(HIP / src)], capture_output=True,
+                text=True, cwd=HIP,
             )
             if r.returncode != 0:
                 tmp.unlink(missing_ok=True)
                 raise RuntimeError(f"gfx1250_mla_mx: building {src} failed:\n{r.stderr[-4000:]}")
+            if not extra and not _prefetch_ok(src, tmp):
+                tmp.unlink(missing_ok=True)
+                warnings.warn(f"gfx1250_mla_mx: {src}: a code prefetch would pass the code object's end; PF_CODE 0")
+                continue
             os.replace(tmp, out)
     return out
 

@@ -36,6 +36,11 @@ using namespace mx;
                    // ds_store's 16 rows hit distinct bank groups (2-way: the minimum) instead of two (8-way); one 2-D TDM
                    // store per region (global row stride 16 rows), spread over the waves
 #endif
+#ifndef PF_CODE
+#define PF_CODE 1  // prefetch the kernel's code from the entry at the start (the cold first workgroup per CU): bit 0 the dq
+                   // kernels (k_dq_mxr -2.7% in the package's fwd + bwd sequence), bit 1 dk / dv (no gain); the package
+                   // checks that the prefetched range ends inside the code object (else it builds with PF_CODE 0)
+#endif
 #ifndef DQ_PRO_PARTIAL
 #define DQ_PRO_PARTIAL 1
 #endif
@@ -301,6 +306,7 @@ __device__ __forceinline__ void dkdv_body(
     float scale, int S, int H, int B, long long dk_sb, long long dk_ss, long long dv_sb, long long dv_ss,
     bf16 *__restrict__ DKP, long long dkp_sb, long long dkp_ss, unsigned char *smem) {
     lock_simd();
+    if constexpr (PF_CODE & 2) prefetch_code<6>();  // 24 KB: k_dkdv_mx(r) 29.4 KB of code
     const uint32_t lds0 = lds_addr(smem);
     const int tid = (int)__builtin_amdgcn_workitem_id_x();
     const int wv = wave_id(tid);
@@ -1036,6 +1042,7 @@ __device__ __forceinline__ void dq_body(
     bf16 *__restrict__ DQ, float scale, int S, int H, int B, long long dq_sb, long long dq_ss,
     const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN, unsigned char *smem) {
     lock_simd();
+    if constexpr (PF_CODE & 1) prefetch_code<10>();  // 40 KB: k_dq_mx 43.9 KB, k_dq_mxr 47.8 KB of code
     const uint32_t lds0 = lds_addr(smem);
     const int tid = (int)__builtin_amdgcn_workitem_id_x();
     const int wv = wave_id(tid);

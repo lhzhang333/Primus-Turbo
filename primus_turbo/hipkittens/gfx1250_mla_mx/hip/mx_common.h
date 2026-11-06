@@ -151,6 +151,13 @@ MX_INLINE void bar_wait() {
     __builtin_amdgcn_sched_barrier(0);
 }
 MX_INLINE void lock_simd() { __builtin_amdgcn_s_setreg(154, 1); }
+// instruction prefetch of the code from here on: NB s_prefetch_inst of 32 lines each at 4 KB steps from the PC (the
+// first workgroup on a CU otherwise misses its once-per-block regions line by line: ~1k cycles every 256 B, 11-06 ATT).
+// NB * 4 KB must stay inside the kernel's code: past the code object's end the prefetch page-faults (11-06)
+template <int NB> MX_INLINE void prefetch_code() {
+    const char *pc = (const char *)__builtin_amdgcn_s_getpc();
+    static_for<NB>([&](auto i) { __builtin_amdgcn_s_prefetch_inst(pc + 4096 * (int)i, 31); });
+}
 MX_INLINE int wave_id(int tid) { return __builtin_amdgcn_readfirstlane(tid) >> 5; }
 MX_INLINE float exp2_raw(float x) { return __builtin_amdgcn_exp2f(x); }
 // bit_cast of a 32-bit value to float. Use it for vector elements: clang's __builtin_bit_cast(float, v[i]) on an
