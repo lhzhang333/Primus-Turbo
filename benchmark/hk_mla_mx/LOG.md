@@ -607,3 +607,15 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   DQ_PRO_PARTIAL 0 1.3286, MS_PA 0 1.3291, KEEP_WAR 0 1.3344, PRO_TDM_FIRST 1.3401, TDM_INC 0 1.3476: dkdv stays.
   dq: **DQ_WAIT0** (the one-block tile loop) k_dq_mx 0.8570 vs 0.8653 ms but k_dq_mxr 0.8770 vs 0.8717: on for
   k_dq_mx only (k_dq_mxr 0.8696 vs 0.8702 after); PF_KV 0 1.172 (!). pytest 30 pass, fused-RoPE test pass.
+- **Quantization: column-code staging** (`k_mxq.hip` RC_XSKEW, default): rc_tile's cols phase stores each lane's two
+  columns (rows d0 = 2 dp, d0 + 1 of 128 B) for 32 consecutive dp per instruction: one bank group (32-way). As 16
+  regions (dp % 8, row parity), bases stepping by D / 16 rows + 16 B (2-way, the minimum), two 2-D TDM stores per
+  wave (global row stride 16 rows). Bit-exact (codes, scales, aux; X8T byte-equal). Lab: q 0.1042 -> 0.0960, k 0.1003
+  -> 0.0858, v 0.0654 -> 0.0498, dO 0.0935 -> 0.0871 ms. Package profile: k_mxq_rctr192 (q, k) 0.231 -> 0.209,
+  k_mxq_rct128 (v, dO) 0.150 -> 0.131; fused-RoPE fwd + bwd 3.377 -> 3.347 ms per step. pytest 30 pass, fused-RoPE
+  test pass. Variants, all the same or slower: 4 / 8 regions (8 / 4-way), 16 / 24 / 48 regions of consecutive rows
+  (with a remapped task order: 2-way), wave 0 issuing all 16 stores, a dense re-pack into the dead input tile + one
+  store (one more barrier: +5%).
+- Pitfall: timing probes numbered >= 2 in k_mxq also skip the XS / X8T / XTS TDM stores (`RCT_PROBE < 2` guards):
+  probes 5..8 of this work looked 20-45% faster only because they wrote no outputs (`scratch_mx/py/x8t_check.py`
+  fills the outputs with 0xAB and checks they were written).
