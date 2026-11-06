@@ -55,6 +55,9 @@ DRAIN = ["\ts_wait_loadcnt 0x0", "\ts_wait_storecnt 0x0", "\ts_wait_dscnt 0x0", 
          "\ts_wait_alu depctr_va_vdst(0) depctr_vm_vsrc(0)"] + ["\tv_nop"] * 5  # fmt: skip
 LAT_RAW = {"WMMA": 16, "TRANS": 6, "VALU": 3, "DS_LD": 32, "VM_LD": 600, "SALU": 1, "TDM": 1, "OTHER": 1}
 WIN_OK = (2, 3, 6, 7)
+# asmkit's va_vdst rule: LLVM's, except that a write-after-read on an in-flight WMMA keeps the per-class bound (the bf16
+# HK backward generator's rule; forward 0.606 vs 0.610 ms with LLVM's rule)
+VA_RULE = "llvm_war_xdl"
 DS_GAP = 2
 
 
@@ -319,7 +322,7 @@ def _emit_loop(T, items, fmap):
     entry0 = T.EM.Flow([T.E.State(unknown=False)], [T.EM.XState(False)], [[T.EM._NOP] * 5])
     fl_in = entry0
     for _ in range(30):
-        lines, fl_out = T.EM.emit_block(items, fl_in, fmap, "llvm")
+        lines, fl_out = T.EM.emit_block(items, fl_in, fmap, VA_RULE)
         nxt = T.EM.Flow.join([entry0, fl_out])
         if repr(nxt.sig()) == repr(fl_in.sig()):
             return lines

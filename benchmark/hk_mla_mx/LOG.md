@@ -469,3 +469,6 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   build + a warning; `PRIMUS_TURBO_MLA_MX_RESCHED=0` (common.envs) turns it off; the cache key covers asm_resched and
   asmkit. setup.py now ships gfx1250_mla_mx/hip and asmkit. pytest 30 pass, fused-RoPE package test bit-exact.
   Package forward per call, alternating A / B: 0.9544 vs 0.9835 ms (-3.0%; medians of 3 runs each).
+- asmkit va_vdst rule of the emitted loop: LLVM's 0.6099, `llvm_war_xdl` (the bf16 HK backward generator's) 0.6063,
+  the per-class bound `class` 0.6022 ms (all toy..prod pass). Package: `llvm_war_xdl` (validated on hardware by the
+  bf16 generator; `class` is only asmkit's model). pytest 30 pass, fused-RoPE test bit-exact.
