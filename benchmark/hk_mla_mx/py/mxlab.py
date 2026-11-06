@@ -222,6 +222,8 @@ KERNELS = {
 }
 KERNELS["k_dkdv_mxr"] = (KERNELS["k_dkdv_mx"][0], 128,
                          KERNELS["k_dkdv_mx"][2] + [("DKP", "ptr"), ("dkp_sb", "i64"), ("dkp_ss", "i64")])
+# the fused-RoPE path's dQ kernel (rung b5): k_dq_mx's args + COS, SIN [S, 64] bf16
+KERNELS["k_dq_mxr"] = (KERNELS["k_dq_mx"][0], 128, KERNELS["k_dq_mx"][2] + [("COS", "ptr"), ("SIN", "ptr")])
 # rung b2's dV / dK kernels (k_mla_bwd_mx2.hip) take k_dkdv_mx's arguments
 KERNELS["k_dv_mx"] = KERNELS["k_dk_mx"] = KERNELS["k_dkdv_mx"]
 _SIZE = {"ptr": 8, "i64": 8, "f64": 8, "i32": 4, "u32": 4, "f32": 4}

@@ -795,29 +795,7 @@ extern "C" __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(
     rctr_body(X, X8, XS, X8T, XTS, kbar, aux, S, H, sb, ss, sh, PE, pb, ps, ph, COS, SIN, mode, pre, smem);
 }
 
-// ---- the RoPE backward of the fused path (Megatron's rotary_bwd_q / _kv math): for the gradient g of the roped pe
-// values (halves gl = g[0..31], gr = g[32..63]) the input gradient x1[i] = gl c[i] + gr sn[32 + i] (to pe[2 i]), x2[i] =
-// -gl sn[i] + gr c[32 + i] (to pe[2 i + 1]), fp32 per op, bf16 out.
-__device__ __forceinline__ void irope8(const f32x8 &gl, const f32x8 &gr, const u32x4 cl, const u32x4 sl, const u32x4 cr,
-                                       const u32x4 sr, u32x4 &o0, u32x4 &o1) {
-    const bf16x8 c0 = __builtin_bit_cast(bf16x8, cl), s0 = __builtin_bit_cast(bf16x8, sl);
-    const bf16x8 c1 = __builtin_bit_cast(bf16x8, cr), s1 = __builtin_bit_cast(bf16x8, sr);
-    bf16x8 a, b;
-    static_for<8>([&](auto kk) {
-        constexpr int k = kk;
-        const bf16 x1 = (bf16)__fadd_rn(__fmul_rn(gl[k], (float)c0[k]), __fmul_rn(gr[k], (float)s1[k]));
-        const bf16 x2 = (bf16)__fsub_rn(__fmul_rn(gr[k], (float)c1[k]), __fmul_rn(gl[k], (float)s0[k]));
-        if constexpr (k < 4) {
-            a[2 * k] = x1;
-            a[2 * k + 1] = x2;
-        } else {
-            b[2 * (k - 4)] = x1;
-            b[2 * (k - 4) + 1] = x2;
-        }
-    });
-    o0 = __builtin_bit_cast(u32x4, a);
-    o1 = __builtin_bit_cast(u32x4, b);
-}
+// ---- the RoPE backward of the fused path: irope8 (mx_common.h)
 
 // k_rope_bwd_q: in place on G [b, s, h, 192] (d 128..191: the roped gradient -> the pre-RoPE one); 4 lanes per row
 // (the lanes of a row in one wave: all of its loads before its stores); grid (B S H / 64), 256 threads

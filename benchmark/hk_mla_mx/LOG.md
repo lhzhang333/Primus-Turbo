@@ -548,3 +548,18 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   dot FMAs ~26 cycles each, branches / xcnt waits ~3k cycles per wave): RC_YPRE (O rows of both passes loaded before
   the tile's TDM wait): at the 128-VGPR target 36 B spills, 0.100 vs 0.092 ms; at 7 waves per SIMD (137 VGPRs, 3
   workgroups per CU) 0.0911 vs 0.0921. Off.
+- **k_dq_mxr** (fused-RoPE path; `attn_bwd_rope` no longer launches k_rope_bwd_q): dQ's inverse RoPE in the dq
+  epilogue. The pairs it combines (d 128 + 8 m + r and the value 32 further) are d16 tiles 8 + p / 10 + p of the same
+  lane. The block's cos / sin rows (256 x 128 B each, rows padded to 144 B) are TDM-loaded into the idle ring stage of
+  tile n during tile n - 2 (waves 0 / 1 in place of their NULL ops); the dQ staging is split into halves in the other two
+  stages (two TDM stores); irope8 moved from k_mxq.hip to mx_common.h. Bit-exact with k_dq_mx + k_rope_bwd_q (five
+  shapes, realistic and random cos / sin, `scratch_mx/py/dqr_test.py`): the rope columns' products dq * scale pass an
+  empty asm, else LLVM folds fpext(fptrunc(x * scale)) into v_fma_mixlo_bf16 (one rounding of the exact product: 2.5e-6
+  of the inputs an ulp off, the rotated values more where the two terms cancel; `#pragma clang fp contract(off)` and
+  __fmul_rn do not stop it: HIP's __fmul_rn is a plain contractible multiply). The rotation itself is exact per op even
+  when contracted (bf16 x bf16 products are exact in f32). Lab: k_dq_mxr 0.8956 vs k_dq_mx 0.8940 ms, k_dq_mx +
+  k_rope_bwd_q 0.9283; with per-lane global cos / sin loads instead of the TDM (32 poorly coalesced 16-byte loads per
+  lane, latency exposed in the epilogue) 0.904-0.908. Package (profiler, two runs): k_dq_mxr 0.922 / 0.915 vs k_dq_mx
+  0.904 / 0.907 + k_rope_bwd_q 0.037 ms; backward per call 2.459 / 2.443 vs 2.469 / 2.473 ms (events 2.538 vs 2.549):
+  the rope math adds ~400 VALU per wave to an epilogue nothing overlaps (one workgroup per CU). pytest 30 pass,
+  fused-RoPE test pass (dq bitwise with the unfused composition).

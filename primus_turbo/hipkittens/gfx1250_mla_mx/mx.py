@@ -111,8 +111,6 @@ KERNELS = {
     "k_mxq_rct128": ("k_mxq.hip", 256, _RC_ARGS),
     "k_mxq_rctr192": ("k_mxq.hip", 256, _RCTR_ARGS),
     "k_mxq_kbar_rope": ("k_mxq.hip", 768, _KBR_ARGS),
-    "k_rope_bwd_q": ("k_mxq.hip", 256, (("G", "ptr"), ("B", "i32"), ("S", "i32"), ("H", "i32"), ("gb", "i64"),
-                                        ("gs", "i64"), ("gh", "i64"), ("COS", "ptr"), ("SIN", "ptr"))),
     "k_rope_bwd_kpe": ("k_mxq.hip", 256, (("GH", "ptr"), ("GP", "ptr"), ("B", "i32"), ("S", "i32"), ("H", "i32"),
                                           ("hb", "i64"), ("hs", "i64"), ("hh", "i64"), ("pb", "i64"), ("ps", "i64"),
                                           ("COS", "ptr"), ("SIN", "ptr"))),
@@ -194,6 +192,8 @@ KERNELS = {
 }
 KERNELS["k_dkdv_mxr"] = (KERNELS["k_dkdv_mx"][0], 128,
                          KERNELS["k_dkdv_mx"][2] + (("DKP", "ptr"), ("dkp_sb", "i64"), ("dkp_ss", "i64")))
+# the fused-RoPE path's dQ kernel: dQ's rope columns through the inverse rotation (COS / SIN [S, 64] bf16)
+KERNELS["k_dq_mxr"] = (KERNELS["k_dq_mx"][0], 128, KERNELS["k_dq_mx"][2] + (("COS", "ptr"), ("SIN", "ptr")))
 # k_mxq modes (k_mxq.hip): 1 subtract kbar, 2 aux = x . kbar, 4 aux = x . Y, 16 scale layout R2, 32 quantize x * pre
 MODE_Q, MODE_K, MODE_DO = 2 | 16 | 32, 1 | 16, 4
 _SIZE = {"ptr": 8, "i64": 8, "i32": 4, "f32": 4}
@@ -472,8 +472,8 @@ def rope_unsupported_reason(q, kv, kpe, cos, sin, causal):
         return f"seqlen {s} must be a multiple of 256"
     if cos.dtype != torch.bfloat16 or sin.dtype != torch.bfloat16 or cos.numel() < s * 64 or sin.numel() < s * 64:
         return "cos / sin: bf16, >= seqlen rows of 64"
-    if not (cos.is_contiguous() and sin.is_contiguous()):
-        return "cos / sin must be contiguous"
+    if not (cos.is_contiguous() and sin.is_contiguous()) or cos.data_ptr() % 16 or sin.data_ptr() % 16:
+        return "cos / sin must be contiguous and 16-byte aligned"
     for t in (q, kv, kpe):
         if t.stride(-1) != 1 or t.data_ptr() % 16 or any(x % 8 for x in t.stride()[:-1]):
             return "q / kv / k_pe need a contiguous last dim and 16-byte aligned rows"
@@ -544,11 +544,9 @@ def attn_bwd_rope(dout, out, lse_c, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8
     _launch("k_dkdv_mxr", (math.ceil(s / DKDV_KV_ROWS), h, b),
             [q8, qs, k8, ks, v8, vsr, do8, dos, do8t, dots, q8t, qts, lse2, delta, dk, dv, sc, s, h, b, dk.stride(0),
              dk.stride(1), dv.stride(0), dv.stride(1), dkph, dkph.stride(0), dkph.stride(1)])  # fmt: skip
-    _launch("k_dq_mx", (s // 256, h, b),
-            [q8, qs, k8, ks, v8, vsr, do8, dos, k8t, kts, lse2, delta, dq, sc, s, h, b, dq.stride(0),
-             dq.stride(1)])  # fmt: skip
-    _launch("k_rope_bwd_q", ((b * s * h + 63) // 64, 1, 1),
-            [dq, b, s, h, dq.stride(0), dq.stride(1), dq.stride(2), cos, sin])
+    _launch("k_dq_mxr", (s // 256, h, b),
+            [q8, qs, k8, ks, v8, vsr, do8, dos, k8t, kts, lse2, delta, dq, sc, s, h, b, dq.stride(0), dq.stride(1),
+             cos, sin])  # fmt: skip
     dkpe = torch.empty(s, b, 64, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     _launch("k_rope_bwd_kpe", (b * s, 1, 1),
             [dkph, dkpe, b, s, h, dkph.stride(0), dkph.stride(1), dkph.stride(2), dkpe.stride(0), dkpe.stride(1), cos,

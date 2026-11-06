@@ -948,6 +948,8 @@ void k_dkdv_mxr(const unsigned char *__restrict__ Q8, const unsigned char *__res
 // 6 TDM ops), in the forward's orientation: S^T = K Q^T, dP^T = V dO^T (C layout: lane = q column, rows = kv), P^T,
 // dS^T, dS^T of kv16 tiles 2m, 2m + 1 quantized per q column (16 values + peer) into the dQ B operand (bytes 8 j + r = kv
 // 16 j + 8 h + r) and its scale byte m; then dQ^T += K^T dS^T (12 d16 tiles, A = K8T rows).
+// k_dq_mxr (the fused-RoPE path): the same with dQ's rope columns through the inverse RoPE in the epilogue (the block's
+// cos / sin rows TDM-loaded into the idle stage of tile n during tile n - 2): replaces k_dq_mx + k_rope_bwd_q, bit-exact.
 namespace {
 template <typename T>
 MX_INLINE void dq_keep(const T &x) {
@@ -975,15 +977,16 @@ constexpr int Q_LDS_B = Q_OFF_DEL + BMQ * 4;      // 320256
 static_assert(Q_LDS_B <= 327680, "LDS");
 }  // namespace
 
-extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
-void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
-             const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
-             const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
-             const unsigned char *__restrict__ DO8, const unsigned char *__restrict__ DOS,
-             const unsigned char *__restrict__ K8T, const unsigned char *__restrict__ KTS,
-             const float *__restrict__ LSE2, const float *__restrict__ DELTA, bf16 *__restrict__ DQ, float scale, int S,
-             int H, int B, long long dq_sb, long long dq_ss) {
-    __shared__ __attribute__((aligned(1024))) unsigned char smem[Q_LDS_B];
+// the kernel body; ROPE: dQ's rope columns (d 128..191, the gradient of the roped q values) through the inverse
+// rotation (k_rope_bwd_q's math on the bf16-rounded values: bit-exact with that pass) with the COS / SIN rows [S, 64]
+template <bool ROPE>
+__device__ __forceinline__ void dq_body(
+    const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS, const unsigned char *__restrict__ K8,
+    const unsigned char *__restrict__ KS, const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
+    const unsigned char *__restrict__ DO8, const unsigned char *__restrict__ DOS, const unsigned char *__restrict__ K8T,
+    const unsigned char *__restrict__ KTS, const float *__restrict__ LSE2, const float *__restrict__ DELTA,
+    bf16 *__restrict__ DQ, float scale, int S, int H, int B, long long dq_sb, long long dq_ss,
+    const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN, unsigned char *smem) {
     lock_simd();
     const uint32_t lds0 = lds_addr(smem);
     const int tid = (int)__builtin_amdgcn_workitem_id_x();
@@ -1047,6 +1050,19 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
         tdm_load(tdm_g0(st + top0.lds, top0.base + tt * top0.mult, real ? top0.on : 0), top0.g1);
         tdm_load(tdm_g0(st + top1.lds, top1.base + tt * top1.mult, real ? top1.on : 0), top1.g1);
     };
+    // ROPE: the block's cos / sin rows (256 x 128 B each, rows padded to 144 B) into the stage of tile n (idle from tile
+    // n - 2 on), with tile n's ops (issued in tile n - 2): waves 0 / 1 in place of their first (NULL) op; the dQ staging
+    // then in the other two stages (128 rows each)
+    constexpr unsigned RS_B = BMQ * X128;  // 36864: cos (sin at + RS_B)
+    static_assert(2 * RS_B <= Q_STG && 128 * 2 * D_QK <= Q_STG, "cos / sin in one stage, half the dQ staging in one");
+    [[maybe_unused]] auto issue_rope_tile = [&](int t) {  // t = n
+        const unsigned st = lds0 + (unsigned)((t % Q_NSTG) * Q_STG);
+        const bf16 *rs = wv == 0 ? COS : SIN;
+        const i32x4 g0 = wv < 2 ? tdm_g0(st + (unsigned)wv * RS_B, (unsigned long long)(uintptr_t)(rs + (long long)q0 * 64))
+                                : tdm_g0(st + top0.lds, top0.base, 0);
+        tdm_load(g0, wv < 2 ? tdm_g1(W0_128, BMQ, 128, BMQ, 128) : top0.g1);
+        tdm_load(tdm_g0(st + top1.lds, top1.base, 0), top1.g1);
+    };
     // prologue: the block's Q8 / QS / DO8 / DOS / LSE / DELTA, two ops per wave: [Q nope, LSE], [Q rope, DELTA],
     // [QS, DO8], [DOS, -]
     {
@@ -1108,7 +1124,10 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
             bar_signal();
             bar_wait();        // tile t visible; every wave is done with tile t - 1
         }
-        issue_tile(t + 2);     // into the stage of tile t - 1
+        if constexpr (ROPE && DC == 1)
+            issue_rope_tile(t + 2);  // t + 2 = n: cos / sin
+        else
+            issue_tile(t + 2);  // into the stage of tile t - 1
         const unsigned st = lds0 + (unsigned)((t % Q_NSTG) * Q_STG);
         const int kv0 = t * NBK;
         i32x16 dsB[QTW];
@@ -1338,7 +1357,8 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     tile(n - 2, std::integral_constant<int, 1>{});
     tile(n - 1, std::integral_constant<int, 2>{});
 #if OSTAGE
-    // epilogue: dQ rows as bf16 into LDS (the ring, idle now), one TDM store of 256 x 384 B by wave 0
+    // epilogue: dQ rows as bf16 into LDS (the ring, idle now), one TDM store of 256 x 384 B by wave 0 (ROPE: the halves
+    // of 128 rows in the stages of tiles n + 1, n + 2, stored by waves 0 / 1)
     tensor_wait<0>();
     bar_signal();
     bar_wait();
@@ -1346,25 +1366,80 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     static_assert(BMQ * XDQ <= Q_OFF_Q, "staging inside the ring");
     {
         const int ln = lane_now();
+        [[maybe_unused]] const unsigned csb = lds0 + (unsigned)((n % Q_NSTG) * Q_STG);
+        [[maybe_unused]] const unsigned sth0 = lds0 + (unsigned)(((n + 1) % Q_NSTG) * Q_STG);
+        [[maybe_unused]] const unsigned sth1 = lds0 + (unsigned)(((n + 2) % Q_NSTG) * Q_STG);
+        auto row_b = [&](int i) -> unsigned {
+            if constexpr (ROPE)
+                return (i < 2 ? sth0 : sth1) + (unsigned)((64 * (i & 1) + 16 * wv + (ln & 15)) * XDQ + 16 * (ln >> 4));
+            else
+                return lds0 + (unsigned)((64 * i + 16 * wv + (ln & 15)) * XDQ + 16 * (ln >> 4));
+        };
+        // ROPE: the cos / sin values of the lane's rows (position q0 + 64 i + 16 wv + lr, values 8 lh + 16 j, j < 4)
+        [[maybe_unused]] u32x4 rcs[ROPE ? QTW : 1][4], rsn[ROPE ? QTW : 1][4];
+        if constexpr (ROPE) {
+            static_for<QTW>([&](auto ii) {
+                const unsigned rb = csb + (unsigned)((64 * (int)ii + 16 * wv + (ln & 15)) * X128 + 16 * (ln >> 4));
+                static_for<4>([&](auto j) {
+                    rcs[(int)ii][(int)j] = *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(rb + 32 * (int)j);
+                    rsn[(int)ii][(int)j] = *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(rb + RS_B + 32 * (int)j);
+                });
+            });
+        }
         static_for<QTW>([&](auto ii) {
             constexpr int i = ii;
-            const unsigned rowb = lds0 + (unsigned)((64 * i + 16 * wv + (ln & 15)) * XDQ + 16 * (ln >> 4));
-            static_for<12>([&](auto dd) {
+            const unsigned rowb = row_b(i);
+            static_for<ROPE ? 8 : 12>([&](auto dd) {
                 constexpr int dt = dd;
                 bf16x8 w;
                 static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dq[dt][i][(int)rr] * scale); });
                 *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(rowb + 32 * dt) = __builtin_bit_cast(u32x4, w);
             });
         });
-    }
-    bar_signal();
-    bar_wait();
-    if (wv == 0) {
+        // ROPE (after every row's nope columns): d 128 + 8 m + r (m = 2 p + lh): gl = d16 tile 8 + p, gr = tile 10 + p
+        // (the value 32 further); the rotated pair (o0, o1) to the row's bytes 256 + 32 m (+ 16), as k_rope_bwd_q: bit-
+        // exact with k_dq_mx + k_rope_bwd_q (the rotation of bf16 values is exact per op: bf16 x bf16 products). The
+        // values rotated are bf16 of the f32 products as the unfused path stores them: the products pass an empty asm
+        // (else LLVM folds fpext(fptrunc(x * scale)) into v_fma_mixlo_bf16: one rounding of the exact product, which
+        // moves 2.5e-6 of the inputs by an ulp, and the rotated values by more where the two terms cancel)
+        if constexpr (ROPE) {
+            static_for<QTW>([&](auto ii) {
+                constexpr int i = ii;
+                const unsigned rowb = row_b(i);
+                f32x8 pr[4];
+                static_for<4>([&](auto k) {
+                    static_for<8>([&](auto rr) { pr[(int)k][(int)rr] = dq[8 + (int)k][i][(int)rr] * scale; });
+                });
+                asm("" : "+v"(pr[0]), "+v"(pr[1]), "+v"(pr[2]), "+v"(pr[3]));
+                static_for<2>([&](auto pp) {
+                    constexpr int p = pp;
+                    f32x8 gl, gr;
+                    static_for<8>([&](auto rr) {
+                        gl[(int)rr] = (float)(bf16)pr[p][(int)rr];
+                        gr[(int)rr] = (float)(bf16)pr[2 + p][(int)rr];
+                    });
+                    u32x4 o0, o1;
+                    irope8(gl, gr, rcs[i][p], rsn[i][p], rcs[i][2 + p], rsn[i][2 + p], o0, o1);
+                    const unsigned a = rowb + 256 + 64 * p + 16 * (ln >> 4);
+                    *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)a = o0;
+                    *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(a + 16) = o1;
+                });
+            });
+        }
+        bar_signal();
+        bar_wait();
         const unsigned long long g = (unsigned long long)(uintptr_t)(DQ + (long long)b * dq_sb + (long long)q0 * dq_ss +
                                                                      (long long)h * D_QK);
-        tdm_store(tdm_g0(lds0, g), tdm_g1(tdm_w0(0, 0, 0), BMQ, XDQ, BMQ, 2ull * (unsigned long long)dq_ss));
+        if constexpr (ROPE) {
+            if (wv < 2)
+                tdm_store(tdm_g0(wv == 0 ? sth0 : sth1, g + (unsigned long long)wv * 128ull * 2ull * (unsigned long long)dq_ss),
+                          tdm_g1(tdm_w0(0, 0, 0), 128, XDQ, 128, 2ull * (unsigned long long)dq_ss));
+        } else if (wv == 0) {
+            tdm_store(tdm_g0(lds0, g), tdm_g1(tdm_w0(0, 0, 0), BMQ, XDQ, BMQ, 2ull * (unsigned long long)dq_ss));
+        }
     }
 #else
+    static_assert(!ROPE, "the fused rotation is in the staged epilogue");
     static_for<QTW>([&](auto ii) {
         constexpr int i = ii;
         const int q = q0 + 64 * i + 16 * wv + lr;
@@ -1378,4 +1453,32 @@ void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restri
     });
 #endif
     tensor_wait<0>();
+}
+
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+void k_dq_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
+             const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
+             const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
+             const unsigned char *__restrict__ DO8, const unsigned char *__restrict__ DOS,
+             const unsigned char *__restrict__ K8T, const unsigned char *__restrict__ KTS,
+             const float *__restrict__ LSE2, const float *__restrict__ DELTA, bf16 *__restrict__ DQ, float scale, int S,
+             int H, int B, long long dq_sb, long long dq_ss) {
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[Q_LDS_B];
+    dq_body<false>(Q8, QS, K8, KS, V8, VSR, DO8, DOS, K8T, KTS, LSE2, DELTA, DQ, scale, S, H, B, dq_sb, dq_ss, nullptr,
+                   nullptr, smem);
+}
+
+// the fused-RoPE path's variant: dQ's rope columns as the gradient of q before RoPE (COS / SIN [S, 64] bf16)
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+void k_dq_mxr(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
+              const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
+              const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
+              const unsigned char *__restrict__ DO8, const unsigned char *__restrict__ DOS,
+              const unsigned char *__restrict__ K8T, const unsigned char *__restrict__ KTS,
+              const float *__restrict__ LSE2, const float *__restrict__ DELTA, bf16 *__restrict__ DQ, float scale,
+              int S, int H, int B, long long dq_sb, long long dq_ss, const bf16 *__restrict__ COS,
+              const bf16 *__restrict__ SIN) {
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[Q_LDS_B];
+    dq_body<true>(Q8, QS, K8, KS, V8, VSR, DO8, DOS, K8T, KTS, LSE2, DELTA, DQ, scale, S, H, B, dq_sb, dq_ss, COS, SIN,
+                  smem);
 }
