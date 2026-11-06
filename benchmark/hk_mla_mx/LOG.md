@@ -513,3 +513,7 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   store region left in the rows phase. Codes / scales bit-exact; the fused-RoPE q kernel's aux (q . kbar) moves by
   ~1 ulp (LLVM contracts the dot differently in the changed code; within the tests' tolerance). Fused RoPE q 0.1333 ->
   0.1270, rct q / k -0.7 / -1%. pytest 30 pass, fused-RoPE test pass.
+- k_mxq.hip without SLP (package SRC_FLAGS `-fno-slp-vectorize`; ~286 v_mov / v_mov_b64 per wave were tuple
+  shuffles): fused-RoPE q 0.127 -> 0.124 ms, dout quantization 0.0952 -> 0.0924 (lab) / 0.0863 -> 0.0848 (package),
+  k_rope_bwd_q 0.040 -> 0.036, k_rope_bwd_kpe 0.022 -> 0.018; k / v unchanged; codes bit-exact (aux by ulps).
+  `-misched=gcn-max-ilp` for k_mxq: neutral. pytest 30 pass, fused-RoPE test pass.

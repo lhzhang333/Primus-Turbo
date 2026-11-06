@@ -64,7 +64,7 @@ FLAGS = ("-x", "hip", "--offload-arch=gfx1250", "--cuda-device-only", "--no-gpu-
          "-mllvm", "-misched=gcn-max-ilp")  # fmt: skip
 # per-source extra flags: the quantization kernels without VOPD (LLVM re-materialized a VOPD constant into an SGPR
 # before every dual op: k -7%, the others -1..2%)
-SRC_FLAGS = {"k_mxq.hip": ("-mllvm", "-amdgpu-enable-vopd=0")}
+SRC_FLAGS = {"k_mxq.hip": ("-mllvm", "-amdgpu-enable-vopd=0", "-fno-slp-vectorize")}  # no SLP: fused-RoPE q / dout -3%
 # main loops re-scheduled after register allocation (asm_resched: a list schedule of LLVM's loop body, emitted through
 # gfx1250_mla's asmkit, verified against the code object): the forward's tile loop, -7% (bit-exact). The dK / dV loop
 # is LDS-bound and slower re-scheduled: LLVM's order. PRIMUS_TURBO_MLA_MX_RESCHED=0: plain builds; on any failure
