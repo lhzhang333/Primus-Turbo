@@ -662,3 +662,14 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
 - From ~10:20 UTC the GPU runs every kernel 5-7% slower than at 10:15 (same clocks 1.30 GHz, no throttle flags, no
   other process; forward 0.551 -> 0.590, dkdv 1.328 -> 1.384-1.395, dq 0.86 -> 0.97 ms per call): compare within one
   run only.
+- Forward time vs workgroup rounds (lab, b2 s4096, h 16 / 32 / 64 / 128 = 1 / 2 / 4 / 8 rounds of 256): 87.5 / 163.8
+  / 312.6 / 611.3 us: ~75 us per round, ~12 us of launch + cold start: no dispatch-level loss (the per-workgroup
+  time is what counts).
+- Forward re-schedule with a kind preference among equally early candidates (3 copies): none 0.8819, WMMA 0.9023,
+  TRANS 0.8812, DS_LD 0.8861 ms: the default stays.
+- k_rope_bwd_kpe with 4 (b, s) rows per workgroup (16 loads in flight per thread, same summation order: bit-exact):
+  22.8 / 21.9 -> 22.0 / 21.5 us (lab): not latency-bound enough to matter; reverted.
+- dS for the dQ pass from dk / dv (a GEMM-only dq): dk / dv's S^T / dP^T are in the "lane = kv" orientation (A = Q,
+  B = K), the dQ operand needs dS quantized along kv with lane = q: a q <-> kv transpose through LDS per step (~42 KB
+  free in dk / dv) on an LDS-bound kernel (+15-20% estimated) and a bf16 rounding before the quantization (no longer
+  bit-exact): not pursued.
