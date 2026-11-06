@@ -37,6 +37,9 @@
 #ifndef RC_NODIV
 #define RC_NODIV 1  // rc_tile: branch-free rows phase (pad lanes recompute a block; only the code stores masked)
 #endif
+#ifndef RC_YPRE
+#define RC_YPRE 0  // rct (D 128, Y dots: dout): the Y rows loaded before the tile wait
+#endif
 #ifndef RC_KBF16
 #define RC_KBF16 0  // k centring in bf16: kbar rounded to bf16 values (every consumer: k rows / cols, q . kbar), k - kbar
                     // by v_pk_add_bf16 (RNE to bf16) and the bf16 MX path (not bit-exact with the fp32 subtraction)
@@ -370,12 +373,17 @@ __device__ __forceinline__ void rc_body(const bf16 *__restrict__ X, unsigned cha
 
 // rows + cols of one bf16 tile in LDS (unpadded rows of D * 2 bytes) into LDS staging: x8 rows (128 x D), xs (128 x RS),
 // x8t (D x 128), xts (D x 4); NT threads
+// Y rows preloaded by rct_body (D 128: the two passes' 4 x 16 bytes of the lane's block)
+struct YPre {
+    u32x4 v[8];
+    bool on = false;
+};
 template <int D, int NT>
 __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char *x8, unsigned char *xs,
                                         unsigned char *x8t, unsigned char *xts, const float *kb_lds,
                                         const bf16 *__restrict__ Y, float *__restrict__ aux, int b, int h, int kt,
                                         long long bh, int S, long long yb, long long ys, long long yh, int mode,
-                                        float pre) {
+                                        float pre, const YPre &ypre = YPre{}) {
     constexpr int XR = D * 2;
     constexpr int NBLK = D / 32;
     constexpr int LPR = D == 192 ? 8 : 4;
@@ -439,7 +447,7 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
             if (mode & 4) {
                 const bf16 *yp = Y + b * yb + (long long)(kt * 128 + r) * ys + h * yh + 32 * jj;
                 static_for<4>([&](auto i) {
-                    const f32x8 y = bf8_to_f32(*(const u32x4 *)(yp + 8 * (int)i));
+                    const f32x8 y = bf8_to_f32(ypre.on ? (r0 == 0 ? ypre.v[(int)i] : ypre.v[4 + (int)i]) : *(const u32x4 *)(yp + 8 * (int)i));
                     static_for<8>([&](auto e) { pd[(int)i] += v[(int)i][(int)e] * y[(int)e]; });
                 });
             }
@@ -643,11 +651,30 @@ __device__ __forceinline__ void rct_body(const bf16 *__restrict__ X, unsigned ch
     if (mode & 3) {
         for (int i = t; i < D; i += NT) kb_lds[i] = kbar[bh * D + i];
     }
+#if RC_YPRE
+    // the Y rows of both passes (D 128: 4 lanes per row, 64 rows per pass) issued before the tile wait: their latency
+    // overlaps the tile's TDM load (per pass inside the rows phase it was exposed: ~26 cycles per dot FMA)
+    YPre ypre{};
+    if (D == 128 && (mode & 4)) {
+        ypre.on = true;
+        static_for<2>([&](auto pp) {
+            const int r = (int)pp * (NT / 4) + t / 4, j = t % 4;
+            const bf16 *yp = Y + b * yb + (long long)(kt * 128 + r) * ys + h * yh + 32 * j;
+            static_for<4>([&](auto i) { ypre.v[(int)pp * 4 + (int)i] = *(const u32x4 *)(yp + 8 * (int)i); });
+        });
+    }
+#endif
     if (wv == 0) tensor_wait<0>();
     __syncthreads();
 #if RCT_PROBE != 1  // timing probes: 1 = no compute (TDM traffic only), 2 = no TDM (compute only)
     rc_tile<D, NT>(smem, RC_X8G ? X8 + (bh * S + (long long)kt * 128) * D : smem + O_X8, smem + O_XS, smem + O_X8T,
-                   smem + O_XTS, kb_lds, Y, aux, b, h, kt, bh, S, yb, ys, yh, mode, pre);
+                   smem + O_XTS, kb_lds, Y, aux, b, h, kt, bh, S, yb, ys, yh, mode, pre,
+#if RC_YPRE
+                   ypre
+#else
+                   YPre{}
+#endif
+    );
 #endif
     __syncthreads();
     if (wv == 0 && RCT_PROBE < 2) {

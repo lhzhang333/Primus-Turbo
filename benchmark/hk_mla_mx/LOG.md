@@ -544,3 +544,7 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   (bf16 HK 0.863 / 2.429 in the same run).
 - The pass orders generalized (DKDV_ORDER / DQ_ORDER = number of passes): dkdv 2 / 4 / 8 passes 1.377 / 1.377 / 1.384,
   dq 0.881 / 0.875 / 0.880 ms (all bit-exact). Package: dkdv 2, dq 4 passes; pytest 30 pass, fused-RoPE test pass.
+- dout quantization (rct128 mode 4: the dO . O row dots read O by per-lane global loads in the rows passes; ATT: the
+  dot FMAs ~26 cycles each, branches / xcnt waits ~3k cycles per wave): RC_YPRE (O rows of both passes loaded before
+  the tile's TDM wait): at the 128-VGPR target 36 B spills, 0.100 vs 0.092 ms; at 7 waves per SIMD (137 VGPRs, 3
+  workgroups per CU) 0.0911 vs 0.0921. Off.
