@@ -682,3 +682,11 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
 - The q quantization's row dots q . kbar (mode 2, the aux) only form the API lse: the fused-RoPE autograd path
   (need_lse False) quantizes q with mode 48: same codes / scales, 116.2 -> 104.7 us per call (-10%). pytest 30 pass,
   fused-RoPE test pass.
+- Forward loop costs (ATT, 4 trips, package build): v_exp 1.7 cycles each (256 / trip), WMMA 4.1 (100), ds_load
+  2.0 (114), v_max3 1.5 (144), pk8 conversions 3.4 (34): issue-bound, a sum of per-instruction costs. A model probe
+  without VGPR anti / output dependences (the bound of renaming spare VGPRs) predicts no gain (1485 -> 1558 model
+  cycles: the greedy order gets worse; the model is ~285 cycles below the measured trip). A third S buffer in the
+  source changes nothing (SSA: LLVM's allocation decides the reuse).
+- `v_exp_f16` / `v_exp_bf16` (micro-benchmark `scratch_mx/bt/expbench`, 4 waves per SIMD, 8 chains per lane):
+  ~5.3 cycles per exp per SIMD vs v_exp_f32 ~2.5: no faster 16-bit transcendental (and bf16 inputs would be too
+  coarse for exp2(s - m)).
