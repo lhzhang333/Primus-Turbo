@@ -55,6 +55,10 @@
                    // rows (4-way, k -1%); the cols phase's reads stay conflict-free. rct192 stays dense (padding 16 B per
                    // 512 B of its stream, 384 being no power of two: 4-way but q +5%, k +3% from the address math)
 #endif
+#ifndef RC_RPRE
+#define RC_RPRE 1  // rctr192: each thread's cos / sin rows for the rotation loaded before the tile's TDM wait (their latency
+                   // under the load) instead of in the rotation loop
+#endif
 #ifndef RC_FAST
 #define RC_FAST 1  // tree reductions (amax, row dots) and the kbar slice in registers (rc_tile)
 #endif
@@ -859,9 +863,32 @@ __device__ __forceinline__ void rctr_body(const bf16 *__restrict__ X, unsigned c
     if (mode & 3) {
         for (int i = t; i < D; i += NT) kb_lds[i] = kbar[bh * D + i];
     }
+#if RC_RPRE
+    static_assert(128 * 4 == 2 * NT, "two rotation items per thread");
+    u32x4 rcs[2][4];  // item t + NT u: cos / sin of its row, values 8 m .. and 32 + 8 m ..
+    static_for<2>([&](auto u) {
+        const int it = t + NT * (int)u, r = it >> 2, m = it & 3;
+        const bf16 *cs = COS + (long long)(kt * 128 + r) * 64, *sn = SIN + (long long)(kt * 128 + r) * 64;
+        rcs[(int)u][0] = *(const u32x4 *)(cs + 8 * m);
+        rcs[(int)u][1] = *(const u32x4 *)(sn + 8 * m);
+        rcs[(int)u][2] = *(const u32x4 *)(cs + 32 + 8 * m);
+        rcs[(int)u][3] = *(const u32x4 *)(sn + 32 + 8 * m);
+    });
+#endif
     if (wv == 0) tensor_wait<0>();
     __syncthreads();
     // rotation: item (row r, group m of 8 pairs): 512 items, 2 per thread
+#if RC_RPRE
+    static_for<2>([&](auto u) {
+        const int it = t + NT * (int)u, r = it >> 2, m = it & 3;
+        const unsigned char *pe = smem + O_PE + r * 128 + 32 * m;
+        u32x4 lo, hi;
+        rope8(*(const u32x4 *)pe, *(const u32x4 *)(pe + 16), rcs[(int)u][0], rcs[(int)u][1], rcs[(int)u][2],
+              rcs[(int)u][3], lo, hi);
+        *(u32x4 *)(smem + r * XR + 2 * (128 + 8 * m)) = lo;
+        *(u32x4 *)(smem + r * XR + 2 * (160 + 8 * m)) = hi;
+    });
+#else
     for (int it = t; it < 128 * 4; it += NT) {
         const int r = it >> 2, m = it & 3;
         const unsigned char *pe = smem + O_PE + r * 128 + 32 * m;
@@ -872,6 +899,7 @@ __device__ __forceinline__ void rctr_body(const bf16 *__restrict__ X, unsigned c
         *(u32x4 *)(smem + r * XR + 2 * (128 + 8 * m)) = lo;
         *(u32x4 *)(smem + r * XR + 2 * (160 + 8 * m)) = hi;
     }
+#endif
     __syncthreads();
     rc_tile<D, NT, RC_XSKEW, XR, 0>(smem, RC_X8G ? X8 + (bh * S + (long long)kt * 128) * D : smem + O_X8, smem + O_XS, smem + O_X8T,
                    smem + O_XTS, kb_lds, nullptr, aux, b, h, kt, bh, S, 0, 0, 0, mode & ~4, pre);

@@ -625,3 +625,5 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
   B after every 512 B of its stream (384 is no power of two; the TDM pads by the stream, verified bit-exact): 4-way but
   q +5%, k +3% (address math): left dense. Bit-exact. Package: k_mxq_rct128 0.131 -> 0.126 ms (two calls), fused-RoPE
   fwd + bwd 3.341 ms per step. pytest 30 pass, fused-RoPE test pass.
+- rctr192 **RC_RPRE** (default): each thread's cos / sin rows for the two rotation items loaded before the tile's TDM
+  wait (their latency under the load): q 0.1203 -> 0.1172, k 0.0921 -> 0.0897 ms, bit-exact, no extra VGPRs (105).
