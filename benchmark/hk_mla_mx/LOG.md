@@ -825,3 +825,12 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   in the rows passes; RC_YPRE's register preload spilled). LDS 53 -> 88 KB (4 -> 3 workgroups per CU). Bitwise (lab:
   scratch_mx/py/doq_ab.py; package vs the lab's old build: doq_pkg_check.py). Lab 0.0786 -> 0.0659 ms, package profile
   0.081 -> 0.071 ms. pytest 34 pass, fused-RoPE test pass.
+- LLVM scheduler strategies on the backward source (no SLP, expert mode): dkdv_mxd gcn-max-ilp (the package's)
+  1.477, gcn-max-memory-clause 1.474, gcn-max-occupancy 1.476, + disable-unclustered-high-rp-reschedule 1.478, pending
+  queue limit 0 1.478, gcn-iterative-ilp 1.514, gcn-iterative-minreg 1.645, no post-RA misched 1.507 ms (all bitwise):
+  nothing to take.
+- k_mxq_qkv ATT (package): ~9.9k cycles per wave, 48% waits (TDM load / store 2.6k, LDS 1.2k, barriers 0.9k), VALU
+  1.9k: latency-bound per workgroup (4 per CU); the persistent rcp variant was slower on 11-05.
+- Package profile now (fused-RoPE fwd + bwd per step, slow GPU): 3.140 ms with the script's 0.205 ms of gradient adds:
+  dkdv_mxrd 1.534, forward 0.585, dqg_mxr 0.492, qkv 0.223, dO 0.071, rope_bwd_kpe 0.016, kbar 0.013 (11-06 package in
+  the same harness: 3.50).
