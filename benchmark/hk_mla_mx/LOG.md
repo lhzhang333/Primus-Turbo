@@ -841,3 +841,8 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
 - Note for fusing the quantization into the producers: subtracting kbar from k is exact for any vector (the softmax
   cancels q . kbar per row; sum_kv dS = 0 removes dS kbar from dQ; the API lse adds q . kbar back): a stale kbar (e.g.
   the previous step's) only changes the quantization error.
+- dK / dV generator budget (for its machine model): with four waves loading, a ds_load costs ~6.2 cycles per wave (the
+  11-05 micro: ~1.55 cycles per load per CU, any width); a step's 215 loads per wave are ~1333 cycles of LDS time, its
+  ~950 instructions >= ~950 issue cycles, its 88 WMMAs 704 pipe cycles: an overlapped step could be ~1400-1500 cycles vs
+  2450 measured (LLVM). A load's latency then grows with the CU's queue (~1.55 cycles per load ahead + a base): the
+  schedule has to keep loads ~300 cycles ahead of their consumers (LLVM's order: ~380) with the registers for them.
