@@ -795,3 +795,5 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
 - A GPU fault marker (scratch_mx/logs/GPU0.FAULT) was written by mistake: the MES / queue-reset lines came from another
   session's pytest sweep that ended just before this job (dmesg's clock lags the wall clock by ~15 s, and gx.sh's window
   had been widened). gx.sh now checks only the kernel-log lines added during the job (line count at the start).
+- dkdv re-scheduled with a bwdgen-like LDS model (one LDS op per 8 / 11 cycles, no burst, latency 70 / 90; height /
+  ready): 1.546 / 1.585 / 1.569 vs 1.497 ms (bitwise): the dK / dV loop stays LLVM's.
