@@ -16,8 +16,12 @@ kernels with fixed scales; dS along the reduction dim of dK (q) and of dQ (kv).
 
 Kernels: forward rung m7 (``k_mla_fwd_mx7.hip``: m6 with two q blocks per workgroup; branch-free softmax with per-lane integer shifts, O accumulated against
 a fixed per-row reference through the PV WMMAs' E8M0 B scale; the first tile's exp2 runs unshifted, so the centred
-logits of a row's first 128 keys must stay under 126 in log2 units, i.e. 87 nats), backward rung b5
-(``k_mla_bwd_mx5.hip``: k_dkdv_mx software-pipelined across steps, k_dq_mx); all in XCD-local workgroup order with the
+logits of a row's first 128 keys must stay under 126 in log2 units, i.e. 87 nats), backward rung b7
+(``k_mla_bwd_mx5.hip``: k_dkdv_mxd, software-pipelined across steps, also stores bf16 dS = P (dP - delta) into causal
+128 x 128 tiles of a workspace; k_dqg_mx computes dQ as a GEMM over them, MX-quantizing dS along kv, two q blocks
+p / nqb-1-p per workgroup; its code object is post-RA rescheduled, ``asm_resched.py``). Without the workspace
+(PRIMUS_TURBO_MLA_MX_DQ_GEMM=0, over PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES, or out of memory) it runs rung b5: k_dkdv_mx and
+k_dq_mx, which recomputes P and dS (dQ then MX-quantizes the fp32 dS: ~35 dB from b7's). All in XCD-local workgroup order with the
 TDM ops spread over the waves
 and the outputs written through LDS by TDM stores (benchmark/hk_mla_mx/LOG.md, 2026-11-05 (b)),
 quantization ``k_mxq.hip`` (kbar; rows + cols of a tensor in one read: ``k_mxq_rct``, the tile in and the four

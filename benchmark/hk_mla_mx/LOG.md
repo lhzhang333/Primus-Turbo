@@ -852,3 +852,7 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   loop has no schedule headroom left; any further gain needs other registers (a generator) or another decomposition.
 - Register-allocation / pre-RA scheduling flags on the backward source (dkdv_mxd): without the regclass priority
   1.480, relaxed occupancy 1.478, pending queue 512 1.478, no pre-RA misched 1.889 vs 1.478 ms (bitwise).
+- Training gate **g120l** (everything above: b7 with paired + re-scheduled dqg, the qkv launch, RC_YTDM; slow GPU):
+  bf16 HK 1001.1, hk_mx + fused RoPE 973.2 ms / iteration (**-2.79%**; g120k -2.70%), final-window loss 0.0818 both,
+  grad-norm ratio max 1.014. Plain build (PRIMUS_TURBO_MLA_MX_RESCHED=0): fused-RoPE test pass, pytest 34 pass,
+  b7_sweep pass.
