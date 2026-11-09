@@ -234,6 +234,11 @@ _DQG_ARGS = [("DSB", "ptr"), ("K8T", "ptr"), ("KTS", "ptr"), ("DQ", "ptr"), ("sc
              ("B", "i32"), ("dq_sb", "i64"), ("dq_ss", "i64")]
 KERNELS["k_dqg_mx"] = (KERNELS["k_dq_mx"][0], 128, _DQG_ARGS)
 KERNELS["k_dqg_mxr"] = (KERNELS["k_dq_mx"][0], 128, _DQG_ARGS + [("COS", "ptr"), ("SIN", "ptr")])
+# rung b8: dK's dS operand (32 q x 32 kv block scales) stored as is (fp8 + scales), dQ straight from it
+KERNELS["k_dkdv_mx8"] = KERNELS["k_dkdv_mxd"]
+KERNELS["k_dkdv_mxr8"] = KERNELS["k_dkdv_mxrd"]
+KERNELS["k_dqg_mx8"] = KERNELS["k_dqg_mx"]
+KERNELS["k_dqg_mxr8"] = KERNELS["k_dqg_mxr"]
 _SIZE = {"ptr": 8, "i64": 8, "f64": 8, "i32": 4, "u32": 4, "f32": 4}
 
 
@@ -898,6 +903,55 @@ def bwd_mx7(qz, bz, lse, scale=SCALE, tag="5ni", keep_ds=False, dsb=None):
     return (dq, dk, dv, dsb) if keep_ds else (dq, dk, dv)
 
 
+DS8_TILE = 128 * 128 + 128  # rung b8's dS tile record: 16 KB of E4M3 + the 4 waves' scale words (+ pad)
+
+
+def ds8_bytes(b, h, s):
+    """Bytes of rung b8's dS records (causal 128 x 128 tiles per (b, h))."""
+    nb = s // 128
+    return b * h * (nb * (nb + 1) // 2) * DS8_TILE
+
+
+def bwd_mx8(qz, bz, lse, scale=SCALE, tag="5ni", keep_ds=False, dsb=None):
+    """Rung b8: k_dkdv_mx8 (dK, dV and the fp8 dS records) then k_dqg_mx8 (dQ from them, paired grid with "P" in the
+    tag). Returns dq, dk, dv (+ the dS buffer with keep_ds)."""
+    b, s, h = qz["b"], qz["s"], qz["h"]
+    assert s % 256 == 0
+    dev = qz["q8"].device
+    lse2 = lse * LOG2E
+    dq = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    dk = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    dv = torch.empty(s, b, h, D_V, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    if dsb is None:
+        dsb = torch.empty(ds8_bytes(b, h, s), device=dev, dtype=torch.uint8)
+    _launch("k_dkdv_mx8", (s // 128, h, b),
+            [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"], bz["dots"],
+             bz["q8t"], bz["qts"], lse2, bz["delta"], dk, dv, float(scale), s, h, b, dk.stride(0), dk.stride(1),
+             dv.stride(0), dv.stride(1), dsb], tag)  # fmt: skip
+    _launch("k_dqg_mx8", dqg_grid(s, h, b, "P" in tag),
+            [dsb, bz["k8t"], bz["kts"], dq, float(scale), s, h, b, dq.stride(0), dq.stride(1)], tag)  # fmt: skip
+    return (dq, dk, dv, dsb) if keep_ds else (dq, dk, dv)
+
+
+def ds8_unpack(dsb, b, h, s):
+    """rung b8's dS records -> (dequantized dense fp32 [b, h, s (q), s (kv)], scale bytes [b, h, tiles, 4 w, 4 m])."""
+    nb = s // 128
+    nt = nb * (nb + 1) // 2
+    rec = dsb.view(b, h, nt, DS8_TILE)
+    codes = rec[..., :16384].contiguous().view(torch.float8_e4m3fn).float().view(b, h, nt, 4, 4, 2, 2, 16, 2, 8)
+    scb = rec[..., 16384:16400].contiguous().view(b, h, nt, 4, 4)  # w, m
+    sc = torch.ldexp(torch.ones_like(scb, dtype=torch.float32), scb.to(torch.int32) - 127)
+    # codes dims: w m j lh lr s r; q = 32 m + 16 s + 8 lh + r, kv = 32 w + 16 j + lr
+    deq = codes * sc[..., None, None, None, None, None]
+    out = torch.zeros(b, h, s, s, device=dsb.device)
+    for qb in range(nb):
+        for kb in range(qb + 1):
+            x = deq[:, :, qb * (qb + 1) // 2 + kb]  # b h w m j lh lr s r
+            blk = x.permute(0, 1, 3, 7, 5, 8, 2, 4, 6).reshape(b, h, 128, 128)  # (m s lh r) x (w j lr)
+            out[:, :, qb * 128:(qb + 1) * 128, kb * 128:(kb + 1) * 128] = blk
+    return out, scb
+
+
 def dqg_grid(s, h, b, paired):
     """k_dqg_mx's grid: q blocks of 256 (paired builds, DQG_PAIR: two blocks per workgroup when nqb % 2 == 0 and
     b h % 8 == 0; lab tags with a "P")"""
@@ -958,10 +1012,19 @@ def mxq(x, dim):
     return deq.movedim(-1, dim)
 
 
-def emu_bwd(qz, bz, lse, scale=SCALE, chunk=256, dq_bf16=False, ds_out=None):
+def mxq_block(x, bq=32, bk=32):
+    """Fake MX quantization of fp32 x [..., Q, KV] with one scale per aligned bq x bk block (the kernels' rule)."""
+    *lead, nq, nk = x.shape
+    xb = x.reshape(*lead, nq // bq, bq, nk // bk, bk).movedim(-3, -2).reshape(*lead, nq // bq, nk // bk, bq * bk)
+    codes, e = mx_quant_last(xb, block=bq * bk)
+    deq = codes.float() * torch.ldexp(torch.ones_like(e, dtype=torch.float32), e)  # e [..., 1]
+    return deq.reshape(*lead, nq // bq, nk // bk, bq, bk).movedim(-2, -3).reshape(x.shape)
+
+
+def emu_bwd(qz, bz, lse, scale=SCALE, chunk=256, dq_bf16=False, ds_out=None, ds_block=False):
     """fp32 emulation of k_dkdv_mx / k_dq_mx on the quantized operands: dq, dk [b, s, h, 192], dv [b, s, h, 128]
-    (recipe m4: Q8 already in log2 units). dq_bf16: rung b7's dQ (MX of bf16(dS)); ds_out: a [b, h, s, s] tensor that
-    receives dS (fp32, masked)."""
+    (recipe m4: Q8 already in log2 units). dq_bf16: rung b7's dQ (MX of bf16(dS)); ds_block: rung b8 (one fp8 dS with
+    32 q x 32 kv block scales for dK and dQ); ds_out: a [b, h, s, s] tensor that receives dS (fp32, masked)."""
     m4 = qz.get("recipe") == "m4"
     qf = deq_qk(qz["q8"], qz["qs"], r2=m4)
     kf = deq_qk(qz["k8"], qz["ks"], r2=m4)
@@ -990,8 +1053,9 @@ def emu_bwd(qz, bz, lse, scale=SCALE, chunk=256, dq_bf16=False, ds_out=None):
                 ds_out[:, sl, qs_, : q0 + chunk] = dS
             Pq = e4m3(P * 256.0).float() / 256.0
             dv[:, sl, : q0 + chunk] += torch.einsum("bhqk,bhqd->bhkd", Pq, doc[:, sl, qs_])
-            dk[:, sl, : q0 + chunk] += torch.einsum("bhqk,bhqd->bhkd", mxq(dS, 2), qt[:, sl, qs_]) * scale
-            dsq = mxq(dS.bfloat16().float(), 3) if dq_bf16 else mxq(dS, 3)
+            dsb8 = mxq_block(dS) if ds_block else None
+            dk[:, sl, : q0 + chunk] += torch.einsum("bhqk,bhqd->bhkd", dsb8 if ds_block else mxq(dS, 2), qt[:, sl, qs_]) * scale
+            dsq = dsb8 if ds_block else (mxq(dS.bfloat16().float(), 3) if dq_bf16 else mxq(dS, 3))
             dq[:, sl, qs_] = torch.einsum("bhqk,bhkd->bhqd", dsq, kt[:, sl, : q0 + chunk]) * scale
     t = lambda x: x.permute(0, 2, 1, 3)  # noqa: E731
     return t(dq), t(dk), t(dv)

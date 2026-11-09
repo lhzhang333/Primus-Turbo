@@ -895,3 +895,32 @@ half the CUs, b1 h16).
   the job's start (the kernel clock runs ~12 s behind /proc/uptime and the wall clock). GPU0.FAULT written by hand;
   GPU work stopped until it is cleared. Clusters are not pursued for dK / dV (no gain on k_dkdv_mx); DKDV_CL stays a
   lab knob (default 0).
+
+## 2026-11-09 (c): rung b8 (design, CPU builds; GPU checks pending: GPU0.FAULT)
+
+- Idea: k_dkdv_mx already quantizes dS for dK (the B operand of dK^T += Q^T dS, along q, per (kv, 32 q) scales). With
+  ONE E8M0 scale per 32 q x 32 kv block (a slot pair x the wave's 32 kv rows) the same fp8 bytes are also a valid MX
+  operand along kv for dQ: dkdv stores its dK operand as is (no bf16 conversion), dQ needs no quantization.
+- CPU numerics (`scratch_mx/b8/ds_recipes.py`: only dS quantized, every other operand fp32, the kernels' E8M0 rule:
+  +1 exponent when the mantissa >= 1.75, no saturation): dQ / dK SNR vs fp32 at s 512 / 1024 / 2048 (+ a sharper
+  softmax): b7 (dK per (kv, 32 q), dQ MX(bf16 dS)) 31.25-31.40 / 31.40-31.57 dB, b5 (dQ MX(fp32 dS)) 31.30-31.47 /
+  same, **b8 32 x 32 blocks 31.30-31.47 / 31.40-31.57: = b5's dQ (better than b7 by 0.05 dB), dK unchanged**: E4M3
+  under a shared E8M0 keeps 3 mantissa bits over ~2^14 below the block max, wider than the spread inside a block.
+  (With the OCP rule, which saturates the block max, larger blocks looked 1.5 dB better: an artefact of the rule.)
+- DS8_TILE record (16 KB + 128 B per causal 128 x 128 tile): wave w's 4 KB at 4096 w, chunk 2 m + j = slot pair m of
+  kv16 tile j, lane L = kv % 16 + 16 (q % 16 / 8) at 16 L, byte 8 s + r = q 32 m + 16 s + 8 (L / 16) + r (= dsB[j]
+  dwords 4 m .. 4 m + 3); scale words at 16384 + 4 w (byte m).
+- k_dkdv_mx8 / k_dkdv_mxr8 (dkdv_body DSO 2): at each odd slot the block |dS| max over the lane's 32 values, the wave
+  (DPP row_xmask 1 / 2 / 4 / 8 + lane ^ 16), readfirstlane (SGPR scale), 4 pk8 conversions; at the step end 8
+  global_store_b128 of dsB + one b32 store of the scale word (every lane the same address). 786 / 788 VGPRs, no
+  scratch; the loop 1173 / 1143 instructions vs b7's 1222 / 1218 (no v_cvt_pk_bf16, 8 instead of 16 stores; 16
+  unfolded v_mov_b32_dpp).
+- k_dqg_mx8 / k_dqg_mxr8 (dqg2_body B8): dS records by TDM (129 rows of 128 B), the B operand by 8 ds_load_tr8_b64 per
+  q16 tile straight into the b7 operand layout (8-lane groups: lane c <- byte c of the 8 rows its group addresses,
+  lane rows = 16-byte slots 16 (l % 8) + 256 ((l / 8) % 2) + 128 (l / 16) + 8 s: assumed by analogy with tr16, to be
+  probed: `scratch_mx/bt/trload8.py`), three operand buffers (no copies), the E8M0 word = byte m of the four waves'
+  scale words (4 v_bfe). 772 VGPRs; the tile loop 1279 vs 2535 instructions (k_dqg_mx).
+- mxlab: KERNELS k_dkdv_mx8 / mxr8 / k_dqg_mx8 / mxr8, DS8_TILE, ds8_bytes, bwd_mx8, ds8_unpack, mxq_block,
+  emu_bwd(ds_block=True); pack / unpack self-test on CPU (`scratch_mx/b8/unpack_selftest.py`). GPU checks:
+  `scratch_mx/py/b8_test.py` (dV bitwise = b7, dS records vs the emulation, dK / dQ vs the b8 emulation > 40 dB, vs the
+  fp32 reference), `scratch_mx/py/b8_time.py`; lab tag P8 (= 5ni flags).
