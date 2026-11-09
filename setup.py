@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import importlib.util
 import os
 import platform
 import re
@@ -103,6 +104,32 @@ def check_submodules():
                 sys.exit(1)
             return
     print("[Primus-Turbo] Submodules already initialized.")
+
+
+# -------- gfx1250 HipKittens attention code objects --------
+# csrc/kernels/attention/hipkittens/gfx1250/hsaco.py builds them into primus_turbo/lib/hk_gfx1250 with the
+# flags its manifest.json pins (not the extension's); output that is not the pinned bytes is dropped, and the
+# HIPKITTENS backend then runs FlyDSL's kernels. PRIMUS_TURBO_BUILD_HK_ATTN=0 skips the step.
+HK_GFX1250_HSACO = PROJECT_ROOT / "csrc" / "kernels" / "attention" / "hipkittens" / "gfx1250" / "hsaco.py"
+
+
+def build_hk_gfx1250_hsaco(offload_arch_list):
+    """Build the code objects for a gfx1250 build; the package_data patterns of what it built."""
+    if "--offload-arch=gfx1250" not in offload_arch_list:
+        return []
+    if os.environ.get("PRIMUS_TURBO_BUILD_HK_ATTN", "1") == "0":
+        return []
+    try:
+        spec = importlib.util.spec_from_file_location("_hk_gfx1250_hsaco", HK_GFX1250_HSACO)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.build(log=lambda msg: print(f"[Primus-Turbo Setup] {msg}"))
+    except Exception as e:  # noqa: BLE001 -- optional kernels: never fail the install
+        print(
+            f"[Primus-Turbo Setup] WARNING: gfx1250 HipKittens attention kernels not built: {type(e).__name__}: {e}"
+        )
+        return []
+    return ["lib/hk_gfx1250/*.hsaco"]
 
 
 def get_extras_require():
@@ -527,6 +554,7 @@ if __name__ == "__main__":
     ]
 
     offload_arch_list, _ = get_offload_archs()
+    hk_gfx1250_package_data = build_hk_gfx1250_hsaco(offload_arch_list)
 
     # flydsl 0.3.4.1 does support gfx1250: the four symbols the gfx1250 kernels need
     # (rocdl.WMMA, rocdl.make_tdm_atom, rocdl.tdm_ops, rocdl.ds_load_tr16_b128) are all
@@ -557,7 +585,7 @@ if __name__ == "__main__":
         long_description=(PROJECT_ROOT / "README.md").read_text(encoding="utf-8"),
         long_description_content_type="text/markdown",
         packages=find_packages(exclude=["tests", "tests.*"]),
-        package_data={"primus_turbo": ["lib/*.so"]},
+        package_data={"primus_turbo": ["lib/*.so", *hk_gfx1250_package_data]},
         ext_modules=ext_modules,
         cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
         entry_points=entry_points,

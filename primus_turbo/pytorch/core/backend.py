@@ -64,9 +64,10 @@ class BackendType(Enum):
     DEEP_EP = auto()
     TURBO = auto()
     FLYDSL = auto()
-    # HipKittens attention. gfx950-only at runtime: the kernels are built into the shared extension
-    # in all arch configurations but are guarded on __gfx950__ and must be capability-gated before
-    # launch (see is_gfx950()/hipkittens_attn_supported).
+    # HipKittens attention. On gfx950 the kernels are built into the shared extension in all arch
+    # configurations but are guarded on __gfx950__ and must be capability-gated before launch (see
+    # is_gfx950()/hipkittens_attn_supported). On gfx1250 it names the head-dim-128 code objects of
+    # csrc/kernels/attention/hipkittens/gfx1250 (attention_hipkittens_gfx1250_impl).
     HIPKITTENS = auto()
     GLUON = auto()
 

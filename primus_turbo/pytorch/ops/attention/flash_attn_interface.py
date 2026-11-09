@@ -45,6 +45,11 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
 from primus_turbo.pytorch.kernels.attention.attention_gluon_impl import (
     flash_attn_gluon_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_hipkittens_gfx1250_impl import (
+    flash_attn_hipkittens_gfx1250_backward_impl,
+    flash_attn_hipkittens_gfx1250_forward_impl,
+    hk_gfx1250_operands,
+)
 from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
     flash_attn_sbhd_hipkittens_backward_impl,
     flash_attn_sbhd_hipkittens_forward_impl,
@@ -96,10 +101,11 @@ def _any_requires_grad(*tensors) -> bool:
 class FlashAttnFunc(torch.autograd.Function):
     """Dense flash attention; ``backend`` picks the implementation and ctx carries it so the
     backward takes the same one. q/k/v arrive ``[b, s, h, d]``-shaped, so the sbhd-native
-    kernels -- FlyDSL's gfx950 ones and HipKittens -- take their ``[s, b, h, d]`` permute (the
+    kernels -- FlyDSL's and HipKittens' gfx950 ones -- take their ``[s, b, h, d]`` permute (the
     original tensor, since only sbhd storage is eligible) and permute their results back.
     FlyDSL's gfx1250 kernels (the DeepSeek-V3 MLA head dims, and head dim 128) take any byte
-    order."""
+    order, made contiguous; HipKittens' gfx1250 kernels (head dim 128) take contiguous and sbhd
+    storage as it is and return out / dq / dk / dv in the layouts of q / q / k / v."""
 
     @staticmethod
     def forward(
@@ -123,8 +129,10 @@ class FlashAttnFunc(torch.autograd.Function):
         backend: BackendType = BackendType.AITER,
     ):
         ctx.backend = backend
-        # FLYDSL names two kernel families; the arch decides which, once, for both passes.
+        # FLYDSL and HIPKITTENS name two kernel families each; the arch decides which, once, for
+        # both passes.
         ctx.flydsl_gfx1250 = backend == BackendType.FLYDSL and is_gfx1250()
+        ctx.hk_gfx1250 = backend == BackendType.HIPKITTENS and is_gfx1250()
         if backend == BackendType.TRITON:
             # The dispatcher only picks this backend when DenseAttnFwdTritonBackend.can_handle
             # said yes, but FlashAttnFunc.apply is reachable directly, and these arguments have
@@ -159,7 +167,7 @@ class FlashAttnFunc(torch.autograd.Function):
             )
             return (out, lse) if return_lse else out
 
-        if backend == BackendType.HIPKITTENS:
+        if backend == BackendType.HIPKITTENS and not ctx.hk_gfx1250:
             # Same sbhd precondition as FlyDSL's gfx950 kernels below, and for the same reason.
             assert _sbhd_layout(q, qkv_format), f"hipkittens dense attention is sbhd only, got {qkv_format}"
             q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
@@ -182,23 +190,24 @@ class FlashAttnFunc(torch.autograd.Function):
             # matches the [B, Hq, Sq] every other backend hands back.
             return (out, lse.squeeze(2)) if return_lse else out
 
-        if ctx.flydsl_gfx1250:
+        if ctx.flydsl_gfx1250 or ctx.hk_gfx1250:
+            name = "gfx1250 hipkittens attention" if ctx.hk_gfx1250 else "gfx1250 flydsl attention"
             # As for Triton: apply() is reachable without the gate.
             if dropout_p != 0.0 or bias is not None or alibi_slopes is not None or sink is not None:
-                raise ValueError("gfx1250 flydsl attention does not implement dropout, bias, alibi or sink")
+                raise ValueError(f"{name} does not implement dropout, bias, alibi or sink")
             if return_softmax:
-                raise ValueError("gfx1250 flydsl attention cannot return the softmax matrix")
+                raise ValueError(f"{name} cannot return the softmax matrix")
             if int(window_size[0]) >= 0 or int(window_size[1]) > 0:
-                raise ValueError(f"gfx1250 flydsl attention has no sliding window, got {window_size}")
+                raise ValueError(f"{name} has no sliding window, got {window_size}")
             if softmax_scale is not None and (
                 not isinstance(softmax_scale, Real) or isinstance(softmax_scale, bool)
             ):
-                raise ValueError(
-                    f"gfx1250 flydsl attention: softmax_scale must be a number, got {softmax_scale!r}"
-                )
+                raise ValueError(f"{name}: softmax_scale must be a number, got {softmax_scale!r}")
             # Two kernel families with disjoint head dims: the call's head dims pick one, for
-            # both passes.
+            # both passes. HipKittens has only the head-dim-128 one.
             ctx.flydsl_gfx1250_mla = is_mla_head_dims(q, k, v)
+            if ctx.flydsl_gfx1250_mla and ctx.hk_gfx1250:
+                raise ValueError(f"{name} takes head dim 128; the MLA head dims run on the FLYDSL backend")
             if ctx.flydsl_gfx1250_mla:
                 reason = flydsl_gfx1250_mla_unsupported_reason(q, k, v, causal)
                 if reason is not None:
@@ -209,18 +218,22 @@ class FlashAttnFunc(torch.autograd.Function):
             else:
                 # Same rule as the gate: a right bound of 0 is a causal mask, so it needs causal=True.
                 if int(window_size[1]) == 0 and not causal:
-                    raise ValueError(
-                        f"gfx1250 flydsl attention has no sliding window, got {window_size} (causal={causal})"
-                    )
+                    raise ValueError(f"{name} has no sliding window, got {window_size} (causal={causal})")
+                # HipKittens runs on top of FlyDSL's gate: a direction its kernels cannot take runs
+                # on the FlyDSL kernels.
                 reason = flydsl_gfx1250_unsupported_reason(q, k, v, causal)
                 if reason is not None:
-                    raise ValueError(f"gfx1250 flydsl attention: {reason}")
-                # [b, s, h, d] in any byte order; the adapter makes q/k/v contiguous BSHD and the
-                # backward consumes exactly those tensors and lse [B, Hq, Sq].
-                q_c, k_c, v_c = (t.contiguous() for t in (q, k, v))
-                out, lse = flash_attn_flydsl_gfx1250_forward_impl(
-                    q_c, k_c, v_c, softmax_scale=softmax_scale, causal=causal
-                )
+                    raise ValueError(f"{name}: {reason}")
+                # [b, s, h, d] in any byte order. FlyDSL takes contiguous BSHD; HipKittens takes
+                # contiguous and sbhd storage as it is (out then comes in q's layout). The backward
+                # consumes exactly these tensors and lse [B, Hq, Sq].
+                if ctx.hk_gfx1250:
+                    q_c, k_c, v_c = hk_gfx1250_operands(q, k, v)
+                    forward_impl = flash_attn_hipkittens_gfx1250_forward_impl
+                else:
+                    q_c, k_c, v_c = (t.contiguous() for t in (q, k, v))
+                    forward_impl = flash_attn_flydsl_gfx1250_forward_impl
+                out, lse = forward_impl(q_c, k_c, v_c, softmax_scale=softmax_scale, causal=causal)
                 saved = (q_c, k_c, v_c, out, lse)
             if is_grad_enabled and _any_requires_grad(q, k, v):
                 ctx.save_for_backward(*saved)
@@ -336,7 +349,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 "internal contract violation: gluon flash-attn is forward-only and must not reach backward"
             )
 
-        if ctx.backend == BackendType.HIPKITTENS:
+        if ctx.backend == BackendType.HIPKITTENS and not ctx.hk_gfx1250:
             q_s, k_s, v_s, out_s, lse = ctx.saved_tensors
             dq, dk, dv = flash_attn_sbhd_hipkittens_backward_impl(
                 dout.permute(1, 0, 2, 3).contiguous(),
@@ -368,14 +381,19 @@ class FlashAttnFunc(torch.autograd.Function):
             )
             return _flash_attn_grads(dq, dk, dv, None, dsink)
 
-        if ctx.flydsl_gfx1250:
+        if ctx.flydsl_gfx1250 or ctx.hk_gfx1250:
             if ctx.flydsl_gfx1250_mla:
                 dq, dk, dv = flash_attn_flydsl_gfx1250_mla_backward_impl(
                     dout, *ctx.saved_tensors, softmax_scale=ctx.softmax_scale, causal=ctx.causal
                 )
             else:
                 q, k, v, out, lse = ctx.saved_tensors
-                dq, dk, dv = flash_attn_flydsl_gfx1250_backward_impl(
+                backward_impl = (
+                    flash_attn_hipkittens_gfx1250_backward_impl
+                    if ctx.hk_gfx1250
+                    else flash_attn_flydsl_gfx1250_backward_impl
+                )
+                dq, dk, dv = backward_impl(
                     dout,
                     q,
                     k,
@@ -612,7 +630,9 @@ def flash_attn_func(
     """q/k/v are ``[b, s, h, d]``-shaped; an sbhd caller passes a permuted view and permutes
     the result back. aiter reads the memory layout to allocate outputs and grads matching it.
     FlyDSL takes sbhd only on gfx950 and any layout on gfx1250, where its head-dim-128 kernels
-    return contiguous [b, s, h, d] outputs and grads.
+    return contiguous [b, s, h, d] outputs and grads. HipKittens on gfx1250
+    (``PRIMUS_TURBO_ATTN_BACKEND=HIPKITTENS``) reads sbhd storage in place and returns out / dq /
+    dk / dv in the layouts of q / q / k / v.
     """
     qkv_format = _infer_qkv_format(q, k, v)
     is_grad_enabled = torch.is_grad_enabled()

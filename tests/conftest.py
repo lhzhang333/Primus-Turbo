@@ -54,6 +54,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
     # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 128.
     "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
+    # HipKittens attention at head_dim 128 (csrc/kernels/attention/hipkittens/gfx1250).
+    "tests/pytorch/ops/test_attention_hipkittens_gfx1250.py",
     # Sparse MLA (primus_turbo/flydsl/attention/gfx1250_sparse_mla); every backend it can pick
     # runs here.
     "tests/pytorch/ops/test_attention.py::test_sparse_mla_op",

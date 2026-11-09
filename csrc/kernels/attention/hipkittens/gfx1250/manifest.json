@@ -1,0 +1,37 @@
+{
+  "arch": "gfx1250",
+  "toolchain": "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git 862306352beb9946c78b3e355d0d5201bbccfa3a)",
+  "flags": [
+    "-x",
+    "hip",
+    "--offload-arch=gfx1250",
+    "--cuda-device-only",
+    "--no-gpu-bundle-output",
+    "-O3",
+    "-std=c++20",
+    "-DNDEBUG",
+    "-Iinclude"
+  ],
+  "kernels": {
+    "k_attn_fwd": {
+      "src": "src/k_attn_fwd.hip",
+      "extra_flags": [
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode",
+        "-mllvm",
+        "-structurizecfg-skip-uniform-regions",
+        "-mllvm",
+        "-amdgpu-sched-strategy=coexec"
+      ],
+      "hsaco_sha256": "865fc5939656367233efcac721d8a98cfd0d2dd807ab674fce647caa81571aec"
+    },
+    "k_attn_bwd": {
+      "src": "src/k_attn_bwd.hip",
+      "extra_flags": [
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "hsaco_sha256": "9ffc772e61727151aadaf348d9afde7e3c723f8aa648c3a9003e4fa946c19c38"
+    }
+  }
+}
