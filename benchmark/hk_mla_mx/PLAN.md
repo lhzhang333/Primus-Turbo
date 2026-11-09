@@ -103,9 +103,11 @@ efficiency but lose more in LDS latency (several hundred cycles under load) and 
 Next (each several days):
 1. **Quantization fused into the q / kv up-projection GEMMs (P4)**: the GEMM epilogue writes the MX operands (rows +
    cols + scales, RoPE on the rope columns) instead of bf16 q / kv: -0.22 ms quantization, the bf16 write + read of
-   q / kv, smaller saved activations. Open: k's centring by kbar (a mean over s, a separate pass before the GEMM or a
-   recipe change), the GEMM (Turbo's own HIP / Triton GEMM with a custom epilogue instead of TE / hipBLASLt), Primus'
-   MLA module.
+   q / kv, smaller saved activations. k's centring by kbar is exact for ANY vector kbar (S moves by q . kbar per row,
+   which the softmax cancels; dQ's extra dS kbar vanishes as sum_kv dS = 0; the API lse adds q . kbar back): only the
+   quantization error depends on kbar being near the mean, so a running estimate (the previous step's per-head mean)
+   removes the global dependency on the GEMM's output. Open: the GEMM (Turbo's own HIP / Triton GEMM with a custom
+   epilogue instead of TE / hipBLASLt), Primus' MLA module.
 2. **dK / dV generator** (tools/bwdgen-style: explicit registers, slot scheduler calibrated by ATT): the loop's
    ~1000 instructions per step vs ~2450 cycles; realistic -10..15% of 1.53 ms. Calibrate first: LDS latency /
    rate under four loading waves, WMMA operand-port stalls next to VALU, the pk8 converter's occupancy.

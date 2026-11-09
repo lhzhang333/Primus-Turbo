@@ -834,3 +834,10 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
 - Package profile now (fused-RoPE fwd + bwd per step, slow GPU): 3.140 ms with the script's 0.205 ms of gradient adds:
   dkdv_mxrd 1.534, forward 0.585, dqg_mxr 0.492, qkv 0.223, dO 0.071, rope_bwd_kpe 0.016, kbar 0.013 (11-06 package in
   the same harness: 3.50).
+- ATT of the WMMAs (one median trip): LLVM's order loses 354 cycles right before WMMAs, 83 of them after an
+  s_wait_dscnt; first-ready-first loses 721, 504 after an s_wait_dscnt: the WMMAs wait for LDS-loaded operands the
+  schedule put too close to their loads. A generator must keep ~300+ cycles between an LDS load and its consumer
+  under four loading waves (LLVM's order keeps ~380 model cycles).
+- Note for fusing the quantization into the producers: subtracting kbar from k is exact for any vector (the softmax
+  cancels q . kbar per row; sum_kv dS = 0 removes dS kbar from dQ; the API lse adds q . kbar back): a stale kbar (e.g.
+  the previous step's) only changes the quantization error.
