@@ -83,6 +83,36 @@ fused into the producers (RoPE / up-projection epilogues) in Primus.
 | Turbo | hk_mx (m4 + b1 + rc; fp8-only saved tensors) | CPU tests pass; GPU numerics pending |
 | e2e | training gate scripts (mx_gate.sh, summary) | prepared |
 
+## 3c. Status (2026-11-09, heliosr-1b112-a30-4, GPU stuck at ~1.3 GHz: same-run numbers only; details in LOG.md)
+
+| piece | package rung | per call, b2 s4096 h128 (package profile, slow GPU) |
+|---|---|---|
+| forward quantization | k_mxq_kbar_rope + k_mxq_qkv (q, k with RoPE, v rows + cols in one launch) | 0.013 + 0.223 ms |
+| forward | m7 (DMASK, OSKEW, QFIRST), tile loop + diagonal block re-scheduled after RA (asm_resched ready / 32) | 0.585 |
+| dO quantization | k_mxq_rct128 mode 4 (O by TDM: RC_YTDM) | 0.071 |
+| dK / dV | b7 k_dkdv_mxrd = b5 + bf16 dS tiles stored (the step's 16 stores at its end) | 1.534 |
+| dQ | b7 k_dqg_mxr: dQ = scale dS K over the stored dS (no recompute), paired q blocks, re-scheduled (height / 96) | 0.492 |
+| fused-RoPE fwd + bwd per step | (+ k_rope_bwd_kpe 0.016) | ~2.94 (3.30 on 11-06) |
+
+Training gate g120k: -2.70% iteration time vs bf16 HK, same loss. Exhausted on dK / dV (LOG.md 11-09): every post-RA
+list schedule (LDS latency 32..500, height / ready / orig, bwdgen-like LDS model, WMMA chain latency), LLVM scheduler
+strategies, sched_group_barrier patterns, fewer LDS loads for VALU (DPP lse / delta), slot source orders. ATT: the loop
+is bound by LDS (4 waves x ~215 loads per step + the TDM writes) and VALU at once; re-orders gain VALU / TRANS
+efficiency but lose more in LDS latency (several hundred cycles under load) and WMMA stalls the models lack.
+
+Next (each several days):
+1. **Quantization fused into the q / kv up-projection GEMMs (P4)**: the GEMM epilogue writes the MX operands (rows +
+   cols + scales, RoPE on the rope columns) instead of bf16 q / kv: -0.22 ms quantization, the bf16 write + read of
+   q / kv, smaller saved activations. Open: k's centring by kbar (a mean over s, a separate pass before the GEMM or a
+   recipe change), the GEMM (Turbo's own HIP / Triton GEMM with a custom epilogue instead of TE / hipBLASLt), Primus'
+   MLA module.
+2. **dK / dV generator** (tools/bwdgen-style: explicit registers, slot scheduler calibrated by ATT): the loop's
+   ~1000 instructions per step vs ~2450 cycles; realistic -10..15% of 1.53 ms. Calibrate first: LDS latency /
+   rate under four loading waves, WMMA operand-port stalls next to VALU, the pk8 converter's occupancy.
+3. A larger kv reuse per wave (48 kv rows: fewer LDS bytes per WMMA) needs 192-row kv blocks against 128-row q steps /
+   dS tiles / dQ tiles: a re-tiling of dK / dV and dQ together.
+4. Re-tune at full clocks (2.4 GHz) once the node is fixed: every A / B of 11-06 / 11-09 ran at 1.3 GHz.
+
 ## 4. Rules
 
 GPU2 only, through `scratch_mx/g2.sh` (lock, FAULT interlock, dmesg check, hard timeout); new kernels on toy
