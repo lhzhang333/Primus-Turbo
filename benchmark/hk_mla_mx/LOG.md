@@ -811,3 +811,6 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   four loading waves is several hundred cycles, not the model's 32-160. With an LDS latency of 300 / 400 / 500 cycles:
   height 1.514 / 1.523 / 1.523, ready 1.583, height 300 burst 2 1.504 vs LLVM 1.491 ms (bitwise): closer, not better
   (the WMMA stalls the model does not have remain).
+- dkdv with the WMMA accumulator-chain latency raised in the model (asm_resched wmma_c_lat 16 / 24, LDS latency 300,
+  burst 2; height / ready): 1.507 / 1.508 / 1.583 vs LLVM 1.492 ms. The dK / dV loop stays LLVM's; asm_resched keeps
+  the option (default 8: the forward / dQ builds unchanged).

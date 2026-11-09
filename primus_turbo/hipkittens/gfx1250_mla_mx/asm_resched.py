@@ -167,7 +167,7 @@ def _order_class(n):
     return None
 
 
-def _dag(T, items, lat_ds=None):
+def _dag(T, items, lat_ds=None, wmma_c_lat=8):
     """succ[i] = {j: latency} for every dependence i -> j a new order must keep (lat_ds: the LDS load latency the
     schedule assumes, default LAT_RAW's)."""
     LAT = dict(LAT_RAW, **({"DS_LD": lat_ds} if lat_ds is not None else {}))
@@ -189,7 +189,7 @@ def _dag(T, items, lat_ds=None):
                 lat = LAT.get(p.kind, 1)
                 if p.kind == "WMMA" and it.kind == "WMMA":
                     _, ab = T.EM.wmma_regs(it.x)
-                    lat = 16 if (r[0] == "v" and r[1] in ab) else 8
+                    lat = 16 if (r[0] == "v" and r[1] in ab) else wmma_c_lat
                 edge(i, j, lat)
         for r in rd:
             for i in readers.get(r, []):
@@ -455,7 +455,8 @@ def _verify(T, new, objdump, tmp):
     return bad
 
 
-def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, regions=True, prio="ready", lat_ds=None):
+def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, regions=True, prio="ready", lat_ds=None,
+          wmma_c_lat=8):
     """Compile src (flags + no VOPD + save-temps) into out with the main loop of each kernel re-scheduled (prio, lat_ds:
     _schedule's tie rule and the assumed LDS load latency); raises on any failure (the caller falls back to the plain
     build). Returns {kernel: (items, LLVM lines, emitted lines)}."""
@@ -484,7 +485,7 @@ def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, r
         items = with_req(_items(T, ins, la, lb))
         if items[-1].kind != "BR":
             raise RuntimeError("the loop body does not end with its branch")
-        order = _schedule(items, _dag(T, items, lat_ds), lds_gap, lds_burst, prio)
+        order = _schedule(items, _dag(T, items, lat_ds, wmma_c_lat), lds_gap, lds_burst, prio)
         label = ins[la].label
         new_items = [items[i] for i in order]
         sgpr_waits(new_items, loop_carried_valu_sgprs(new_items))
@@ -498,7 +499,7 @@ def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, r
                 ra, rb, _ = rg
                 items = with_req(_items(T, ins, ra, rb))
                 tail = items.pop() if items and items[-1].kind == "BR" else None
-                order = _schedule(items, _dag(T, items, lat_ds), lds_gap, lds_burst, prio)
+                order = _schedule(items, _dag(T, items, lat_ds, wmma_c_lat), lds_gap, lds_burst, prio)
                 new_items = sgpr_waits([items[i] for i in order])
                 entry = T.EM.Flow([T.E.State(unknown=False)], [T.EM.XState(False)], [[T.EM._NOP] * 5])
                 body, _ = T.EM.emit_block(new_items, entry, fmap, VA_RULE)
