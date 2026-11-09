@@ -28,9 +28,10 @@ CNT_RE = re.compile(
 
 def regs_of(tok):
     """Full VGPR numbers of an operand token (``v[26:33] /*v[794:801]*/``: the comment has the true ones)."""
-    m = re.search(r"/\*\s*(v\[?[\d:]+\]?)\s*\*/", tok)
+    m = re.search(r"/\*\s*(v\[?[\d:]+\]?)(?:\.[lh])?\s*\*/", tok)
     t = (m.group(1) if m else tok).strip().strip("|-")
     t = re.sub(r"^(neg|abs)\((.*)\)$", r"\2", t)
+    t = re.sub(r"\.[lh]$", "", t)  # a 16-bit half (true16): the register (partial-write handled by parse_line)
     m = REG_RE.match(t)
     if not m:
         return []

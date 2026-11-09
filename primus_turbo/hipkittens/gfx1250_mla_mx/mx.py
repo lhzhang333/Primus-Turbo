@@ -76,11 +76,11 @@ SRC_FLAGS = {
 # main loops re-scheduled after register allocation (asm_resched: a list schedule of LLVM's loop body, emitted through
 # gfx1250_mla's asmkit, verified against the code object): source -> (kernels, asm_resched.build options). The
 # forward's tile loop + its largest straight-line block (first-ready-first, LDS latency 32: -9%); dQ's tile loop (the
-# longest path first, LDS latency 96, LDS burst 2: dqg_mxr -8.6%). The dK / dV loop is LLVM's (every schedule tried is
+# longest path first, LDS latency 96, LDS burst 2; + the block of the last two tiles: dqg_mxr -9%). The dK / dV loop is LLVM's (every schedule tried is
 # slower). PRIMUS_TURBO_MLA_MX_RESCHED=0: plain builds; on any failure the source is built plainly (a warning)
 RESCHED = {
     "k_mla_fwd_mx7.hip": (("k_mla_fwd_mx",), {}),
-    "k_mla_bwd_mx5.hip": (("k_dqg_mx", "k_dqg_mxr"), {"prio": "height", "lat_ds": 96, "lds_burst": 2.0, "regions": False}),
+    "k_mla_bwd_mx5.hip": (("k_dqg_mx", "k_dqg_mxr"), {"prio": "height", "lat_ds": 96, "lds_burst": 2.0}),
 }
 DKDV_KV_ROWS = 128  # kv rows per k_dkdv_mx workgroup (4 waves x 2 kv16 tiles)
 

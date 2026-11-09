@@ -786,3 +786,12 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
 - Tests: test_dq_gemm_matches_recompute (dK / dV bitwise between the dQ GEMM and the recompute kernel, dQ > 30 dB apart,
   both over the fp32 floor; paired grid, odd q blocks, b h % 8 != 0), test_dq_gemm_workspace_cap (the cap falls back,
   bitwise). pytest 34 pass.
+- asmkit (gfx1250_mla/tools/asmkit/isa.py regs_of): 16-bit register halves (`v168.l`, `v253.l /*v765.l*/`) parse as
+  their register (parse_line already marks such writes partial); inputs that parsed before are unchanged (the bf16 HK
+  regen_asm_patch.py --check passes: both generated kernels current).
+- With it: dqg's block of its last two tiles re-scheduled too (regions): dqg_mx 0.446 -> 0.439, dqg_mxr 0.460 -> 0.458
+  ms, bitwise; package on (k_dqg_mxr 0.490-0.498 in the profile). k_mxq_qkv's loop re-scheduled (ready): 0.2260 vs
+  0.2228 ms: not taken.
+- A GPU fault marker (scratch_mx/logs/GPU0.FAULT) was written by mistake: the MES / queue-reset lines came from another
+  session's pytest sweep that ended just before this job (dmesg's clock lags the wall clock by ~15 s, and gx.sh's window
+  had been widened). gx.sh now checks only the kernel-log lines added during the job (line count at the start).
