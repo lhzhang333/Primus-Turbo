@@ -765,3 +765,12 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   is the larger cost; each value is quantized once already).
 - DKDV_SGB (sched_group_barrier issue patterns per dkdv slot): [W 2T 4V 2DS] x 12 2.299, [W T 2V DS] x 16 1.784,
   S / dP WMMAs first then [W 3V 2DS] 1.510 vs 1.486 ms (bitwise): off.
+- **dqg re-scheduled after register allocation** (asm_resched): the tile loop made one basic block (the per-tile wait +
+  barrier also at tile 0; issue() by selects only: per-wave / per-block base addresses and bytes per tile precomputed),
+  the halves' max of the bf16 amax by a rotate + packed max (no 16-bit register halves: asmkit's parser does not read
+  `v.l / v.h`). Lab, bitwise with LLVM's order: dqg_mx LLVM 0.490, identity 0.471, ready 0.466, **height / LDS latency
+  96 / LDS burst 2: 0.447, dqg_mxr 0.503 -> 0.460** (height 64 / 128 / 160, gap 4 / 8: 0.454-0.467 / 0.467-0.489).
+  Package: asm_resched gained the height priority and an LDS latency option; RESCHED per source with options
+  (k_mla_bwd_mx5.hip: k_dqg_mx, k_dqg_mxr; the prefetch range is checked on the re-scheduled object too). Package
+  profile: k_dqg_mxr 0.555 -> 0.510-0.516 ms, fused-RoPE fwd + bwd per step 3.22 -> 3.19-3.21. pytest 30 pass,
+  fused-RoPE test pass.

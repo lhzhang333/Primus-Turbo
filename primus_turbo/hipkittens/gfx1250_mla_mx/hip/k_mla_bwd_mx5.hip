@@ -229,8 +229,11 @@ MX_INLINE float amax16_bf16(const u32x4 &x0, const u32x4 &x1) {
         const u16x2 pm = __builtin_bit_cast(u16x2, __builtin_elementwise_max(p, s16x2{0, 0}));
         const u16x2 nm = __builtin_bit_cast(u16x2, __builtin_bit_cast(unsigned, n) & 0x7fff7fffu);
         const u16x2 m2 = __builtin_elementwise_max(pm, nm);
-        const unsigned mb = m2[0] > m2[1] ? (unsigned)m2[0] : (unsigned)m2[1];
-        return __builtin_bit_cast(float, mb << 16);
+        // the two halves' max by 32-bit ops (a rotate + one packed max: no 16-bit register halves, which asm_resched's
+        // parser does not read), the result in the high half = the f32 bits of the bf16 max
+        const unsigned m2u = __builtin_bit_cast(unsigned, m2);
+        const u16x2 mm = __builtin_elementwise_max(m2, __builtin_bit_cast(u16x2, __builtin_amdgcn_alignbit(m2u, m2u, 16)));
+        return __builtin_bit_cast(float, __builtin_bit_cast(unsigned, mm) & 0xffff0000u);
     }
     auto ab = [](unsigned x) { return __builtin_bit_cast(s16x2, x & 0x7fff7fffu); };
     const s16x2 m0 = __builtin_elementwise_max(__builtin_elementwise_max(ab(x0[0]), ab(x0[1])),
@@ -2183,15 +2186,20 @@ __device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB,
                         : wv == 2 ? tdm_g1(W0_128, D_QK, 128, D_QK, (unsigned long long)S)
                                   : tdm_g1(W0_S, D_QK, 4, D_QK, 4);
     auto stage = [&](int T) __attribute__((always_inline)) { return lds0 + (unsigned)((T % G_NSTG) * G2_STG); };
-    auto issue = [&](int T) __attribute__((always_inline)) {
+    // per wave and block: tile 0's global address, the bytes per tile, the last real tile (dS of q block 2 qb: 2 qb)
+    const unsigned long long op_mult = wv <= 1 ? (unsigned long long)DS_TILE : wv == 2 ? (unsigned long long)NBK
+                                                                                      : (unsigned long long)(D_QK * 4);
+    auto op_base = [&](int qb) __attribute__((always_inline)) {
+        return wv <= 1 ? dsbh + (unsigned long long)ds_tile_index(0, 2 * qb + wv) * DS_TILE : wv == 2 ? kt_base : kts_base;
+    };
+    const unsigned long long base0 = op_base(qbs[0]), base1 = op_base(qbs[1]);
+    const int lim0 = wv == 0 ? 2 * qbs[0] : 1 << 20, lim1 = wv == 0 ? 2 * qbs[1] : 1 << 20;
+    auto issue = [&](int T) __attribute__((always_inline)) {  // selects only (the tile loop stays one basic block)
         const bool first = T < n0;
-        const int t = first ? T : T - n0, qb = first ? qbs[0] : qbs[1], n = first ? n0 : n1;
-        const bool real = T < NT && (wv != 0 || t <= 2 * qb);
+        const int t = first ? T : T - n0, n = first ? n0 : n1, lim = first ? lim0 : lim1;
+        const bool real = T < NT && t <= lim;
         const unsigned long long tt = (unsigned long long)(t < n ? t : n - 1);
-        const int qrow = 2 * qb + (wv == 1 ? 1 : 0);
-        const unsigned long long ga = wv <= 1 ? dsbh + ((unsigned long long)ds_tile_index(0, qrow) + tt) * DS_TILE
-                                      : wv == 2 ? kt_base + tt * NBK
-                                                : kts_base + tt * (D_QK * 4);
+        const unsigned long long ga = (first ? base0 : base1) + tt * op_mult;
         tdm_load(tdm_g0(stage(T) + op_lds, ga, real ? 1 : 0), op_g1);
     };
     // ROPE: a block's cos / sin rows (256 x 128 B, rows padded to 144 B) into the stage of tile T (waves 0 / 1; 2 / 3 NULL)
@@ -2209,10 +2217,7 @@ __device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB,
         }
     };
     issue(0);
-    issue(1);
-    tensor_wait<1>();  // tile 0 (tile 1 may stay in flight)
-    bar_signal();
-    bar_wait();
+    issue(1);  // tile 0's wait + barrier: in tile(0) as in every tile (the tile loop stays one basic block)
 
     f32x8 dq[12][QTW];
     static_for<12>([&](auto d) { static_for<QTW>([&](auto i) { dq[(int)d][(int)i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
@@ -2224,11 +2229,9 @@ __device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB,
     // 2 qb; issues the block's cos / sin (ROPE) into tile T + 2's stage instead of the next block's tile 1)
     auto tile = [&](int T, int q0, auto cl_c) __attribute__((always_inline)) {
         constexpr int CL = decltype(cl_c)::value;
-        if (T > 0) {
-            tensor_wait<1>();  // tile T landed (T + 1 in flight)
-            bar_signal();
-            bar_wait();  // tile T visible; every wave is done with tile T - 1
-        }
+        tensor_wait<1>();  // tile T landed (T + 1 in flight)
+        bar_signal();
+        bar_wait();  // tile T visible; every wave is done with tile T - 1
         if constexpr (CL == 2)
             issue_extra(T + 2, q0);
         else

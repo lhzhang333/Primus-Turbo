@@ -167,8 +167,10 @@ def _order_class(n):
     return None
 
 
-def _dag(T, items):
-    """succ[i] = {j: latency} for every dependence i -> j a new order must keep."""
+def _dag(T, items, lat_ds=None):
+    """succ[i] = {j: latency} for every dependence i -> j a new order must keep (lat_ds: the LDS load latency the
+    schedule assumes, default LAT_RAW's)."""
+    LAT = dict(LAT_RAW, **({"DS_LD": lat_ds} if lat_ds is not None else {}))
     n = len(items)
     succ = [dict() for _ in range(n)]
 
@@ -184,7 +186,7 @@ def _dag(T, items):
             i = last_def.get(r)
             if i is not None:
                 p = items[i]
-                lat = LAT_RAW.get(p.kind, 1)
+                lat = LAT.get(p.kind, 1)
                 if p.kind == "WMMA" and it.kind == "WMMA":
                     _, ab = T.EM.wmma_regs(it.x)
                     lat = 16 if (r[0] == "v" and r[1] in ab) else 8
@@ -201,7 +203,7 @@ def _dag(T, items):
                 edge(i, j, lat)
             i = last_def.get(r)
             if i is not None:
-                edge(i, j, LAT_RAW.get(items[i].kind, 1) if items[i].kind in ("DS_LD", "VM_LD") else 1)
+                edge(i, j, LAT.get(items[i].kind, 1) if items[i].kind in ("DS_LD", "VM_LD") else 1)
         for r in rd:
             last_def[r] = j
             readers[r] = []
@@ -293,9 +295,20 @@ class _Machine:
         self.last_kind, self.last_t = n.kind, t
 
 
-def _schedule(items, succ, lds_gap, lds_burst):
-    """First-ready-first list schedule on the issue model; ties by the original order."""
+def _heights(succ):
+    """The longest latency path from each item to the end."""
+    h = [0] * len(succ)
+    for i in range(len(succ) - 1, -1, -1):
+        h[i] = max([lat + h[j] for j, lat in succ[i].items()], default=0)
+    return h
+
+
+def _schedule(items, succ, lds_gap, lds_burst, prio="ready"):
+    """List schedule on the issue model: the ready item that can issue first; ties by prio: "ready" the earliest ready
+    (then the original order), "height" the longest latency path to the end, an item needing no s_set_vgpr_msb switch
+    preferred by one cycle of height (the lab's resched.py --prio height)."""
     n = len(items)
+    h = _heights(succ) if prio == "height" else None
     pred_n = [0] * n
     for i in range(n):
         for j in succ[i]:
@@ -308,7 +321,11 @@ def _schedule(items, succ, lds_gap, lds_burst):
         best = None
         for i in avail:
             e = m.earliest(items[i], max(t, ready_t[i]))
-            key = (-e, -ready_t[i], -i)
+            if h is not None:
+                sw = 1 if (items[i].req and m.switch(items[i])) else 0
+                key = (-e, h[i] - sw, -i)
+            else:
+                key = (-e, -ready_t[i], -i)
             if best is None or key > best[0]:
                 best = (key, i, e)
         _, i, e = best
@@ -438,9 +455,10 @@ def _verify(T, new, objdump, tmp):
     return bad
 
 
-def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, regions=True):
-    """Compile src (flags + no VOPD + save-temps) into out with the main loop of each kernel re-scheduled; raises on any
-    failure (the caller falls back to the plain build). Returns {kernel: (items, LLVM lines, emitted lines)}."""
+def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, regions=True, prio="ready", lat_ds=None):
+    """Compile src (flags + no VOPD + save-temps) into out with the main loop of each kernel re-scheduled (prio, lat_ds:
+    _schedule's tie rule and the assumed LDS load latency); raises on any failure (the caller falls back to the plain
+    build). Returns {kernel: (items, LLVM lines, emitted lines)}."""
     T = _Tools()
     T.EM.msb_required = _msb_required(T)  # + operands not remapped by s_set_vgpr_msb (WMMA scale operands)
     tmp = Path(tmp)
@@ -466,7 +484,7 @@ def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, r
         items = with_req(_items(T, ins, la, lb))
         if items[-1].kind != "BR":
             raise RuntimeError("the loop body does not end with its branch")
-        order = _schedule(items, _dag(T, items), lds_gap, lds_burst)
+        order = _schedule(items, _dag(T, items, lat_ds), lds_gap, lds_burst, prio)
         label = ins[la].label
         new_items = [items[i] for i in order]
         sgpr_waits(new_items, loop_carried_valu_sgprs(new_items))
@@ -480,7 +498,7 @@ def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, r
                 ra, rb, _ = rg
                 items = with_req(_items(T, ins, ra, rb))
                 tail = items.pop() if items and items[-1].kind == "BR" else None
-                order = _schedule(items, _dag(T, items), lds_gap, lds_burst)
+                order = _schedule(items, _dag(T, items, lat_ds), lds_gap, lds_burst, prio)
                 new_items = sgpr_waits([items[i] for i in order])
                 entry = T.EM.Flow([T.E.State(unknown=False)], [T.EM.XState(False)], [[T.EM._NOP] * 5])
                 body, _ = T.EM.emit_block(new_items, entry, fmap, VA_RULE)

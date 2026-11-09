@@ -74,10 +74,14 @@ SRC_FLAGS = {
     "k_mla_bwd_mx5.hip": ("-fno-slp-vectorize",),
 }
 # main loops re-scheduled after register allocation (asm_resched: a list schedule of LLVM's loop body, emitted through
-# gfx1250_mla's asmkit, verified against the code object): the forward's tile loop, -7% (bit-exact). The dK / dV loop
-# is LDS-bound and slower re-scheduled: LLVM's order. PRIMUS_TURBO_MLA_MX_RESCHED=0: plain builds; on any failure
-# the source is built plainly (a warning)
-RESCHED = {"k_mla_fwd_mx7.hip": ("k_mla_fwd_mx",)}
+# gfx1250_mla's asmkit, verified against the code object): source -> (kernels, asm_resched.build options). The
+# forward's tile loop + its largest straight-line block (first-ready-first, LDS latency 32: -9%); dQ's tile loop (the
+# longest path first, LDS latency 96, LDS burst 2: dqg_mxr -8.6%). The dK / dV loop is LLVM's (every schedule tried is
+# slower). PRIMUS_TURBO_MLA_MX_RESCHED=0: plain builds; on any failure the source is built plainly (a warning)
+RESCHED = {
+    "k_mla_fwd_mx7.hip": (("k_mla_fwd_mx",), {}),
+    "k_mla_bwd_mx5.hip": (("k_dqg_mx", "k_dqg_mxr"), {"prio": "height", "lat_ds": 96, "lds_burst": 2.0, "regions": False}),
+}
 DKDV_KV_ROWS = 128  # kv rows per k_dkdv_mx workgroup (4 waves x 2 kv16 tiles)
 
 _ROWS_ARGS = (("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("kbar", "ptr"), ("Y", "ptr"), ("aux", "ptr"),
@@ -349,8 +353,11 @@ def _code_object(src):
         if not out.is_file() and src in RESCHED and _resched_on():
             tmp = out.with_suffix(f".{os.getpid()}.tmp")
             try:
+                kernels, opts = RESCHED[src]
                 with tempfile.TemporaryDirectory(prefix="mx_resched_") as td:
-                    asm_resched.build(cxx, HIP / src, tmp, [*FLAGS, *SRC_FLAGS.get(src, ())], RESCHED[src], HIP, td)
+                    asm_resched.build(cxx, HIP / src, tmp, [*FLAGS, *SRC_FLAGS.get(src, ())], kernels, HIP, td, **opts)
+                if not _prefetch_ok(src, tmp):
+                    raise RuntimeError("a code prefetch would pass the code object's end")
                 os.replace(tmp, out)
             except Exception as e:  # noqa: BLE001 - any failure: the plain build below
                 tmp.unlink(missing_ok=True)
