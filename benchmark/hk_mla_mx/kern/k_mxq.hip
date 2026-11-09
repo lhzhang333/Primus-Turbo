@@ -416,7 +416,12 @@ __device__ __forceinline__ void rc_body(const bf16 *__restrict__ X, unsigned cha
 struct YPre {
     u32x4 v[8];
     bool on = false;
+    const unsigned char *yt = nullptr;  // RC_YTDM: the Y tile in LDS (the X tile's layout)
 };
+#ifndef RC_YTDM
+#define RC_YTDM 0  // rct128 with Y dots (dout): the O tile by a TDM load into LDS next to the dO tile (wave 1)
+#endif
+template <int D> constexpr int RCT_YB = RC_YTDM && D == 128 ? RCT_TB<D> : 0;  // its LDS bytes
 template <int D, int NT, bool XSK = false, int TXR = 2 * D, int TPSH = 0>
 __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char *x8, unsigned char *xs,
                                         unsigned char *x8t, unsigned char *xts, const float *kb_lds,
@@ -486,7 +491,9 @@ __device__ __forceinline__ void rc_tile(const unsigned char *tile, unsigned char
             if (mode & 4) {
                 const bf16 *yp = Y + b * yb + (long long)(kt * 128 + r) * ys + h * yh + 32 * jj;
                 static_for<4>([&](auto i) {
-                    const f32x8 y = bf8_to_f32(ypre.on ? (r0 == 0 ? ypre.v[(int)i] : ypre.v[4 + (int)i]) : *(const u32x4 *)(yp + 8 * (int)i));
+                    const f32x8 y = bf8_to_f32(ypre.yt ? *(const u32x4 *)(ypre.yt + tile_at<TXR, TPSH>(r, 2 * (32 * jj + 8 * (int)i)))
+                                               : ypre.on ? (r0 == 0 ? ypre.v[(int)i] : ypre.v[4 + (int)i])
+                                                         : *(const u32x4 *)(yp + 8 * (int)i));
                     static_for<8>([&](auto e) { pd[(int)i] += v[(int)i][(int)e] * y[(int)e]; });
                 });
             }
@@ -717,17 +724,23 @@ __device__ __forceinline__ void rct_body(const bf16 *__restrict__ X, unsigned ch
         });
     }
 #endif
-    if (wv == 0) tensor_wait<0>();
+    constexpr int O_Y = O_KB + D * 4;  // RC_YTDM (D 128): the Y tile
+    static_assert(O_Y % 128 == 0, "TDM alignment");
+    const bool ytdm = RCT_YB<D> > 0 && (mode & 4);
+    if (ytdm && wv == 1 && RCT_PROBE < 2) {
+        const unsigned long long gy = (unsigned long long)(uintptr_t)(Y + b * yb + (long long)(kt * 128) * ys + h * yh);
+        constexpr unsigned WL = RCT_TXR<D> != 2 * D ? tdm_w0(0, 64, (RCT_TXR<D> - 2 * D) / 4) : W0;
+        tdm_load(tdm_g0(lds0 + O_Y, gy), tdm_g1(WL, 128, XR, 128, 2ull * (unsigned long long)ys));
+    }
+    if (wv == 0 || (ytdm && wv == 1)) tensor_wait<0>();
     __syncthreads();
 #if RCT_PROBE != 1  // timing probes: 1 = no compute (TDM traffic only), 2 = no TDM (compute only)
-    rc_tile<D, NT, RC_XSKEW, TXR, TPSH>(smem, RC_X8G ? X8 + (bh * S + (long long)kt * 128) * D : smem + O_X8, smem + O_XS, smem + O_X8T,
-                   smem + O_XTS, kb_lds, Y, aux, b, h, kt, bh, S, yb, ys, yh, mode, pre,
-#if RC_YPRE
-                   ypre
-#else
-                   YPre{}
+#if !RC_YPRE
+    YPre ypre{};
 #endif
-    );
+    if (ytdm) ypre.yt = smem + O_Y;
+    rc_tile<D, NT, RC_XSKEW, TXR, TPSH>(smem, RC_X8G ? X8 + (bh * S + (long long)kt * 128) * D : smem + O_X8, smem + O_XS, smem + O_X8T,
+                   smem + O_XTS, kb_lds, Y, aux, b, h, kt, bh, S, yb, ys, yh, mode, pre, ypre);
 #endif
     __syncthreads();
     if (RC_XSKEW && RCT_PROBE < 2)
@@ -1147,7 +1160,7 @@ RC_KERNEL(128)
         const bf16 *__restrict__ Y, float *__restrict__ aux, int S, int H, long long sb, long long ss, long long sh, \
         long long yb, long long ys, long long yh, int mode, float pre) {                                             \
         __shared__ __attribute__((aligned(1024))) unsigned char smem[RCT_TB<D> + (RC_X8G ? 0 : 128 * D) + 128 * 8 + X8T_B<D> + \
-                                                                     D * 4 + D * 4];                                 \
+                                                                     D * 4 + D * 4 + RCT_YB<D>];                                 \
         rct_body<D>(X, X8, XS, X8T, XTS, kbar, Y, aux, S, H, sb, ss, sh, yb, ys, yh, mode, pre, smem, (int)blockIdx.x,  \
                     (int)blockIdx.y, (int)blockIdx.z);                                                               \
     }

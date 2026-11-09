@@ -820,3 +820,8 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   (scratch_mx/py/b7_sweep.py, 12 shapes: s 256..4096, h 1..128, odd q blocks, b h % 8 != 0): dK / dV bitwise between
   the dQ GEMM and the recompute kernel, dQ 34.7-38.3 dB apart; pytest 34 pass. (The package profiles of the two paths
   ran in separate processes with the variable set before the first read: valid.)
+- **RC_YTDM** (k_mxq.hip, rct128 with Y dots = the dO quantization + delta): the O tile by a TDM load (wave 1) into LDS
+  next to the dO tile, the rows phase's dO . O dots read it from LDS (the per-lane global O loads exposed their latency
+  in the rows passes; RC_YPRE's register preload spilled). LDS 53 -> 88 KB (4 -> 3 workgroups per CU). Bitwise (lab:
+  scratch_mx/py/doq_ab.py; package vs the lab's old build: doq_pkg_check.py). Lab 0.0786 -> 0.0659 ms, package profile
+  0.081 -> 0.071 ms. pytest 34 pass, fused-RoPE test pass.
