@@ -210,6 +210,21 @@ _DQG_ARGS = (("DSB", "ptr"), ("K8T", "ptr"), ("KTS", "ptr"), ("DQ", "ptr"), ("sc
 KERNELS["k_dqg_mx"] = (KERNELS["k_dq_mx"][0], 128, _DQG_ARGS)
 KERNELS["k_dqg_mxr"] = (KERNELS["k_dq_mx"][0], 128, _DQG_ARGS + (("COS", "ptr"), ("SIN", "ptr")))
 DS_TILE = 128 * 128 * 2  # bytes of one causal dS tile (k_mla_bwd_mx5.hip ds_tile_index)
+# struct RctrArgs (k_mxq.hip): one k_mxq_rctr192 argument set (natural alignment)
+_RCTR_SET = (("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("X8T", "ptr"), ("XTS", "ptr"), ("aux", "ptr"), ("sb", "i64"),
+             ("ss", "i64"), ("sh", "i64"), ("PE", "ptr"), ("pb", "i64"), ("ps", "i64"), ("ph", "i64"), ("mode", "i32"),
+             ("pre", "f32"))  # fmt: skip
+# k_mxq_qkv: the fused-RoPE forward's q, k (rctr192 sets) and v (struct RctArgs: rct128 rows + cols) in one launch
+_RCT_SET = (("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("X8T", "ptr"), ("XTS", "ptr"), ("sb", "i64"), ("ss", "i64"),
+            ("sh", "i64"))  # fmt: skip
+KERNELS["k_mxq_qkv"] = (
+    "k_mxq.hip",
+    256,
+    tuple((n + "0", k) for n, k in _RCTR_SET) + tuple((n + "1", k) for n, k in _RCTR_SET)
+    + tuple((n + "v", k) for n, k in _RCT_SET)
+    + (("kbar", "ptr"), ("S", "i32"), ("H", "i32"), ("B", "i32"), ("COS", "ptr"), ("SIN", "ptr"), ("dummy_bf", "ptr"),
+       ("dummy_f", "ptr")),
+)
 
 
 def _dqg_grid(s, h, b):
@@ -590,6 +605,32 @@ def quant_rope(x, pe, pe_head_stride, cos, sin, mode=0, kbar=None, pre=1.0):
     return x8, xs, aux, x8t, xts
 
 
+def quant_qkv_rope(sets, v, cos, sin, kbar):
+    """The fused-RoPE forward's quantizations in one launch (k_mxq_qkv): two quant_rope calls (sets = [(x, pe,
+    pe_head_stride, mode, pre)] x 2 of the same [b, s, h]) and quant_rc(v, 128) -> [(x8, xs, aux | None, x8t, xts)] x 2,
+    (v8, vsr, v8t, vs)."""
+    b, s, h, _ = sets[0][0].shape
+    dev = sets[0][0].device
+    vals, outs = [], []
+    for x, pe, pe_head_stride, mode, pre in sets:
+        x8 = torch.empty(b, h, s, D_QK, device=dev, dtype=torch.uint8)
+        xs = torch.empty(b, h, s, 8, device=dev, dtype=torch.uint8)
+        x8t = torch.empty(b, h, D_QK, s, device=dev, dtype=torch.uint8)
+        xts = torch.empty(b, h, s // 128, D_QK, 4, device=dev, dtype=torch.uint8)
+        aux = torch.empty(b, h, s, device=dev, dtype=torch.float32) if mode & 6 else None
+        vals += [x, x8, xs, x8t, xts, aux if aux is not None else _dummy(dev), x.stride(0), x.stride(1), x.stride(2),
+                 pe, pe.stride(0), pe.stride(1), pe_head_stride, mode, float(pre)]  # fmt: skip
+        outs.append((x8, xs, aux, x8t, xts))
+    v8 = torch.empty(b, h, s, D_V, device=dev, dtype=torch.uint8)
+    vsr = torch.empty(b, h, s, 4, device=dev, dtype=torch.uint8)
+    v8t = torch.empty(b, h, D_V, s, device=dev, dtype=torch.uint8)
+    vs = torch.empty(b, h, s // 128, D_V, 4, device=dev, dtype=torch.uint8)
+    vals += [v, v8, vsr, v8t, vs, v.stride(0), v.stride(1), v.stride(2)]
+    d = _dummy(dev)
+    _launch("k_mxq_qkv", (s // 128, h, 3 * b), vals + [kbar, s, h, b, cos, sin, d, d])
+    return outs, (v8, vsr, v8t, vs)
+
+
 def attn_fwd_rope(q, kv, kpe, cos, sin, softmax_scale, need_lse=True):
     """q [b, s, h, 192] (d 128..191 before RoPE), kv [b, s, h, 256] ([k nope | v]), kpe [b, s, 1, 64] (before RoPE,
     shared by the heads), cos / sin [>= s, 64] bf16 -> (out [b, s, h, 128] bf16 (BSHD view of SBHD storage), lse [b, h,
@@ -599,9 +640,9 @@ def attn_fwd_rope(q, kv, kpe, cos, sin, softmax_scale, need_lse=True):
     kbar = kbar_rope(kv, kpe, cos, sin)
     # q . kbar (the aux of mode 2) only forms the API lse: without need_lse the q quantization skips the row dots
     mode_q = MODE_Q if need_lse else MODE_Q & ~2
-    q8, qs, qk, q8t, qts = quant_rope(q, q[..., D_NOPE:], q.stride(2), cos, sin, mode=mode_q, kbar=kbar, pre=pre)
-    k8, ks, _, k8t, kts = quant_rope(kv, kpe, 0, cos, sin, mode=MODE_K, kbar=kbar)
-    v8, vsr, _, v8t, vs = quant_rc(kv[..., D_NOPE:], D_V)
+    ((q8, qs, qk, q8t, qts), (k8, ks, _, k8t, kts)), (v8, vsr, v8t, vs) = quant_qkv_rope(
+        [(q, q[..., D_NOPE:], q.stride(2), mode_q, pre), (kv, kpe, 0, MODE_K, 1.0)], kv[..., D_NOPE:], cos, sin, kbar
+    )
     out = torch.empty(s, b, h, D_V, device=q.device, dtype=torch.bfloat16).transpose(0, 1)
     lse2 = torch.empty(b, h, s, device=q.device, dtype=torch.float32)  # log2 units of the centred logits
     nqb = s // 256

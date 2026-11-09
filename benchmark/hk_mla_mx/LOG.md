@@ -754,3 +754,7 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
 - LTDT_DPP (lab, off): a q16 tile's lse / delta C tuples from one ds_load_b32 each + 8 DPP row_share broadcasts
   (row_share works on gfx1250) instead of 2 + 2 ds_load_b128 (-14% of the loop's LDS bytes, +128 VALU / step):
   bitwise, dkdv_mx 1.330 -> 1.514, dkdv_mxd 1.489 -> 1.669 ms: the loop is not LDS-bandwidth bound (per-wave issue).
+- The fused-RoPE forward's quantizations in one launch: **k_mxq_qkv** (q and k rctr192 argument sets as structs, v as
+  rct128 rows + cols; grid (S / 128, H, 3 B); rctr_body / rct_body take (kt, h, b)): two separate rctr192 launches 0.200
+  -> 0.185 ms in a two-way version, q + k + v 0.2285 -> 0.222 ms in the three-way one (package profile); fused == unfused
+  bitwise, pytest 30 pass. Package fused-RoPE fwd + bwd per step 3.25 -> ~3.23 ms.

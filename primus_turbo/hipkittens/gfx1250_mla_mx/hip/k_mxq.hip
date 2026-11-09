@@ -638,7 +638,7 @@ __device__ __forceinline__ void rct_body(const bf16 *__restrict__ X, unsigned ch
                                          unsigned char *__restrict__ XTS, const float *__restrict__ kbar,
                                          const bf16 *__restrict__ Y, float *__restrict__ aux, int S, int H,
                                          long long sb, long long ss, long long sh, long long yb, long long ys,
-                                         long long yh, int mode, float pre, unsigned char *smem) {
+                                         long long yh, int mode, float pre, unsigned char *smem, int kt, int h, int b) {
     constexpr int XR = D * 2;  // bf16 row bytes (unpadded)
     constexpr int TXR = RCT_TXR<D>, TPSH = RCT_TPSH<D>;  // the tile in LDS (RC_TPAD)
     constexpr int NT = 256;
@@ -648,7 +648,7 @@ __device__ __forceinline__ void rct_body(const bf16 *__restrict__ X, unsigned ch
     constexpr int RPP = NT / LPR;
     constexpr int O_X8 = RCT_TB<D>, O_XS = O_X8 + (RC_X8G ? 0 : 128 * D), O_X8T = O_XS + 128 * RS,
                   O_XTS = O_X8T + X8T_B<D>, O_KB = O_XTS + D * 4;
-    const int kt = blockIdx.x, h = blockIdx.y, b = blockIdx.z, t = threadIdx.x;
+    const int t = threadIdx.x;
     const int wv = __builtin_amdgcn_readfirstlane(t >> 5);
     const long long bh = (long long)b * H + h;
     const unsigned lds0 = (unsigned)(uintptr_t)smem;
@@ -783,12 +783,12 @@ __device__ __forceinline__ void rctr_body(const bf16 *__restrict__ X, unsigned c
                                           float *__restrict__ aux, int S, int H, long long sb, long long ss,
                                           long long sh, const bf16 *__restrict__ PE, long long pb, long long ps,
                                           long long ph, const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN,
-                                          int mode, float pre, unsigned char *smem) {
+                                          int mode, float pre, unsigned char *smem, int kt, int h, int b) {
     constexpr int D = 192, XR = RCTR_TXR, NT = 256, RS = 8;  // XR: the tile's LDS row pitch (RC_TPAD 400)
     constexpr int O_X8 = 128 * XR, O_XS = O_X8 + (RC_X8G ? 0 : 128 * D), O_X8T = O_XS + 128 * RS,
                   O_XTS = O_X8T + X8T_B<D>, O_KB = O_XTS + D * 4,
                   O_PE = O_X8T;  // pe side buffer (128 x 128 B) in the X8T staging, written only in the cols phase
-    const int kt = blockIdx.x, h = blockIdx.y, b = blockIdx.z, t = threadIdx.x;
+    const int t = threadIdx.x;
     const int wv = __builtin_amdgcn_readfirstlane(t >> 5);
     const long long bh = (long long)b * H + h;
     const unsigned lds0 = (unsigned)(uintptr_t)smem;
@@ -875,8 +875,21 @@ extern "C" __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(
     float pre) {
     __shared__ __attribute__((aligned(1024))) unsigned char smem[128 * RCTR_TXR + (RC_X8G ? 0 : 128 * 192) + 128 * 8 +
                                                                  X8T_B<192> + 192 * 4 + 192 * 4];
-    rctr_body(X, X8, XS, X8T, XTS, kbar, aux, S, H, sb, ss, sh, PE, pb, ps, ph, COS, SIN, mode, pre, smem);
+    rctr_body(X, X8, XS, X8T, XTS, kbar, aux, S, H, sb, ss, sh, PE, pb, ps, ph, COS, SIN, mode, pre, smem,
+              (int)blockIdx.x, (int)blockIdx.y, (int)blockIdx.z);
 }
+
+// the argument set of one k_mxq_rctr192 call (k_mxq_qkv takes two)
+struct RctrArgs {
+    const bf16 *X;
+    unsigned char *X8, *XS, *X8T, *XTS;
+    float *aux;
+    long long sb, ss, sh;
+    const bf16 *PE;
+    long long pb, ps, ph;
+    int mode;
+    float pre;
+};
 
 // ---- the RoPE backward of the fused path: irope8 (mx_common.h)
 
@@ -1074,10 +1087,37 @@ RC_KERNEL(128)
         long long yb, long long ys, long long yh, int mode, float pre) {                                             \
         __shared__ __attribute__((aligned(1024))) unsigned char smem[RCT_TB<D> + (RC_X8G ? 0 : 128 * D) + 128 * 8 + X8T_B<D> + \
                                                                      D * 4 + D * 4];                                 \
-        rct_body<D>(X, X8, XS, X8T, XTS, kbar, Y, aux, S, H, sb, ss, sh, yb, ys, yh, mode, pre, smem);               \
+        rct_body<D>(X, X8, XS, X8T, XTS, kbar, Y, aux, S, H, sb, ss, sh, yb, ys, yh, mode, pre, smem, (int)blockIdx.x,  \
+                    (int)blockIdx.y, (int)blockIdx.z);                                                               \
     }
 RCT_KERNEL(192)
 RCT_KERNEL(128)
+
+// the fused-RoPE forward's three quantizations in one launch: q and k (k_mxq_rctr192: a0, a1) and v (k_mxq_rct128, mode
+// 0: rows + cols); grid (S / 128, H, 3 B): z < B q, < 2 B k, else v
+struct RctArgs {
+    const bf16 *X;
+    unsigned char *X8, *XS, *X8T, *XTS;
+    long long sb, ss, sh;
+};
+extern "C" __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(RCTR_WPE))) void k_mxq_qkv(
+    RctrArgs a0, RctrArgs a1, RctArgs av, const float *__restrict__ kbar, int S, int H, int B,
+    const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN, const bf16 *__restrict__ dummy_bf,
+    float *__restrict__ dummy_f) {
+    constexpr int LR = 128 * RCTR_TXR + (RC_X8G ? 0 : 128 * 192) + 128 * 8 + X8T_B<192> + 192 * 4 + 192 * 4;
+    constexpr int LV = RCT_TB<128> + (RC_X8G ? 0 : 128 * 128) + 128 * 8 + X8T_B<128> + 128 * 4 + 128 * 4;
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[LR > LV ? LR : LV];
+    const int z = (int)blockIdx.z;
+    if (z < 2 * B) {
+        const bool second = z >= B;
+        const RctrArgs &a = second ? a1 : a0;
+        rctr_body(a.X, a.X8, a.XS, a.X8T, a.XTS, kbar, a.aux, S, H, a.sb, a.ss, a.sh, a.PE, a.pb, a.ps, a.ph, COS, SIN,
+                  a.mode, a.pre, smem, (int)blockIdx.x, (int)blockIdx.y, second ? z - B : z);
+    } else {
+        rct_body<128>(av.X, av.X8, av.XS, av.X8T, av.XTS, kbar, dummy_bf, dummy_f, S, H, av.sb, av.ss, av.sh, 0, 0, 0, 0,
+                      1.0f, smem, (int)blockIdx.x, (int)blockIdx.y, z - 2 * B);
+    }
+}
 
 // persistent rows + cols through TDM: grid (number of workgroups, 1, 1), 512 threads (rcp_body); LDS 245 KB (D 192)
 #define RCP_KERNEL(D)                                                                                                \
