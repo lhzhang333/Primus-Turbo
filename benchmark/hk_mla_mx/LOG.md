@@ -803,3 +803,11 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   the 11th op of the wave waits for the first to land), the barrier after it (~1.6k), a cold s_load of the kernel
   arguments (~1k, first wave), SGPR spills to VGPR lanes (58 writelane + 39 readlane, ~0.46k): per-workgroup latency
   (8 workgroups per CU: ~9% of the kernel); only overlapping workgroups (persistent: SGPR-bound on 11-06) would hide it.
+- Why the dkdv re-schedules lose (ATT, one trip): LLVM's order 2522 cycles / trip with 156 cycles of s_wait_dscnt;
+  first-ready-first 2775 with 569 (19.6 per wait) although its VALU / TRANS run better (exp 2.23 vs 2.80, pk8 cvt 4.69 vs
+  6.91, mul 1.48 vs 1.95 cycles each) and its WMMAs worse (4.19 vs 2.85). The loads are not pinned by register reuse
+  (scratch_mx/py/war_slack.py: the slack between a load's last WAR / WAW predecessor and its first consumer is 545
+  model cycles at the median, none under 128); LLVM's load-to-use distance is ~380 model cycles: the LDS latency under
+  four loading waves is several hundred cycles, not the model's 32-160. With an LDS latency of 300 / 400 / 500 cycles:
+  height 1.514 / 1.523 / 1.523, ready 1.583, height 300 burst 2 1.504 vs LLVM 1.491 ms (bitwise): closer, not better
+  (the WMMA stalls the model does not have remain).
