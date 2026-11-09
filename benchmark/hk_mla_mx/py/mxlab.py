@@ -227,6 +227,13 @@ KERNELS["k_dkdv_mxr"] = (KERNELS["k_dkdv_mx"][0], 128,
 KERNELS["k_dq_mxr"] = (KERNELS["k_dq_mx"][0], 128, KERNELS["k_dq_mx"][2] + [("COS", "ptr"), ("SIN", "ptr")])
 # rung b2's dV / dK kernels (k_mla_bwd_mx2.hip) take k_dkdv_mx's arguments
 KERNELS["k_dv_mx"] = KERNELS["k_dk_mx"] = KERNELS["k_dkdv_mx"]
+# rung b7 (k_mla_bwd_mx5.hip, build without SLP): k_dkdv_mx(r) + the bf16 dS tiles (DSB), dQ as a GEMM over them
+KERNELS["k_dkdv_mxd"] = (KERNELS["k_dkdv_mx"][0], 128, KERNELS["k_dkdv_mx"][2] + [("DSB", "ptr")])
+KERNELS["k_dkdv_mxrd"] = (KERNELS["k_dkdv_mx"][0], 128, KERNELS["k_dkdv_mxr"][2] + [("DSB", "ptr")])
+_DQG_ARGS = [("DSB", "ptr"), ("K8T", "ptr"), ("KTS", "ptr"), ("DQ", "ptr"), ("scale", "f32"), ("S", "i32"), ("H", "i32"),
+             ("B", "i32"), ("dq_sb", "i64"), ("dq_ss", "i64")]
+KERNELS["k_dqg_mx"] = (KERNELS["k_dq_mx"][0], 128, _DQG_ARGS)
+KERNELS["k_dqg_mxr"] = (KERNELS["k_dq_mx"][0], 128, _DQG_ARGS + [("COS", "ptr"), ("SIN", "ptr")])
 _SIZE = {"ptr": 8, "i64": 8, "f64": 8, "i32": 4, "u32": 4, "f32": 4}
 
 
@@ -861,6 +868,51 @@ def bwd_mx(qz, bz, lse, scale=SCALE, tag=""):
     return dq, dk, dv
 
 
+DS_TILE = 128 * 128 * 2  # rung b7's dS tile bytes (k_mla_bwd_mx5.hip ds_tile_index layout)
+
+
+def ds_bytes(b, h, s):
+    """Bytes of rung b7's materialized dS (bf16 causal 128 x 128 tiles per (b, h))."""
+    nb = s // 128
+    return b * h * (nb * (nb + 1) // 2) * DS_TILE
+
+
+def bwd_mx7(qz, bz, lse, scale=SCALE, tag="5ni", keep_ds=False, dsb=None):
+    """Rung b7: k_dkdv_mxd (dK, dV and the bf16 dS tiles) then k_dqg_mx (dQ = scale dS K). lse natural (as bwd_mx).
+    Returns dq, dk, dv (+ the dS buffer with keep_ds)."""
+    b, s, h = qz["b"], qz["s"], qz["h"]
+    assert s % 256 == 0
+    dev = qz["q8"].device
+    lse2 = lse * LOG2E
+    dq = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    dk = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    dv = torch.empty(s, b, h, D_V, device=dev, dtype=torch.bfloat16).transpose(0, 1)
+    if dsb is None:
+        dsb = torch.empty(ds_bytes(b, h, s), device=dev, dtype=torch.uint8)
+    _launch("k_dkdv_mxd", (s // 128, h, b),
+            [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"], bz["dots"],
+             bz["q8t"], bz["qts"], lse2, bz["delta"], dk, dv, float(scale), s, h, b, dk.stride(0), dk.stride(1),
+             dv.stride(0), dv.stride(1), dsb], tag)  # fmt: skip
+    _launch("k_dqg_mx", (s // 256, h, b),
+            [dsb, bz["k8t"], bz["kts"], dq, float(scale), s, h, b, dq.stride(0), dq.stride(1)], tag)  # fmt: skip
+    return (dq, dk, dv, dsb) if keep_ds else (dq, dk, dv)
+
+
+def ds_unpack(dsb, b, h, s):
+    """rung b7's dS buffer -> dense bf16 [b, h, s (q), s (kv)] (tiles above the diagonal block row: 0)."""
+    nb = s // 128
+    nt = nb * (nb + 1) // 2
+    t = dsb.view(torch.bfloat16).view(b, h, nt, 4, 8, 2, 2, 16, 8)  # tile, w, qt, j, qh, kvl, r
+    out = torch.zeros(b, h, s, s, device=dsb.device, dtype=torch.bfloat16)
+    for qb in range(nb):
+        for kb in range(qb + 1):
+            x = t[:, :, qb * (qb + 1) // 2 + kb]  # b h w qt j qh kvl r
+            # q = 16 qt + 8 qh + r, kv = 32 w + 16 j + kvl
+            blk = x.permute(0, 1, 3, 5, 7, 2, 4, 6).reshape(b, h, 128, 128)
+            out[:, :, qb * 128:(qb + 1) * 128, kb * 128:(kb + 1) * 128] = blk
+    return out
+
+
 # ------------------------------------------------------------------------------------- backward references
 
 
@@ -897,9 +949,10 @@ def mxq(x, dim):
     return deq.movedim(-1, dim)
 
 
-def emu_bwd(qz, bz, lse, scale=SCALE, chunk=256):
+def emu_bwd(qz, bz, lse, scale=SCALE, chunk=256, dq_bf16=False, ds_out=None):
     """fp32 emulation of k_dkdv_mx / k_dq_mx on the quantized operands: dq, dk [b, s, h, 192], dv [b, s, h, 128]
-    (recipe m4: Q8 already in log2 units)."""
+    (recipe m4: Q8 already in log2 units). dq_bf16: rung b7's dQ (MX of bf16(dS)); ds_out: a [b, h, s, s] tensor that
+    receives dS (fp32, masked)."""
     m4 = qz.get("recipe") == "m4"
     qf = deq_qk(qz["q8"], qz["qs"], r2=m4)
     kf = deq_qk(qz["k8"], qz["ks"], r2=m4)
@@ -924,10 +977,13 @@ def emu_bwd(qz, bz, lse, scale=SCALE, chunk=256):
             P = P.masked_fill(qi[qs_, None] < qi[None, : q0 + chunk], 0.0)
             dP = torch.einsum("bhqd,bhkd->bhqk", dor[:, sl, qs_], vr[:, sl, : q0 + chunk])
             dS = P * (dP - delta[:, sl, qs_, None])
+            if ds_out is not None:
+                ds_out[:, sl, qs_, : q0 + chunk] = dS
             Pq = e4m3(P * 256.0).float() / 256.0
             dv[:, sl, : q0 + chunk] += torch.einsum("bhqk,bhqd->bhkd", Pq, doc[:, sl, qs_])
             dk[:, sl, : q0 + chunk] += torch.einsum("bhqk,bhqd->bhkd", mxq(dS, 2), qt[:, sl, qs_]) * scale
-            dq[:, sl, qs_] = torch.einsum("bhqk,bhkd->bhqd", mxq(dS, 3), kt[:, sl, : q0 + chunk]) * scale
+            dsq = mxq(dS.bfloat16().float(), 3) if dq_bf16 else mxq(dS, 3)
+            dq[:, sl, qs_] = torch.einsum("bhqk,bhkd->bhqd", dsq, kt[:, sl, : q0 + chunk]) * scale
     t = lambda x: x.permute(0, 2, 1, 3)  # noqa: E731
     return t(dq), t(dk), t(dv)
 

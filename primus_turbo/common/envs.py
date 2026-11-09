@@ -64,6 +64,8 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_MLA_BWD_IMPL: str = ""
     PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES: str = ""
     PRIMUS_TURBO_MLA_MX_RESCHED: bool = True
+    PRIMUS_TURBO_MLA_MX_DQ_GEMM: bool = True
+    PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES: int = 16 << 30
 
 
 def backend_spec(name: str) -> Callable[[], str | None]:
@@ -251,6 +253,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The MXFP8 MLA kernels (primus_turbo/hipkittens/gfx1250_mla_mx): "0" builds the forward kernel without the
     # post-register-allocation re-scheduling of its tile loop (asm_resched); anything else, or unset: re-scheduled.
     "PRIMUS_TURBO_MLA_MX_RESCHED": lambda: os.getenv("PRIMUS_TURBO_MLA_MX_RESCHED", "1").strip() != "0",
+    # MXFP8 MLA backward: dK / dV store dS (bf16) and dQ runs as a GEMM over it (0: dQ recomputes S / P / dP); the dS
+    # workspace (b h S^2 bytes / 2 + the diagonal tiles) only up to this many bytes, else the recompute kernel
+    "PRIMUS_TURBO_MLA_MX_DQ_GEMM": lambda: os.getenv("PRIMUS_TURBO_MLA_MX_DQ_GEMM", "1").strip() != "0",
+    "PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES": lambda: int(os.getenv("PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES", str(16 << 30))),
     # ================== Read by the C++ extension ==================
     # These getters mirror the C++ parsing so Python can report the effective value; C++ reads
     # the variable itself and caches it once per process.

@@ -690,3 +690,49 @@ Everything below on the slow GPU (b5 dkdv ~1.385 ms, same-run A / B only).
 - `v_exp_f16` / `v_exp_bf16` (micro-benchmark `scratch_mx/bt/expbench`, 4 waves per SIMD, 8 chains per lane):
   ~5.3 cycles per exp per SIMD vs v_exp_f32 ~2.5: no faster 16-bit transcendental (and bf16 inputs would be too
   coarse for exp2(s - m)).
+
+## 2026-11-09: rung b7, dS materialized by dK / dV, dQ as a GEMM (design, CPU builds)
+
+GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
+- Why: k_dq_mx spends 96 of its 144 WMMAs per tile and all of its exps recomputing S / P / dP that k_dkdv_mx already
+  has (per-step budget, 11-06 slow GPU: dkdv 1.33, dq 0.86, forward 0.55, quantization 0.34 of 3.30 ms).
+- b7: k_dkdv_mxd / k_dkdv_mxrd = k_dkdv_mx / _mxr + the f32 dS = P (dP - delta) as bf16 (one global_store_b128 of 512
+  contiguous bytes per (slot, kv16 tile): 64 v_cvt_pk_bf16 + 16 stores per step and wave) into causal 128 x 128 tiles
+  (per (b, h): index qb (qb + 1) / 2 + kb, a q block's tiles consecutive; chunk 16 w + 2 qt + j = dkdv wave w's kv16
+  tile j at slot qt; 4.33 GB at b2 s4096 h128). k_dqg_mx / _mxr: grid and order as k_dq_mx, a 3-stage TDM ring of
+  [dS (t, 2 qb), dS (t, 2 qb + 1), K8T, KTS] (one op per wave), the B operand by ds_load_tr16_b128 (8-lane transposed
+  16-bit loads; lane map tr_off, to be confirmed on the GPU by scratch_mx/bt/trload.py), MX along kv from bf16 as k_dq_mx
+  (16 values + the peer lane per block), 48 dQ WMMAs per tile, k_dq_mx's epilogue (skewed staging, fused inverse RoPE).
+  No masks: dkdv writes exact zeros where P is masked. Expected memory-bound (4.33 GB of dS at ~15 TB/s ~0.3 ms).
+  Recipe change: dQ uses MX(bf16(dS)) instead of MX(dS): ~3% of the codes move by one E4M3 ulp (double rounding),
+  dK / dV unchanged (bitwise).
+- Build: with SLP the dS stores make the SLP vectorizer's block scheduling pull 36 of the step's dV / dK WMMAs (slots
+  1..6) into slot 7's load region (IR level, before the sched_barriers matter): 986 VGPRs + 96 spilled in the loop.
+  `-fno-slp-vectorize`: every dkdv variant 782 VGPRs, no scratch (k_dkdv_mxrd: one 4-byte value, 7 reloads / trip);
+  k_dqg 675 VGPRs, no scratch. Lab tags: 5xi (EXPERT_I, b5 kernels), 5ni (EXPERT_I + no SLP: b7).
+- Tests / timing: `scratch_mx/py/b7_test.py` (dK / dV bitwise vs b5, dS vs the emulation, dQ SNR vs emu / b5 / fp32
+  reference; dS buffer poisoned), `scratch_mx/py/b7_time.py`; mxlab.bwd_mx7, ds_unpack, emu_bwd(dq_bf16=, ds_out=).
+- GPU (same slow clock): `ds_load_tr16_b128` / `global_load_tr16_b128` = 8-lane groups, lane c gets column c (16-bit) of
+  the 8 rows its group's lanes address (`scratch_mx/bt/trload.py`): tr_off as assumed. b7_test (toy shapes): dK / dV
+  bitwise = b5 (SLP and no-SLP builds), every dS byte written, dS 55.5 dB vs the emulation (= bf16 rounding), dQ vs
+  the emulation of b7's recipe 48-52 dB, vs the fp32 reference 21.62 dB (b5 21.65).
+- First timing (b2 s4096 h128): dkdv_mx 1.327, dkdv_mxd 1.549 (+17%), dq_mx 0.848, dqg_mx 0.536 (8.3 TB/s of dS).
+  dkdv: ATT +253 cycles / trip; store-pair stalls (VALU -> VMEM data ~23 cycles), an s_wait_xcnt (78) where the RA
+  reused the store data registers. Probes: stores to one L2-resident tile 1.516, conversions without stores 1.347:
+  the store instructions themselves, not the HBM writes. Store placement (DSO_LATE): 0 1.543, 1 1.542, 2 1.531,
+  **3 (the step's 16 stores at its end) 1.486**, 4 (two bursts) 1.644; non-temporal stores no change. ATT (DSO_LATE 2):
+  trips 2400-3600 with sporadic 400-1100-cycle ds_load issue stalls 160-360 cycles after a store pair (base: steady
+  2200-2300): VMEM stores interleaved with the LDS stream; fewer with the burst.
+- dqg ATT: 1704 cycles / tile, LDS-issue bound (48 K8T b128 per wave per tile: all four waves read the whole K8T tile)
+  + ~600 VALU of quantization; not HBM-bound. DQG_V 1 (12 K8T fragments resident, q tiles pipelined: loads of i + 2,
+  quantization of i + 1 next to i's 12 WMMAs; E8M0 on the bits): 0.518; DQG_AMAX 1 (signed and unsigned int16 max
+  trees instead of AND + max) and DQG_ORDER 1 (transposed loads first, K8T next to the first quantization): 0.495 ms.
+  All bitwise identical with the first version (b7_ab.py, five shapes). ATT: 1639 cycles / tile, the first ~800 without
+  WMMAs (the K8T + dS loads of all waves at once).
+- Lab, same run: dkdv_mxr 1.325 + dq_mxr 0.857 = 2.182 -> dkdv_mxrd 1.484 + dqg_mxr 0.511 = 1.995 ms (-8.6%).
+- Package: b7 on by default (PRIMUS_TURBO_MLA_MX_DQ_GEMM, PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES 16 GiB, OOM -> recompute
+  kernel), k_mla_bwd_mx5.hip built without SLP. pytest 30 pass, fused-RoPE test pass (fused == unfused bitwise).
+  Profile (fused-RoPE fwd + bwd per step): 3.544 (b5 kernels, no-SLP build) -> 3.276 ms.
+- A lab timing script bug (k_dkdv_mxr given dK / dV of head stride 192 / 128: the kernel's DK / DV are kv-gradient
+  views with head stride 256) page-faulted (no-retry, TCP) and the queue was reset; the GPU recovered. gx.sh's dmesg
+  window now starts 30 s early (dmesg runs ~10 s ahead of the wall clock: the fault was not caught).

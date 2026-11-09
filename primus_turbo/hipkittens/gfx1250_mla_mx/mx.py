@@ -67,7 +67,12 @@ FLAGS = ("-x", "hip", "--offload-arch=gfx1250", "--cuda-device-only", "--no-gpu-
          "-mllvm", "-misched=gcn-max-ilp")  # fmt: skip
 # per-source extra flags: the quantization kernels without VOPD (LLVM re-materialized a VOPD constant into an SGPR
 # before every dual op: k -7%, the others -1..2%)
-SRC_FLAGS = {"k_mxq.hip": ("-mllvm", "-amdgpu-enable-vopd=0", "-fno-slp-vectorize")}  # no SLP: fused-RoPE q / dout -3%
+SRC_FLAGS = {
+    "k_mxq.hip": ("-mllvm", "-amdgpu-enable-vopd=0", "-fno-slp-vectorize"),  # no SLP: fused-RoPE q / dout -3%
+    # no SLP: with the dS stores of k_dkdv_mxd the SLP vectorizer's block scheduling moves dV / dK WMMAs out of their
+    # slots (96 VGPRs spilled); without it every dK / dV variant fits 782-810 VGPRs (k_dkdv_mx: same time)
+    "k_mla_bwd_mx5.hip": ("-fno-slp-vectorize",),
+}
 # main loops re-scheduled after register allocation (asm_resched: a list schedule of LLVM's loop body, emitted through
 # gfx1250_mla's asmkit, verified against the code object): the forward's tile loop, -7% (bit-exact). The dK / dV loop
 # is LDS-bound and slower re-scheduled: LLVM's order. PRIMUS_TURBO_MLA_MX_RESCHED=0: plain builds; on any failure
@@ -197,6 +202,30 @@ KERNELS["k_dkdv_mxr"] = (KERNELS["k_dkdv_mx"][0], 128,
                          KERNELS["k_dkdv_mx"][2] + (("DKP", "ptr"), ("dkp_sb", "i64"), ("dkp_ss", "i64")))
 # the fused-RoPE path's dQ kernel: dQ's rope columns through the inverse rotation (COS / SIN [S, 64] bf16)
 KERNELS["k_dq_mxr"] = (KERNELS["k_dq_mx"][0], 128, KERNELS["k_dq_mx"][2] + (("COS", "ptr"), ("SIN", "ptr")))
+# rung b7: dK / dV kernels that also store dS (bf16, DS_TILE tiles) and dQ as a GEMM over them (no S / P / dP recompute)
+KERNELS["k_dkdv_mxd"] = (KERNELS["k_dkdv_mx"][0], 128, KERNELS["k_dkdv_mx"][2] + (("DSB", "ptr"),))
+KERNELS["k_dkdv_mxrd"] = (KERNELS["k_dkdv_mx"][0], 128, KERNELS["k_dkdv_mxr"][2] + (("DSB", "ptr"),))
+_DQG_ARGS = (("DSB", "ptr"), ("K8T", "ptr"), ("KTS", "ptr"), ("DQ", "ptr"), ("scale", "f32"), ("S", "i32"),
+             ("H", "i32"), ("B", "i32"), ("dq_sb", "i64"), ("dq_ss", "i64"))  # fmt: skip
+KERNELS["k_dqg_mx"] = (KERNELS["k_dq_mx"][0], 128, _DQG_ARGS)
+KERNELS["k_dqg_mxr"] = (KERNELS["k_dq_mx"][0], 128, _DQG_ARGS + (("COS", "ptr"), ("SIN", "ptr")))
+DS_TILE = 128 * 128 * 2  # bytes of one causal dS tile (k_mla_bwd_mx5.hip ds_tile_index)
+
+
+def _ds_workspace(b, h, s, dev):
+    """The bf16 dS buffer of rung b7 (b h S/128 (S/128 + 1) / 2 tiles), or None: rung b7 off
+    (PRIMUS_TURBO_MLA_MX_DQ_GEMM=0), larger than PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES (default 16 GiB; it grows as S^2) or
+    out of memory -> the recompute dQ kernel."""
+    if not envs.PRIMUS_TURBO_MLA_MX_DQ_GEMM:
+        return None
+    nb = s // 128
+    nbytes = b * h * (nb * (nb + 1) // 2) * DS_TILE
+    if nbytes > envs.PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES:
+        return None
+    try:
+        return torch.empty(nbytes, device=dev, dtype=torch.uint8)
+    except torch.OutOfMemoryError:
+        return None
 # k_mxq modes (k_mxq.hip): 1 subtract kbar, 2 aux = x . kbar, 4 aux = x . Y, 16 scale layout R2, 32 quantize x * pre
 MODE_Q, MODE_K, MODE_DO = 2 | 16 | 32, 1 | 16, 4
 _SIZE = {"ptr": 8, "i64": 8, "i32": 4, "f32": 4}
@@ -488,9 +517,14 @@ def attn_bwd(dout, out, lse2, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr,
     dk = torch.empty(s, b, h, D_QK, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     dv = torch.empty(s, b, h, D_V, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     sc = float(softmax_scale)
-    _launch("k_dkdv_mx", (math.ceil(s / DKDV_KV_ROWS), h, b),
-            [q8, qs, k8, ks, v8, vsr, do8, dos, do8t, dots, q8t, qts, lse2, delta, dk, dv, sc, s, h, b,
-             dk.stride(0), dk.stride(1), dv.stride(0), dv.stride(1)])  # fmt: skip
+    dk_args = [q8, qs, k8, ks, v8, vsr, do8, dos, do8t, dots, q8t, qts, lse2, delta, dk, dv, sc, s, h, b,
+               dk.stride(0), dk.stride(1), dv.stride(0), dv.stride(1)]  # fmt: skip
+    dsb = _ds_workspace(b, h, s, dev)
+    if dsb is not None:
+        _launch("k_dkdv_mxd", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args + [dsb])
+        _launch("k_dqg_mx", (s // 256, h, b), [dsb, k8t, kts, dq, sc, s, h, b, dq.stride(0), dq.stride(1)])
+        return dq, dk, dv
+    _launch("k_dkdv_mx", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args)
     _launch("k_dq_mx", (s // 256, h, b),
             [q8, qs, k8, ks, v8, vsr, do8, dos, k8t, kts, lse2, delta, dq, sc, s, h, b, dq.stride(0),
              dq.stride(1)])  # fmt: skip
@@ -584,12 +618,19 @@ def attn_bwd_rope(dout, out, lse2, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8,
     dkph = torch.empty(s, b, h, 64, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     dk, dv = dkv[..., :D_NOPE], dkv[..., D_NOPE:]
     sc = float(softmax_scale)
-    _launch("k_dkdv_mxr", (math.ceil(s / DKDV_KV_ROWS), h, b),
-            [q8, qs, k8, ks, v8, vsr, do8, dos, do8t, dots, q8t, qts, lse2, delta, dk, dv, sc, s, h, b, dk.stride(0),
-             dk.stride(1), dv.stride(0), dv.stride(1), dkph, dkph.stride(0), dkph.stride(1)])  # fmt: skip
-    _launch("k_dq_mxr", (s // 256, h, b),
-            [q8, qs, k8, ks, v8, vsr, do8, dos, k8t, kts, lse2, delta, dq, sc, s, h, b, dq.stride(0), dq.stride(1),
-             cos, sin])  # fmt: skip
+    dk_args = [q8, qs, k8, ks, v8, vsr, do8, dos, do8t, dots, q8t, qts, lse2, delta, dk, dv, sc, s, h, b, dk.stride(0),
+               dk.stride(1), dv.stride(0), dv.stride(1), dkph, dkph.stride(0), dkph.stride(1)]  # fmt: skip
+    dsb = _ds_workspace(b, h, s, dev)
+    if dsb is not None:
+        _launch("k_dkdv_mxrd", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args + [dsb])
+        _launch("k_dqg_mxr", (s // 256, h, b),
+                [dsb, k8t, kts, dq, sc, s, h, b, dq.stride(0), dq.stride(1), cos, sin])  # fmt: skip
+        del dsb
+    else:
+        _launch("k_dkdv_mxr", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args)
+        _launch("k_dq_mxr", (s // 256, h, b),
+                [q8, qs, k8, ks, v8, vsr, do8, dos, k8t, kts, lse2, delta, dq, sc, s, h, b, dq.stride(0), dq.stride(1),
+                 cos, sin])  # fmt: skip
     dkpe = torch.empty(s, b, 64, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     _launch("k_rope_bwd_kpe", (b * s, 1, 1),
             [dkph, dkpe, b, s, h, dkph.stride(0), dkph.stride(1), dkph.stride(2), dkpe.stride(0), dkpe.stride(1), cos,
