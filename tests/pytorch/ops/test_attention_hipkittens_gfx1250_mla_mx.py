@@ -292,6 +292,13 @@ def test_rope_fused_matches_unfused(b, s, h):
 # ---------------------------------------------------------------------------
 
 
+def _setenv(monkeypatch, name, value):
+    from primus_turbo.common import envs
+
+    monkeypatch.setenv(name, value)
+    envs.reset_cache(name)  # envs caches a value at its first read
+
+
 def _mx_fwd_bwd(b, s, h, seed=7):
     mx = _mx()
     g = torch.Generator(device="cuda").manual_seed(seed)
@@ -305,11 +312,12 @@ def _mx_fwd_bwd(b, s, h, seed=7):
 def test_dq_gemm_matches_recompute(monkeypatch, b, s, h):
     """dK / dV are bitwise the same either way; dQ differs only by dS's bf16 rounding before its MX quantization."""
     mx, (q, k, v, dout), res = _mx_fwd_bwd(b, s, h)
-    monkeypatch.setenv("PRIMUS_TURBO_MLA_MX_DQ_GEMM", "1")
+    _setenv(monkeypatch, "PRIMUS_TURBO_MLA_MX_DQ_GEMM", "1")
     dq1, dk1, dv1 = mx.attn_bwd(dout, res[0], *res[2:], MLA_SCALE)
-    monkeypatch.setenv("PRIMUS_TURBO_MLA_MX_DQ_GEMM", "0")
+    _setenv(monkeypatch, "PRIMUS_TURBO_MLA_MX_DQ_GEMM", "0")
     dq0, dk0, dv0 = mx.attn_bwd(dout, res[0], *res[2:], MLA_SCALE)
     assert torch.equal(dk1, dk0) and torch.equal(dv1, dv0)
+    assert not torch.equal(dq1, dq0)  # the two paths ran (bf16 dS moves some E4M3 codes)
     assert compute_snr(dq0.float(), dq1.float()) > 30
     ref = _reference(q, k, v, dout, MLA_SCALE)
     for x in (dq0, dq1):
@@ -320,9 +328,11 @@ def test_dq_gemm_matches_recompute(monkeypatch, b, s, h):
 def test_dq_gemm_workspace_cap(monkeypatch):
     """A dS workspace over PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES runs the recompute kernel (bitwise as with the GEMM off)."""
     mx, (q, k, v, dout), res = _mx_fwd_bwd(2, 512, 8)
-    monkeypatch.setenv("PRIMUS_TURBO_MLA_MX_DQ_GEMM", "0")
+    _setenv(monkeypatch, "PRIMUS_TURBO_MLA_MX_DQ_GEMM", "0")
     ref = mx.attn_bwd(dout, res[0], *res[2:], MLA_SCALE)
-    monkeypatch.setenv("PRIMUS_TURBO_MLA_MX_DQ_GEMM", "1")
-    monkeypatch.setenv("PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES", "1")
+    _setenv(monkeypatch, "PRIMUS_TURBO_MLA_MX_DQ_GEMM", "1")
+    gemm = mx.attn_bwd(dout, res[0], *res[2:], MLA_SCALE)
+    _setenv(monkeypatch, "PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES", "1")
     capped = mx.attn_bwd(dout, res[0], *res[2:], MLA_SCALE)
+    assert not torch.equal(gemm[0], ref[0])  # the cap is what switches the path back
     assert all(torch.equal(a, c) for a, c in zip(ref, capped))

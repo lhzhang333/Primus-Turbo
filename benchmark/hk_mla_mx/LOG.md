@@ -814,3 +814,9 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
 - dkdv with the WMMA accumulator-chain latency raised in the model (asm_resched wmma_c_lat 16 / 24, LDS latency 300,
   burst 2; height / ready): 1.507 / 1.508 / 1.583 vs LLVM 1.492 ms. The dK / dV loop stays LLVM's; asm_resched keeps
   the option (default 8: the forward / dQ builds unchanged).
+- Correction: the first version of test_dq_gemm_matches_recompute / _workspace_cap toggled the knobs with setenv only,
+  but primus_turbo.common.envs caches a value at its first read: both runs took the same path (they passed vacuously).
+  Fixed (envs.reset_cache after setenv) and strengthened (the two paths' dQ must differ). Package sweep
+  (scratch_mx/py/b7_sweep.py, 12 shapes: s 256..4096, h 1..128, odd q blocks, b h % 8 != 0): dK / dV bitwise between
+  the dQ GEMM and the recompute kernel, dQ 34.7-38.3 dB apart; pytest 34 pass. (The package profiles of the two paths
+  ran in separate processes with the variable set before the first read: valid.)
