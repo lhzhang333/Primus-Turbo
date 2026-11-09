@@ -856,3 +856,42 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   bf16 HK 1001.1, hk_mx + fused RoPE 973.2 ms / iteration (**-2.79%**; g120k -2.70%), final-window loss 0.0818 both,
   grad-norm ratio max 1.014. Plain build (PRIMUS_TURBO_MLA_MX_RESCHED=0): fused-RoPE test pass, pytest 34 pass,
   b7_sweep pass.
+
+## 2026-11-09 (b): what bounds dK / dV: memory-path probes, workgroup clusters with TDM multicast
+
+Same slow GPU (sclk 1304 MHz). Lab probes in k_mla_bwd_mx5.hip (timing only, wrong results): DKDV_MEMPROBE 1 = the
+step loop keeps its TDM rounds, waits and barriers but computes nothing, 2 = + the dS stores, 3 = the full loop with
+every TDM op moving no data, 4 / 5 = 1 with only the q / A part moving data; DKDV_MEMMASK = the TDM ops k that move
+data (bit k of dk_op). Script `scratch_mx/py/memprobe_shapes.py` (k_dkdv_mx at b2 h128, b1 h4 = one workgroup per CU on
+half the CUs, b1 h16).
+- b2 s4096 h128: full 1.330 ms, TDM only 1.105, compute only 1.157 (mxd: 1.487 / 1.110 (+stores 1.294) / 1.248): the
+  data movement alone is 83% of the kernel and the compute alone 87%; they overlap well.
+- TDM only, per op (minus the no-data skeleton 182 us): Q rows (nope + rope, 24 KB / step) +245, dO rows (16 KB) +137,
+  dO^T (16 KB) +136, Q^T (24 KB) +160, the scale / lse / delta ops +65 each part; all 11 ops +930 (sum of parts 810):
+  additive, i.e. throughput-bound: ~12 TB/s aggregate (11.4 GB of TDM reads). Q's 192-byte rows cost ~1.8x dO's per
+  byte (rows straddle 128-byte lines; the rope op adds nothing next to the nope op: line-granular).
+- At light load (b1 h4) the same TDM-only step is ~1560 cycles vs ~2150 at full load: per CU 2.5x the throughput, so
+  the limit is shared (L2 / fabric), not the CU's TDM engine.
+- **Workgroup clusters** (gfx1250): `__cluster_dims__(2, 1, 1)` on the kernel and a plain hipModuleLaunchKernel form
+  2-workgroup clusters (cluster_workgroup_id_x alternates 0 / 1); the launch attribute path (hipDrvLaunchKernelEx +
+  hipLaunchAttributeClusterDimension) returns hipErrorInvalidConfiguration and poisons the context. **TDM multicast**
+  (group 1 word 0 bits 15:0 = workgroup mask, bit 21 early timeout; `scratch_mx/bt/mcast/`): every workgroup the mask
+  names must issue the same load with the same mask (as FlyDSL's grouped GEMM does); the hardware fetches once and each
+  peer waits its own tensorcnt. A load issued by one peer only fills only the issuer's LDS.
+- DKDV_CL 2 (lab): kv blocks 2 p, 2 p + 1 of one (b, h) as a cluster (XCD-local order over clusters), q / A loads of
+  shared q blocks multicast. (a) DKDV_CL_REORDER 1: rank 0 runs its diagonal step last so both take q block 2 p + 1 + s
+  at step s: TDM-only 1.112 -> 0.878 ms, but the extra step instantiations ((no diag, no prev) first, (diag, prev)
+  last) cost the loop ~100 instructions and the last step 452 B of scratch: compute-only 1.153 -> 1.449 (the cluster
+  launch alone: 1.175), full 1.56 ms. (b) REORDER 0: both diagonal first, rank 1's LDS rings rotated by one stage (its
+  round r = rank 0's round r + 1); without a lock-step rank 1 runs ahead and the multicast loads do not pair (TDM-only
+  1.19-1.49, full 1.47-1.65); with DKDV_CL_BAR (the per-step barrier also a cluster barrier, rank 1 one extra at the
+  start) TDM-only 0.831 / 0.856 ms (early timeout on / off: -25%), but full k_dkdv_mx 1.365 / 1.378 vs 1.333 (no
+  multicast 1.397): the kernel is bound by LDS (TDM writes + ds_loads) and VALU, which multicast does not reduce.
+- **GPU fault**: timing the k_dkdv_mxd (dS stores) builds of these variants (scratch_mx/py/dkdv_ab_time.py, 09:15 UTC)
+  page-faulted (read, TCP, 0x725deec0a000..) and hung; MES REMOVE_QUEUE / SUSPEND timeouts, my queue reset, "device
+  wedged, but recovered through reset". Which variant is unknown (all arms run in the warm-up; the first new one was
+  CL_BAR + multicast without early timeout). gx.sh missed it: the kernel log's ring buffer is full (ionic logs every
+  2 s), so the line-count window was empty; gx.sh now takes the lines whose raw timestamp is after the log's last line at
+  the job's start (the kernel clock runs ~12 s behind /proc/uptime and the wall clock). GPU0.FAULT written by hand;
+  GPU work stopped until it is cleared. Clusters are not pursued for dK / dV (no gain on k_dkdv_mx); DKDV_CL stays a
+  lab knob (default 0).

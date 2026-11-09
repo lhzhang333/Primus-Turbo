@@ -156,6 +156,43 @@ using namespace mx;
 #ifndef DSO_NT
 #define DSO_NT 0  // b7: the dS stores non-temporal (th:TH_STORE_NT: streamed, not kept in the caches)
 #endif
+#ifndef DKDV_CL
+#define DKDV_CL 0  // 2: dK / dV in workgroup clusters of 2 (kv blocks 2 p, 2 p + 1 of one (b, h)): rank 0 runs its diagonal
+                   // step last, so both take q block 2 p + 1 + s at step s, and their q / A TDM loads of those steps are
+                   // multicast (both issue the same load with workgroup mask 0b11: one fetch for the pair)
+#endif
+#ifndef DKDV_CL_MC
+#define DKDV_CL_MC 1  // DKDV_CL: 0 no multicast mask (timing: the pairing and step order alone)
+#endif
+#ifndef DKDV_CL_REORDER
+#define DKDV_CL_REORDER 1  // DKDV_CL: 0 both ranks diagonal first (timing only: the steps do not align)
+#endif
+#ifndef DKDV_CL_ATTR
+#define DKDV_CL_ATTR 1  // DKDV_CL: 0 a plain launch (rank = blockIdx.x & 1; timing only without multicast)
+#endif
+#ifndef DKDV_CL_BAR
+#define DKDV_CL_BAR 0  // DKDV_CL_REORDER 0: 1 the per-step barrier is also a cluster barrier (rank 1 one extra at the start:
+                       // its step s meets rank 0's step s + 1, so both issue the same round right after it)
+#endif
+#ifndef DKDV_MC_EARLY
+#define DKDV_MC_EARLY 1  // DKDV_CL: the early-timeout bit of the multicast loads
+#endif
+#if DKDV_CL == 2 && !TDM_INC
+#error "DKDV_CL needs TDM_INC"
+#endif
+#if DKDV_CL == 2 && DKDV_CL_ATTR
+#define DKDV_CLATTR __cluster_dims__(2, 1, 1)
+#else
+#define DKDV_CLATTR
+#endif
+#ifndef DKDV_MEMMASK
+#define DKDV_MEMMASK 0x7ff  // timing probes only: the dkdv TDM ops k (dk_op) that move data (bit k)
+#endif
+#ifndef DKDV_MEMPROBE
+#define DKDV_MEMPROBE 0  // timing probes only (wrong results): 1 the step loop keeps its TDM rounds, waits and barriers but
+                         // computes nothing; 2 as 1 + the dS stores (DSO); 3 the full loop with every TDM op moving no data;
+                         // 4 / 5 as 1 with only the q part / the A part of the rounds moving data
+#endif
 
 namespace {
 constexpr int D_QK = 192, D_V = 128;
@@ -443,13 +480,43 @@ __device__ __forceinline__ void dkdv_body(
         }
     }
 #else
-    const int kb = blk.slot, h = blk.h, b = blk.b;
+    int kb = blk.slot, h = blk.h, b = blk.b;
 #endif
+    // DKDV_CL: dlast = this workgroup (cluster rank 0, kv block 2 p) runs its diagonal step last
+    [[maybe_unused]] bool dlast = false;
+    // DKDV_CL_REORDER 0: crank 1 (kv block 2 p + 1) runs one step behind rank 0 in q blocks: its step s is rank 0's step
+    // s + 1 (q block 2 p + 1 + s), so its LDS rings are rotated by one stage (rot) and its round r matches rank 0's r + 1
+    [[maybe_unused]] int crank = 0, rot = 0;
+    if constexpr (DKDV_CL == 2) {
+        const int npair = S / (2 * KB),
+                  rank = DKDV_CL_ATTR ? (int)__builtin_amdgcn_cluster_workgroup_id_x() : (int)(blockIdx.x & 1);
+        const int Lc = (int)(blockIdx.x >> 1) + npair * ((int)blockIdx.y + H * (int)blockIdx.z);
+        int pair, bhx;
+        if ((B * H) % 8 == 0) {
+            const int k = Lc >> 3;
+            bhx = (Lc & 7) + 8 * (k / npair);
+            pair = k % npair;
+        } else {
+            pair = (int)(blockIdx.x >> 1);
+            bhx = (int)blockIdx.y + H * (int)blockIdx.z;
+        }
+        h = bhx % H;
+        b = bhx / H;
+        kb = 2 * pair + rank;
+        dlast = DKDV_CL_REORDER && rank == 0;
+        crank = rank;
+        rot = DKDV_CL_REORDER ? 0 : rank;
+    }
     const int kv0 = kb * KB;
     const int qs0 = kv0;  // KB == QS_
     const int nst = (S - qs0) / QS_;
     const unsigned long long bh = (unsigned long long)b * H + h;
     const int kvw = kv0 + KBW * wv;  // this wave's first kv row
+    // the q block of step s (DKDV_CL rank 0: kb + 1 + s, its diagonal block kb at the last step)
+    auto qblk = [&](int s) __attribute__((always_inline)) -> int {
+        if constexpr (DKDV_CL == 2) return dlast ? (s < nst - 1 ? kb + 1 + s : kb) : kb + s;
+        return kb + s;
+    };
 
 #if !PRO_TDM_FIRST
     // ---- resident B operands: the wave's K / V rows
@@ -502,6 +569,8 @@ __device__ __forceinline__ void dkdv_body(
         unsigned long long ga, inc;
         unsigned lds, lbase, lstep;
         int si;
+        bool ap;
+        int k;
     };
     auto mk_run = [&](const TdmOp &op, int k) __attribute__((always_inline)) -> OpRun {
         const bool ap = k >= 5 && k <= 8;
@@ -511,13 +580,28 @@ __device__ __forceinline__ void dkdv_body(
         o.ga = op.base + (unsigned long long)qs0 * op.mult;
         o.lbase = (ap ? lds0 + ARING : lds0) + op.lds;
         o.lstep = ap ? (unsigned)ASTG : (unsigned)QSTG;
-        o.lds = ap ? o.lbase + 2 * o.lstep : o.lbase;  // stage (si mod 3)
+        o.lds = o.lbase + (unsigned)(((ap ? 2 : 0) + rot) % 3) * o.lstep;  // stage ((si + rot) mod 3)
+        o.ap = ap;
+        o.k = k;
         return o;
     };
     OpRun run0 = mk_run(op0, k0), run1 = mk_run(op1, k1), run2 = mk_run(op2, k2);
     auto issue_one = [&](const TdmOp &op, OpRun &o) __attribute__((always_inline)) {
-        const bool real = o.si >= 0 && o.si < nst;
-        tdm_load(tdm_g0(o.lds, o.ga, real ? op.on : 0), op.g1);
+        const bool real = o.si >= 0 && o.si < nst && DKDV_MEMPROBE != 3 && !(DKDV_MEMPROBE == 4 && o.ap) &&
+                          !(DKDV_MEMPROBE == 5 && !o.ap) && ((DKDV_MEMMASK >> o.k) & 1);
+        if constexpr (DKDV_CL == 2) {
+            // the step's q block directly (rank 0's last step jumps back to its diagonal block); multicast unless it is
+            // rank 0's diagonal step (the partner has none)
+            const int sc = o.si < 0 ? 0 : (o.si < nst ? o.si : nst - 1);
+            const unsigned long long ga = op.base + (unsigned long long)(qblk(sc) * QS_) * op.mult;
+            const bool partner = DKDV_CL_REORDER ? !(dlast && o.si == nst - 1) : !(crank == 0 && o.si == 0);
+            const bool mc = DKDV_CL_MC && real && partner;
+            i32x8 g1 = op.g1;
+            g1[0] |= mc ? (int)(3u | (DKDV_MC_EARLY ? (1u << 21) : 0u)) : 0;
+            tdm_load(tdm_g0(o.lds, ga, real ? op.on : 0), g1);
+        } else {
+            tdm_load(tdm_g0(o.lds, o.ga, real ? op.on : 0), op.g1);
+        }
         o.ga = (o.si >= 0 && o.si + 1 < nst) ? o.ga + o.inc : o.ga;
         o.lds = o.lds == o.lbase + 2 * o.lstep ? o.lbase : o.lds + o.lstep;
         o.si += 1;
@@ -543,7 +627,21 @@ __device__ __forceinline__ void dkdv_body(
         issue_one(op2, k2, r);
     };
 #endif
+    // the cluster part of a barrier (after the workgroup barrier): one signal per workgroup, every wave waits
+    [[maybe_unused]] auto cl_bar = [&]() __attribute__((always_inline)) {
+        if constexpr (DKDV_CL == 2 && DKDV_CL_BAR) {
+            if (wv == 0) __builtin_amdgcn_s_barrier_signal(-3);
+            __builtin_amdgcn_s_barrier_wait(-3);
+        }
+    };
     issue_round(0);
+    if constexpr (DKDV_CL == 2 && DKDV_CL_BAR && !DKDV_CL_REORDER) {
+        if (crank == 1) {  // meets rank 0's barrier of step 0, after which rank 0 issues round 2 (= this round 1)
+            bar_signal();
+            bar_wait();
+            cl_bar();
+        }
+    }
     issue_round(1);
 #if PRO_TDM_FIRST
     // ---- resident B operands: the wave's K / V rows
@@ -571,8 +669,8 @@ __device__ __forceinline__ void dkdv_body(
     static_for<12>([&](auto d) { static_for<NJ>([&](auto j) { dk[(int)d][(int)j] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
 
     auto addr = [&](int s) __attribute__((always_inline)) -> StepAddr {
-        const unsigned sq = lds0 + (unsigned)((s % NSTG) * QSTG);
-        const unsigned sa = lds0 + ARING + (unsigned)(((s + NSTG - 1) % NSTG) * ASTG);  // the A part of step s - 1
+        const unsigned sq = lds0 + (unsigned)(((s + rot) % NSTG) * QSTG);
+        const unsigned sa = lds0 + ARING + (unsigned)(((s + rot + NSTG - 1) % NSTG) * ASTG);  // the A part of step s - 1
         const int ln = lane_now(), r16 = ln & 15, hh = ln >> 4;
         const unsigned rq = sq + (unsigned)(r16 * XK), r1 = sq + (unsigned)(r16 * X128), ra = sa + (unsigned)(r16 * X128);
         const unsigned lo = LTDT_DPP ? (unsigned)(4 * (8 * hh + (ln & 7))) : (unsigned)(32 * hh);
@@ -846,7 +944,7 @@ __device__ __forceinline__ void dkdv_body(
     // (the wave's 8 KB of the tile as a uniform global base + the lane's 32-bit offset: global_store saddr)
     auto ds_ptr = [&](int s) __attribute__((always_inline)) -> DsOut {
         if constexpr (!DSO) return DsOut{nullptr, 0u};
-        const int qbk = DSO_PROBE == 1 ? kb : kb + s;
+        const int qbk = DSO_PROBE == 1 ? kb : qblk(s);
         return DsOut{(g_u8 *)(uintptr_t)(ds_bh + (unsigned long long)ds_tile_index(kb, qbk) * DS_TILE +
                                          (unsigned long long)(wv * 8192)),
                      16u * (unsigned)lane_now()};
@@ -862,12 +960,25 @@ __device__ __forceinline__ void dkdv_body(
         tensor_wait<TDM_PER_ROUND>();  // round s landed: the q part of step s, the A part of step s - 1
         bar_signal();
         bar_wait();          // visible to every wave; every wave is done with step s - 1 (and the dV / dK of s - 2)
+        cl_bar();
         issue_round(s + 2);  // q part of step s + 2 into step s - 1's q stage, A part of s + 1 into step s - 2's A stage
 #endif
         const StepAddr a = addr(s);
         i32x16 pB[NJ], dsB[NJ];
         int dss[NJ] = {};
-        step(s, ds_ptr(s), a, qs0 + s * QS_, pB, dsB, dss, pBo, dsBo, dsso, pre_t, pre_a, diag_c, prev_c);
+#if DKDV_MEMPROBE == 1 || DKDV_MEMPROBE == 2 || DKDV_MEMPROBE == 4 || DKDV_MEMPROBE == 5
+        (void)a;
+        static_for<NJ>([&](auto jj) {
+            pB[(int)jj] = i32x16{};
+            dsB[(int)jj] = i32x16{};
+        });
+        if constexpr (DKDV_MEMPROBE == 2 && DSO) {
+            const DsOut d = ds_ptr(s);
+            static_for<2 * NQT>([&](auto i) { ds_store16(d.tile + d.voff + (int)i * 512, u32x4{(unsigned)s, 0u, 0u, 0u}); });
+        }
+#else
+        step(s, ds_ptr(s), a, qblk(s) * QS_, pB, dsB, dss, pBo, dsBo, dsso, pre_t, pre_a, diag_c, prev_c);
+#endif
         static_for<NJ>([&](auto jj) {
             pBo[(int)jj] = pB[(int)jj];
             dsBo[(int)jj] = dsB[(int)jj];
@@ -914,14 +1025,25 @@ __device__ __forceinline__ void dkdv_body(
             });
     }
 #else
-    run(0, std::true_type{}, std::false_type{});
-    for (int s = 1; s < nst; ++s) run(s, std::false_type{}, std::true_type{});
+    if constexpr (DKDV_CL == 2) {
+        if (dlast)
+            run(0, std::false_type{}, std::false_type{});
+        else
+            run(0, std::true_type{}, std::false_type{});
+        const int nloop = dlast ? nst - 1 : nst;
+        for (int s = 1; s < nloop; ++s) run(s, std::false_type{}, std::true_type{});
+        if (dlast) run(nst - 1, std::true_type{}, std::true_type{});
+    } else {
+        run(0, std::true_type{}, std::false_type{});
+        for (int s = 1; s < nst; ++s) run(s, std::false_type{}, std::true_type{});
+    }
 #endif
 
     // ---- the dV / dK of the last step (its A part: round nst), A fragments two groups ahead
     tensor_wait<0>();
     bar_signal();
     bar_wait();  // the last A part visible; every wave is done with the q ring
+    cl_bar();
     {
         const StepAddr a = addr(nst);
         constexpr int NAB = 4;
@@ -989,7 +1111,7 @@ __device__ __forceinline__ void dkdv_body(
         constexpr int D_DK = (P_END + 127) / 128 * 128, D_DP = D_DK + KB * XDN;
         static_assert(D_DP + (SPLIT ? KB * 128 : 0) <= ARING, "padded staging + dense dK inside the q ring");
         static_assert(KB * XDV <= ASTG, "dense dV inside one A stage");
-        const unsigned d_dv = (unsigned)(ARING + (nst % NSTG) * ASTG);
+        const unsigned d_dv = (unsigned)(ARING + ((nst + rot) % NSTG) * ASTG);
         const int ln = lane_now();
         static_for<NJ>([&](auto jj) {
             constexpr int j = jj;
@@ -1172,7 +1294,7 @@ __device__ __forceinline__ void dkdv_body(
 #endif
 }
 
-extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1))) DKDV_CLATTR
 void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
                const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
                const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
@@ -1189,7 +1311,7 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
 
 // the fused-RoPE path's variant: DK / DV views of the kv gradient [b, s, h, 256] (DK at d 0, DV at d 128; the head
 // stride 256 is fixed), dK's rope columns to DKP [b, s, h, 64] (dkp_sb / dkp_ss its b / s strides)
-extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1))) DKDV_CLATTR
 void k_dkdv_mxr(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
                 const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
                 const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
@@ -1205,7 +1327,7 @@ void k_dkdv_mxr(const unsigned char *__restrict__ Q8, const unsigned char *__res
 }
 
 // rung b7: k_dkdv_mx / k_dkdv_mxr that also store dS (bf16) to DSB for k_dqg_mx / k_dqg_mxr
-extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1))) DKDV_CLATTR
 void k_dkdv_mxd(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
                 const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
                 const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
@@ -1219,7 +1341,7 @@ void k_dkdv_mxd(const unsigned char *__restrict__ Q8, const unsigned char *__res
     dkdv_body<false, true>(Q8, QS, K8, KS, V8, VSR, DO8, DOS, DO8T, DOTS, Q8T, QTS, LSE2, DELTA, DK, DV, scale, S, H, B,
                            dk_sb, dk_ss, dv_sb, dv_ss, nullptr, 0, 0, DSB, smem);
 }
-extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1))) DKDV_CLATTR
 void k_dkdv_mxrd(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
                  const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
                  const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
