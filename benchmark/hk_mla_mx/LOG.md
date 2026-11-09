@@ -850,3 +850,5 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   LLVM's order, every other item stays between the same two of them; only the VALU / TRANS / SALU inside a window move):
   height 32 1.503, ready 32 1.505, height 300 1.503 vs 1.497 ms (bitwise): within LLVM's register allocation the dK / dV
   loop has no schedule headroom left; any further gain needs other registers (a generator) or another decomposition.
+- Register-allocation / pre-RA scheduling flags on the backward source (dkdv_mxd): without the regclass priority
+  1.480, relaxed occupancy 1.478, pending queue 512 1.478, no pre-RA misched 1.889 vs 1.478 ms (bitwise).
