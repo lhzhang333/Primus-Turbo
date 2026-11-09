@@ -774,3 +774,15 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   (k_mla_bwd_mx5.hip: k_dqg_mx, k_dqg_mxr; the prefetch range is checked on the re-scheduled object too). Package
   profile: k_dqg_mxr 0.555 -> 0.510-0.516 ms, fused-RoPE fwd + bwd per step 3.22 -> 3.19-3.21. pytest 30 pass,
   fused-RoPE test pass.
+- Forward re-schedule sweep with the package scheduler (SLP on, as the package): ready / 32 (the package's) 0.556, ready
+  / 64 0.557, height / 32 / 64 / 96 0.598-0.607, height 96 burst 2 0.591 ms (bitwise): the forward keeps ready / 32.
+- Training gate **g120k** (qkv launch, paired + re-scheduled dqg; another session's e2e jobs ran between the two arms):
+  bf16 HK 1002.2, hk_mx + fused RoPE 975.1 ms / iteration (-2.70%; g120j -2.61%), loss 0.0818 both, grad-norm ratio
+  max 1.014.
+- dkdv budget (11-09 ATT + probes): per step and CU ~860 LDS loads (4 waves x ~215) plus ~95 KB of TDM writes into LDS
+  (~80% of LDS time at an assumed 256 B / cycle), VALU near full too: fewer LDS loads for more VALU (LTDT_DPP) and fewer
+  scale loads (DKDV_SCPROBE, a probe: 1.334 -> 1.557 ms, LLVM's code changes around it) are slower. A generator would
+  fight the same two limits; a larger reuse (48 kv rows per wave) needs another tile / dS layout.
+- Tests: test_dq_gemm_matches_recompute (dK / dV bitwise between the dQ GEMM and the recompute kernel, dQ > 30 dB apart,
+  both over the fp32 floor; paired grid, odd q blocks, b h % 8 != 0), test_dq_gemm_workspace_cap (the cap falls back,
+  bitwise). pytest 34 pass.
