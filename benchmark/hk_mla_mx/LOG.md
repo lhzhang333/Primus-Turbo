@@ -758,3 +758,10 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   rct128 rows + cols; grid (S / 128, H, 3 B); rctr_body / rct_body take (kt, h, b)): two separate rctr192 launches 0.200
   -> 0.185 ms in a two-way version, q + k + v 0.2285 -> 0.222 ms in the three-way one (package profile); fused == unfused
   bitwise, pytest 30 pass. Package fused-RoPE fwd + bwd per step 3.25 -> ~3.23 ms.
+- dkdv re-scheduling with longer LDS latencies in the model (ready 96 / 160, height 128, orig 128): 1.574-1.585 /
+  1.493 / 1.511 vs 1.478 ms: no setting helps.
+- dqg probes (wrong results, timing only): no K8T fragment loads 0.491 -> 0.449 ms (a K8T-from-global path with a
+  fragment-major layout could gain at most ~8%: not pursued), no dS quantization 0.397 (the VALU of the quantization
+  is the larger cost; each value is quantized once already).
+- DKDV_SGB (sched_group_barrier issue patterns per dkdv slot): [W 2T 4V 2DS] x 12 2.299, [W T 2V DS] x 16 1.784,
+  S / dP WMMAs first then [W 3V 2DS] 1.510 vs 1.486 ms (bitwise): off.

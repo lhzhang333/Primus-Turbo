@@ -135,6 +135,11 @@ using namespace mx;
 // stores trigger sporadic 400-1100-cycle ds_load stalls), 4 slots 0..3 after slot 3 and 4..7 at the end (1.644, spills)
 #define DSO_LATE 3
 #endif
+#ifndef DKDV_SGB
+// dkdv: sched_group_barrier issue pattern per slot (0 off): 1 [W, 2 T, 4 V, 2 DS] x 12; 2 [W, T, 2 V, DS] x 16 then the
+// rest; 3 the S / dP WMMAs first ([W, T, T] x 6) then [W, 3 V, 2 DS] x 6
+#define DKDV_SGB 0
+#endif
 #ifndef DSO_PROBE
 #define DSO_PROBE 0  // timing probes only: 1 every step stores to the block's diagonal tile (L2-resident), 2 no stores
 #endif
@@ -763,6 +768,31 @@ __device__ __forceinline__ void dkdv_body(
                     });
             };
             if constexpr (DSO_LATE == 1) dso_store();
+            if constexpr (DKDV_SGB == 1) {
+                static_for<12>([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x8, 1, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x400, 2, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x2, 4, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x100, 2, 0);
+                });
+            } else if constexpr (DKDV_SGB == 2) {
+                static_for<16>([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x8, 1, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x400, 1, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x2, 2, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x100, 1, 0);
+                });
+            } else if constexpr (DKDV_SGB == 3) {
+                static_for<6>([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x8, 1, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x400, 2, 0);
+                });
+                static_for<6>([&](auto) {
+                    __builtin_amdgcn_sched_group_barrier(0x8, 1, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x2, 3, 0);
+                    __builtin_amdgcn_sched_group_barrier(0x100, 2, 0);
+                });
+            }
             fence();
             if constexpr (DSO_LATE == 2) dso_store();
             if constexpr (DSO && DSO_LATE >= 3) static_for<NJ>([&](auto jj) { dso_all[DSO_LATE >= 3 ? qt : 0][(int)jj] = dso_w[(int)jj]; });
@@ -1766,6 +1796,9 @@ void k_dq_mxr(const unsigned char *__restrict__ Q8, const unsigned char *__restr
 // resident, the q tiles pipelined (tile i + 2's transposed loads and tile i + 1's quantization next to tile i's WMMAs)
 #define DQG_V 1
 #endif
+#ifndef DQG_PROBE
+#define DQG_PROBE 0  // timing probes only (wrong dQ): 1 no K8T fragment loads (one fragment reused), 2 no dS quantization
+#endif
 #ifndef DQG_TR
 #define DQG_TR 0  // the transposed-load lane map (0: lane 16 h + 8 qh + c reads chunk row 16 qh + 8 h + c), see tr_off
 #endif
@@ -2231,6 +2264,11 @@ __device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB,
         auto quant = [&](auto ic) __attribute__((always_inline)) {
             constexpr int i = ic;
             int sc_word = 0;
+            if constexpr (DQG_PROBE == 2) {
+                static_for<16>([&](auto e) { db[i % 2][(int)e] = (int)xr[i % 2][(int)e / 4][(int)e % 4]; });
+                dsc[i % 2] = 0x7f7f7f7f;
+                return;
+            }
             static_for<4>([&](auto mm) {
                 constexpr int m = mm;
                 const u32x4 &x0 = xr[i % 2][2 * m], &x1 = xr[i % 2][2 * m + 1];
@@ -2250,7 +2288,10 @@ __device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB,
         ldx(std::integral_constant<int, I0>{});
         ldx(std::integral_constant<int, I0 + 1>{});
         fence();
-        if constexpr (DQG_ORDER == 1) static_for<12>([&](auto dd) { kf[(int)dd] = lda(dd); });
+        if constexpr (DQG_PROBE == 1) {
+            kf[0] = lda(std::integral_constant<int, 0>{});
+            static_for<11>([&](auto dd) { kf[(int)dd + 1] = kf[0]; });
+        } else if constexpr (DQG_ORDER == 1) static_for<12>([&](auto dd) { kf[(int)dd] = lda(dd); });
         quant(std::integral_constant<int, I0>{});
         fence();
         static_for<QTW>([&](auto ii) {
