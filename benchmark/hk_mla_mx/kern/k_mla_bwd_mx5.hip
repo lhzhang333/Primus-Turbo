@@ -122,6 +122,12 @@ using namespace mx;
 #ifndef LTDT_D
 #define LTDT_D 2
 #endif
+#ifndef LTDT_DPP
+// dkdv: a q16 tile's lse / delta C tuples (rows 8 lh + r, r < 8) from one ds_load_b32 each (lane l of a 16-lane row holds
+// row 8 lh + l % 8) and 8 DPP row_share broadcasts, instead of 2 + 2 ds_load_b128 (the kernel is LDS-bandwidth bound:
+// four waves read every q-side byte)
+#define LTDT_DPP 0
+#endif
 #ifndef DSO_LATE
 // b7 (k_dkdv_mxd): where slot qt's two dS stores issue: 0 right after the conversion (waits for the WMMA -> exp -> mul ->
 // cvt chain: ~23 cycles per store pair, ATT; 1.543 ms), 1 after the slot's dV / dK WMMAs (1.542), 2 after the slot's
@@ -182,6 +188,12 @@ MX_INLINE int lane_now() {
     asm volatile("v_mbcnt_lo_u32_b32 %0, -1, 0" : "=v"(l));
     return l;
 }
+template <int... I>
+MX_INLINE f32x8 bcast8_impl(uint32_t x, std::integer_sequence<int, I...>) {
+    return f32x8{as_f((uint32_t)__builtin_amdgcn_mov_dpp((int)x, 0x150 + I, 0xf, 0xf, false))...};
+}
+// lane l gets lane 16 (l / 16) + r's x as element r (DPP row_share r)
+MX_INLINE f32x8 bcast8(uint32_t x) { return bcast8_impl(x, std::make_integer_sequence<int, 8>{}); }
 MX_INLINE f32x8 f8(u32x4 a, u32x4 b) {
     return f32x8{as_f(a[0]), as_f(a[1]), as_f(a[2]), as_f(a[3]), as_f(b[0]), as_f(b[1]), as_f(b[2]), as_f(b[3])};
 }
@@ -345,7 +357,10 @@ MX_INLINE QTile load_qtile(const StepAddr &a) {
     t.dox = cat4(lds_b128(pdo, od), lds_b128(pdo, od + 16), lds_b128(pdo, od + 32), lds_b128(pdo, od + 48));
     t.qsc = (int)lds_b32(lds_ptr(a.qs), QT * 16 * 8);
     t.dsc = (int)lds_b32(lds_ptr(a.dos), QT * 16 * 4);
-#if !LTDT_G
+#if LTDT_DPP
+    t.lt = bcast8(lds_b32(lds_ptr(a.lse), QT * 64));
+    t.dt = bcast8(lds_b32(lds_ptr(a.del), QT * 64));
+#elif !LTDT_G
     t.lt = f8(lds_b128(lds_ptr(a.lse), QT * 64), lds_b128(lds_ptr(a.lse), QT * 64 + 16));
     t.dt = f8(lds_b128(lds_ptr(a.del), QT * 64), lds_b128(lds_ptr(a.del), QT * 64 + 16));
 #endif
@@ -545,9 +560,10 @@ __device__ __forceinline__ void dkdv_body(
         const unsigned sa = lds0 + ARING + (unsigned)(((s + NSTG - 1) % NSTG) * ASTG);  // the A part of step s - 1
         const int ln = lane_now(), r16 = ln & 15, hh = ln >> 4;
         const unsigned rq = sq + (unsigned)(r16 * XK), r1 = sq + (unsigned)(r16 * X128), ra = sa + (unsigned)(r16 * X128);
+        const unsigned lo = LTDT_DPP ? (unsigned)(4 * (8 * hh + (ln & 7))) : (unsigned)(32 * hh);
         return {pin(rq + O_Q + 64 * hh),         pin(rq + O_Q + 128 + 32 * hh), pin(sq + O_QS + r16 * 8 + 4 * hh),
-                pin(r1 + O_DO + 64 * hh),        pin(sq + O_DOS + r16 * 4),     pin(sq + O_LSE + 32 * hh),
-                pin(sq + O_DEL + 32 * hh),       pin(ra + O_DOT + 64 * hh),     pin(sa + O_DOTS + ln * 4),
+                pin(r1 + O_DO + 64 * hh),        pin(sq + O_DOS + r16 * 4),     pin(sq + O_LSE + lo),
+                pin(sq + O_DEL + lo),            pin(ra + O_DOT + 64 * hh),     pin(sa + O_DOTS + ln * 4),
                 pin(ra + O_QT + 64 * hh),        pin(sa + O_QTS + ln * 4)};
     };
     auto ldA = [&](const StepAddr &a, auto gc) __attribute__((always_inline)) {

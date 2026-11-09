@@ -748,3 +748,9 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   the staging).
 - Package profile, same harness and run (prof_pkg.py, fused-RoPE fwd + bwd per step, two rounds each): the 11-06 package
   (db260777) 3.500 / 3.507, this one 3.256 / 3.251 ms (-7.1%; both include 0.205 ms of the script's gradient adds).
+- dkdv post-RA re-scheduling again (resched.py on k_dkdv_mxd, no-SLP build): the model predicts LLVM's order to the
+  cycle (2452 vs ATT 2456 / trip) and 1810 for first-ready-first, but measured identity 1.493, orig 1.517, height
+  1.579, ready 1.594 vs 1.477 ms (bitwise): still no gain from re-ordering dK / dV.
+- LTDT_DPP (lab, off): a q16 tile's lse / delta C tuples from one ds_load_b32 each + 8 DPP row_share broadcasts
+  (row_share works on gfx1250) instead of 2 + 2 ds_load_b128 (-14% of the loop's LDS bytes, +128 VALU / step):
+  bitwise, dkdv_mx 1.330 -> 1.514, dkdv_mxd 1.489 -> 1.669 ms: the loop is not LDS-bandwidth bound (per-wave issue).
