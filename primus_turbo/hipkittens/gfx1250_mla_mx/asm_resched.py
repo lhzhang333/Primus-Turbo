@@ -295,6 +295,26 @@ class _Machine:
         self.last_kind, self.last_t = n.kind, t
 
 
+ANCHOR_KINDS = ("DS_LD", "DS_ST", "WMMA", "TDM", "VM_LD", "VM_ST", "BAR_S", "BAR_W", "WAIT_CNT", "BR")
+
+
+def _anchor(items, succ):
+    """Keep the memory / WMMA / barrier items in their order and every other item between the same two of them as in
+    the original: only the VALU / TRANS / SALU work inside each window is re-ordered."""
+    anc = [i for i, it in enumerate(items) if it.kind in ANCHOR_KINDS]
+
+    def edge(i, j):
+        if i != j and succ[i].get(j, -1) < 0:
+            succ[i][j] = 0
+
+    for a, b in zip(anc, anc[1:]):
+        edge(a, b)
+        for k in range(a + 1, b):
+            edge(a, k)
+            edge(k, b)
+    return succ
+
+
 def _heights(succ):
     """The longest latency path from each item to the end."""
     h = [0] * len(succ)
@@ -456,7 +476,7 @@ def _verify(T, new, objdump, tmp):
 
 
 def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, regions=True, prio="ready", lat_ds=None,
-          wmma_c_lat=8):
+          wmma_c_lat=8, anchored=False):
     """Compile src (flags + no VOPD + save-temps) into out with the main loop of each kernel re-scheduled (prio, lat_ds:
     _schedule's tie rule and the assumed LDS load latency); raises on any failure (the caller falls back to the plain
     build). Returns {kernel: (items, LLVM lines, emitted lines)}."""
@@ -485,7 +505,8 @@ def build(cxx, src, out, flags, kernels, cwd, tmp, lds_gap=6.0, lds_burst=4.0, r
         items = with_req(_items(T, ins, la, lb))
         if items[-1].kind != "BR":
             raise RuntimeError("the loop body does not end with its branch")
-        order = _schedule(items, _dag(T, items, lat_ds, wmma_c_lat), lds_gap, lds_burst, prio)
+        dag = _dag(T, items, lat_ds, wmma_c_lat)
+        order = _schedule(items, _anchor(items, dag) if anchored else dag, lds_gap, lds_burst, prio)
         label = ins[la].label
         new_items = [items[i] for i in order]
         sgpr_waits(new_items, loop_carried_valu_sgprs(new_items))

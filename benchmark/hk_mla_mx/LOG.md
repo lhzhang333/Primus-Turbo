@@ -846,3 +846,7 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   ~950 instructions >= ~950 issue cycles, its 88 WMMAs 704 pipe cycles: an overlapped step could be ~1400-1500 cycles vs
   2450 measured (LLVM). A load's latency then grows with the CU's queue (~1.55 cycles per load ahead + a base): the
   schedule has to keep loads ~300 cycles ahead of their consumers (LLVM's order: ~380) with the registers for them.
+- Anchored re-schedule of dkdv (asm_resched anchored=True: LDS / WMMA / TDM / store / barrier / wait items keep
+  LLVM's order, every other item stays between the same two of them; only the VALU / TRANS / SALU inside a window move):
+  height 32 1.503, ready 32 1.505, height 300 1.503 vs 1.497 ms (bitwise): within LLVM's register allocation the dK / dV
+  loop has no schedule headroom left; any further gain needs other registers (a generator) or another decomposition.
