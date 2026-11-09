@@ -797,3 +797,9 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
   had been widened). gx.sh now checks only the kernel-log lines added during the job (line count at the start).
 - dkdv re-scheduled with a bwdgen-like LDS model (one LDS op per 8 / 11 cycles, no burst, latency 70 / 90; height /
   ready): 1.546 / 1.585 / 1.569 vs 1.497 ms (bitwise): the dK / dV loop stays LLVM's.
+- SLOT_ORDER 1 (every kv16 tile's S / dP WMMAs of a dkdv slot first, then the softmax per tile): 1.489 vs 1.490 ms
+  (bitwise): LLVM normalizes the order.
+- Forward prologue (ATT, package build): ~8.9k cycles per workgroup: the first TDM data (s_wait_tensorcnt 0xa, ~2k:
+  the 11th op of the wave waits for the first to land), the barrier after it (~1.6k), a cold s_load of the kernel
+  arguments (~1k, first wave), SGPR spills to VGPR lanes (58 writelane + 39 readlane, ~0.46k): per-workgroup latency
+  (8 workgroups per CU: ~9% of the kernel); only overlapping workgroups (persistent: SGPR-bound on 11-06) would hide it.

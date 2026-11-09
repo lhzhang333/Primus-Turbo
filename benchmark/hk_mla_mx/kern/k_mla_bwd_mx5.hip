@@ -144,6 +144,9 @@ using namespace mx;
 #define DKDV_SCPROBE 0  // timing probe only (wrong dK / dV): 1 the q tiles' Q / dO scale words and the A fragments' scale
                         // words loaded for tile / group 0 only (the cost of ~26 b32 LDS loads per step)
 #endif
+#ifndef SLOT_ORDER
+#define SLOT_ORDER 0  // dkdv slot: 0 per kv16 tile j (S, dP WMMAs, exps, ...); 1 every j's S / dP WMMAs first
+#endif
 #ifndef DSO_PROBE
 #define DSO_PROBE 0  // timing probes only: 1 every step stores to the block's diagonal tile (L2-resident), 2 no stores
 #endif
@@ -699,11 +702,25 @@ __device__ __forceinline__ void dkdv_body(
             const i32x16 &dox = cur.dox;
             const int qsc = cur.qsc, dsc = cur.dsc;
             [[maybe_unused]] u32x4 dso_w[NJ];
+            [[maybe_unused]] f32x8 svs[NJ], dps[NJ];
+            if constexpr (SLOT_ORDER == 1)
+                static_for<NJ>([&](auto jj) {
+                    constexpr int j = jj;
+                    svs[j] = wmma_mxc<0, 0, NEG_C>(lo16(qx), lo16(kx[j]), clt, qsc, ksc[j]);
+                    svs[j] = wmma_mx<1, 1>(mid16(qx), mid16(kx[j]), svs[j], qsc, ksc[j]);
+                    dps[j] = wmma_mxc<0, 0, NEG_C>(dox, vb[j], cdt, dsc, vsc[j]);
+                });
             static_for<NJ>([&](auto jj) {
                 constexpr int j = jj;
-                f32x8 sv = wmma_mxc<0, 0, NEG_C>(lo16(qx), lo16(kx[j]), clt, qsc, ksc[j]);
-                sv = wmma_mx<1, 1>(mid16(qx), mid16(kx[j]), sv, qsc, ksc[j]);
-                const f32x8 dp = wmma_mxc<0, 0, NEG_C>(dox, vb[j], cdt, dsc, vsc[j]);
+                f32x8 sv, dp;
+                if constexpr (SLOT_ORDER == 1) {
+                    sv = svs[j];
+                    dp = dps[j];
+                } else {
+                    sv = wmma_mxc<0, 0, NEG_C>(lo16(qx), lo16(kx[j]), clt, qsc, ksc[j]);
+                    sv = wmma_mx<1, 1>(mid16(qx), mid16(kx[j]), sv, qsc, ksc[j]);
+                    dp = wmma_mxc<0, 0, NEG_C>(dox, vb[j], cdt, dsc, vsc[j]);
+                }
                 f32x8 p, ds;
                 static_for<8>([&](auto rr) {
                     constexpr int r = rr;

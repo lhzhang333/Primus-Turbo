@@ -140,6 +140,13 @@ using namespace mx;
 // rest; 3 the S / dP WMMAs first ([W, T, T] x 6) then [W, 3 V, 2 DS] x 6
 #define DKDV_SGB 0
 #endif
+#ifndef DKDV_SCPROBE
+#define DKDV_SCPROBE 0  // timing probe only (wrong dK / dV): 1 the q tiles' Q / dO scale words and the A fragments' scale
+                        // words loaded for tile / group 0 only (the cost of ~26 b32 LDS loads per step)
+#endif
+#ifndef SLOT_ORDER
+#define SLOT_ORDER 0  // dkdv slot: 0 per kv16 tile j (S, dP WMMAs, exps, ...); 1 every j's S / dP WMMAs first
+#endif
 #ifndef DSO_PROBE
 #define DSO_PROBE 0  // timing probes only: 1 every step stores to the block's diagonal tile (L2-resident), 2 no stores
 #endif
@@ -363,8 +370,8 @@ MX_INLINE QTile load_qtile(const StepAddr &a) {
     t.qx = frag24(lds_b128(pqn, oq), lds_b128(pqn, oq + 16), lds_b128(pqn, oq + 32), lds_b128(pqn, oq + 48),
                   lds_b128(pqr, oq), lds_b128(pqr, oq + 16));
     t.dox = cat4(lds_b128(pdo, od), lds_b128(pdo, od + 16), lds_b128(pdo, od + 32), lds_b128(pdo, od + 48));
-    t.qsc = (int)lds_b32(lds_ptr(a.qs), QT * 16 * 8);
-    t.dsc = (int)lds_b32(lds_ptr(a.dos), QT * 16 * 4);
+    t.qsc = (int)lds_b32(lds_ptr(a.qs), DKDV_SCPROBE ? 0 : QT * 16 * 8);
+    t.dsc = (int)lds_b32(lds_ptr(a.dos), DKDV_SCPROBE ? 0 : QT * 16 * 4);
 #if LTDT_DPP
     t.lt = bcast8(lds_b32(lds_ptr(a.lse), QT * 64));
     t.dt = bcast8(lds_b32(lds_ptr(a.del), QT * 64));
@@ -383,7 +390,7 @@ MX_INLINE AFrag load_afrag(uint32_t base, uint32_t sbase) {
     const lds_u8 *p = lds_ptr(base);
     constexpr int o = D * 16 * X128;
     return {cat4(lds_b128(p, o), lds_b128(p, o + 16), lds_b128(p, o + 32), lds_b128(p, o + 48)),
-            (int)lds_b32(lds_ptr(sbase), (D / 2) * 128)};
+            (int)lds_b32(lds_ptr(sbase), DKDV_SCPROBE ? 0 : (D / 2) * 128)};
 }
 MX_INLINE void fence() { __builtin_amdgcn_sched_barrier(0); }
 // an empty use: x stays in its registers up to here, so loads issued before it cannot be given those registers while
@@ -695,11 +702,25 @@ __device__ __forceinline__ void dkdv_body(
             const i32x16 &dox = cur.dox;
             const int qsc = cur.qsc, dsc = cur.dsc;
             [[maybe_unused]] u32x4 dso_w[NJ];
+            [[maybe_unused]] f32x8 svs[NJ], dps[NJ];
+            if constexpr (SLOT_ORDER == 1)
+                static_for<NJ>([&](auto jj) {
+                    constexpr int j = jj;
+                    svs[j] = wmma_mxc<0, 0, NEG_C>(lo16(qx), lo16(kx[j]), clt, qsc, ksc[j]);
+                    svs[j] = wmma_mx<1, 1>(mid16(qx), mid16(kx[j]), svs[j], qsc, ksc[j]);
+                    dps[j] = wmma_mxc<0, 0, NEG_C>(dox, vb[j], cdt, dsc, vsc[j]);
+                });
             static_for<NJ>([&](auto jj) {
                 constexpr int j = jj;
-                f32x8 sv = wmma_mxc<0, 0, NEG_C>(lo16(qx), lo16(kx[j]), clt, qsc, ksc[j]);
-                sv = wmma_mx<1, 1>(mid16(qx), mid16(kx[j]), sv, qsc, ksc[j]);
-                const f32x8 dp = wmma_mxc<0, 0, NEG_C>(dox, vb[j], cdt, dsc, vsc[j]);
+                f32x8 sv, dp;
+                if constexpr (SLOT_ORDER == 1) {
+                    sv = svs[j];
+                    dp = dps[j];
+                } else {
+                    sv = wmma_mxc<0, 0, NEG_C>(lo16(qx), lo16(kx[j]), clt, qsc, ksc[j]);
+                    sv = wmma_mx<1, 1>(mid16(qx), mid16(kx[j]), sv, qsc, ksc[j]);
+                    dp = wmma_mxc<0, 0, NEG_C>(dox, vb[j], cdt, dsc, vsc[j]);
+                }
                 f32x8 p, ds;
                 static_for<8>([&](auto rr) {
                     constexpr int r = rr;
