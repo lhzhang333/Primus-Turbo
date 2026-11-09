@@ -736,3 +736,15 @@ GPU still at sclk ~1304 MHz (amd-smi, idle 855 W): same-run A / B only.
 - A lab timing script bug (k_dkdv_mxr given dK / dV of head stride 192 / 128: the kernel's DK / DV are kv-gradient
   views with head stride 256) page-faulted (no-retry, TCP) and the queue was reset; the GPU recovered. gx.sh's dmesg
   window now starts 30 s early (dmesg runs ~10 s ahead of the wall clock: the fault was not caught).
+- Training gate **g120j** (slow GPU, 120 iterations): bf16 HK 1001.9, hk_mx + fused RoPE (b7) 975.7 ms / iteration
+  (-2.61%; g120i -2.27%), final-window loss 0.0818 both, grad-norm ratio max 1.014.
+- DK_BF16 (dK's dS operand MX-quantized from the stored bf16 values, dQ's recipe): dkdv_mxd 1.709 vs 1.490 ms: off.
+- **DQG_PAIR** (k_dqg: q blocks nqb - 1 - p and p per workgroup, 2 nqb + 2 tiles each; grid (nqb / 2, H, B), the
+  kernel takes the paired path only when launched with it): stages padded to 98816 B so the first block's dQ staging
+  fits its last tile's stage; that tile issues the block's cos / sin (ROPE) or a NULL op in place of the next block's tile
+  1, which is issued after the epilogue's stores; the next block's first wait (<= 1 outstanding) covers its tile 0 and
+  the stores (the staging stage takes its tile 2). Bitwise = unpaired (five shapes). dqg_mx 0.496 -> 0.483, dqg_mxr
+  0.504 -> 0.496 ms (the block switch still exposes one TDM latency: three stages hold tiles 0..2 of the next block or
+  the staging).
+- Package profile, same harness and run (prof_pkg.py, fused-RoPE fwd + bwd per step, two rounds each): the 11-06 package
+  (db260777) 3.500 / 3.507, this one 3.256 / 3.251 ms (-7.1%; both include 0.205 ms of the script's gradient adds).

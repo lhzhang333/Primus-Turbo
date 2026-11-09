@@ -893,9 +893,18 @@ def bwd_mx7(qz, bz, lse, scale=SCALE, tag="5ni", keep_ds=False, dsb=None):
             [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"], bz["dots"],
              bz["q8t"], bz["qts"], lse2, bz["delta"], dk, dv, float(scale), s, h, b, dk.stride(0), dk.stride(1),
              dv.stride(0), dv.stride(1), dsb], tag)  # fmt: skip
-    _launch("k_dqg_mx", (s // 256, h, b),
+    _launch("k_dqg_mx", dqg_grid(s, h, b, "P" in tag),
             [dsb, bz["k8t"], bz["kts"], dq, float(scale), s, h, b, dq.stride(0), dq.stride(1)], tag)  # fmt: skip
     return (dq, dk, dv, dsb) if keep_ds else (dq, dk, dv)
+
+
+def dqg_grid(s, h, b, paired):
+    """k_dqg_mx's grid: q blocks of 256 (paired builds, DQG_PAIR: two blocks per workgroup when nqb % 2 == 0 and
+    b h % 8 == 0; lab tags with a "P")"""
+    nqb = s // 256
+    if paired and nqb % 2 == 0 and (b * h) % 8 == 0:
+        return (nqb // 2, h, b)
+    return (nqb, h, b)
 
 
 def ds_unpack(dsb, b, h, s):

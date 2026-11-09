@@ -132,6 +132,9 @@ using namespace mx;
 #ifndef DSO_PROBE
 #define DSO_PROBE 0  // timing probes only: 1 every step stores to the block's diagonal tile (L2-resident), 2 no stores
 #endif
+#ifndef DK_BF16
+#define DK_BF16 0  // b7 (DSO): dK's dS operand MX-quantized (along q) from the bf16 dS that is stored (as dQ's), not f32
+#endif
 #ifndef DSO_NT
 #define DSO_NT 0  // b7: the dS stores non-temporal (th:TH_STORE_NT: streamed, not kept in the caches)
 #endif
@@ -181,6 +184,45 @@ MX_INLINE int lane_now() {
 }
 MX_INLINE f32x8 f8(u32x4 a, u32x4 b) {
     return f32x8{as_f(a[0]), as_f(a[1]), as_f(a[2]), as_f(a[3]), as_f(b[0]), as_f(b[1]), as_f(b[2]), as_f(b[3])};
+}
+typedef short s16x2 __attribute__((ext_vector_type(2)));
+#ifndef DQG_AMAX
+#define DQG_AMAX 1  // |x| max of 16 bf16: 0 AND then max on the magnitudes; 1 signed max (largest positive) and unsigned max
+                    // (the negative of largest magnitude) trees, one AND at the end
+#endif
+#ifndef DQG_ORDER
+#define DQG_ORDER 1  // DQG_V 1: 0 the 12 K8T fragments loaded first; 1 the first two q tiles' transposed loads first, the
+                     // K8T fragments next to the first quantization
+#endif
+typedef unsigned short u16x2 __attribute__((ext_vector_type(2)));
+// |x| max of 16 bf16 values (two u32x4) on the magnitude bits (their integer order is the float order), as a float
+MX_INLINE float amax16_bf16(const u32x4 &x0, const u32x4 &x1) {
+    if constexpr (DQG_AMAX == 1) {
+        // as int16 a positive bf16 orders by magnitude and every negative is below it; as uint16 every negative
+        // (0x8000 | mag) is above every positive and orders by magnitude
+        auto si = [](unsigned x) { return __builtin_bit_cast(s16x2, x); };
+        auto su = [](unsigned x) { return __builtin_bit_cast(u16x2, x); };
+        auto mx3 = [](auto a, auto b, auto c) { return __builtin_elementwise_max(__builtin_elementwise_max(a, b), c); };
+        const s16x2 p = mx3(mx3(si(x0[0]), si(x0[1]), si(x0[2])), mx3(si(x0[3]), si(x1[0]), si(x1[1])),
+                            __builtin_elementwise_max(si(x1[2]), si(x1[3])));
+        const u16x2 n = mx3(mx3(su(x0[0]), su(x0[1]), su(x0[2])), mx3(su(x0[3]), su(x1[0]), su(x1[1])),
+                            __builtin_elementwise_max(su(x1[2]), su(x1[3])));
+        // p: the largest positive (int16 < 0 when there is none: clamped to 0); n & 0x7fff: the largest magnitude among
+        // the negatives when there is one, else the largest positive again
+        const u16x2 pm = __builtin_bit_cast(u16x2, __builtin_elementwise_max(p, s16x2{0, 0}));
+        const u16x2 nm = __builtin_bit_cast(u16x2, __builtin_bit_cast(unsigned, n) & 0x7fff7fffu);
+        const u16x2 m2 = __builtin_elementwise_max(pm, nm);
+        const unsigned mb = m2[0] > m2[1] ? (unsigned)m2[0] : (unsigned)m2[1];
+        return __builtin_bit_cast(float, mb << 16);
+    }
+    auto ab = [](unsigned x) { return __builtin_bit_cast(s16x2, x & 0x7fff7fffu); };
+    const s16x2 m0 = __builtin_elementwise_max(__builtin_elementwise_max(ab(x0[0]), ab(x0[1])),
+                                               __builtin_elementwise_max(ab(x0[2]), ab(x0[3])));
+    const s16x2 m1 = __builtin_elementwise_max(__builtin_elementwise_max(ab(x1[0]), ab(x1[1])),
+                                               __builtin_elementwise_max(ab(x1[2]), ab(x1[3])));
+    const s16x2 mm = __builtin_elementwise_max(m0, m1);
+    const int mb = mm[0] > mm[1] ? (int)mm[0] : (int)mm[1];
+    return __builtin_bit_cast(float, (unsigned)mb << 16);
 }
 // MX-quantize two 8-value column halves x0, x1 (16 values of this lane + 16 of its peer: one block of 32): the E8M0
 // byte and the two E4M3 pairs
@@ -563,6 +605,7 @@ __device__ __forceinline__ void dkdv_body(
         int thr[NJ];
         static_for<NJ>([&](auto jj) { thr[(int)jj] = kvw + 16 * (int)jj + lr - q0 - 8 * lh; });
         f32x8 dsprev[NJ];
+        [[maybe_unused]] u32x4 dswprev[NJ];  // DK_BF16: the even slot's bf16 dS
         AFrag ab[20];
 #if MIDSYNC
         StepAddr an;  // step s + 1 (after the mid-step barrier)
@@ -641,15 +684,16 @@ __device__ __forceinline__ void dkdv_body(
                     p[r] = pv;
                     ds[r] = pv * dp[r];
                 });
+                [[maybe_unused]] u32x4 wq = {0u, 0u, 0u, 0u};
                 if constexpr (DSO) {
                     // the chunk (wv, qt, j): this lane's 8 q values (rows 8 lh + r) of kv column lr, as bf16 (one vector
                     // conversion: scalar ones let the SLP vectorizer re-schedule the block, moving slots' dV / dK
                     // WMMAs to the step end, 96 VGPRs spilled)
-                    const bf16x8 w = __builtin_convertvector(ds, bf16x8);
+                    wq = __builtin_bit_cast(u32x4, __builtin_convertvector(ds, bf16x8));
                     if constexpr (DSO_LATE == 0)
-                        ds_store16(dsp.tile + dsp.voff + (2 * qt + j) * 512, __builtin_bit_cast(u32x4, w));
+                        ds_store16(dsp.tile + dsp.voff + (2 * qt + j) * 512, wq);
                     else
-                        dso_w[j] = __builtin_bit_cast(u32x4, w);
+                        dso_w[j] = wq;
                 }
 #if PIN_Q & 1
                 u32x2 pq = cvt8_e4m3(p, 1.0f / 256.0f);
@@ -659,7 +703,23 @@ __device__ __forceinline__ void dkdv_body(
 #endif
                 pB[j][2 * qt] = (int)pq[0];
                 pB[j][2 * qt + 1] = (int)pq[1];
-                if constexpr (qt % 2 == 0) {
+                if constexpr (DSO && DK_BF16) {
+                    // dK's dS block (q 32 (qt / 2) .. + 31 of kv column lr): the bf16 values as stored (dQ's recipe)
+                    if constexpr (qt % 2 == 0) {
+                        dswprev[j] = wq;
+                    } else {
+                        const float am = amax16_bf16(dswprev[j], wq);
+                        const int byte = e8m0_byte(__builtin_fmaxf(am, peer(am)));
+                        const float sc = e8m0_scale(byte);
+                        const u32x2 c0 = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(__builtin_bit_cast(bf16x8, dswprev[j]), sc);
+                        const u32x2 c1 = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(__builtin_bit_cast(bf16x8, wq), sc);
+                        dsB[j][2 * (qt - 1)] = (int)c0[0];
+                        dsB[j][2 * (qt - 1) + 1] = (int)c0[1];
+                        dsB[j][2 * qt] = (int)c1[0];
+                        dsB[j][2 * qt + 1] = (int)c1[1];
+                        dss[j] |= byte << (8 * (qt / 2));
+                    }
+                } else if constexpr (qt % 2 == 0) {
                     dsprev[j] = ds;
                 } else {
 #if PIN_Q & 2
@@ -1702,7 +1762,6 @@ constexpr int G_NSTG = 3;
 constexpr int G_LDS_B = G_NSTG * G_STG;       // 281856
 static_assert(G_LDS_B <= 327680, "LDS");
 static_assert(G_STG % 128 == 0, "TDM alignment");
-typedef short s16x2 __attribute__((ext_vector_type(2)));
 typedef short s16x8 __attribute__((ext_vector_type(8)));
 typedef __attribute__((address_space(3))) s16x8 lds_s16x8;
 // this lane's byte offset in a 512-byte chunk for the transposed load: lane l = 16 h + 8 qh + c reads chunk row
@@ -1714,44 +1773,6 @@ MX_INLINE unsigned tr_off(int l) {
 }
 MX_INLINE u32x4 lds_tr16(uint32_t base, int off) {
     return __builtin_bit_cast(u32x4, __builtin_amdgcn_ds_load_tr16_b128_v8i16((lds_s16x8 *)(uintptr_t)(base + off)));
-}
-#ifndef DQG_AMAX
-#define DQG_AMAX 1  // |x| max of 16 bf16: 0 AND then max on the magnitudes; 1 signed max (largest positive) and unsigned max
-                    // (the negative of largest magnitude) trees, one AND at the end
-#endif
-#ifndef DQG_ORDER
-#define DQG_ORDER 1  // DQG_V 1: 0 the 12 K8T fragments loaded first; 1 the first two q tiles' transposed loads first, the
-                     // K8T fragments next to the first quantization
-#endif
-typedef unsigned short u16x2 __attribute__((ext_vector_type(2)));
-// |x| max of 16 bf16 values (two u32x4) on the magnitude bits (their integer order is the float order), as a float
-MX_INLINE float amax16_bf16(const u32x4 &x0, const u32x4 &x1) {
-    if constexpr (DQG_AMAX == 1) {
-        // as int16 a positive bf16 orders by magnitude and every negative is below it; as uint16 every negative
-        // (0x8000 | mag) is above every positive and orders by magnitude
-        auto si = [](unsigned x) { return __builtin_bit_cast(s16x2, x); };
-        auto su = [](unsigned x) { return __builtin_bit_cast(u16x2, x); };
-        auto mx3 = [](auto a, auto b, auto c) { return __builtin_elementwise_max(__builtin_elementwise_max(a, b), c); };
-        const s16x2 p = mx3(mx3(si(x0[0]), si(x0[1]), si(x0[2])), mx3(si(x0[3]), si(x1[0]), si(x1[1])),
-                            __builtin_elementwise_max(si(x1[2]), si(x1[3])));
-        const u16x2 n = mx3(mx3(su(x0[0]), su(x0[1]), su(x0[2])), mx3(su(x0[3]), su(x1[0]), su(x1[1])),
-                            __builtin_elementwise_max(su(x1[2]), su(x1[3])));
-        // p: the largest positive (int16 < 0 when there is none: clamped to 0); n & 0x7fff: the largest magnitude among
-        // the negatives when there is one, else the largest positive again
-        const u16x2 pm = __builtin_bit_cast(u16x2, __builtin_elementwise_max(p, s16x2{0, 0}));
-        const u16x2 nm = __builtin_bit_cast(u16x2, __builtin_bit_cast(unsigned, n) & 0x7fff7fffu);
-        const u16x2 m2 = __builtin_elementwise_max(pm, nm);
-        const unsigned mb = m2[0] > m2[1] ? (unsigned)m2[0] : (unsigned)m2[1];
-        return __builtin_bit_cast(float, mb << 16);
-    }
-    auto ab = [](unsigned x) { return __builtin_bit_cast(s16x2, x & 0x7fff7fffu); };
-    const s16x2 m0 = __builtin_elementwise_max(__builtin_elementwise_max(ab(x0[0]), ab(x0[1])),
-                                               __builtin_elementwise_max(ab(x0[2]), ab(x0[3])));
-    const s16x2 m1 = __builtin_elementwise_max(__builtin_elementwise_max(ab(x1[0]), ab(x1[1])),
-                                               __builtin_elementwise_max(ab(x1[2]), ab(x1[3])));
-    const s16x2 mm = __builtin_elementwise_max(m0, m1);
-    const int mb = mm[0] > mm[1] ? (int)mm[0] : (int)mm[1];
-    return __builtin_bit_cast(float, (unsigned)mb << 16);
 }
 }  // namespace
 
@@ -2056,12 +2077,287 @@ __device__ __forceinline__ void dqg_body(const unsigned char *__restrict__ DSB, 
     tensor_wait<0>();
 }
 
+
+#ifndef DQG_PAIR
+#define DQG_PAIR 1  // k_dqg: q blocks nqb - 1 - p and p in one workgroup (every workgroup 2 nqb + 2 tiles; the first block's
+                    // epilogue overlaps the second's first tiles); grid (nqb / 2, H, B) when nqb % 2 == 0 and B H % 8 == 0
+#endif
+namespace {
+__host__ __device__ constexpr bool dqg_paired(int nqb, int B, int H) {
+    return DQG_PAIR != 0 && nqb % 2 == 0 && (B * H) % 8 == 0;
+}
+// paired k_dqg: a stage also holds a block's whole dQ staging (16 regions of 16 rows x 384 B + 16 B: 98560 B; ROPE: two
+// halves of 8 rows per region: 98816 B) so the first block's epilogue needs one stage only
+constexpr int G2_STG = 98816;
+constexpr int G2_LDS_B = G_NSTG * G2_STG;  // 296448
+static_assert(G2_LDS_B <= 327680 && G2_STG % 128 == 0 && G_KTS + D_QK * 4 <= G2_STG, "LDS");
+}  // namespace
+
+template <bool ROPE>
+__device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB, const unsigned char *__restrict__ K8T,
+                                          const unsigned char *__restrict__ KTS, bf16 *__restrict__ DQ, float scale,
+                                          int S, int H, int B, long long dq_sb, long long dq_ss,
+                                          const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN,
+                                          unsigned char *smem) {
+    lock_simd();
+    const uint32_t lds0 = lds_addr(smem);
+    const int tid = (int)__builtin_amdgcn_workitem_id_x();
+    const int wv = wave_id(tid);
+    const int nqb = S / BMQ;
+    int qbs[2], h, b, nblk;
+    if (dqg_paired(nqb, B, H) && 2 * (int)gridDim.x == nqb) {  // the host launched the paired grid
+        // XCD-local: the k-th workgroup of XCD x takes pair k % (nqb / 2) of (b, h) = x + 8 (k / (nqb / 2))
+        const int np = nqb / 2;
+        const int L = (int)(blockIdx.x + np * (blockIdx.y + H * blockIdx.z)), k = L >> 3, xc = L & 7;
+        const int bhx = xc + 8 * (k / np), pp = k % np;
+        qbs[0] = nqb - 1 - pp;
+        qbs[1] = pp;
+        h = bhx % H;
+        b = bhx / H;
+        nblk = 2;
+    } else {
+        const BlockOf blk = xcd_block(nqb, H, B);
+        qbs[0] = qbs[1] = nqb - 1 - blk.slot;
+        h = blk.h;
+        b = blk.b;
+        nblk = 1;
+    }
+    const int n0 = 2 * qbs[0] + 2, n1 = 2 * qbs[1] + 2;  // kv tiles of each block
+    const int NT = nblk == 2 ? n0 + n1 : n0;
+    const unsigned long long bh = (unsigned long long)b * H + h;
+    const unsigned long long dsbh = (unsigned long long)(uintptr_t)DSB + bh * ds_tiles_per_bh(S) * DS_TILE;
+    const unsigned long long kt_base = (unsigned long long)(uintptr_t)K8T + bh * D_QK * (unsigned long long)S;
+    const unsigned long long kts_base = (unsigned long long)(uintptr_t)KTS + bh * (unsigned long long)(S / 128) * D_QK * 4;
+    // this wave's op of a tile: 0 dS (t, 2 qb) (t <= 2 qb), 1 dS (t, 2 qb + 1), 2 K8T rows, 3 KTS
+    const unsigned op_lds = wv == 0 ? 0u : wv == 1 ? (unsigned)G_DS1 : wv == 2 ? (unsigned)G_KT : (unsigned)G_KTS;
+    const i32x8 op_g1 = wv <= 1 ? tdm_g1(W0_S, 256, 128, 256, 128)
+                        : wv == 2 ? tdm_g1(W0_128, D_QK, 128, D_QK, (unsigned long long)S)
+                                  : tdm_g1(W0_S, D_QK, 4, D_QK, 4);
+    auto stage = [&](int T) __attribute__((always_inline)) { return lds0 + (unsigned)((T % G_NSTG) * G2_STG); };
+    auto issue = [&](int T) __attribute__((always_inline)) {
+        const bool first = T < n0;
+        const int t = first ? T : T - n0, qb = first ? qbs[0] : qbs[1], n = first ? n0 : n1;
+        const bool real = T < NT && (wv != 0 || t <= 2 * qb);
+        const unsigned long long tt = (unsigned long long)(t < n ? t : n - 1);
+        const int qrow = 2 * qb + (wv == 1 ? 1 : 0);
+        const unsigned long long ga = wv <= 1 ? dsbh + ((unsigned long long)ds_tile_index(0, qrow) + tt) * DS_TILE
+                                      : wv == 2 ? kt_base + tt * NBK
+                                                : kts_base + tt * (D_QK * 4);
+        tdm_load(tdm_g0(stage(T) + op_lds, ga, real ? 1 : 0), op_g1);
+    };
+    // ROPE: a block's cos / sin rows (256 x 128 B, rows padded to 144 B) into the stage of tile T (waves 0 / 1; 2 / 3 NULL)
+    constexpr unsigned RS_B = BMQ * X128;
+    static_assert(2 * RS_B <= G2_STG, "cos / sin in one stage");
+    auto issue_extra = [&](int T, int q0) __attribute__((always_inline)) {
+        if constexpr (ROPE) {
+            const bf16 *rs = wv == 0 ? COS : SIN;
+            const i32x4 g0 = wv < 2 ? tdm_g0(stage(T) + (unsigned)wv * RS_B,
+                                             (unsigned long long)(uintptr_t)(rs + (long long)q0 * 64))
+                                    : tdm_g0(stage(T) + op_lds, kt_base, 0);
+            tdm_load(g0, wv < 2 ? tdm_g1(W0_128, BMQ, 128, BMQ, 128) : op_g1);
+        } else {
+            tdm_load(tdm_g0(stage(T) + op_lds, kt_base, 0), op_g1);  // NULL (keeps every wave's count in step)
+        }
+    };
+    issue(0);
+    issue(1);
+    tensor_wait<1>();  // tile 0 (tile 1 may stay in flight)
+    bar_signal();
+    bar_wait();
+
+    f32x8 dq[12][QTW];
+    static_for<12>([&](auto d) { static_for<QTW>([&](auto i) { dq[(int)d][(int)i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
+    struct AF {
+        i32x16 x;
+        int s;
+    };
+    // tile T (of the block starting at q0): CL 0 interior, 1 the block's tile n - 2, 2 its tile n - 1 (no dS of q block
+    // 2 qb; issues the block's cos / sin (ROPE) into tile T + 2's stage instead of the next block's tile 1)
+    auto tile = [&](int T, int q0, auto cl_c) __attribute__((always_inline)) {
+        constexpr int CL = decltype(cl_c)::value;
+        if (T > 0) {
+            tensor_wait<1>();  // tile T landed (T + 1 in flight)
+            bar_signal();
+            bar_wait();  // tile T visible; every wave is done with tile T - 1
+        }
+        if constexpr (CL == 2)
+            issue_extra(T + 2, q0);
+        else
+            issue(T + 2);  // into the stage of tile T - 1
+        const unsigned st = stage(T);
+        const int ln = lane_now(), r16 = ln & 15, hh = ln >> 4;
+        const uint32_t trb = pin(st + tr_off(ln) + (unsigned)(wv * 1024)),
+                       kt_t = pin(st + G_KT + (unsigned)(r16 * X128 + 64 * hh)),
+                       kt_s = pin(st + G_KTS + (unsigned)(ln * 4));
+        auto lda = [&](auto dc) __attribute__((always_inline)) {
+            constexpr int dt = decltype(dc)::value;
+            const lds_u8 *tp = lds_ptr(kt_t);
+            constexpr int o = 16 * dt * X128;
+            return AF{cat4(lds_b128(tp, o), lds_b128(tp, o + 16), lds_b128(tp, o + 32), lds_b128(tp, o + 48)),
+                      (int)lds_b32(lds_ptr(kt_s), 32 * (dt / 2) * 4)};
+        };
+        // the B operand of q tile i (q block qa + i / 2, its q16 tile qt = 4 (i % 2) + wv): kv16 tile J = 2 m + u in chunk
+        // 16 (J / 2) + 2 qt + J % 2, MX blocks m along kv (with the peer lane), the E8M0 rule on the bits (= mx_exp)
+        AF kf[12];
+        if constexpr (DQG_ORDER == 0) static_for<12>([&](auto dd) { kf[(int)dd] = lda(dd); });
+        constexpr int I0 = CL == 2 ? 2 : 0;  // tile n - 1: no dS of q block qa
+        u32x4 xr[2][8];
+        i32x16 db[2];
+        int dsc[2];
+        auto ldx = [&](auto ic) __attribute__((always_inline)) {
+            constexpr int i = ic;
+            constexpr int oi = (i / 2) * DS_TILE + 4 * (i % 2) * 1024;
+            static_for<8>([&](auto jj) {
+                constexpr int J = jj;
+                xr[i % 2][J] = lds_tr16(trb, oi + (16 * (J / 2) + J % 2) * 512);
+            });
+        };
+        auto quant = [&](auto ic) __attribute__((always_inline)) {
+            constexpr int i = ic;
+            int sc_word = 0;
+            static_for<4>([&](auto mm) {
+                constexpr int m = mm;
+                const u32x4 &x0 = xr[i % 2][2 * m], &x1 = xr[i % 2][2 * m + 1];
+                const float am = amax16_bf16(x0, x1);
+                const int byte = e8m0_byte(__builtin_fmaxf(am, peer(am)));
+                const float sc = e8m0_scale(byte);
+                const u32x2 c0 = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(__builtin_bit_cast(bf16x8, x0), sc);
+                const u32x2 c1 = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(__builtin_bit_cast(bf16x8, x1), sc);
+                db[i % 2][4 * m] = (int)c0[0];
+                db[i % 2][4 * m + 1] = (int)c0[1];
+                db[i % 2][4 * m + 2] = (int)c1[0];
+                db[i % 2][4 * m + 3] = (int)c1[1];
+                sc_word |= byte << (8 * m);
+            });
+            dsc[i % 2] = sc_word;
+        };
+        ldx(std::integral_constant<int, I0>{});
+        ldx(std::integral_constant<int, I0 + 1>{});
+        fence();
+        if constexpr (DQG_ORDER == 1) static_for<12>([&](auto dd) { kf[(int)dd] = lda(dd); });
+        quant(std::integral_constant<int, I0>{});
+        fence();
+        static_for<QTW>([&](auto ii) {
+            constexpr int i = ii;
+            if constexpr (i >= I0) {
+                if constexpr (i + 2 < QTW) ldx(std::integral_constant<int, (i + 2 < QTW ? i + 2 : 0)>{});
+                if constexpr (i + 1 < QTW) quant(std::integral_constant<int, (i + 1 < QTW ? i + 1 : 0)>{});
+                static_for<12>([&](auto dd) {
+                    constexpr int dt = dd;
+                    if constexpr (dt % 2 == 0)
+                        dq[dt][i] = wmma_mx<0, 0>(kf[dt].x, db[i % 2], dq[dt][i], kf[dt].s, dsc[i % 2]);
+                    else
+                        dq[dt][i] = wmma_mx<1, 0>(kf[dt].x, db[i % 2], dq[dt][i], kf[dt].s, dsc[i % 2]);
+                });
+                fence();
+            }
+        });
+    };
+    // a block's epilogue: dQ rows as bf16 into the stage of its last tile (ROPE: the cos / sin rows in tile T + 2's
+    // stage), skewed regions, TDM stores; then (first of two blocks) the dQ accumulators cleared and the second block's
+    // tile 1 issued into the cos / sin stage (read by every wave before the barrier)
+    constexpr int XDQ = 2 * D_QK;
+    constexpr unsigned RG = (ROPE ? 8 : 16) * XDQ + 16;
+    static_assert((ROPE ? 32 : 16) * RG <= G2_STG, "a block's staging in one stage");
+    auto epilogue = [&](int Tl, int q0) __attribute__((always_inline)) {
+        tensor_wait<0>();
+        bar_signal();
+        bar_wait();
+        const int ln = lane_now();
+        const unsigned stg = stage(Tl);
+        [[maybe_unused]] const unsigned csb = stage(Tl + 2);
+        const unsigned sth0 = stg, sth1 = stg + 16 * RG;
+        auto row_b = [&](int i) -> unsigned {
+            if constexpr (ROPE)
+                return (i < 2 ? sth0 : sth1) + (unsigned)((ln & 15) * RG + (4 * (i & 1) + wv) * XDQ + 16 * (ln >> 4));
+            else
+                return stg + (unsigned)((ln & 15) * RG + (4 * i + wv) * XDQ + 16 * (ln >> 4));
+        };
+        [[maybe_unused]] u32x4 rcs[ROPE ? QTW : 1][4], rsn[ROPE ? QTW : 1][4];
+        if constexpr (ROPE) {
+            static_for<QTW>([&](auto ii) {
+                const unsigned rb = csb + (unsigned)((64 * (int)ii + 16 * wv + (ln & 15)) * X128 + 16 * (ln >> 4));
+                static_for<4>([&](auto j) {
+                    rcs[(int)ii][(int)j] = *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(rb + 32 * (int)j);
+                    rsn[(int)ii][(int)j] = *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(rb + RS_B + 32 * (int)j);
+                });
+            });
+        }
+        static_for<QTW>([&](auto ii) {
+            constexpr int i = ii;
+            const unsigned rowb = row_b(i);
+            static_for<ROPE ? 8 : 12>([&](auto dd) {
+                constexpr int dt = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dq[dt][i][(int)rr] * scale); });
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(rowb + 32 * dt) = __builtin_bit_cast(u32x4, w);
+            });
+        });
+        if constexpr (ROPE) {
+            static_for<QTW>([&](auto ii) {
+                constexpr int i = ii;
+                const unsigned rowb = row_b(i);
+                f32x8 pr[4];
+                static_for<4>([&](auto k) {
+                    static_for<8>([&](auto rr) { pr[(int)k][(int)rr] = dq[8 + (int)k][i][(int)rr] * scale; });
+                });
+                asm("" : "+v"(pr[0]), "+v"(pr[1]), "+v"(pr[2]), "+v"(pr[3]));
+                static_for<2>([&](auto pc) {
+                    constexpr int p = pc;
+                    f32x8 gl, gr;
+                    static_for<8>([&](auto rr) {
+                        gl[(int)rr] = (float)(bf16)pr[p][(int)rr];
+                        gr[(int)rr] = (float)(bf16)pr[2 + p][(int)rr];
+                    });
+                    u32x4 o0, o1;
+                    irope8(gl, gr, rcs[i][p], rsn[i][p], rcs[i][2 + p], rsn[i][2 + p], o0, o1);
+                    const unsigned a = rowb + 256 + 64 * p + 16 * (ln >> 4);
+                    *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)a = o0;
+                    *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(a + 16) = o1;
+                });
+            });
+        }
+        bar_signal();
+        bar_wait();
+        const unsigned long long g = (unsigned long long)(uintptr_t)(DQ + (long long)b * dq_sb + (long long)q0 * dq_ss +
+                                                                     (long long)h * D_QK);
+        const unsigned long long rs = 2ull * (unsigned long long)dq_ss;  // one row (bytes)
+        static_for<ROPE ? 2 : 1>([&](auto hc) {
+            const unsigned base = (int)hc == 0 ? sth0 : sth1;
+            static_for<4>([&](auto jj) {
+                const int j = 4 * wv + (int)jj;
+                tdm_store(tdm_g0(base + (unsigned)j * RG, g + ((unsigned long long)(128 * (int)hc) + (unsigned long long)j) * rs),
+                          tdm_g1(tdm_w0(0, 0, 0), ROPE ? 8 : 16, XDQ, ROPE ? 8 : 16, 16ull * rs));
+            });
+        });
+    };
+    int T0 = 0;
+    for (int k = 0; k < nblk; ++k) {
+        const int n = k == 0 ? n0 : n1, q0 = (k == 0 ? qbs[0] : qbs[1]) * BMQ;
+        for (int t = 0; t < n - 2; ++t) tile(T0 + t, q0, std::integral_constant<int, 0>{});
+        tile(T0 + n - 2, q0, std::integral_constant<int, 1>{});
+        tile(T0 + n - 1, q0, std::integral_constant<int, 2>{});
+        epilogue(T0 + n - 1, q0);
+        T0 += n;
+        if (k + 1 < nblk) {
+            static_for<12>([&](auto d) {
+                static_for<QTW>([&](auto i) { dq[(int)d][(int)i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; });
+            });
+            issue(T0 + 1);  // the next block's tile 1 (its tile 0 was issued in this block's tile n - 2)
+        }
+    }
+    tensor_wait<0>();
+}
+
 extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
 void k_dqg_mx(const unsigned char *__restrict__ DSB, const unsigned char *__restrict__ K8T,
               const unsigned char *__restrict__ KTS, bf16 *__restrict__ DQ, float scale, int S, int H, int B,
               long long dq_sb, long long dq_ss) {
-    __shared__ __attribute__((aligned(1024))) unsigned char smem[G_LDS_B];
-    dqg_body<false>(DSB, K8T, KTS, DQ, scale, S, H, B, dq_sb, dq_ss, nullptr, nullptr, smem);
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[DQG_PAIR ? G2_LDS_B : G_LDS_B];
+    if constexpr (DQG_PAIR)
+        dqg2_body<false>(DSB, K8T, KTS, DQ, scale, S, H, B, dq_sb, dq_ss, nullptr, nullptr, smem);
+    else
+        dqg_body<false>(DSB, K8T, KTS, DQ, scale, S, H, B, dq_sb, dq_ss, nullptr, nullptr, smem);
 }
 
 // the fused-RoPE path's variant: dQ's rope columns as the gradient of q before RoPE (COS / SIN [S, 64] bf16)
@@ -2069,6 +2365,9 @@ extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdg
 void k_dqg_mxr(const unsigned char *__restrict__ DSB, const unsigned char *__restrict__ K8T,
                const unsigned char *__restrict__ KTS, bf16 *__restrict__ DQ, float scale, int S, int H, int B,
                long long dq_sb, long long dq_ss, const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN) {
-    __shared__ __attribute__((aligned(1024))) unsigned char smem[G_LDS_B];
-    dqg_body<true>(DSB, K8T, KTS, DQ, scale, S, H, B, dq_sb, dq_ss, COS, SIN, smem);
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[DQG_PAIR ? G2_LDS_B : G_LDS_B];
+    if constexpr (DQG_PAIR)
+        dqg2_body<true>(DSB, K8T, KTS, DQ, scale, S, H, B, dq_sb, dq_ss, COS, SIN, smem);
+    else
+        dqg_body<true>(DSB, K8T, KTS, DQ, scale, S, H, B, dq_sb, dq_ss, COS, SIN, smem);
 }

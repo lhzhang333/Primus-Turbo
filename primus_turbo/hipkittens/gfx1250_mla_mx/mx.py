@@ -212,6 +212,13 @@ KERNELS["k_dqg_mxr"] = (KERNELS["k_dq_mx"][0], 128, _DQG_ARGS + (("COS", "ptr"),
 DS_TILE = 128 * 128 * 2  # bytes of one causal dS tile (k_mla_bwd_mx5.hip ds_tile_index)
 
 
+def _dqg_grid(s, h, b):
+    """k_dqg_mx(r)'s grid: two q blocks of 256 per workgroup (nqb - 1 - p and p: equal work) when nqb is even and
+    b h % 8 == 0 (the kernel's dqg_paired), else one block each."""
+    nqb = s // 256
+    return (nqb // 2, h, b) if nqb % 2 == 0 and (b * h) % 8 == 0 else (nqb, h, b)
+
+
 def _ds_workspace(b, h, s, dev):
     """The bf16 dS buffer of rung b7 (b h S/128 (S/128 + 1) / 2 tiles), or None: rung b7 off
     (PRIMUS_TURBO_MLA_MX_DQ_GEMM=0), larger than PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES (default 16 GiB; it grows as S^2) or
@@ -522,7 +529,7 @@ def attn_bwd(dout, out, lse2, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr,
     dsb = _ds_workspace(b, h, s, dev)
     if dsb is not None:
         _launch("k_dkdv_mxd", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args + [dsb])
-        _launch("k_dqg_mx", (s // 256, h, b), [dsb, k8t, kts, dq, sc, s, h, b, dq.stride(0), dq.stride(1)])
+        _launch("k_dqg_mx", _dqg_grid(s, h, b), [dsb, k8t, kts, dq, sc, s, h, b, dq.stride(0), dq.stride(1)])
         return dq, dk, dv
     _launch("k_dkdv_mx", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args)
     _launch("k_dq_mx", (s // 256, h, b),
@@ -623,7 +630,7 @@ def attn_bwd_rope(dout, out, lse2, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8,
     dsb = _ds_workspace(b, h, s, dev)
     if dsb is not None:
         _launch("k_dkdv_mxrd", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args + [dsb])
-        _launch("k_dqg_mxr", (s // 256, h, b),
+        _launch("k_dqg_mxr", _dqg_grid(s, h, b),
                 [dsb, k8t, kts, dq, sc, s, h, b, dq.stride(0), dq.stride(1), cos, sin])  # fmt: skip
         del dsb
     else:
