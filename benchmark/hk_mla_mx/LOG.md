@@ -990,3 +990,18 @@ half the CUs, b1 h16).
   quantization 0.059, kpe 0.013, kbar 0.011. Estimated ceilings with full register / schedule control (generator-class
   work, bf16 HK precedent 1.48x forward, 1.28x dK / dV per tile): dkdv ~10-20% (LDS-bound), forward ~15-30%
   (issue-bound: exps and WMMAs in separate stretches), dqg ~30% (LDS ~66%, WMMA ~34% busy).
+- Register renaming for asm_resched (model only, scratch_mx/rn/): with CFG liveness at the loop exit, k_dqg_mx8's loop
+  has 384 fixed registers (the accumulators) and its K8T / dS fragments renameable in block 0; k_dkdv_mx8 477 fixed,
+  231 / 36 / 40 / 4 free per 256-block. Issue model (asm_resched._Machine) makespans, LLVM order / list schedule with
+  LLVM's registers / list schedule on RAW only: dqg8 954 / 891 / 767 (LDS latency 96), dkdv8 2449 / 1704 / 1452; but
+  the model's list-schedule gains never showed on the GPU (it under-counts LDS throughput): not built.
+- **k_dqg_mx8x** (lab, DQG_XPF, no RoPE; the user's pick 11-10): b8's half-size dS records make a 60 KB stage, so 4
+  stages; the per-tile wait + barrier after a tile's first two q tiles, then tile T + 3 issued (two tiles of lead) and
+  tile T + 1's first six K8T fragments, its first two q tiles' dS and its scale words prefetched into the other register
+  set (both full K8T sets spilled 2-4 KB: half of them double-buffered, the other six loaded at the tile start); tiles in
+  pairs (sets A / B), a block's dQ staged in its last two tiles' stages (adjacent), the next block's tiles 2, 3 issued
+  at its tile 0 after the stores. Bitwise = k_dqg_mx8 (five shapes, paired and unpaired; a first version let the block's
+  last tile's prefetch overwrite its own q tiles 2, 3: fixed). 914 VGPRs, 3 scratch ops. **Slower: 0.261 vs 0.249 ms**.
+  ATT: 2938 cycles per tile pair (1469 a tile vs 1123): WMMAs 7.8 cycles each (now in dense runs), the mid-tile
+  s_wait_tensorcnt ~61 cycles each, address math (v_add3 16 cycles each) and the per-tile runtime branches; 76% in the
+  loop (87% before). Not pursued further; the kernel stays in the lab source (mxlab tag "X").

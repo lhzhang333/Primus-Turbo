@@ -239,6 +239,7 @@ KERNELS["k_dkdv_mx8"] = KERNELS["k_dkdv_mxd"]
 KERNELS["k_dkdv_mxr8"] = KERNELS["k_dkdv_mxrd"]
 KERNELS["k_dqg_mx8"] = KERNELS["k_dqg_mx"]
 KERNELS["k_dqg_mxr8"] = KERNELS["k_dqg_mxr"]
+KERNELS["k_dqg_mx8x"] = KERNELS["k_dqg_mx"]  # DQG_XPF: the next tile's loads under this tile's WMMAs (no RoPE)
 _SIZE = {"ptr": 8, "i64": 8, "f64": 8, "i32": 4, "u32": 4, "f32": 4}
 
 
@@ -928,7 +929,7 @@ def bwd_mx8(qz, bz, lse, scale=SCALE, tag="5ni", keep_ds=False, dsb=None):
             [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"], bz["dots"],
              bz["q8t"], bz["qts"], lse2, bz["delta"], dk, dv, float(scale), s, h, b, dk.stride(0), dk.stride(1),
              dv.stride(0), dv.stride(1), dsb], tag)  # fmt: skip
-    _launch("k_dqg_mx8", dqg_grid(s, h, b, "P" in tag),
+    _launch("k_dqg_mx8x" if "X" in tag else "k_dqg_mx8", dqg_grid(s, h, b, "P" in tag),
             [dsb, bz["k8t"], bz["kts"], dq, float(scale), s, h, b, dq.stride(0), dq.stride(1)], tag)  # fmt: skip
     return (dq, dk, dv, dsb) if keep_ds else (dq, dk, dv)
 

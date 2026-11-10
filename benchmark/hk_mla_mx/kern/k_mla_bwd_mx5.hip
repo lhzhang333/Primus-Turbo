@@ -2969,6 +2969,286 @@ void k_dqg_mx(const unsigned char *__restrict__ DSB, const unsigned char *__rest
         dqg_body<false>(DSB, K8T, KTS, DQ, scale, S, H, B, dq_sb, dq_ss, nullptr, nullptr, smem);
 }
 
+// =====================================================================================================================
+// k_dqg_mx8x (rung b8, DQG_XPF): k_dqg_mx8 with the next tile's loads under this tile's WMMAs. b8's dS records are half
+// the bf16 tiles, so a stage is 60 KB and the ring has 4 stages; the per-tile wait + barrier sits after a tile's first two
+// q tiles: then tile T + 1 is visible (its K8T fragments, the first two q tiles' dS and the scale words are loaded into
+// the other register set while this tile's last two q tiles run) and tile T - 1's stage is free (tile T + 3 issued into
+// it: two tiles of lead). Tiles in pairs (a block has an even count): register sets A (even) / B (odd). A block's dQ is
+// staged in the stages of its last two tiles (adjacent: n - 2 is even); the next block's tiles 0, 1 load ahead as usual,
+// its tiles 2, 3 (the staging stages) after the stores, at its tile 0. No RoPE.
+// =====================================================================================================================
+namespace {
+constexpr int X_DS1 = DS8_TILE, X_KT = 2 * DS8_TILE, X_KTS = X_KT + D_QK * X128, X_STG = 61440, X_NSTG = 4;
+constexpr int X_LDS_B = X_NSTG * X_STG;  // 245760
+static_assert(X_KTS + D_QK * 4 <= X_STG && X_STG % 128 == 0 && X_DS1 % 128 == 0 && X_KT % 128 == 0 && X_KTS % 128 == 0,
+              "XPF stage");
+static_assert(16 * (16 * 2 * D_QK + 16) <= 2 * X_STG, "a block's dQ staging in two stages");
+}  // namespace
+__device__ __forceinline__ void dqg3_body(const unsigned char *__restrict__ DSB, const unsigned char *__restrict__ K8T,
+                                          const unsigned char *__restrict__ KTS, bf16 *__restrict__ DQ, float scale,
+                                          int S, int H, int B, long long dq_sb, long long dq_ss, unsigned char *smem) {
+    lock_simd();
+    const uint32_t lds0 = lds_addr(smem);
+    const int tid = (int)__builtin_amdgcn_workitem_id_x();
+    const int wv = wave_id(tid);
+    const int nqb = S / BMQ;
+    int qbs[2], h, b, nblk;
+    if (dqg_paired(nqb, B, H) && 2 * (int)gridDim.x == nqb) {
+        const int np = nqb / 2;
+        const int L = (int)(blockIdx.x + np * (blockIdx.y + H * blockIdx.z)), k = L >> 3, xc = L & 7;
+        const int bhx = xc + 8 * (k / np), pp = k % np;
+        qbs[0] = nqb - 1 - pp;
+        qbs[1] = pp;
+        h = bhx % H;
+        b = bhx / H;
+        nblk = 2;
+    } else {
+        const BlockOf blk = xcd_block(nqb, H, B);
+        qbs[0] = qbs[1] = nqb - 1 - blk.slot;
+        h = blk.h;
+        b = blk.b;
+        nblk = 1;
+    }
+    const int n0 = 2 * qbs[0] + 2, n1 = 2 * qbs[1] + 2;
+    const int NT = nblk == 2 ? n0 + n1 : n0;
+    const unsigned long long bh = (unsigned long long)b * H + h;
+    const unsigned long long dsbh = (unsigned long long)(uintptr_t)DSB + bh * ds_tiles_per_bh(S) * DS8_TILE;
+    const unsigned long long kt_base = (unsigned long long)(uintptr_t)K8T + bh * D_QK * (unsigned long long)S;
+    const unsigned long long kts_base = (unsigned long long)(uintptr_t)KTS + bh * (unsigned long long)(S / 128) * D_QK * 4;
+    const unsigned op_lds = wv == 0 ? 0u : wv == 1 ? (unsigned)X_DS1 : wv == 2 ? (unsigned)X_KT : (unsigned)X_KTS;
+    const i32x8 op_g1 = wv <= 1 ? tdm_g1(W0_S, DS8_TILE / 128, 128, DS8_TILE / 128, 128)
+                        : wv == 2 ? tdm_g1(W0_128, D_QK, 128, D_QK, (unsigned long long)S)
+                                  : tdm_g1(W0_S, D_QK, 4, D_QK, 4);
+    auto stage = [&](int T) __attribute__((always_inline)) { return lds0 + (unsigned)((T % X_NSTG) * X_STG); };
+    const unsigned long long op_mult = wv <= 1 ? (unsigned long long)DS8_TILE : wv == 2 ? (unsigned long long)NBK
+                                                                                       : (unsigned long long)(D_QK * 4);
+    auto op_base = [&](int qb) __attribute__((always_inline)) {
+        return wv <= 1 ? dsbh + (unsigned long long)ds_tile_index(0, 2 * qb + wv) * DS8_TILE : wv == 2 ? kt_base : kts_base;
+    };
+    const unsigned long long base0 = op_base(qbs[0]), base1 = op_base(qbs[1]);
+    const int lim0 = wv == 0 ? 2 * qbs[0] : 1 << 20, lim1 = wv == 0 ? 2 * qbs[1] : 1 << 20;
+    // tile T's op of this wave; ok = false: a NULL op (keeps every wave's tensorcnt in step)
+    auto issue = [&](int T, bool ok) __attribute__((always_inline)) {
+        const bool first = T < n0;
+        const int t = first ? T : T - n0, n = first ? n0 : n1, lim = first ? lim0 : lim1;
+        const bool real = ok && T < NT && t <= lim;
+        const unsigned long long tt = (unsigned long long)(t < n ? t : n - 1);
+        const unsigned long long ga = (first ? base0 : base1) + tt * op_mult;
+        tdm_load(tdm_g0(stage(T) + op_lds, ga, real ? 1 : 0), op_g1);
+    };
+    f32x8 dq[12][QTW];
+    static_for<12>([&](auto d) { static_for<QTW>([&](auto i) { dq[(int)d][(int)i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
+    struct AF {
+        i32x16 x;
+        int s;
+    };
+    AF kfa[2][6];        // K8T fragments d16 tiles 0..5 of the even (0) / odd (1) tile (prefetched a tile ahead)
+    AF kfb[6];           // d16 tiles 6..11 of the current tile (loaded at its start, under the first WMMAs)
+    i32x16 d8[4];        // dS B operands: q tile i in d8[i] (the block's last tile: q tiles 2, 3 in d8[0], d8[1])
+    u32x4 sw[2][2];      // the scale words of the even / odd tile's two dS records
+    int dsc[2];
+    // the loads of tile T (stage st): K8T fragments into set P, q tiles i0, i0 + 1's dS into d8[db], d8[db + 1], scales
+    auto load_frag = [&](unsigned st, int P, auto i0c, auto dbc) __attribute__((always_inline)) {
+        constexpr int i0 = decltype(i0c)::value, db = decltype(dbc)::value;
+        const int ln = lane_now(), r16 = ln & 15, hh = ln >> 4;
+        const uint32_t trb = pin(st + tr8_off(ln) + (unsigned)(1024 * (wv >> 1) + 8 * (wv & 1)));
+        static_for<2>([&](auto kk) {
+            constexpr int i = i0 + (int)kk;
+            constexpr int oi = (i / 2) * X_DS1 + 2048 * (i % 2);
+            static_for<8>([&](auto jj) {
+                constexpr int J = jj;
+                const i32x2 v = __builtin_amdgcn_ds_load_tr8_b64_v2i32(
+                    (__attribute__((address_space(3))) i32x2 *)(uintptr_t)(trb + (unsigned)(oi + 4096 * (J / 2) + 512 * (J % 2))));
+                d8[db + (int)kk][2 * J] = v[0];
+                d8[db + (int)kk][2 * J + 1] = v[1];
+            });
+        });
+        sw[P][0] = lds_b128(lds_ptr(st), 16384);
+        sw[P][1] = lds_b128(lds_ptr(st), X_DS1 + 16384);
+        const uint32_t kt_t = pin(st + X_KT + (unsigned)(r16 * X128 + 64 * hh)), kt_s = pin(st + X_KTS + (unsigned)(ln * 4));
+        static_for<6>([&](auto dd) {
+            constexpr int dt = dd;
+            const lds_u8 *tp = lds_ptr(kt_t);
+            constexpr int o = 16 * dt * X128;
+            kfa[P][dt] = AF{cat4(lds_b128(tp, o), lds_b128(tp, o + 16), lds_b128(tp, o + 32), lds_b128(tp, o + 48)),
+                            (int)lds_b32(lds_ptr(kt_s), 32 * (dt / 2) * 4)};
+        });
+    };
+    // d16 tiles 6..11 of the tile in stage st
+    auto load_kfb = [&](unsigned st) __attribute__((always_inline)) {
+        const int ln = lane_now(), r16 = ln & 15, hh = ln >> 4;
+        const uint32_t kt_t = pin(st + X_KT + (unsigned)(r16 * X128 + 64 * hh)), kt_s = pin(st + X_KTS + (unsigned)(ln * 4));
+        static_for<6>([&](auto dd) {
+            constexpr int dt = 6 + (int)dd;
+            const lds_u8 *tp = lds_ptr(kt_t);
+            constexpr int o = 16 * dt * X128;
+            kfb[(int)dd] = AF{cat4(lds_b128(tp, o), lds_b128(tp, o + 16), lds_b128(tp, o + 32), lds_b128(tp, o + 48)),
+                              (int)lds_b32(lds_ptr(kt_s), 32 * (dt / 2) * 4)};
+        });
+    };
+    // q tile i's dS of tile T (stage st) into d8[db] (the first half's loads of q tiles 2, 3)
+    auto ldx = [&](unsigned st, auto ic, auto dbc) __attribute__((always_inline)) {
+        constexpr int i = decltype(ic)::value, db = decltype(dbc)::value;
+        const int ln = lane_now();
+        const uint32_t trb = pin(st + tr8_off(ln) + (unsigned)(1024 * (wv >> 1) + 8 * (wv & 1)));
+        constexpr int oi = (i / 2) * X_DS1 + 2048 * (i % 2);
+        static_for<8>([&](auto jj) {
+            constexpr int J = jj;
+            const i32x2 v = __builtin_amdgcn_ds_load_tr8_b64_v2i32(
+                (__attribute__((address_space(3))) i32x2 *)(uintptr_t)(trb + (unsigned)(oi + 4096 * (J / 2) + 512 * (J % 2))));
+            d8[db][2 * J] = v[0];
+            d8[db][2 * J + 1] = v[1];
+        });
+    };
+    auto quant = [&](int P, auto ic) __attribute__((always_inline)) {
+        constexpr int i = decltype(ic)::value;
+        const unsigned sh = 16u * (unsigned)(i % 2) + 8u * (unsigned)(wv >> 1);
+        const u32x4 &s = sw[P][i / 2];
+        dsc[i % 2] = (int)(__builtin_amdgcn_ubfe(s[0], sh, 8) | (__builtin_amdgcn_ubfe(s[1], sh, 8) << 8) |
+                           (__builtin_amdgcn_ubfe(s[2], sh, 8) << 16) | (__builtin_amdgcn_ubfe(s[3], sh, 8) << 24));
+    };
+    // q tile i's WMMAs over d16 tiles h0 .. h0 + 5 (h0 0: set kfa[P], 6: kfb), dS operand d8[db], scale word dsc[i % 2]
+    auto wmmas = [&](int P, auto ic, auto dbc, auto hc) __attribute__((always_inline)) {
+        constexpr int i = decltype(ic)::value, db = decltype(dbc)::value, h0 = decltype(hc)::value;
+        static_for<6>([&](auto dd) {
+            constexpr int dt = h0 + (int)dd;
+            const AF &f = h0 == 0 ? kfa[P][(int)dd] : kfb[(int)dd];
+            if constexpr (dt % 2 == 0)
+                dq[dt][i] = wmma_mx<0, 0>(f.x, d8[db], dq[dt][i], f.s, dsc[i % 2]);
+            else
+                dq[dt][i] = wmma_mx<1, 0>(f.x, d8[db], dq[dt][i], f.s, dsc[i % 2]);
+        });
+    };
+    // tile T (global; P its parity in the block: register set), CL 0 interior / 1 the block's tile n - 2 / 2 its tile
+    // n - 1 (no dS of q block 2 qb: q tiles 2, 3 only, in d8[0], d8[1]). nx: the next tile's kind (0 normal, 2 a CL 2 tile,
+    // -1 none); trans: at a block's first tile with a previous block, issue the delayed tile T + 2 too (after the stores)
+    auto tile = [&](int T, auto pc, auto cl_c, auto nx_c, bool trans, bool skip3, bool has_next) __attribute__((always_inline)) {
+        constexpr int P = decltype(pc)::value, CL = decltype(cl_c)::value, NX = decltype(nx_c)::value;
+        const unsigned st = stage(T);
+        using I0 = std::integral_constant<int, 0>;
+        using I6 = std::integral_constant<int, 6>;
+        load_kfb(st);  // d16 tiles 6..11 of this tile, under the first WMMAs (d16 tiles 0..5 were prefetched)
+        if constexpr (CL != 2) {
+            // first half: q tiles 0, 1 (their dS in d8[0], d8[1]); q tiles 2, 3's dS loaded under them
+            ldx(st, std::integral_constant<int, 2>{}, std::integral_constant<int, 2>{});
+            quant(P, std::integral_constant<int, 0>{});
+            const int dsc0 = dsc[0];
+            quant(P, std::integral_constant<int, 1>{});
+            const int dsc1 = dsc[1];
+            fence();
+            dsc[0] = dsc0;
+            wmmas(P, std::integral_constant<int, 0>{}, std::integral_constant<int, 0>{}, I0{});
+            wmmas(P, std::integral_constant<int, 1>{}, std::integral_constant<int, 1>{}, I0{});
+            fence();
+            ldx(st, std::integral_constant<int, 3>{}, std::integral_constant<int, 3>{});
+            wmmas(P, std::integral_constant<int, 0>{}, std::integral_constant<int, 0>{}, I6{});
+            dsc[1] = dsc1;
+            wmmas(P, std::integral_constant<int, 1>{}, std::integral_constant<int, 1>{}, I6{});
+            fence();
+        }
+        // tile T + 1 landed and visible; every wave is done with tile T - 1 (and this tile's first half)
+        if (trans)
+            tensor_wait<0>();  // + the previous block's dQ stores (they read the stages tiles T + 2, T + 3 take)
+        else
+            tensor_wait<1>();
+        bar_signal();
+        bar_wait();
+        if (trans) issue(T + 2, true);
+        issue(T + 3, !skip3);
+        if constexpr (NX == 2)
+            load_frag(stage(T + 1), 1 - P, std::integral_constant<int, 2>{}, std::integral_constant<int, 0>{});
+        else if constexpr (CL != 2) {
+            if (has_next) load_frag(stage(T + 1), 1 - P, std::integral_constant<int, 0>{}, std::integral_constant<int, 0>{});
+        }
+        fence();
+        // second half: q tiles 2, 3
+        constexpr int b2 = CL == 2 ? 0 : 2;
+        quant(P, std::integral_constant<int, 2>{});
+        wmmas(P, std::integral_constant<int, 2>{}, std::integral_constant<int, b2>{}, I0{});
+        wmmas(P, std::integral_constant<int, 2>{}, std::integral_constant<int, b2>{}, I6{});
+        fence();
+        quant(P, std::integral_constant<int, 3>{});
+        wmmas(P, std::integral_constant<int, 3>{}, std::integral_constant<int, b2 + 1>{}, I0{});
+        wmmas(P, std::integral_constant<int, 3>{}, std::integral_constant<int, b2 + 1>{}, I6{});
+        fence();
+        // a block's last tile: its q tiles 2, 3 used d8[0], d8[1]: the next block's tile 0 loads after them
+        if constexpr (CL == 2 && NX != 2)
+            if (has_next) load_frag(stage(T + 1), 1 - P, std::integral_constant<int, 0>{}, std::integral_constant<int, 0>{});
+    };
+    // a block's epilogue: dQ rows as bf16 into the stages of its last two tiles (adjacent), skewed regions, TDM stores
+    constexpr int XDQ = 2 * D_QK;
+    constexpr unsigned RG = 16 * XDQ + 16;
+    auto epilogue = [&](int Tl, int q0) __attribute__((always_inline)) {
+        tensor_wait<0>();
+        bar_signal();
+        bar_wait();
+        const int ln = lane_now();
+        const unsigned stg = stage(Tl - 1);  // Tl - 1 = n - 2 + block start: even, so stages Tl - 1, Tl are adjacent
+        static_for<QTW>([&](auto ii) {
+            constexpr int i = ii;
+            const unsigned rowb = stg + (unsigned)((ln & 15) * RG + (4 * i + wv) * XDQ + 16 * (ln >> 4));
+            static_for<12>([&](auto dd) {
+                constexpr int dt = dd;
+                bf16x8 w;
+                static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dq[dt][i][(int)rr] * scale); });
+                *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(rowb + 32 * dt) = __builtin_bit_cast(u32x4, w);
+            });
+        });
+        bar_signal();
+        bar_wait();
+        const unsigned long long g = (unsigned long long)(uintptr_t)(DQ + (long long)b * dq_sb + (long long)q0 * dq_ss +
+                                                                     (long long)h * D_QK);
+        const unsigned long long rs = 2ull * (unsigned long long)dq_ss;
+        static_for<4>([&](auto jj) {
+            const int j = 4 * wv + (int)jj;
+            tdm_store(tdm_g0(stg + (unsigned)j * RG, g + (unsigned long long)j * rs),
+                      tdm_g1(tdm_w0(0, 0, 0), 16, XDQ, 16, 16ull * rs));
+        });
+    };
+    // ring start: tiles 0, 1, 2; tile 0's loads
+    issue(0, true);
+    issue(1, true);
+    issue(2, true);
+    tensor_wait<2>();
+    bar_signal();
+    bar_wait();
+    load_frag(stage(0), 0, std::integral_constant<int, 0>{}, std::integral_constant<int, 0>{});
+    int T0 = 0;
+    for (int k = 0; k < nblk; ++k) {
+        const int n = k == 0 ? n0 : n1, q0 = (k == 0 ? qbs[0] : qbs[1]) * BMQ;
+        // the previous block staged its dQ in the stages of tiles T0 - 2, T0 - 1 (= T0 + 2, T0 + 3): this block's tile 0
+        // issues tile T0 + 2 too, after the stores; the previous block's last two mid-tile issues of T0 + 2 / T0 + 3: NULL
+        const bool tr = k > 0;
+        const bool more = k + 1 < nblk;  // a next block: its tiles 0, 1 load ahead, 2, 3 wait for the staging
+        using C0 = std::integral_constant<int, 0>;
+        using C1 = std::integral_constant<int, 1>;
+        using C2 = std::integral_constant<int, 2>;
+        for (int t = 0; t < n - 2; t += 2) {
+            tile(T0 + t, C0{}, C0{}, C0{}, tr && t == 0, false, true);
+            tile(T0 + t + 1, C1{}, C0{}, C0{}, false, false, true);
+        }
+        // tile n - 2 issues T0 + n + 1 (the next block's tile 1); tile n - 1 would issue T0 + n + 2 (a staging stage):
+        // NULL (issued at the next block's tile 0, after the stores)
+        tile(T0 + n - 2, C0{}, C1{}, C2{}, tr && n == 2, false, true);
+        tile(T0 + n - 1, C1{}, C2{}, C0{}, false, true, more);
+        epilogue(T0 + n - 1, q0);
+        T0 += n;
+        if (more)
+            static_for<12>([&](auto d) {
+                static_for<QTW>([&](auto i) { dq[(int)d][(int)i] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; });
+            });
+    }
+    tensor_wait<0>();
+}
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+void k_dqg_mx8x(const unsigned char *__restrict__ DSB, const unsigned char *__restrict__ K8T,
+                const unsigned char *__restrict__ KTS, bf16 *__restrict__ DQ, float scale, int S, int H, int B,
+                long long dq_sb, long long dq_ss) {
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[X_LDS_B];
+    dqg3_body(DSB, K8T, KTS, DQ, scale, S, H, B, dq_sb, dq_ss, smem);
+}
+
 // rung b8: dQ over k_dkdv_mx8's fp8 dS (paired grid as k_dqg_mx; the unpaired launch also takes dqg2_body)
 extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
 void k_dqg_mx8(const unsigned char *__restrict__ DSB, const unsigned char *__restrict__ K8T,
