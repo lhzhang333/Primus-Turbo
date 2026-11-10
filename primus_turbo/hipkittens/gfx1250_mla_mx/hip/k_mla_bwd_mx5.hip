@@ -156,6 +156,43 @@ using namespace mx;
 #ifndef DSO_NT
 #define DSO_NT 0  // b7: the dS stores non-temporal (th:TH_STORE_NT: streamed, not kept in the caches)
 #endif
+#ifndef DKDV_CL
+#define DKDV_CL 0  // 2: dK / dV in workgroup clusters of 2 (kv blocks 2 p, 2 p + 1 of one (b, h)): rank 0 runs its diagonal
+                   // step last, so both take q block 2 p + 1 + s at step s, and their q / A TDM loads of those steps are
+                   // multicast (both issue the same load with workgroup mask 0b11: one fetch for the pair)
+#endif
+#ifndef DKDV_CL_MC
+#define DKDV_CL_MC 1  // DKDV_CL: 0 no multicast mask (timing: the pairing and step order alone)
+#endif
+#ifndef DKDV_CL_REORDER
+#define DKDV_CL_REORDER 1  // DKDV_CL: 0 both ranks diagonal first (timing only: the steps do not align)
+#endif
+#ifndef DKDV_CL_ATTR
+#define DKDV_CL_ATTR 1  // DKDV_CL: 0 a plain launch (rank = blockIdx.x & 1; timing only without multicast)
+#endif
+#ifndef DKDV_CL_BAR
+#define DKDV_CL_BAR 0  // DKDV_CL_REORDER 0: 1 the per-step barrier is also a cluster barrier (rank 1 one extra at the start:
+                       // its step s meets rank 0's step s + 1, so both issue the same round right after it)
+#endif
+#ifndef DKDV_MC_EARLY
+#define DKDV_MC_EARLY 1  // DKDV_CL: the early-timeout bit of the multicast loads
+#endif
+#if DKDV_CL == 2 && !TDM_INC
+#error "DKDV_CL needs TDM_INC"
+#endif
+#if DKDV_CL == 2 && DKDV_CL_ATTR
+#define DKDV_CLATTR __cluster_dims__(2, 1, 1)
+#else
+#define DKDV_CLATTR
+#endif
+#ifndef DKDV_MEMMASK
+#define DKDV_MEMMASK 0x7ff  // timing probes only: the dkdv TDM ops k (dk_op) that move data (bit k)
+#endif
+#ifndef DKDV_MEMPROBE
+#define DKDV_MEMPROBE 0  // timing probes only (wrong results): 1 the step loop keeps its TDM rounds, waits and barriers but
+                         // computes nothing; 2 as 1 + the dS stores (DSO); 3 the full loop with every TDM op moving no data;
+                         // 4 / 5 as 1 with only the q part / the A part of the rounds moving data
+#endif
 
 namespace {
 constexpr int D_QK = 192, D_V = 128;
@@ -257,6 +294,18 @@ struct DsQ {
     int byte;
     u32x2 a, b;
 };
+// the max over the wave's 32 lanes (every lane gets it): DPP row_xmask 1, 2, 4, 8 in each row of 16, then lane l ^ 16
+template <int CTL>
+MX_INLINE float dpp_f(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, v), CTL, 0xf, 0xf, false));
+}
+MX_INLINE float wave_max32(float x) {
+    x = __builtin_fmaxf(x, dpp_f<0x161>(x));
+    x = __builtin_fmaxf(x, dpp_f<0x162>(x));
+    x = __builtin_fmaxf(x, dpp_f<0x164>(x));
+    x = __builtin_fmaxf(x, dpp_f<0x168>(x));
+    return __builtin_fmaxf(x, peer(x));
+}
 MX_INLINE DsQ quant_pair(const f32x8 &x0, const f32x8 &x1) {
     float a = 0.f;
     static_for<8>([&](auto rr) {
@@ -286,12 +335,18 @@ MX_INLINE BlockOf xcd_block(int nblk, int H, int B) {
 // (512 B) holds kv16 tile 2 w + j x q16 tile qt as k_dkdv_mx's wave w computes it in slot qt: lane L = kv % 16 + 16 (q %
 // 16 / 8) at 16 L, its 8 q values (q % 8 = r) at 16 L + 2 r
 constexpr int DS_TILE = 128 * 128 * 2;
+// rung b8: dS as fp8 E4M3 with one E8M0 scale per 32 q x 32 kv block (the dK operand k_dkdv_mx builds, also dQ's): per
+// (b, h) the same causal tile order, DS8_TILE bytes each: wave w's 4 KB at 4096 w, chunk 2 m + j (512 B) = slot pair m
+// (q 32 m .. + 31) of kv16 tile j, lane L = kv % 16 + 16 (q % 16 / 8) at 16 L, byte 8 s + r = q 32 m + 16 s + 8 (L / 16)
+// + r (k_dkdv_mx's dK B-operand bytes); the scales at 16384 + 4 w (byte m = slot pair m of wave w's 32 kv rows)
+constexpr int DS8_TILE = 128 * 128 + 128;
 __host__ __device__ constexpr int ds_tile_index(int kb, int qb) { return qb * (qb + 1) / 2 + kb; }
 typedef __attribute__((address_space(1))) unsigned char g_u8;
 typedef __attribute__((address_space(1))) u32x4 g_u32x4;
 struct DsOut {
     g_u8 *tile;     // uniform: this wave's part of the step's dS tile
     unsigned voff;  // the lane's 16-byte slot of a chunk
+    g_u8 *scl;      // b8: this wave's scale word of the tile
 };
 MX_INLINE void ds_store16(g_u8 *p, u32x4 v) {
     if constexpr (DSO_PROBE == 2) {
@@ -406,8 +461,10 @@ static_assert(gs(NQT) == 20, "groups");
 
 // the kernel body; SPLIT: dK's nope columns (d < 128) to DK (its rows d 0..127 only) and the rope columns to DKP (the
 // fused-RoPE path: DK = the kv gradient [.., 0:128], DKP a per-head [b, s, h, 64] buffer), else 192-column dK rows.
-// DSO (rung b7): also store dS = P (dP - delta) as bf16 to DSB in the tile layout k_dqg_mx reads (ds_tile_index)
-template <bool SPLIT, bool DSO = false>
+// DSO 1 (rung b7): also store dS = P (dP - delta) as bf16 to DSB in the tile layout k_dqg_mx reads (ds_tile_index);
+// DSO 2 (rung b8): dK's dS operand quantized with one scale per 32 q x 32 kv block and stored as is (fp8 + scales:
+// DS8_TILE layout) for k_dqg_mx8
+template <bool SPLIT, int DSO = 0>
 __device__ __forceinline__ void dkdv_body(
     const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS, const unsigned char *__restrict__ K8,
     const unsigned char *__restrict__ KS, const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
@@ -443,13 +500,43 @@ __device__ __forceinline__ void dkdv_body(
         }
     }
 #else
-    const int kb = blk.slot, h = blk.h, b = blk.b;
+    int kb = blk.slot, h = blk.h, b = blk.b;
 #endif
+    // DKDV_CL: dlast = this workgroup (cluster rank 0, kv block 2 p) runs its diagonal step last
+    [[maybe_unused]] bool dlast = false;
+    // DKDV_CL_REORDER 0: crank 1 (kv block 2 p + 1) runs one step behind rank 0 in q blocks: its step s is rank 0's step
+    // s + 1 (q block 2 p + 1 + s), so its LDS rings are rotated by one stage (rot) and its round r matches rank 0's r + 1
+    [[maybe_unused]] int crank = 0, rot = 0;
+    if constexpr (DKDV_CL == 2) {
+        const int npair = S / (2 * KB),
+                  rank = DKDV_CL_ATTR ? (int)__builtin_amdgcn_cluster_workgroup_id_x() : (int)(blockIdx.x & 1);
+        const int Lc = (int)(blockIdx.x >> 1) + npair * ((int)blockIdx.y + H * (int)blockIdx.z);
+        int pair, bhx;
+        if ((B * H) % 8 == 0) {
+            const int k = Lc >> 3;
+            bhx = (Lc & 7) + 8 * (k / npair);
+            pair = k % npair;
+        } else {
+            pair = (int)(blockIdx.x >> 1);
+            bhx = (int)blockIdx.y + H * (int)blockIdx.z;
+        }
+        h = bhx % H;
+        b = bhx / H;
+        kb = 2 * pair + rank;
+        dlast = DKDV_CL_REORDER && rank == 0;
+        crank = rank;
+        rot = DKDV_CL_REORDER ? 0 : rank;
+    }
     const int kv0 = kb * KB;
     const int qs0 = kv0;  // KB == QS_
     const int nst = (S - qs0) / QS_;
     const unsigned long long bh = (unsigned long long)b * H + h;
     const int kvw = kv0 + KBW * wv;  // this wave's first kv row
+    // the q block of step s (DKDV_CL rank 0: kb + 1 + s, its diagonal block kb at the last step)
+    auto qblk = [&](int s) __attribute__((always_inline)) -> int {
+        if constexpr (DKDV_CL == 2) return dlast ? (s < nst - 1 ? kb + 1 + s : kb) : kb + s;
+        return kb + s;
+    };
 
 #if !PRO_TDM_FIRST
     // ---- resident B operands: the wave's K / V rows
@@ -502,6 +589,8 @@ __device__ __forceinline__ void dkdv_body(
         unsigned long long ga, inc;
         unsigned lds, lbase, lstep;
         int si;
+        bool ap;
+        int k;
     };
     auto mk_run = [&](const TdmOp &op, int k) __attribute__((always_inline)) -> OpRun {
         const bool ap = k >= 5 && k <= 8;
@@ -511,13 +600,28 @@ __device__ __forceinline__ void dkdv_body(
         o.ga = op.base + (unsigned long long)qs0 * op.mult;
         o.lbase = (ap ? lds0 + ARING : lds0) + op.lds;
         o.lstep = ap ? (unsigned)ASTG : (unsigned)QSTG;
-        o.lds = ap ? o.lbase + 2 * o.lstep : o.lbase;  // stage (si mod 3)
+        o.lds = o.lbase + (unsigned)(((ap ? 2 : 0) + rot) % 3) * o.lstep;  // stage ((si + rot) mod 3)
+        o.ap = ap;
+        o.k = k;
         return o;
     };
     OpRun run0 = mk_run(op0, k0), run1 = mk_run(op1, k1), run2 = mk_run(op2, k2);
     auto issue_one = [&](const TdmOp &op, OpRun &o) __attribute__((always_inline)) {
-        const bool real = o.si >= 0 && o.si < nst;
-        tdm_load(tdm_g0(o.lds, o.ga, real ? op.on : 0), op.g1);
+        const bool real = o.si >= 0 && o.si < nst && DKDV_MEMPROBE != 3 && !(DKDV_MEMPROBE == 4 && o.ap) &&
+                          !(DKDV_MEMPROBE == 5 && !o.ap) && ((DKDV_MEMMASK >> o.k) & 1);
+        if constexpr (DKDV_CL == 2) {
+            // the step's q block directly (rank 0's last step jumps back to its diagonal block); multicast unless it is
+            // rank 0's diagonal step (the partner has none)
+            const int sc = o.si < 0 ? 0 : (o.si < nst ? o.si : nst - 1);
+            const unsigned long long ga = op.base + (unsigned long long)(qblk(sc) * QS_) * op.mult;
+            const bool partner = DKDV_CL_REORDER ? !(dlast && o.si == nst - 1) : !(crank == 0 && o.si == 0);
+            const bool mc = DKDV_CL_MC && real && partner;
+            i32x8 g1 = op.g1;
+            g1[0] |= mc ? (int)(3u | (DKDV_MC_EARLY ? (1u << 21) : 0u)) : 0;
+            tdm_load(tdm_g0(o.lds, ga, real ? op.on : 0), g1);
+        } else {
+            tdm_load(tdm_g0(o.lds, o.ga, real ? op.on : 0), op.g1);
+        }
         o.ga = (o.si >= 0 && o.si + 1 < nst) ? o.ga + o.inc : o.ga;
         o.lds = o.lds == o.lbase + 2 * o.lstep ? o.lbase : o.lds + o.lstep;
         o.si += 1;
@@ -543,7 +647,21 @@ __device__ __forceinline__ void dkdv_body(
         issue_one(op2, k2, r);
     };
 #endif
+    // the cluster part of a barrier (after the workgroup barrier): one signal per workgroup, every wave waits
+    [[maybe_unused]] auto cl_bar = [&]() __attribute__((always_inline)) {
+        if constexpr (DKDV_CL == 2 && DKDV_CL_BAR) {
+            if (wv == 0) __builtin_amdgcn_s_barrier_signal(-3);
+            __builtin_amdgcn_s_barrier_wait(-3);
+        }
+    };
     issue_round(0);
+    if constexpr (DKDV_CL == 2 && DKDV_CL_BAR && !DKDV_CL_REORDER) {
+        if (crank == 1) {  // meets rank 0's barrier of step 0, after which rank 0 issues round 2 (= this round 1)
+            bar_signal();
+            bar_wait();
+            cl_bar();
+        }
+    }
     issue_round(1);
 #if PRO_TDM_FIRST
     // ---- resident B operands: the wave's K / V rows
@@ -571,8 +689,8 @@ __device__ __forceinline__ void dkdv_body(
     static_for<12>([&](auto d) { static_for<NJ>([&](auto j) { dk[(int)d][(int)j] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
 
     auto addr = [&](int s) __attribute__((always_inline)) -> StepAddr {
-        const unsigned sq = lds0 + (unsigned)((s % NSTG) * QSTG);
-        const unsigned sa = lds0 + ARING + (unsigned)(((s + NSTG - 1) % NSTG) * ASTG);  // the A part of step s - 1
+        const unsigned sq = lds0 + (unsigned)(((s + rot) % NSTG) * QSTG);
+        const unsigned sa = lds0 + ARING + (unsigned)(((s + rot + NSTG - 1) % NSTG) * ASTG);  // the A part of step s - 1
         const int ln = lane_now(), r16 = ln & 15, hh = ln >> 4;
         const unsigned rq = sq + (unsigned)(r16 * XK), r1 = sq + (unsigned)(r16 * X128), ra = sa + (unsigned)(r16 * X128);
         const unsigned lo = LTDT_DPP ? (unsigned)(4 * (8 * hh + (ln & 7))) : (unsigned)(32 * hh);
@@ -636,6 +754,7 @@ __device__ __forceinline__ void dkdv_body(
         int thr[NJ];
         static_for<NJ>([&](auto jj) { thr[(int)jj] = kvw + 16 * (int)jj + lr - q0 - 8 * lh; });
         f32x8 dsprev[NJ];
+        [[maybe_unused]] f32x8 dscur[NJ];    // b8: the odd slot's dS
         [[maybe_unused]] u32x4 dswprev[NJ];  // DK_BF16: the even slot's bf16 dS
         AFrag ab[20];
 #if MIDSYNC
@@ -730,7 +849,7 @@ __device__ __forceinline__ void dkdv_body(
                     ds[r] = pv * dp[r];
                 });
                 [[maybe_unused]] u32x4 wq = {0u, 0u, 0u, 0u};
-                if constexpr (DSO) {
+                if constexpr (DSO == 1) {
                     // the chunk (wv, qt, j): this lane's 8 q values (rows 8 lh + r) of kv column lr, as bf16 (one vector
                     // conversion: scalar ones let the SLP vectorizer re-schedule the block, moving slots' dV / dK
                     // WMMAs to the step end, 96 VGPRs spilled)
@@ -748,7 +867,13 @@ __device__ __forceinline__ void dkdv_body(
 #endif
                 pB[j][2 * qt] = (int)pq[0];
                 pB[j][2 * qt + 1] = (int)pq[1];
-                if constexpr (DSO && DK_BF16) {
+                if constexpr (DSO == 2) {
+                    // b8: the slot pair's 32 q x 32 kv block is quantized after both kv16 tiles (below)
+                    if constexpr (qt % 2 == 0)
+                        dsprev[j] = ds;
+                    else
+                        dscur[j] = ds;
+                } else if constexpr (DSO == 1 && DK_BF16) {
                     // dK's dS block (q 32 (qt / 2) .. + 31 of kv column lr): the bf16 values as stored (dQ's recipe)
                     if constexpr (qt % 2 == 0) {
                         dswprev[j] = wq;
@@ -780,13 +905,37 @@ __device__ __forceinline__ void dkdv_body(
                     dss[j] |= z.byte << (8 * (qt / 2));
                 }
             });
+            if constexpr (DSO == 2 && qt % 2 == 1) {
+                // b8: |dS| max over the block (this lane's 2 x 2 x 8 values, then the wave), one E8M0 scale for both kv16
+                // tiles' dK operand bytes. Kept in VGPRs (no readfirstlane): with a uniform scale word LLVM feeds the dK
+                // WMMAs an SGPR scale operand, and dK came out wrong (b8_test 11-10: 2 dB)
+                float a = 0.f;
+                static_for<NJ>([&](auto jj) {
+                    static_for<8>([&](auto rr) {
+                        a = __builtin_fmaxf(a, __builtin_fmaxf(__builtin_fabsf(dsprev[(int)jj][(int)rr]),
+                                                               __builtin_fabsf(dscur[(int)jj][(int)rr])));
+                    });
+                });
+                a = wave_max32(a);
+                const int byte = e8m0_byte(a);
+                const float sc = e8m0_scale(byte);
+                static_for<NJ>([&](auto jj) {
+                    constexpr int j = jj;
+                    const u32x2 c0 = cvt8_e4m3(dsprev[j], sc), c1 = cvt8_e4m3(dscur[j], sc);
+                    dsB[j][2 * (qt - 1)] = (int)c0[0];
+                    dsB[j][2 * (qt - 1) + 1] = (int)c0[1];
+                    dsB[j][2 * qt] = (int)c1[0];
+                    dsB[j][2 * qt + 1] = (int)c1[1];
+                    dss[j] |= byte << (8 * (qt / 2));
+                });
+            }
             if constexpr (PREV)
                 static_for<gs(qt + 1) - gs(qt)>([&](auto i) {
                     constexpr int g = gs(qt) + (int)i;
                     group(std::integral_constant<int, g>{}, ab[g], pBo, dsBo, dsso);
                 });
             auto dso_store = [&]() __attribute__((always_inline)) {
-                if constexpr (DSO && DSO_LATE != 0)
+                if constexpr (DSO == 1 && DSO_LATE != 0)
                     static_for<NJ>([&](auto jj) {
                         ds_store16(dsp.tile + dsp.voff + (2 * qt + (int)jj) * 512, dso_w[(int)jj]);
                     });
@@ -819,8 +968,8 @@ __device__ __forceinline__ void dkdv_body(
             }
             fence();
             if constexpr (DSO_LATE == 2) dso_store();
-            if constexpr (DSO && DSO_LATE >= 3) static_for<NJ>([&](auto jj) { dso_all[DSO_LATE >= 3 ? qt : 0][(int)jj] = dso_w[(int)jj]; });
-            if constexpr (DSO && DSO_LATE == 4 && qt == 3)
+            if constexpr (DSO == 1 && DSO_LATE >= 3) static_for<NJ>([&](auto jj) { dso_all[DSO_LATE >= 3 ? qt : 0][(int)jj] = dso_w[(int)jj]; });
+            if constexpr (DSO == 1 && DSO_LATE == 4 && qt == 3)
                 static_for<4>([&](auto qq) {
                     static_for<NJ>([&](auto jj) {
                         ds_store16(dsp.tile + dsp.voff + (2 * (int)qq + (int)jj) * 512, dso_all[(int)qq][(int)jj]);
@@ -828,13 +977,26 @@ __device__ __forceinline__ void dkdv_body(
                 });
             if constexpr (qt + 1 < NQT) cur = nxt;
         });
-        if constexpr (DSO && DSO_LATE >= 3)
+        if constexpr (DSO == 1 && DSO_LATE >= 3)
             static_for<NQT>([&](auto qq) {
                 if constexpr (DSO_LATE == 3 || (int)qq >= 4)
                     static_for<NJ>([&](auto jj) {
                         ds_store16(dsp.tile + dsp.voff + (2 * (int)qq + (int)jj) * 512, dso_all[(int)qq][(int)jj]);
                     });
             });
+        if constexpr (DSO == 2) {
+            // b8: the step's dK operand bytes (chunk 2 m + j: dwords 4 m .. 4 m + 3 of kv16 tile j) and the scale word
+            // (every lane stores the same word)
+            static_for<4>([&](auto mm) {
+                static_for<NJ>([&](auto jj) {
+                    constexpr int m = mm, j = jj;
+                    ds_store16(dsp.tile + dsp.voff + (2 * m + j) * 512,
+                               u32x4{(unsigned)dsB[j][4 * m], (unsigned)dsB[j][4 * m + 1], (unsigned)dsB[j][4 * m + 2],
+                                     (unsigned)dsB[j][4 * m + 3]});
+                });
+            });
+            *(__attribute__((address_space(1))) unsigned *)dsp.scl = (unsigned)dss[0];
+        }
     };
 
     i32x16 pBo[NJ], dsBo[NJ];
@@ -842,14 +1004,20 @@ __device__ __forceinline__ void dkdv_body(
     QTile pre_t;
     AFrag pre_a[gs(1)];
     // DSO: step s's dS tile (kv block kb, q block kb + s), this wave's 8 KB, this lane's 16 B of each 512-byte chunk
-    const unsigned long long ds_bh = DSO ? (unsigned long long)(uintptr_t)DSB + bh * ds_tiles_per_bh(S) * DS_TILE : 0ull;
+    const unsigned long long ds_bh =
+        DSO ? (unsigned long long)(uintptr_t)DSB + bh * ds_tiles_per_bh(S) * (DSO == 2 ? DS8_TILE : DS_TILE) : 0ull;
     // (the wave's 8 KB of the tile as a uniform global base + the lane's 32-bit offset: global_store saddr)
     auto ds_ptr = [&](int s) __attribute__((always_inline)) -> DsOut {
-        if constexpr (!DSO) return DsOut{nullptr, 0u};
-        const int qbk = DSO_PROBE == 1 ? kb : kb + s;
+        if constexpr (!DSO) return DsOut{nullptr, 0u, nullptr};
+        const int qbk = DSO_PROBE == 1 ? kb : qblk(s);
+        if constexpr (DSO == 2) {
+            const unsigned long long rec = ds_bh + (unsigned long long)ds_tile_index(kb, qbk) * DS8_TILE;
+            return DsOut{(g_u8 *)(uintptr_t)(rec + (unsigned long long)(wv * 4096)), 16u * (unsigned)lane_now(),
+                         (g_u8 *)(uintptr_t)(rec + 16384ull + (unsigned long long)(wv * 4))};
+        }
         return DsOut{(g_u8 *)(uintptr_t)(ds_bh + (unsigned long long)ds_tile_index(kb, qbk) * DS_TILE +
                                          (unsigned long long)(wv * 8192)),
-                     16u * (unsigned)lane_now()};
+                     16u * (unsigned)lane_now(), nullptr};
     };
 #if MIDSYNC
     tensor_wait<TDM_PER_ROUND>();  // round 0 (the q part of step 0) landed; round 1 may be in flight
@@ -862,12 +1030,25 @@ __device__ __forceinline__ void dkdv_body(
         tensor_wait<TDM_PER_ROUND>();  // round s landed: the q part of step s, the A part of step s - 1
         bar_signal();
         bar_wait();          // visible to every wave; every wave is done with step s - 1 (and the dV / dK of s - 2)
+        cl_bar();
         issue_round(s + 2);  // q part of step s + 2 into step s - 1's q stage, A part of s + 1 into step s - 2's A stage
 #endif
         const StepAddr a = addr(s);
         i32x16 pB[NJ], dsB[NJ];
         int dss[NJ] = {};
-        step(s, ds_ptr(s), a, qs0 + s * QS_, pB, dsB, dss, pBo, dsBo, dsso, pre_t, pre_a, diag_c, prev_c);
+#if DKDV_MEMPROBE == 1 || DKDV_MEMPROBE == 2 || DKDV_MEMPROBE == 4 || DKDV_MEMPROBE == 5
+        (void)a;
+        static_for<NJ>([&](auto jj) {
+            pB[(int)jj] = i32x16{};
+            dsB[(int)jj] = i32x16{};
+        });
+        if constexpr (DKDV_MEMPROBE == 2 && DSO == 1) {
+            const DsOut d = ds_ptr(s);
+            static_for<2 * NQT>([&](auto i) { ds_store16(d.tile + d.voff + (int)i * 512, u32x4{(unsigned)s, 0u, 0u, 0u}); });
+        }
+#else
+        step(s, ds_ptr(s), a, qblk(s) * QS_, pB, dsB, dss, pBo, dsBo, dsso, pre_t, pre_a, diag_c, prev_c);
+#endif
         static_for<NJ>([&](auto jj) {
             pBo[(int)jj] = pB[(int)jj];
             dsBo[(int)jj] = dsB[(int)jj];
@@ -914,14 +1095,25 @@ __device__ __forceinline__ void dkdv_body(
             });
     }
 #else
-    run(0, std::true_type{}, std::false_type{});
-    for (int s = 1; s < nst; ++s) run(s, std::false_type{}, std::true_type{});
+    if constexpr (DKDV_CL == 2) {
+        if (dlast)
+            run(0, std::false_type{}, std::false_type{});
+        else
+            run(0, std::true_type{}, std::false_type{});
+        const int nloop = dlast ? nst - 1 : nst;
+        for (int s = 1; s < nloop; ++s) run(s, std::false_type{}, std::true_type{});
+        if (dlast) run(nst - 1, std::true_type{}, std::true_type{});
+    } else {
+        run(0, std::true_type{}, std::false_type{});
+        for (int s = 1; s < nst; ++s) run(s, std::false_type{}, std::true_type{});
+    }
 #endif
 
     // ---- the dV / dK of the last step (its A part: round nst), A fragments two groups ahead
     tensor_wait<0>();
     bar_signal();
     bar_wait();  // the last A part visible; every wave is done with the q ring
+    cl_bar();
     {
         const StepAddr a = addr(nst);
         constexpr int NAB = 4;
@@ -989,7 +1181,7 @@ __device__ __forceinline__ void dkdv_body(
         constexpr int D_DK = (P_END + 127) / 128 * 128, D_DP = D_DK + KB * XDN;
         static_assert(D_DP + (SPLIT ? KB * 128 : 0) <= ARING, "padded staging + dense dK inside the q ring");
         static_assert(KB * XDV <= ASTG, "dense dV inside one A stage");
-        const unsigned d_dv = (unsigned)(ARING + (nst % NSTG) * ASTG);
+        const unsigned d_dv = (unsigned)(ARING + ((nst + rot) % NSTG) * ASTG);
         const int ln = lane_now();
         static_for<NJ>([&](auto jj) {
             constexpr int j = jj;
@@ -1172,7 +1364,7 @@ __device__ __forceinline__ void dkdv_body(
 #endif
 }
 
-extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1))) DKDV_CLATTR
 void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
                const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
                const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
@@ -1189,7 +1381,7 @@ void k_dkdv_mx(const unsigned char *__restrict__ Q8, const unsigned char *__rest
 
 // the fused-RoPE path's variant: DK / DV views of the kv gradient [b, s, h, 256] (DK at d 0, DV at d 128; the head
 // stride 256 is fixed), dK's rope columns to DKP [b, s, h, 64] (dkp_sb / dkp_ss its b / s strides)
-extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1))) DKDV_CLATTR
 void k_dkdv_mxr(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
                 const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
                 const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
@@ -1205,7 +1397,7 @@ void k_dkdv_mxr(const unsigned char *__restrict__ Q8, const unsigned char *__res
 }
 
 // rung b7: k_dkdv_mx / k_dkdv_mxr that also store dS (bf16) to DSB for k_dqg_mx / k_dqg_mxr
-extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1))) DKDV_CLATTR
 void k_dkdv_mxd(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
                 const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
                 const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
@@ -1216,10 +1408,10 @@ void k_dkdv_mxd(const unsigned char *__restrict__ Q8, const unsigned char *__res
                 bf16 *__restrict__ DV, float scale, int S, int H, int B, long long dk_sb, long long dk_ss,
                 long long dv_sb, long long dv_ss, unsigned char *__restrict__ DSB) {
     __shared__ __attribute__((aligned(1024))) unsigned char smem[LDS_B];
-    dkdv_body<false, true>(Q8, QS, K8, KS, V8, VSR, DO8, DOS, DO8T, DOTS, Q8T, QTS, LSE2, DELTA, DK, DV, scale, S, H, B,
-                           dk_sb, dk_ss, dv_sb, dv_ss, nullptr, 0, 0, DSB, smem);
+    dkdv_body<false, 1>(Q8, QS, K8, KS, V8, VSR, DO8, DOS, DO8T, DOTS, Q8T, QTS, LSE2, DELTA, DK, DV, scale, S, H, B,
+                        dk_sb, dk_ss, dv_sb, dv_ss, nullptr, 0, 0, DSB, smem);
 }
-extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1))) DKDV_CLATTR
 void k_dkdv_mxrd(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
                  const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
                  const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
@@ -1231,8 +1423,40 @@ void k_dkdv_mxrd(const unsigned char *__restrict__ Q8, const unsigned char *__re
                  long long dv_sb, long long dv_ss, bf16 *__restrict__ DKP, long long dkp_sb, long long dkp_ss,
                  unsigned char *__restrict__ DSB) {
     __shared__ __attribute__((aligned(1024))) unsigned char smem[LDS_B];
-    dkdv_body<true, true>(Q8, QS, K8, KS, V8, VSR, DO8, DOS, DO8T, DOTS, Q8T, QTS, LSE2, DELTA, DK, DV, scale, S, H, B,
-                          dk_sb, dk_ss, dv_sb, dv_ss, DKP, dkp_sb, dkp_ss, DSB, smem);
+    dkdv_body<true, 1>(Q8, QS, K8, KS, V8, VSR, DO8, DOS, DO8T, DOTS, Q8T, QTS, LSE2, DELTA, DK, DV, scale, S, H, B,
+                       dk_sb, dk_ss, dv_sb, dv_ss, DKP, dkp_sb, dkp_ss, DSB, smem);
+}
+
+// rung b8: k_dkdv_mxd / k_dkdv_mxrd with dK's dS operand on 32 q x 32 kv block scales, stored as is (fp8 + scales,
+// DS8_TILE layout) for k_dqg_mx8 / k_dqg_mxr8
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1))) DKDV_CLATTR
+void k_dkdv_mx8(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
+                const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
+                const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
+                const unsigned char *__restrict__ DO8, const unsigned char *__restrict__ DOS,
+                const unsigned char *__restrict__ DO8T, const unsigned char *__restrict__ DOTS,
+                const unsigned char *__restrict__ Q8T, const unsigned char *__restrict__ QTS,
+                const float *__restrict__ LSE2, const float *__restrict__ DELTA, bf16 *__restrict__ DK,
+                bf16 *__restrict__ DV, float scale, int S, int H, int B, long long dk_sb, long long dk_ss,
+                long long dv_sb, long long dv_ss, unsigned char *__restrict__ DSB) {
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[LDS_B];
+    dkdv_body<false, 2>(Q8, QS, K8, KS, V8, VSR, DO8, DOS, DO8T, DOTS, Q8T, QTS, LSE2, DELTA, DK, DV, scale, S, H, B,
+                        dk_sb, dk_ss, dv_sb, dv_ss, nullptr, 0, 0, DSB, smem);
+}
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1))) DKDV_CLATTR
+void k_dkdv_mxr8(const unsigned char *__restrict__ Q8, const unsigned char *__restrict__ QS,
+                 const unsigned char *__restrict__ K8, const unsigned char *__restrict__ KS,
+                 const unsigned char *__restrict__ V8, const unsigned char *__restrict__ VSR,
+                 const unsigned char *__restrict__ DO8, const unsigned char *__restrict__ DOS,
+                 const unsigned char *__restrict__ DO8T, const unsigned char *__restrict__ DOTS,
+                 const unsigned char *__restrict__ Q8T, const unsigned char *__restrict__ QTS,
+                 const float *__restrict__ LSE2, const float *__restrict__ DELTA, bf16 *__restrict__ DK,
+                 bf16 *__restrict__ DV, float scale, int S, int H, int B, long long dk_sb, long long dk_ss,
+                 long long dv_sb, long long dv_ss, bf16 *__restrict__ DKP, long long dkp_sb, long long dkp_ss,
+                 unsigned char *__restrict__ DSB) {
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[LDS_B];
+    dkdv_body<true, 2>(Q8, QS, K8, KS, V8, VSR, DO8, DOS, DO8T, DOTS, Q8T, QTS, LSE2, DELTA, DK, DV, scale, S, H, B,
+                       dk_sb, dk_ss, dv_sb, dv_ss, DKP, dkp_sb, dkp_ss, DSB, smem);
 }
 
 // =====================================================================================================================
@@ -1844,6 +2068,14 @@ MX_INLINE unsigned tr_off(int l) {
     if constexpr (DQG_TR == 0) return (unsigned)(256 * ((l >> 3) & 1) + 128 * (l >> 4) + 16 * (l & 7));
     else return (unsigned)(16 * l);
 }
+typedef int i32x2 __attribute__((ext_vector_type(2)));
+// ds_load_tr8_b64 (probed, scratch_mx/bt/trload8.py): in each 16-lane half H, lane l (c = l % 8, sub = l % 16 / 8) gets
+// byte column c of 8 rows of 8 B, element e from the row lane 16 H + 4 sub + e % 4 + 8 (e / 4) addresses. For b8's dS
+// the consumer (half = kv half hh, sub = q half lh, c = q % 8) needs element e = the 16-byte slot of kv 8 hh + e, q half
+// lh: lane l' (k = l' % 16) addresses slot 8 (l' / 16) + (k % 4 + 4 (k / 8)) + 16 ((k / 4) % 2)
+MX_INLINE unsigned tr8_off(int l) {
+    return (unsigned)(128 * (l >> 4) + 16 * ((l & 3) + 4 * ((l >> 3) & 1)) + 256 * ((l >> 2) & 1));
+}
 MX_INLINE u32x4 lds_tr16(uint32_t base, int off) {
     return __builtin_bit_cast(u32x4, __builtin_amdgcn_ds_load_tr16_b128_v8i16((lds_s16x8 *)(uintptr_t)(base + off)));
 }
@@ -2166,7 +2398,9 @@ constexpr int G2_LDS_B = G_NSTG * G2_STG;  // 296448
 static_assert(G2_LDS_B <= 327680 && G2_STG % 128 == 0 && G_KTS + D_QK * 4 <= G2_STG, "LDS");
 }  // namespace
 
-template <bool ROPE>
+// B8 (rung b8): dS from k_dkdv_mx8's fp8 tiles (DS8_TILE: ds_load_tr8_b64 straight into the B operand, the block
+// scales as its E8M0 word), no quantization
+template <bool ROPE, bool B8 = false>
 __device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB, const unsigned char *__restrict__ K8T,
                                           const unsigned char *__restrict__ KTS, bf16 *__restrict__ DQ, float scale,
                                           int S, int H, int B, long long dq_sb, long long dq_ss,
@@ -2198,20 +2432,21 @@ __device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB,
     const int n0 = 2 * qbs[0] + 2, n1 = 2 * qbs[1] + 2;  // kv tiles of each block
     const int NT = nblk == 2 ? n0 + n1 : n0;
     const unsigned long long bh = (unsigned long long)b * H + h;
-    const unsigned long long dsbh = (unsigned long long)(uintptr_t)DSB + bh * ds_tiles_per_bh(S) * DS_TILE;
+    constexpr int DSR = B8 ? DS8_TILE : DS_TILE;  // bytes per dS tile record
+    const unsigned long long dsbh = (unsigned long long)(uintptr_t)DSB + bh * ds_tiles_per_bh(S) * DSR;
     const unsigned long long kt_base = (unsigned long long)(uintptr_t)K8T + bh * D_QK * (unsigned long long)S;
     const unsigned long long kts_base = (unsigned long long)(uintptr_t)KTS + bh * (unsigned long long)(S / 128) * D_QK * 4;
     // this wave's op of a tile: 0 dS (t, 2 qb) (t <= 2 qb), 1 dS (t, 2 qb + 1), 2 K8T rows, 3 KTS
     const unsigned op_lds = wv == 0 ? 0u : wv == 1 ? (unsigned)G_DS1 : wv == 2 ? (unsigned)G_KT : (unsigned)G_KTS;
-    const i32x8 op_g1 = wv <= 1 ? tdm_g1(W0_S, 256, 128, 256, 128)
+    const i32x8 op_g1 = wv <= 1 ? (B8 ? tdm_g1(W0_S, DS8_TILE / 128, 128, DS8_TILE / 128, 128) : tdm_g1(W0_S, 256, 128, 256, 128))
                         : wv == 2 ? tdm_g1(W0_128, D_QK, 128, D_QK, (unsigned long long)S)
                                   : tdm_g1(W0_S, D_QK, 4, D_QK, 4);
     auto stage = [&](int T) __attribute__((always_inline)) { return lds0 + (unsigned)((T % G_NSTG) * G2_STG); };
     // per wave and block: tile 0's global address, the bytes per tile, the last real tile (dS of q block 2 qb: 2 qb)
-    const unsigned long long op_mult = wv <= 1 ? (unsigned long long)DS_TILE : wv == 2 ? (unsigned long long)NBK
+    const unsigned long long op_mult = wv <= 1 ? (unsigned long long)DSR : wv == 2 ? (unsigned long long)NBK
                                                                                       : (unsigned long long)(D_QK * 4);
     auto op_base = [&](int qb) __attribute__((always_inline)) {
-        return wv <= 1 ? dsbh + (unsigned long long)ds_tile_index(0, 2 * qb + wv) * DS_TILE : wv == 2 ? kt_base : kts_base;
+        return wv <= 1 ? dsbh + (unsigned long long)ds_tile_index(0, 2 * qb + wv) * DSR : wv == 2 ? kt_base : kts_base;
     };
     const unsigned long long base0 = op_base(qbs[0]), base1 = op_base(qbs[1]);
     const int lim0 = wv == 0 ? 2 * qbs[0] : 1 << 20, lim1 = wv == 0 ? 2 * qbs[1] : 1 << 20;
@@ -2259,7 +2494,8 @@ __device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB,
             issue(T + 2);  // into the stage of tile T - 1
         const unsigned st = stage(T);
         const int ln = lane_now(), r16 = ln & 15, hh = ln >> 4;
-        const uint32_t trb = pin(st + tr_off(ln) + (unsigned)(wv * 1024)),
+        // B8: the q16 tile qt = 4 (i % 2) + wv is slot pair m = 2 (i % 2) + wv / 2, half s = wv % 2 of it
+        const uint32_t trb = pin(st + (B8 ? tr8_off(ln) + (unsigned)(1024 * (wv >> 1) + 8 * (wv & 1)) : tr_off(ln) + (unsigned)(wv * 1024))),
                        kt_t = pin(st + G_KT + (unsigned)(r16 * X128 + 64 * hh)),
                        kt_s = pin(st + G_KTS + (unsigned)(ln * 4));
         auto lda = [&](auto dc) __attribute__((always_inline)) {
@@ -2277,8 +2513,27 @@ __device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB,
         u32x4 xr[2][8];
         i32x16 db[2];
         int dsc[2];
+        [[maybe_unused]] i32x16 d8[3];  // B8: q tile i's B operand in d8[i % 3] (loaded two tiles ahead, no copies)
+        [[maybe_unused]] u32x4 sw[2];   // B8: the scale words of the two dS records (wave w's at word w)
+        if constexpr (B8) {
+            sw[0] = lds_b128(lds_ptr(st), 16384);
+            sw[1] = lds_b128(lds_ptr(st), G_DS1 + 16384);
+        }
         auto ldx = [&](auto ic) __attribute__((always_inline)) {
             constexpr int i = ic;
+            if constexpr (B8) {
+                // kv16 tile J = 2 w + j: wave w's region, chunk 2 m + j; one transposed 8-bit load = this lane's q row, kv
+                // 16 J + 8 (lane / 16) + 0..7 (the b7 operand's bytes 8 J + r)
+                constexpr int oi = (i / 2) * G_DS1 + 2048 * (i % 2);
+                static_for<8>([&](auto jj) {
+                    constexpr int J = jj;
+                    const i32x2 v = __builtin_amdgcn_ds_load_tr8_b64_v2i32(
+                        (__attribute__((address_space(3))) i32x2 *)(uintptr_t)(trb + (unsigned)(oi + 4096 * (J / 2) + 512 * (J % 2))));
+                    d8[i % 3][2 * J] = v[0];
+                    d8[i % 3][2 * J + 1] = v[1];
+                });
+                return;
+            }
             constexpr int oi = (i / 2) * DS_TILE + 4 * (i % 2) * 1024;
             static_for<8>([&](auto jj) {
                 constexpr int J = jj;
@@ -2287,6 +2542,14 @@ __device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB,
         };
         auto quant = [&](auto ic) __attribute__((always_inline)) {
             constexpr int i = ic;
+            if constexpr (B8) {
+                // the E8M0 word of slot pair m: byte m of each wave's scale word, wave w as byte w
+                const unsigned sh = 16u * (unsigned)(i % 2) + 8u * (unsigned)(wv >> 1);
+                const u32x4 &s = sw[i / 2];
+                dsc[i % 2] = (int)(__builtin_amdgcn_ubfe(s[0], sh, 8) | (__builtin_amdgcn_ubfe(s[1], sh, 8) << 8) |
+                                   (__builtin_amdgcn_ubfe(s[2], sh, 8) << 16) | (__builtin_amdgcn_ubfe(s[3], sh, 8) << 24));
+                return;
+            }
             int sc_word = 0;
             if constexpr (DQG_PROBE == 2) {
                 static_for<16>([&](auto e) { db[i % 2][(int)e] = (int)xr[i % 2][(int)e / 4][(int)e % 4]; });
@@ -2325,10 +2588,11 @@ __device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB,
                 if constexpr (i + 1 < QTW) quant(std::integral_constant<int, (i + 1 < QTW ? i + 1 : 0)>{});
                 static_for<12>([&](auto dd) {
                     constexpr int dt = dd;
+                    const i32x16 &bop = B8 ? d8[i % 3] : db[i % 2];
                     if constexpr (dt % 2 == 0)
-                        dq[dt][i] = wmma_mx<0, 0>(kf[dt].x, db[i % 2], dq[dt][i], kf[dt].s, dsc[i % 2]);
+                        dq[dt][i] = wmma_mx<0, 0>(kf[dt].x, bop, dq[dt][i], kf[dt].s, dsc[i % 2]);
                     else
-                        dq[dt][i] = wmma_mx<1, 0>(kf[dt].x, db[i % 2], dq[dt][i], kf[dt].s, dsc[i % 2]);
+                        dq[dt][i] = wmma_mx<1, 0>(kf[dt].x, bop, dq[dt][i], kf[dt].s, dsc[i % 2]);
                 });
                 fence();
             }
@@ -2439,6 +2703,22 @@ void k_dqg_mx(const unsigned char *__restrict__ DSB, const unsigned char *__rest
         dqg2_body<false>(DSB, K8T, KTS, DQ, scale, S, H, B, dq_sb, dq_ss, nullptr, nullptr, smem);
     else
         dqg_body<false>(DSB, K8T, KTS, DQ, scale, S, H, B, dq_sb, dq_ss, nullptr, nullptr, smem);
+}
+
+// rung b8: dQ over k_dkdv_mx8's fp8 dS (paired grid as k_dqg_mx; the unpaired launch also takes dqg2_body)
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+void k_dqg_mx8(const unsigned char *__restrict__ DSB, const unsigned char *__restrict__ K8T,
+               const unsigned char *__restrict__ KTS, bf16 *__restrict__ DQ, float scale, int S, int H, int B,
+               long long dq_sb, long long dq_ss) {
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[G2_LDS_B];
+    dqg2_body<false, true>(DSB, K8T, KTS, DQ, scale, S, H, B, dq_sb, dq_ss, nullptr, nullptr, smem);
+}
+extern "C" __global__ __attribute__((amdgpu_flat_work_group_size(128, 128), amdgpu_waves_per_eu(1, 1)))
+void k_dqg_mxr8(const unsigned char *__restrict__ DSB, const unsigned char *__restrict__ K8T,
+                const unsigned char *__restrict__ KTS, bf16 *__restrict__ DQ, float scale, int S, int H, int B,
+                long long dq_sb, long long dq_ss, const bf16 *__restrict__ COS, const bf16 *__restrict__ SIN) {
+    __shared__ __attribute__((aligned(1024))) unsigned char smem[G2_LDS_B];
+    dqg2_body<true, true>(DSB, K8T, KTS, DQ, scale, S, H, B, dq_sb, dq_ss, COS, SIN, smem);
 }
 
 // the fused-RoPE path's variant: dQ's rope columns as the gradient of q before RoPE (COS / SIN [S, 64] bf16)

@@ -906,8 +906,9 @@ __device__ __forceinline__ void dkdv_body(
                 }
             });
             if constexpr (DSO == 2 && qt % 2 == 1) {
-                // b8: |dS| max over the block (this lane's 2 x 2 x 8 values, then the wave), one E8M0 scale (wave-uniform:
-                // in an SGPR) for both kv16 tiles' dK operand bytes
+                // b8: |dS| max over the block (this lane's 2 x 2 x 8 values, then the wave), one E8M0 scale for both kv16
+                // tiles' dK operand bytes. Kept in VGPRs (no readfirstlane): with a uniform scale word LLVM feeds the dK
+                // WMMAs an SGPR scale operand, and dK came out wrong (b8_test 11-10: 2 dB)
                 float a = 0.f;
                 static_for<NJ>([&](auto jj) {
                     static_for<8>([&](auto rr) {
@@ -915,7 +916,7 @@ __device__ __forceinline__ void dkdv_body(
                                                                __builtin_fabsf(dscur[(int)jj][(int)rr])));
                     });
                 });
-                a = __builtin_bit_cast(float, __builtin_amdgcn_readfirstlane(__builtin_bit_cast(int, wave_max32(a))));
+                a = wave_max32(a);
                 const int byte = e8m0_byte(a);
                 const float sc = e8m0_scale(byte);
                 static_for<NJ>([&](auto jj) {
@@ -2068,6 +2069,13 @@ MX_INLINE unsigned tr_off(int l) {
     else return (unsigned)(16 * l);
 }
 typedef int i32x2 __attribute__((ext_vector_type(2)));
+// ds_load_tr8_b64 (probed, scratch_mx/bt/trload8.py): in each 16-lane half H, lane l (c = l % 8, sub = l % 16 / 8) gets
+// byte column c of 8 rows of 8 B, element e from the row lane 16 H + 4 sub + e % 4 + 8 (e / 4) addresses. For b8's dS
+// the consumer (half = kv half hh, sub = q half lh, c = q % 8) needs element e = the 16-byte slot of kv 8 hh + e, q half
+// lh: lane l' (k = l' % 16) addresses slot 8 (l' / 16) + (k % 4 + 4 (k / 8)) + 16 ((k / 4) % 2)
+MX_INLINE unsigned tr8_off(int l) {
+    return (unsigned)(128 * (l >> 4) + 16 * ((l & 3) + 4 * ((l >> 3) & 1)) + 256 * ((l >> 2) & 1));
+}
 MX_INLINE u32x4 lds_tr16(uint32_t base, int off) {
     return __builtin_bit_cast(u32x4, __builtin_amdgcn_ds_load_tr16_b128_v8i16((lds_s16x8 *)(uintptr_t)(base + off)));
 }
@@ -2487,7 +2495,7 @@ __device__ __forceinline__ void dqg2_body(const unsigned char *__restrict__ DSB,
         const unsigned st = stage(T);
         const int ln = lane_now(), r16 = ln & 15, hh = ln >> 4;
         // B8: the q16 tile qt = 4 (i % 2) + wv is slot pair m = 2 (i % 2) + wv / 2, half s = wv % 2 of it
-        const uint32_t trb = pin(st + tr_off(ln) + (B8 ? (unsigned)(1024 * (wv >> 1) + 8 * (wv & 1)) : (unsigned)(wv * 1024))),
+        const uint32_t trb = pin(st + (B8 ? tr8_off(ln) + (unsigned)(1024 * (wv >> 1) + 8 * (wv & 1)) : tr_off(ln) + (unsigned)(wv * 1024))),
                        kt_t = pin(st + G_KT + (unsigned)(r16 * X128 + 64 * hh)),
                        kt_s = pin(st + G_KTS + (unsigned)(ln * 4));
         auto lda = [&](auto dc) __attribute__((always_inline)) {

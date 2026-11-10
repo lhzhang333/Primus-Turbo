@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_MLA_MX_RESCHED: bool = True
     PRIMUS_TURBO_MLA_MX_DQ_GEMM: bool = True
     PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES: int = 16 << 30
+    PRIMUS_TURBO_MLA_MX_DS_FP8: bool = True
 
 
 def backend_spec(name: str) -> Callable[[], str | None]:
@@ -257,6 +258,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # workspace (b h S^2 bytes / 2 + the diagonal tiles) only up to this many bytes, else the recompute kernel
     "PRIMUS_TURBO_MLA_MX_DQ_GEMM": lambda: os.getenv("PRIMUS_TURBO_MLA_MX_DQ_GEMM", "1").strip() != "0",
     "PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES": lambda: int(os.getenv("PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES", str(16 << 30))),
+    "PRIMUS_TURBO_MLA_MX_DS_FP8": lambda: os.getenv("PRIMUS_TURBO_MLA_MX_DS_FP8", "1").strip() != "0",
     # ================== Read by the C++ extension ==================
     # These getters mirror the C++ parsing so Python can report the effective value; C++ reads
     # the variable itself and caches it once per process.

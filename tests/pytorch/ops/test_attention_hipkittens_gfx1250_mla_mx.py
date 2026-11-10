@@ -310,18 +310,25 @@ def _mx_fwd_bwd(b, s, h, seed=7):
 @needs_hk_mx
 @pytest.mark.parametrize(("b", "s", "h"), [(2, 512, 8), (1, 768, 4), (1, 1024, 2)])  # paired dQ grid, odd q blocks, b h % 8
 def test_dq_gemm_matches_recompute(monkeypatch, b, s, h):
-    """dK / dV are bitwise the same either way; dQ differs only by dS's bf16 rounding before its MX quantization."""
+    """The three dQ paths against each other: recompute (DQ_GEMM=0), rung b7 (bf16 dS, DS_FP8=0) and rung b8 (fp8 dS on
+    32 x 32 block scales, the default). dV is bitwise the same in all three; dK is bitwise between recompute and b7 and
+    within the block-scale rounding for b8 (dK's dS operand); dQ differs by the dS quantization only."""
     mx, (q, k, v, dout), res = _mx_fwd_bwd(b, s, h)
-    _setenv(monkeypatch, "PRIMUS_TURBO_MLA_MX_DQ_GEMM", "1")
-    dq1, dk1, dv1 = mx.attn_bwd(dout, res[0], *res[2:], MLA_SCALE)
-    _setenv(monkeypatch, "PRIMUS_TURBO_MLA_MX_DQ_GEMM", "0")
-    dq0, dk0, dv0 = mx.attn_bwd(dout, res[0], *res[2:], MLA_SCALE)
-    assert torch.equal(dk1, dk0) and torch.equal(dv1, dv0)
-    assert not torch.equal(dq1, dq0)  # the two paths ran (bf16 dS moves some E4M3 codes)
-    assert compute_snr(dq0.float(), dq1.float()) > 30
+    out = {}
+    for name, gemm, fp8 in (("b8", "1", "1"), ("b7", "1", "0"), ("rc", "0", "1")):
+        _setenv(monkeypatch, "PRIMUS_TURBO_MLA_MX_DQ_GEMM", gemm)
+        _setenv(monkeypatch, "PRIMUS_TURBO_MLA_MX_DS_FP8", fp8)
+        out[name] = mx.attn_bwd(dout, res[0], *res[2:], MLA_SCALE)
+    (dq8, dk8, dv8), (dq7, dk7, dv7), (dq0, dk0, dv0) = out["b8"], out["b7"], out["rc"]
+    assert torch.equal(dv8, dv0) and torch.equal(dv7, dv0)
+    assert torch.equal(dk7, dk0)
+    assert not torch.equal(dq7, dq0) and not torch.equal(dq8, dq7)  # the three paths ran
+    assert compute_snr(dk0.float(), dk8.float()) > 50
+    assert compute_snr(dq0.float(), dq7.float()) > 30 and compute_snr(dq0.float(), dq8.float()) > 30
     ref = _reference(q, k, v, dout, MLA_SCALE)
-    for x in (dq0, dq1):
+    for x in (dq0, dq7, dq8):
         assert compute_snr(ref[2].float().cpu(), x.float().cpu()) >= _MX_FLOORS["dq"]
+    assert compute_snr(ref[3].float().cpu(), dk8.float().cpu()) >= _MX_FLOORS["dk"]
 
 
 @needs_hk_mx

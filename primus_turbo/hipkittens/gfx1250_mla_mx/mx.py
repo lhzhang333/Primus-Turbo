@@ -16,12 +16,14 @@ kernels with fixed scales; dS along the reduction dim of dK (q) and of dQ (kv).
 
 Kernels: forward rung m7 (``k_mla_fwd_mx7.hip``: m6 with two q blocks per workgroup; branch-free softmax with per-lane integer shifts, O accumulated against
 a fixed per-row reference through the PV WMMAs' E8M0 B scale; the first tile's exp2 runs unshifted, so the centred
-logits of a row's first 128 keys must stay under 126 in log2 units, i.e. 87 nats), backward rung b7
-(``k_mla_bwd_mx5.hip``: k_dkdv_mxd, software-pipelined across steps, also stores bf16 dS = P (dP - delta) into causal
-128 x 128 tiles of a workspace; k_dqg_mx computes dQ as a GEMM over them, MX-quantizing dS along kv, two q blocks
-p / nqb-1-p per workgroup; its code object is post-RA rescheduled, ``asm_resched.py``). Without the workspace
-(PRIMUS_TURBO_MLA_MX_DQ_GEMM=0, over PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES, or out of memory) it runs rung b5: k_dkdv_mx and
-k_dq_mx, which recomputes P and dS (dQ then MX-quantizes the fp32 dS: ~35 dB from b7's). All in XCD-local workgroup order with the
+logits of a row's first 128 keys must stay under 126 in log2 units, i.e. 87 nats), backward rung b8
+(``k_mla_bwd_mx5.hip``: k_dkdv_mx8, software-pipelined across steps, quantizes dS = P (dP - delta) for dK with one E8M0
+scale per 32 q x 32 kv block and stores that fp8 operand as is (causal 128 x 128 tile records of a workspace); k_dqg_mx8
+computes dQ as a GEMM straight from it (transposed 8-bit LDS loads, no quantization), two q blocks p / nqb-1-p per
+workgroup; dQ ~ MX of the fp32 dS (b5's recipe), dK within ~70 dB of the per-column scales). PRIMUS_TURBO_MLA_MX_DS_FP8=0:
+rung b7 (k_dkdv_mxd stores bf16 dS, k_dqg_mx MX-quantizes it along kv; post-RA rescheduled, ``asm_resched.py``). Without
+the workspace (PRIMUS_TURBO_MLA_MX_DQ_GEMM=0, over PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES, or out of memory) it runs rung b5:
+k_dkdv_mx and k_dq_mx, which recomputes P and dS. All in XCD-local workgroup order with the
 TDM ops spread over the waves
 and the outputs written through LDS by TDM stores (benchmark/hk_mla_mx/LOG.md, 2026-11-05 (b)),
 quantization ``k_mxq.hip`` (kbar; rows + cols of a tensor in one read: ``k_mxq_rct``, the tile in and the four
@@ -218,6 +220,13 @@ _DQG_ARGS = (("DSB", "ptr"), ("K8T", "ptr"), ("KTS", "ptr"), ("DQ", "ptr"), ("sc
 KERNELS["k_dqg_mx"] = (KERNELS["k_dq_mx"][0], 128, _DQG_ARGS)
 KERNELS["k_dqg_mxr"] = (KERNELS["k_dq_mx"][0], 128, _DQG_ARGS + (("COS", "ptr"), ("SIN", "ptr")))
 DS_TILE = 128 * 128 * 2  # bytes of one causal dS tile (k_mla_bwd_mx5.hip ds_tile_index)
+# rung b8: dK's fp8 dS operand on 32 q x 32 kv block scales, stored as is (DS8_TILE records: 16 KB + the scale words), and
+# dQ straight from it (no quantization in the dQ kernel)
+KERNELS["k_dkdv_mx8"] = KERNELS["k_dkdv_mxd"]
+KERNELS["k_dkdv_mxr8"] = KERNELS["k_dkdv_mxrd"]
+KERNELS["k_dqg_mx8"] = KERNELS["k_dqg_mx"]
+KERNELS["k_dqg_mxr8"] = KERNELS["k_dqg_mxr"]
+DS8_TILE = 128 * 128 + 128
 # struct RctrArgs (k_mxq.hip): one k_mxq_rctr192 argument set (natural alignment)
 _RCTR_SET = (("X", "ptr"), ("X8", "ptr"), ("XS", "ptr"), ("X8T", "ptr"), ("XTS", "ptr"), ("aux", "ptr"), ("sb", "i64"),
              ("ss", "i64"), ("sh", "i64"), ("PE", "ptr"), ("pb", "i64"), ("ps", "i64"), ("ph", "i64"), ("mode", "i32"),
@@ -243,17 +252,19 @@ def _dqg_grid(s, h, b):
 
 
 def _ds_workspace(b, h, s, dev):
-    """The bf16 dS buffer of rung b7 (b h S/128 (S/128 + 1) / 2 tiles), or None: rung b7 off
-    (PRIMUS_TURBO_MLA_MX_DQ_GEMM=0), larger than PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES (default 16 GiB; it grows as S^2) or
-    out of memory -> the recompute dQ kernel."""
+    """The dS buffer of the dQ GEMM (b h S/128 (S/128 + 1) / 2 tiles): rung b8's fp8 records (default) or rung b7's bf16
+    tiles (PRIMUS_TURBO_MLA_MX_DS_FP8=0); returns (buffer, fp8) or None: the dQ GEMM off (PRIMUS_TURBO_MLA_MX_DQ_GEMM=0),
+    larger than PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES (default 16 GiB; it grows as S^2) or out of memory -> the recompute dQ
+    kernel."""
     if not envs.PRIMUS_TURBO_MLA_MX_DQ_GEMM:
         return None
+    fp8 = bool(envs.PRIMUS_TURBO_MLA_MX_DS_FP8)
     nb = s // 128
-    nbytes = b * h * (nb * (nb + 1) // 2) * DS_TILE
+    nbytes = b * h * (nb * (nb + 1) // 2) * (DS8_TILE if fp8 else DS_TILE)
     if nbytes > envs.PRIMUS_TURBO_MLA_MX_DS_MAX_BYTES:
         return None
     try:
-        return torch.empty(nbytes, device=dev, dtype=torch.uint8)
+        return torch.empty(nbytes, device=dev, dtype=torch.uint8), fp8
     except torch.OutOfMemoryError:
         return None
 # k_mxq modes (k_mxq.hip): 1 subtract kbar, 2 aux = x . kbar, 4 aux = x . Y, 16 scale layout R2, 32 quantize x * pre
@@ -552,10 +563,12 @@ def attn_bwd(dout, out, lse2, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8, vsr,
     sc = float(softmax_scale)
     dk_args = [q8, qs, k8, ks, v8, vsr, do8, dos, do8t, dots, q8t, qts, lse2, delta, dk, dv, sc, s, h, b,
                dk.stride(0), dk.stride(1), dv.stride(0), dv.stride(1)]  # fmt: skip
-    dsb = _ds_workspace(b, h, s, dev)
-    if dsb is not None:
-        _launch("k_dkdv_mxd", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args + [dsb])
-        _launch("k_dqg_mx", _dqg_grid(s, h, b), [dsb, k8t, kts, dq, sc, s, h, b, dq.stride(0), dq.stride(1)])
+    ws = _ds_workspace(b, h, s, dev)
+    if ws is not None:
+        dsb, fp8 = ws
+        _launch("k_dkdv_mx8" if fp8 else "k_dkdv_mxd", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args + [dsb])
+        _launch("k_dqg_mx8" if fp8 else "k_dqg_mx", _dqg_grid(s, h, b),
+                [dsb, k8t, kts, dq, sc, s, h, b, dq.stride(0), dq.stride(1)])  # fmt: skip
         return dq, dk, dv
     _launch("k_dkdv_mx", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args)
     _launch("k_dq_mx", (s // 256, h, b),
@@ -679,12 +692,13 @@ def attn_bwd_rope(dout, out, lse2, q8, qs, k8, ks, kbar, q8t, qts, k8t, kts, v8,
     sc = float(softmax_scale)
     dk_args = [q8, qs, k8, ks, v8, vsr, do8, dos, do8t, dots, q8t, qts, lse2, delta, dk, dv, sc, s, h, b, dk.stride(0),
                dk.stride(1), dv.stride(0), dv.stride(1), dkph, dkph.stride(0), dkph.stride(1)]  # fmt: skip
-    dsb = _ds_workspace(b, h, s, dev)
-    if dsb is not None:
-        _launch("k_dkdv_mxrd", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args + [dsb])
-        _launch("k_dqg_mxr", _dqg_grid(s, h, b),
+    ws = _ds_workspace(b, h, s, dev)
+    if ws is not None:
+        dsb, fp8 = ws
+        _launch("k_dkdv_mxr8" if fp8 else "k_dkdv_mxrd", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args + [dsb])
+        _launch("k_dqg_mxr8" if fp8 else "k_dqg_mxr", _dqg_grid(s, h, b),
                 [dsb, k8t, kts, dq, sc, s, h, b, dq.stride(0), dq.stride(1), cos, sin])  # fmt: skip
-        del dsb
+        del dsb, ws
     else:
         _launch("k_dkdv_mxr", (math.ceil(s / DKDV_KV_ROWS), h, b), dk_args)
         _launch("k_dq_mxr", (s // 256, h, b),

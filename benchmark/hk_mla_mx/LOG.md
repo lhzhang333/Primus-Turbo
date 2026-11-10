@@ -924,3 +924,29 @@ half the CUs, b1 h16).
   emu_bwd(ds_block=True); pack / unpack self-test on CPU (`scratch_mx/b8/unpack_selftest.py`). GPU checks:
   `scratch_mx/py/b8_test.py` (dV bitwise = b7, dS records vs the emulation, dK / dQ vs the b8 emulation > 40 dB, vs the
   fp32 reference), `scratch_mx/py/b8_time.py`; lab tag P8 (= 5ni flags).
+
+## 2026-11-10: rung b8 on the GPU; the node at full clocks
+
+- The node was rebooted 2026-11-10 04:37 UTC: GPU0 now at ~2.2 GHz (sclk 2243 MHz at idle; 11-06..11-09 stuck at
+  1304): every number below is at full clocks, not comparable with 11-06..11-09's. The user cleared GPU0.FAULT (archived
+  as scratch_mx/logs/GPU0.FAULT.20261109_0915_mine); the container is now `lhz_mx_dsv3` (user: `lhz_` prefix).
+- **ds_load_tr8_b64** (probed, `scratch_mx/bt/trload8.py`): NOT the tr16 rule. In each 16-lane half H, lane l (c = l %
+  8, sub = l % 16 / 8) gets byte column c of 8 rows of 8 B, element e from the row lane 16 H + 4 sub + e % 4 + 8 (e / 4)
+  addresses. For b8's dS the lane offsets are tr8_off(l) = 128 (l / 16) + 16 (l % 4 + 4 ((l / 8) % 2)) + 256 ((l / 4) % 2).
+- **WMMA scale operand from an SGPR gives wrong results**: with the b8 block scale made wave-uniform (readfirstlane),
+  LLVM fed the dK WMMAs `..., v69, s0` (B scale in an SGPR) and dK came out at 2 dB vs the emulation (the stored dS and
+  its scale bytes were right). Keeping the scale in VGPRs (no readfirstlane): dK 48-50 dB vs the emulation. Rule: never
+  let a WMMA scale operand become uniform (or force it into a VGPR).
+- b8_test (toy shapes): dV bitwise = b7, every dS byte written, dS records = the emulation's block quantization (99.8%
+  equal codes, 49-51 dB), dQ / dK vs the b8 emulation 48-50 dB; vs the fp32 reference dQ 21.65 (b7 21.62), dK 21.77-21.81
+  (= b7; b8 vs b7 dK 72-76 dB). PASS.
+- Lab kernel times (b2 s4096 h128, full clocks, noisy: min ~10% under the median): dqg_mx 0.359 -> dqg_mx8 0.249 ms
+  (-31%), dqg_mxr 0.361 -> 0.256 (-29%); dkdv_mxd 1.059 -> mx8 1.044, mxrd 1.058 -> mxr8 1.001 ms. asm_resched of the
+  b8 dQ kernels: mx8 0.251 -> 0.244, mxr8 0.260 -> 0.259 (not taken).
+- **Package**: hip synced from the lab; b8 the default (PRIMUS_TURBO_MLA_MX_DS_FP8=1; 0 = b7; DQ_GEMM=0 = recompute);
+  workspace DS8_TILE records (b2 s4096 h128: 2.2 GB instead of 4.3). pytest 34 pass (test_dq_gemm_matches_recompute now
+  runs the three paths: dV bitwise in all, dK b7 == recompute bitwise, b8 dK > 50 dB, every dQ over the floor), fused-RoPE
+  test pass, `scratch_mx/py/b8_sweep.py` (12 shapes): dV bitwise, b8 dK 70-76 dB vs recompute, b8 dQ 71-77 dB vs
+  recompute (b7: 35 dB) PASS. Package profile (fused-RoPE fwd + bwd per step, two interleaved rounds): b7 2.214 / 2.228
+  -> **b8 2.060 / 2.079 ms (-6.8%)**: dqg 0.375 / 0.387 -> 0.268 / 0.280, dkdv 1.011 / 1.032 -> 0.987 / 0.999, forward
+  0.389-0.409, qkv quantization 0.161, dO quantization 0.059.
