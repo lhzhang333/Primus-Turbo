@@ -196,6 +196,19 @@ using namespace mx;
                      // load during block 0's last steps), block 1's K / V rows load before block 0's last dV / dK, and the
                      // epilogue stages dK nope / dV / dK rope in the three stages its last steps freed
 #endif
+#ifndef PAIR_LOOP
+#define PAIR_LOOP 0  // DKDV_PAIR: 1 the two blocks as an outer loop over one copy of the block code (0: two copies)
+#endif
+#ifndef PAIR_KV_EARLY
+#define PAIR_KV_EARLY 0  // DKDV_PAIR: block 1's K / V loads 0 after block 0's last dV / dK, 1 before them, 2 at block 1's
+                         // start (0 / 1: their scale words spilled into block 1's step loop)
+#endif
+#ifndef DEFER_CVT
+#define DEFER_CVT 0  // dkdv: bit 0 a slot's P conversion (pk8) in the next slot's region (after its loads fence), bit 1
+                     // (b8) a slot pair's dS block quantization (|max| tree, wave max, E8M0, pk8) there too; the last slot
+                     // converts in place. In its own region the conversion waits on the exps / the max chain (11-10 ATT:
+                     // ~12 cycles per pk8, ~420 cycles a trip)
+#endif
 #ifndef DKDV_MEMMASK
 #define DKDV_MEMMASK 0x7ff  // timing probes only: the dkdv TDM ops k (dk_op) that move data (bit k)
 #endif
@@ -813,6 +826,7 @@ __device__ __forceinline__ void dkdv_body(
         static_for<NJ>([&](auto jj) { thr[(int)jj] = kvw + 16 * (int)jj + lr - q0 - 8 * lh; });
         f32x8 dsprev[NJ];
         [[maybe_unused]] f32x8 dscur[NJ];    // b8: the odd slot's dS
+        [[maybe_unused]] f32x8 ppend[NJ];    // DEFER_CVT: the previous slot's P, converted in this slot
         [[maybe_unused]] u32x4 dswprev[NJ];  // DK_BF16: the even slot's bf16 dS
         AFrag ab[20];
 #if MIDSYNC
@@ -875,6 +889,36 @@ __device__ __forceinline__ void dkdv_body(
             const f32x8 &clt = cur.lt, &cdt = cur.dt;
 #endif
             fence();
+            if constexpr ((DEFER_CVT & 1) && qt >= 1)
+                static_for<NJ>([&](auto jj) {
+                    constexpr int j = jj;
+                    const u32x2 pq = cvt8_e4m3(ppend[j], 1.0f / 256.0f);
+                    pB[j][2 * (qt - 1)] = (int)pq[0];
+                    pB[j][2 * (qt - 1) + 1] = (int)pq[1];
+                });
+            if constexpr (DSO == 2 && (DEFER_CVT & 2) && qt >= 2 && qt % 2 == 0) {
+                // b8, deferred: the block of slots qt - 2, qt - 1 (dsprev / dscur still hold them: overwritten below)
+                constexpr int qo = qt - 1;
+                float a = 0.f;
+                static_for<NJ>([&](auto jj) {
+                    static_for<8>([&](auto rr) {
+                        a = __builtin_fmaxf(a, __builtin_fmaxf(__builtin_fabsf(dsprev[(int)jj][(int)rr]),
+                                                               __builtin_fabsf(dscur[(int)jj][(int)rr])));
+                    });
+                });
+                a = wave_max32(a);
+                const int byte = e8m0_byte(a);
+                const float sc = e8m0_scale(byte);
+                static_for<NJ>([&](auto jj) {
+                    constexpr int j = jj;
+                    const u32x2 c0 = cvt8_e4m3(dsprev[j], sc), c1 = cvt8_e4m3(dscur[j], sc);
+                    dsB[j][2 * (qo - 1)] = (int)c0[0];
+                    dsB[j][2 * (qo - 1) + 1] = (int)c0[1];
+                    dsB[j][2 * qo] = (int)c1[0];
+                    dsB[j][2 * qo + 1] = (int)c1[1];
+                    dss[j] |= byte << (8 * (qo / 2));
+                });
+            }
             const i32x32 &qx = cur.qx;
             const i32x16 &dox = cur.dox;
             const int qsc = cur.qsc, dsc = cur.dsc;
@@ -921,10 +965,18 @@ __device__ __forceinline__ void dkdv_body(
                 u32x2 pq = cvt8_e4m3(p, 1.0f / 256.0f);
                 asm volatile("" : "+v"(pq));  // P(qt) converted in its slot (LLVM sank it to the step end, next to its use)
 #else
-                const u32x2 pq = cvt8_e4m3(p, 1.0f / 256.0f);
+                if constexpr ((DEFER_CVT & 1) && qt + 1 < NQT) {
+                    ppend[j] = p;
+                } else {
+                    const u32x2 pq = cvt8_e4m3(p, 1.0f / 256.0f);
+                    pB[j][2 * qt] = (int)pq[0];
+                    pB[j][2 * qt + 1] = (int)pq[1];
+                }
 #endif
+#if PIN_Q & 1
                 pB[j][2 * qt] = (int)pq[0];
                 pB[j][2 * qt + 1] = (int)pq[1];
+#endif
                 if constexpr (DSO == 2) {
                     // b8: the slot pair's 32 q x 32 kv block is quantized after both kv16 tiles (below)
                     if constexpr (qt % 2 == 0)
@@ -963,7 +1015,7 @@ __device__ __forceinline__ void dkdv_body(
                     dss[j] |= z.byte << (8 * (qt / 2));
                 }
             });
-            if constexpr (DSO == 2 && qt % 2 == 1) {
+            if constexpr (DSO == 2 && qt % 2 == 1 && !((DEFER_CVT & 2) && qt + 1 < NQT)) {
                 // b8: |dS| max over the block (this lane's 2 x 2 x 8 values, then the wave), one E8M0 scale for both kv16
                 // tiles' dK operand bytes. Kept in VGPRs (no readfirstlane): with a uniform scale word LLVM feeds the dK
                 // WMMAs an SGPR scale operand, and dK came out wrong (b8_test 11-10: 2 dB)
@@ -1145,10 +1197,12 @@ __device__ __forceinline__ void dkdv_body(
         // operands must stay in v0..v255)
         auto do_block = [&](int G, auto second_c) __attribute__((always_inline)) {
             constexpr bool SECOND = decltype(second_c)::value;
-            run_p(G, 0, SECOND, std::true_type{}, std::false_type{});
+            if constexpr (SECOND && PAIR_KV_EARLY == 2) load_kv(kvw);  // block 1's K / V at its start (no prefetch)
+            run_p(G, 0, PAIR_LOOP ? G > 0 : SECOND, std::true_type{}, std::false_type{});
             for (int s = 1; s < nst; ++s) run_p(G + s, s, false, std::false_type{}, std::true_type{});
             const int gl = G + nst - 1;
-            if (!SECOND && nblk == 2) load_kv(kbs[1] * KB + KBW * wv);  // block 1's K / V (the last dV / dK do not use them)
+            if constexpr (PAIR_KV_EARLY == 1)
+                if (!SECOND && nblk == 2 && !PAIR_LOOP) load_kv(kbs[1] * KB + KBW * wv);  // block 1's K / V (the last dV / dK do not use them)
             // the last step's dV / dK (its A part: round gl + 1; round gl + 2, block 1's first, may still be in flight)
             tensor_wait<TDM_PER_ROUND>();
             bar_signal();
@@ -1173,6 +1227,10 @@ __device__ __forceinline__ void dkdv_body(
                     fence();
                 });
             }
+            // block 1's K / V rows (PAIR_KV_EARLY 0: here, after the last dV / dK, when P / dS of the block are dead; the
+            // epilogue covers their latency)
+            if constexpr (PAIR_KV_EARLY == 0)
+                if (!SECOND && nblk == 2) load_kv(kbs[1] * KB + KBW * wv);
             bar_signal();
             bar_wait();  // every wave is done with A stage gl
             const unsigned bq = lds0 + (unsigned)((gl % NSTG) * QSTG), bva = lds0 + ARING + (unsigned)((gl % NSTG) * ASTG),
@@ -1225,20 +1283,38 @@ __device__ __forceinline__ void dkdv_body(
                                      32ull * (unsigned long long)(SPLIT ? dkp_ss : dk_ss)));
                 });
             }
-            if constexpr (!SECOND) {
+            if constexpr (!SECOND || PAIR_LOOP) {
                 static_for<8>([&](auto d) { static_for<NJ>([&](auto j) { dv[(int)d][(int)j] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
                 static_for<12>([&](auto d) { static_for<NJ>([&](auto j) { dk[(int)d][(int)j] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
             }
         };
-        do_block(0, std::false_type{});
-        if (nblk == 2) {
-            const int G1 = nst;
-            kb = kbs[1];
-            kv0 = kb * KB;
-            qs0 = kv0;
-            nst = nsts[1];
-            kvw = kv0 + KBW * wv;
-            do_block(G1, std::true_type{});
+        if constexpr (PAIR_LOOP) {
+            // one copy of the block: an outer loop of nblk trips, each block's K / V loaded at its start
+            static_assert(PAIR_KV_EARLY == 2, "PAIR_LOOP loads K / V at each block's start");
+            int G = 0;
+            for (int k = 0; k < nblk; ++k) {
+                if (k == 1) {
+                    kb = kbs[1];
+                    kv0 = kb * KB;
+                    qs0 = kv0;
+                    nst = nsts[1];
+                    kvw = kv0 + KBW * wv;
+                    load_kv(kvw);
+                }
+                do_block(G, std::false_type{});
+                G += nst;
+            }
+        } else {
+            do_block(0, std::false_type{});
+            if (nblk == 2) {
+                const int G1 = nst;
+                kb = kbs[1];
+                kv0 = kb * KB;
+                qs0 = kv0;
+                nst = nsts[1];
+                kvw = kv0 + KBW * wv;
+                do_block(G1, std::true_type{});
+            }
         }
         tensor_wait<0>();
         return;

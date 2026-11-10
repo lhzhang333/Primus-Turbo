@@ -972,3 +972,21 @@ half the CUs, b1 h16).
   but 1.37 vs 0.97 ms: the outer block loop spilled the K / V scale words (WMMA scale operands, v0..v255) into the step
   loop (16 scratch loads per trip). Two straight copies of the block (no outer loop): still 12-30 scratch ops in the
   kernel (not yet located); paused here (user, 11-10 ~07:00 UTC).
+- DKDV_PAIR follow-ups (all bitwise = unpaired, lab only, off): block 1's K / V loaded after block 0's last dV / dK
+  (PAIR_KV_EARLY 0) or before it (1): block 1's K / V scale words spilled into block 1's step loop (12-30 scratch ops);
+  loaded at block 1's start (2): no spill in k_dkdv_mx8 (loops 1110 / 1183 instructions), but 1.037 vs 1.012 ms. ATT
+  (scratch_mx/py/att_loopcost.py): the transition shrinks from ~12.5k (epilogue + next prologue) to ~8.2-9.1k cycles,
+  but the paired code's loop runs 2797 vs 2666 cycles a trip (all waves, all trips): LLVM schedules the bigger
+  function's loop worse, which eats the ~4% the overlap saves. PAIR_LOOP (one copy of the block in an outer loop of two
+  trips, K / V at each block's start): the step loop = the unpaired one (1152 instructions) but 16 scratch ops again.
+  Parked: the transition is worth ~4% of dkdv at most.
+- DEFER_CVT (lab, off; bitwise): a slot's P conversion (bit 0) and the b8 dS block quantization (bit 1) moved into the
+  next slot's region. ATT (DEFER_CVT 3): the pk8 conversions' cost 418 -> 258 cycles a trip (12.3 -> 7.6 each) but the
+  trip 2666 -> 2678: the cycles moved to v_dual_mul / v_max3 / ds_load / WMMA. Timing 1.035 / 1.034 / 1.025 / 1.033
+  ms (none / 1 / 2 / 3, medians, noise ~1%). The dK / dV loop is throughput-bound (est. ~80% LDS: 893 LDS loads + 84 KB
+  of TDM writes a trip per CU at ~256 B / clk ~ 2100 of 2670 cycles), not latency-bound: re-ordering only moves stalls.
+- Where the time goes now (package, full clocks, per fused-RoPE fwd + bwd, without the profile script's 0.174 ms of
+  gradient adds): 1.886 ms = dkdv 0.987 (52%), forward 0.389 (21%), dqg 0.268 (14%), qkv quantization 0.160, dO
+  quantization 0.059, kpe 0.013, kbar 0.011. Estimated ceilings with full register / schedule control (generator-class
+  work, bf16 HK precedent 1.48x forward, 1.28x dK / dV per tile): dkdv ~10-20% (LDS-bound), forward ~15-30%
+  (issue-bound: exps and WMMAs in separate stretches), dqg ~30% (LDS ~66%, WMMA ~34% busy).
