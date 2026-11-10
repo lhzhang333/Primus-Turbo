@@ -1005,3 +1005,21 @@ half the CUs, b1 h16).
   ATT: 2938 cycles per tile pair (1469 a tile vs 1123): WMMAs 7.8 cycles each (now in dense runs), the mid-tile
   s_wait_tensorcnt ~61 cycles each, address math (v_add3 16 cycles each) and the per-tile runtime branches; 76% in the
   loop (87% before). Not pursued further; the kernel stays in the lab source (mxlab tag "X").
+- **Same-harness A/B vs bf16 HK** (11-10 ~08:40 UTC, full clocks; `scratch_mx/ab/mx_vs_hk.py`: the impl layer training
+  uses, one impl per process, two rounds in alternating order, 7 interleaved rounds each, no intruders; b2 s4096 h128).
+  bf16 HK best = the generator pins of turbo-hkmerge 0cfb6409 (= compact 3eb22972); "branch" = this branch's bf16 HK.
+  Medians (ms), idle mode (20 ms idle before each call) / hot mode (back-to-back):
+
+  | pass | bf16 HK best | bf16 HK branch | hk_mx (b8) |
+  | --- | --- | --- | --- |
+  | fwd (MX: + q / k / v quantization) | 0.631 / 0.591 | 0.660 / 0.597 | 0.653 / 0.534 |
+  | bwd (MX: + dO quantization) | 1.809 / 1.728 | 1.840 / 1.727 | 1.296 / 1.204 |
+  | fwd + bwd | 2.451 / 2.365 | 2.473 / 2.364 | 1.952 / 1.809 |
+  | autograd (flash_attn_func) | 2.505 / 2.387 | 2.525 / 2.380 | 2.033 / 1.816 |
+  | Megatron RoPE kernels + attention, autograd | 2.894 / 2.861 | 2.914 / 2.861 | 2.422 / 2.160 |
+  | mx.mla_rope_attention (RoPE fused) | - | - | **2.034 / 1.875** |
+
+  Training path (RoPE + attention, fwd + bwd): bf16 HK best 2.894 -> MX fused 2.034 ms idle (1.42x), 2.861 -> 1.875 hot
+  (1.53x); attention alone (autograd) 1.23x / 1.31x; backward 1.40x / 1.44x; forward incl. its quantization 0.97x idle /
+  1.11x hot (the quantization kernels pay cold caches after an idle gap). HK hot timings spread ~10% (0.556-0.641 fwd),
+  idle ones < 1%.
