@@ -955,3 +955,8 @@ half the CUs, b1 h16).
 - GPU jobs now run under the project's gpu-lock skill (`.claude/skills/gpu-lock/gpulock run -g 0`, locks in
   /var/tmp/gpu-locks; scratch_mx/gx.sh and gate/gate1.sh take the old logs/gpu0.lock outside it during the move), with
   the timeout inside the container.
+- b8's wave max by `__builtin_amdgcn_update_dpp(0, ..)` instead of mov_dpp: LLVM folds the move into the max
+  (v_max_num_f32_dpp): the dkdv loop 1163 -> 1150 (mx8) / 1126 (mxr8) instructions, bitwise (scratch_mx/py/b8_ab.py,
+  five shapes), time within noise (dkdv_mx8 1.039 -> 1.023, the unchanged b7 kernel moved +-1% in the same run). Package.
+- dkdv balance at full clocks (k_dkdv_mx, memprobe builds): full 829 us, TDM only 653 (79%), compute only 708 (85%):
+  as at 1.3 GHz (83% / 87%): the TDM / L2 path scales with the GPU clock.

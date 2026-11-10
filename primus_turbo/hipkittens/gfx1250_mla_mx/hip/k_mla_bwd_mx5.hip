@@ -295,9 +295,10 @@ struct DsQ {
     u32x2 a, b;
 };
 // the max over the wave's 32 lanes (every lane gets it): DPP row_xmask 1, 2, 4, 8 in each row of 16, then lane l ^ 16
+// (update_dpp with old 0, not mov_dpp: LLVM then folds the move into the max, v_max_num_f32_dpp)
 template <int CTL>
 MX_INLINE float dpp_f(float v) {
-    return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, v), CTL, 0xf, 0xf, false));
+    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), CTL, 0xf, 0xf, false));
 }
 MX_INLINE float wave_max32(float x) {
     x = __builtin_fmaxf(x, dpp_f<0x161>(x));
