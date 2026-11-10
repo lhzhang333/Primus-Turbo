@@ -581,6 +581,25 @@ def gen_attention_varlen_test_cases():
     ]
 
 
+# Attention shapes of models no table above carries (their GEMMs and MoE are not benchmarked from
+# this file). "window_lefts" are the causal sliding windows the model's layers use besides full
+# causal attention, as flash-attn window_size (window_left, 0): gen_attention_test_cases emits the
+# full-attention shape, gen_attention_window_test_cases one case per window.
+AttentionModelConfigs = {
+    # https://github.com/NVIDIA-NeMo/Automodel/blob/752a71ebf731f84b19ca9af5e7c242be003082bd/nemo_automodel/components/models/muse_spark/configuration_muse_spark.py
+    # Muse Spark Open 816B-A42B text tower: layers alternate three sliding-window layers (HF
+    # sliding_window 2048 keys, the query included, i.e. window_size (2047, 0)) and one full causal
+    # layer; trained at seqlen 4096.
+    "Muse-Spark-Open-816B-A42B": {
+        "num_attention_heads": 128,
+        "num_key_value_heads": 16,
+        "head_dim": 64,
+        "seqlen": 4096,
+        "window_lefts": (2047,),
+    },
+}
+
+
 def gen_attention_test_cases():
     """Generate attention test cases from model configs (deduplicated)."""
     seen = set()
@@ -632,7 +651,46 @@ def gen_attention_test_cases():
                 }
             )
 
+    # Attention-only model shapes (full attention; their windows: gen_attention_window_test_cases)
+    for config in AttentionModelConfigs.values():
+        key = (
+            config["num_attention_heads"],
+            config["num_key_value_heads"],
+            config["head_dim"],
+            config["head_dim"],
+            config["seqlen"],
+        )
+        if key not in seen:
+            seen.add(key)
+            test_cases.append(
+                {
+                    "num_head_q": config["num_attention_heads"],
+                    "num_head_kv": config["num_key_value_heads"],
+                    "head_dim_qk": config["head_dim"],
+                    "head_dim_v": config["head_dim"],
+                    "seqlen": config["seqlen"],
+                }
+            )
+
     return test_cases
+
+
+def gen_attention_window_test_cases():
+    """Causal sliding-window attention cases (window_size (window_left, 0)) of the models in
+    AttentionModelConfigs, one per window."""
+    return [
+        {
+            "name": name,
+            "num_head_q": config["num_attention_heads"],
+            "num_head_kv": config["num_key_value_heads"],
+            "head_dim_qk": config["head_dim"],
+            "head_dim_v": config["head_dim"],
+            "seqlen": config["seqlen"],
+            "window_left": window_left,
+        }
+        for name, config in AttentionModelConfigs.items()
+        for window_left in config["window_lefts"]
+    ]
 
 
 def gen_moe_test_cases(names=None):
