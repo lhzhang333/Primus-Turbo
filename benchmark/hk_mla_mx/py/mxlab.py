@@ -924,7 +924,7 @@ def bwd_mx8(qz, bz, lse, scale=SCALE, tag="5ni", keep_ds=False, dsb=None):
     dv = torch.empty(s, b, h, D_V, device=dev, dtype=torch.bfloat16).transpose(0, 1)
     if dsb is None:
         dsb = torch.empty(ds8_bytes(b, h, s), device=dev, dtype=torch.uint8)
-    _launch("k_dkdv_mx8", (s // 128, h, b),
+    _launch("k_dkdv_mx8", dkdv_grid(s, h, b, "W" in tag),
             [qz["q8"], qz["qs"], qz["k8"], qz["ks"], bz["v8"], bz["vsr"], bz["do8"], bz["dos"], bz["do8t"], bz["dots"],
              bz["q8t"], bz["qts"], lse2, bz["delta"], dk, dv, float(scale), s, h, b, dk.stride(0), dk.stride(1),
              dv.stride(0), dv.stride(1), dsb], tag)  # fmt: skip
@@ -950,6 +950,13 @@ def ds8_unpack(dsb, b, h, s):
             blk = x.permute(0, 1, 3, 7, 5, 8, 2, 4, 6).reshape(b, h, 128, 128)  # (m s lh r) x (w j lr)
             out[:, :, qb * 128:(qb + 1) * 128, kb * 128:(kb + 1) * 128] = blk
     return out, scb
+
+
+def dkdv_grid(s, h, b, paired):
+    """k_dkdv_mx(8)'s grid: kv blocks of 128; paired builds (DKDV_PAIR, lab tags with a "W"): two blocks per workgroup
+    when nkb is even"""
+    nkb = s // 128
+    return (nkb // 2, h, b) if paired and nkb % 2 == 0 else (nkb, h, b)
 
 
 def dqg_grid(s, h, b, paired):

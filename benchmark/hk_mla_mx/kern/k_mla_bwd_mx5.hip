@@ -185,6 +185,17 @@ using namespace mx;
 #else
 #define DKDV_CLATTR
 #endif
+#ifndef QONE
+#define QONE 0  // dkdv: the Q rows (192 B, contiguous in global memory) by one TDM op into 240-byte LDS rows (16 B of pad
+                // after every 64 B of the stream) instead of a nope op (128 of 192 B) and a rope op (64 B) into 208-byte
+                // rows: odd rows' nope pieces straddle 128-byte lines (the Q op cost ~1.8x dO's per byte, 11-09 (b))
+#endif
+#ifndef DKDV_PAIR
+#define DKDV_PAIR 0  // dkdv: kv blocks p and nkb - 1 - p in one workgroup when launched with grid (nkb / 2, H, B) (nkb + 1
+                     // steps each: balanced); the TDM rounds run on across the two blocks (block 1's first two rounds
+                     // load during block 0's last steps), block 1's K / V rows load before block 0's last dV / dK, and the
+                     // epilogue stages dK nope / dV / dK rope in the three stages its last steps freed
+#endif
 #ifndef DKDV_MEMMASK
 #define DKDV_MEMMASK 0x7ff  // timing probes only: the dkdv TDM ops k (dk_op) that move data (bit k)
 #endif
@@ -387,9 +398,12 @@ constexpr int NJ = 2;         // kv16 tiles per wave
 constexpr int KBW = 16 * NJ;  // kv rows per wave
 constexpr int KB = 4 * KBW;   // per workgroup
 static_assert(KB == QS_, "b5: step 0 is the only step crossing the diagonal");
-// q part of a stage
+// q part of a stage (XQ: the Q rows' pitch; QONE: segments of 64 B at 80 B steps, nope bytes 64 h at 80 h, rope at 160)
+constexpr int XQ = QONE ? 240 : XK;
+constexpr int Q_NOPE_H = QONE ? 80 : 64, Q_ROPE = QONE ? 160 : 128;
+constexpr unsigned W0_Q1 = tdm_w0(0, 16, 4);
 constexpr int O_Q = 0;
-constexpr int O_QS = O_Q + QS_ * XK;      // 26624
+constexpr int O_QS = O_Q + QS_ * XQ;      // 26624 (QONE 30720)
 constexpr int O_DO = O_QS + QS_ * 8;      // 27648
 constexpr int O_DOS = O_DO + QS_ * X128;  // 46080
 constexpr int O_LSE = O_DOS + QS_ * 4;    // 46592
@@ -421,7 +435,7 @@ struct QTile {
 template <int QT>
 MX_INLINE QTile load_qtile(const StepAddr &a) {
     const lds_u8 *pqn = lds_ptr(a.qn), *pqr = lds_ptr(a.qr), *pdo = lds_ptr(a.dO);
-    constexpr int oq = QT * 16 * XK, od = QT * 16 * X128;
+    constexpr int oq = QT * 16 * XQ, od = QT * 16 * X128;
     QTile t;
     t.qx = frag24(lds_b128(pqn, oq), lds_b128(pqn, oq + 16), lds_b128(pqn, oq + 32), lds_b128(pqn, oq + 48),
                   lds_b128(pqr, oq), lds_b128(pqr, oq + 16));
@@ -528,11 +542,41 @@ __device__ __forceinline__ void dkdv_body(
         crank = rank;
         rot = DKDV_CL_REORDER ? 0 : rank;
     }
-    const int kv0 = kb * KB;
-    const int qs0 = kv0;  // KB == QS_
-    const int nst = (S - qs0) / QS_;
+    // DKDV_PAIR: the paired grid's blocks (XCD-local over the pairs); kbs[k] / nsts[k] the blocks and their steps
+    [[maybe_unused]] int kbs[2] = {kb, kb}, nsts[2] = {0, 0}, nblk = 1;
+    if constexpr (DKDV_PAIR) {
+        const int nkb = (S + KB - 1) / KB;
+        if (nkb % 2 == 0 && 2 * (int)gridDim.x == nkb) {
+            const int np = nkb / 2;
+            int pp, bhx;
+            if ((B * H) % 8 == 0) {
+                const int L = (int)blockIdx.x + np * ((int)blockIdx.y + H * (int)blockIdx.z), k = L >> 3;
+                bhx = (L & 7) + 8 * (k / np);
+                pp = k % np;
+            } else {
+                pp = (int)blockIdx.x;
+                bhx = (int)blockIdx.y + H * (int)blockIdx.z;
+            }
+            h = bhx % H;
+            b = bhx / H;
+            kbs[0] = pp;
+            kbs[1] = nkb - 1 - pp;
+            nblk = 2;
+            kb = pp;
+        }
+        nsts[0] = (S - kbs[0] * KB) / QS_;
+        nsts[1] = (S - kbs[1] * KB) / QS_;
+    }
+    int kv0 = kb * KB;
+    [[maybe_unused]] int qs0 = kv0;  // KB == QS_
+    int nst = (S - qs0) / QS_;
     const unsigned long long bh = (unsigned long long)b * H + h;
-    const int kvw = kv0 + KBW * wv;  // this wave's first kv row
+    int kvw = kv0 + KBW * wv;  // this wave's first kv row
+    // DKDV_PAIR: the global steps of both blocks (TDM rounds run on across them) and the q block of global step g
+    [[maybe_unused]] const int NT = nsts[0] + (nblk == 2 ? nsts[1] : 0);
+    [[maybe_unused]] auto qblk_g = [&](int g) __attribute__((always_inline)) -> int {
+        return g < nsts[0] ? kbs[0] + g : kbs[1] + (g - nsts[0]);
+    };
     // the q block of step s (DKDV_CL rank 0: kb + 1 + s, its diagonal block kb at the last step)
     auto qblk = [&](int s) __attribute__((always_inline)) -> int {
         if constexpr (DKDV_CL == 2) return dlast ? (s < nst - 1 ? kb + 1 + s : kb) : kb + s;
@@ -540,13 +584,17 @@ __device__ __forceinline__ void dkdv_body(
     };
 
 #if !PRO_TDM_FIRST
-    // ---- resident B operands: the wave's K / V rows
+    // ---- resident B operands: the wave's K / V rows (DKDV_PAIR: reloaded for block 1)
     i32x32 kx[NJ];
     i32x16 vb[NJ];
     int ksc[NJ], vsc[NJ];
+    auto load_kv = [&](int kvw_) __attribute__((always_inline)) {
+    // DKDV_PAIR: the lane read again here (volatile), so block 1's lane addresses are not hoisted above the step loop
+    const int lnk = DKDV_PAIR ? lane_now() : lane;
+    const int lr = lnk & 15, lh = lnk >> 4;
     static_for<NJ>([&](auto jj) {
         constexpr int j = jj;
-        const int kvr = kvw + 16 * j + lr;
+        const int kvr = kvw_ + 16 * j + lr;
         const unsigned long long row = bh * S + (unsigned long long)(kvr < S ? kvr : S - 1);
         const unsigned char *kp = K8 + row * D_QK;
         kx[j] = frag24(gload16(kp + 64 * lh), gload16(kp + 64 * lh + 16), gload16(kp + 64 * lh + 32),
@@ -557,6 +605,8 @@ __device__ __forceinline__ void dkdv_body(
                      gload16(vp + 64 * lh + 48));
         vsc[j] = *(const int *)(VSR + row * 4);
     });
+    };
+    load_kv(kvw);
 
 #endif
     // the 11 TDM ops of a round, 3 per wave: [Q^T, QS, LSE], [Q nope, dO scales, delta], [dO, Q rope, -], [dO^T, dO^T
@@ -564,7 +614,8 @@ __device__ __forceinline__ void dkdv_body(
     auto dk_op = [&](int k) -> TdmOp {
         const unsigned long long bS = bh * (unsigned long long)S, bS128 = bh * (unsigned long long)(S / 128);
         switch (k) {
-        case 0: return {O_Q, (unsigned long long)(uintptr_t)Q8 + bS * D_QK, D_QK, tdm_g1(W0_KN, QS_, 128, QS_, D_QK), 1};
+        case 0: return {O_Q, (unsigned long long)(uintptr_t)Q8 + bS * D_QK, D_QK,
+                        QONE ? tdm_g1(W0_Q1, QS_, D_QK, QS_, D_QK) : tdm_g1(W0_KN, QS_, 128, QS_, D_QK), 1};
         case 1: return {O_Q + 128, (unsigned long long)(uintptr_t)Q8 + bS * D_QK + 128, D_QK, tdm_g1(W0_KR, QS_, 64, QS_, D_QK), 1};
         case 2: return {O_QS, (unsigned long long)(uintptr_t)QS + bS * 8, 8, tdm_g1(W0_S, QS_, 8, QS_, 8), 1};
         case 3: return {O_DO, (unsigned long long)(uintptr_t)DO8 + bS * D_V, D_V, tdm_g1(W0_128, QS_, 128, QS_, D_V), 1};
@@ -580,7 +631,7 @@ __device__ __forceinline__ void dkdv_body(
     };
     constexpr int TDM_PER_ROUND = 3;
     const int k0 = wv == 0 ? 7 : wv == 1 ? 0 : wv == 2 ? 3 : 5;
-    const int k1 = wv == 0 ? 2 : wv == 1 ? 4 : wv == 2 ? 1 : 6;
+    const int k1 = wv == 0 ? 2 : wv == 1 ? 4 : wv == 2 ? (QONE ? 11 : 1) : 6;  // QONE: no rope op (11: NULL)
     const int k2 = LTDT_G ? (wv == 3 ? 8 : 11) : (wv == 0 ? 9 : wv == 1 ? 10 : wv == 2 ? 11 : 8);
     const TdmOp op0 = dk_op(k0), op1 = dk_op(k1), op2 = dk_op(k2);
 #if TDM_INC
@@ -610,7 +661,13 @@ __device__ __forceinline__ void dkdv_body(
     auto issue_one = [&](const TdmOp &op, OpRun &o) __attribute__((always_inline)) {
         const bool real = o.si >= 0 && o.si < nst && DKDV_MEMPROBE != 3 && !(DKDV_MEMPROBE == 4 && o.ap) &&
                           !(DKDV_MEMPROBE == 5 && !o.ap) && ((DKDV_MEMMASK >> o.k) & 1);
-        if constexpr (DKDV_CL == 2) {
+        if constexpr (DKDV_PAIR) {
+            // the global step's block and q block (both blocks' steps in one sequence)
+            const bool realp = o.si >= 0 && o.si < NT;
+            const int sc = o.si < 0 ? 0 : (o.si < NT ? o.si : NT - 1);
+            const unsigned long long ga = op.base + (unsigned long long)(qblk_g(sc) * QS_) * op.mult;
+            tdm_load(tdm_g0(o.lds, ga, realp ? op.on : 0), op.g1);
+        } else if constexpr (DKDV_CL == 2) {
             // the step's q block directly (rank 0's last step jumps back to its diagonal block); multicast unless it is
             // rank 0's diagonal step (the partner has none)
             const int sc = o.si < 0 ? 0 : (o.si < nst ? o.si : nst - 1);
@@ -693,9 +750,9 @@ __device__ __forceinline__ void dkdv_body(
         const unsigned sq = lds0 + (unsigned)(((s + rot) % NSTG) * QSTG);
         const unsigned sa = lds0 + ARING + (unsigned)(((s + rot + NSTG - 1) % NSTG) * ASTG);  // the A part of step s - 1
         const int ln = lane_now(), r16 = ln & 15, hh = ln >> 4;
-        const unsigned rq = sq + (unsigned)(r16 * XK), r1 = sq + (unsigned)(r16 * X128), ra = sa + (unsigned)(r16 * X128);
+        const unsigned rq = sq + (unsigned)(r16 * XQ), r1 = sq + (unsigned)(r16 * X128), ra = sa + (unsigned)(r16 * X128);
         const unsigned lo = LTDT_DPP ? (unsigned)(4 * (8 * hh + (ln & 7))) : (unsigned)(32 * hh);
-        return {pin(rq + O_Q + 64 * hh),         pin(rq + O_Q + 128 + 32 * hh), pin(sq + O_QS + r16 * 8 + 4 * hh),
+        return {pin(rq + O_Q + Q_NOPE_H * hh),   pin(rq + O_Q + Q_ROPE + 32 * hh), pin(sq + O_QS + r16 * 8 + 4 * hh),
                 pin(r1 + O_DO + 64 * hh),        pin(sq + O_DOS + r16 * 4),     pin(sq + O_LSE + lo),
                 pin(sq + O_DEL + lo),            pin(ra + O_DOT + 64 * hh),     pin(sa + O_DOTS + ln * 4),
                 pin(ra + O_QT + 64 * hh),        pin(sa + O_QTS + ln * 4)};
@@ -1056,6 +1113,136 @@ __device__ __forceinline__ void dkdv_body(
             dsso[(int)jj] = dss[(int)jj];
         });
     };
+    if constexpr (DKDV_PAIR) {
+        static_assert(!UNROLL2 && !MIDSYNC && !LTDT_G && DKDV_CL == 0 && TDM_INC && EPI_SKEW && !EPI_DIRECT && !EPI_PAD &&
+                          !EPI_WAVE && !PRO_TDM_FIRST,
+                      "DKDV_PAIR");
+        // step s of the current block at global step g (ring stages and TDM rounds by g); w0: wait for every TDM op
+        // (block 1's first step: the previous epilogue's stores read the stages round g + 2 overwrites)
+        auto run_p = [&](int g, int s, bool w0, auto diag_c, auto prev_c) __attribute__((always_inline)) {
+            if (w0)
+                tensor_wait<0>();
+            else
+                tensor_wait<TDM_PER_ROUND>();
+            bar_signal();
+            bar_wait();
+            issue_round(g + 2);
+            const StepAddr a = addr(g);
+            i32x16 pB[NJ], dsB[NJ];
+            int dss[NJ] = {};
+            step(s, ds_ptr(s), a, (kb + s) * QS_, pB, dsB, dss, pBo, dsBo, dsso, pre_t, pre_a, diag_c, prev_c);
+            static_for<NJ>([&](auto jj) {
+                pBo[(int)jj] = pB[(int)jj];
+                dsBo[(int)jj] = dsB[(int)jj];
+                dsso[(int)jj] = dss[(int)jj];
+            });
+        };
+        // epilogue staging: dK nope (256-byte rows) in q stage gl, dV (256) in A stage gl, dK rope (128) in A stage
+        // gl - 1 (gl: the block's last global step), each as 16 skewed regions of KB / 16 rows
+        constexpr int XP = 2 * 128, RRW = KB / 16, RN = RRW * XP + 16, RR = RRW * 128 + 16;
+        static_assert(16 * RN <= QSTG && 16 * RN <= ASTG && 16 * RR <= ASTG, "pair staging inside one stage");
+        // the two blocks as two copies of straight code (an outer loop's carried K / V scales spilled: WMMA scale
+        // operands must stay in v0..v255)
+        auto do_block = [&](int G, auto second_c) __attribute__((always_inline)) {
+            constexpr bool SECOND = decltype(second_c)::value;
+            run_p(G, 0, SECOND, std::true_type{}, std::false_type{});
+            for (int s = 1; s < nst; ++s) run_p(G + s, s, false, std::false_type{}, std::true_type{});
+            const int gl = G + nst - 1;
+            if (!SECOND && nblk == 2) load_kv(kbs[1] * KB + KBW * wv);  // block 1's K / V (the last dV / dK do not use them)
+            // the last step's dV / dK (its A part: round gl + 1; round gl + 2, block 1's first, may still be in flight)
+            tensor_wait<TDM_PER_ROUND>();
+            bar_signal();
+            bar_wait();
+            {
+                const StepAddr a = addr(gl + 1);
+                constexpr int NAB = 4;
+                AFrag ab[NAB];
+                ab[0] = ldA(a, std::integral_constant<int, 0>{});
+                ab[1] = ldA(a, std::integral_constant<int, 1>{});
+                static_for<20>([&](auto dd) {
+                    constexpr int d = dd;
+                    if constexpr (d + 2 < 20) ab[(d + 2) % NAB] = ldA(a, std::integral_constant<int, (d + 2 < 20 ? d + 2 : 0)>{});
+#if KEEP_WAR & 1
+                    if constexpr (d >= 1 && d + 2 < 20) {
+                        keep(ab[(d + NAB - 1) % NAB].x);
+                        keep(ab[(d + NAB - 1) % NAB].s);
+                    }
+#endif
+                    fence();
+                    group(std::integral_constant<int, d>{}, ab[d % NAB], pBo, dsBo, dsso);
+                    fence();
+                });
+            }
+            bar_signal();
+            bar_wait();  // every wave is done with A stage gl
+            const unsigned bq = lds0 + (unsigned)((gl % NSTG) * QSTG), bva = lds0 + ARING + (unsigned)((gl % NSTG) * ASTG),
+                           bra = lds0 + ARING + (unsigned)(((gl + NSTG - 1) % NSTG) * ASTG);
+            {
+                const int ln = lane_now();
+                static_for<NJ>([&](auto jj) {
+                    constexpr int j = jj;
+                    const unsigned r = (unsigned)(KBW * wv + 16 * j + (ln & 15)), hh = (unsigned)(ln >> 4);
+                    const unsigned rg = (unsigned)(ln & 15), rm = r >> 4;
+                    const unsigned dkn = bq + rg * RN + rm * XP + 16 * hh, dvr = bva + rg * RN + rm * XP + 16 * hh;
+                    const unsigned dkr = bra + rg * RR + rm * 128 + 16 * hh;
+                    static_for<12>([&](auto dd) {
+                        constexpr int d = dd;
+                        bf16x8 w;
+                        static_for<8>([&](auto rr) { w[(int)rr] = (bf16)(dk[d][j][(int)rr] * scale); });
+                        const unsigned ad = d >= 8 ? dkr + 32 * (d - 8) : dkn + 32 * d;
+                        *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)ad = __builtin_bit_cast(u32x4, w);
+                    });
+                    static_for<8>([&](auto dd) {
+                        constexpr int d = dd;
+                        bf16x8 w;
+                        static_for<8>([&](auto rr) { w[(int)rr] = (bf16)dv[d][j][(int)rr]; });
+                        *(__attribute__((address_space(3))) u32x4 *)(uintptr_t)(dvr + 32 * d) = __builtin_bit_cast(u32x4, w);
+                    });
+                });
+            }
+            bar_signal();
+            bar_wait();
+            {
+                // wave w: regions j = 4 w .. 4 w + 3 of each piece: rows kv0 + j + 16 m
+                const int rows = min(KB, S - kv0);
+                static_for<4>([&](auto jj) {
+                    const int j = 4 * wv + (int)jj;
+                    const unsigned nr = rows > j ? (unsigned)min(RRW, (rows - j + 15) / 16) : 0u;
+                    const long long kr = (long long)(kv0 + j);
+                    const unsigned long long gk = (unsigned long long)(uintptr_t)(DK + (long long)b * dk_sb + kr * dk_ss +
+                                                                                  (long long)h * (SPLIT ? 256 : D_QK));
+                    tdm_store(tdm_g0(bq + (unsigned)(j * RN), gk),
+                              tdm_g1(tdm_w0(0, 0, 0), nr, XP, RRW, 32ull * (unsigned long long)dk_ss));
+                    const unsigned long long gv = (unsigned long long)(uintptr_t)(DV + (long long)b * dv_sb + kr * dv_ss +
+                                                                                  (long long)h * (SPLIT ? 256 : D_V));
+                    tdm_store(tdm_g0(bva + (unsigned)(j * RN), gv),
+                              tdm_g1(tdm_w0(0, 0, 0), nr, XP, RRW, 32ull * (unsigned long long)dv_ss));
+                    const unsigned long long gr =
+                        SPLIT ? (unsigned long long)(uintptr_t)(DKP + (long long)b * dkp_sb + kr * dkp_ss + (long long)h * 64)
+                              : (unsigned long long)(uintptr_t)(DK + (long long)b * dk_sb + kr * dk_ss + (long long)h * D_QK + 128);
+                    tdm_store(tdm_g0(bra + (unsigned)(j * RR), gr),
+                              tdm_g1(tdm_w0(0, 0, 0), nr, 128, RRW,
+                                     32ull * (unsigned long long)(SPLIT ? dkp_ss : dk_ss)));
+                });
+            }
+            if constexpr (!SECOND) {
+                static_for<8>([&](auto d) { static_for<NJ>([&](auto j) { dv[(int)d][(int)j] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
+                static_for<12>([&](auto d) { static_for<NJ>([&](auto j) { dk[(int)d][(int)j] = f32x8{0, 0, 0, 0, 0, 0, 0, 0}; }); });
+            }
+        };
+        do_block(0, std::false_type{});
+        if (nblk == 2) {
+            const int G1 = nst;
+            kb = kbs[1];
+            kv0 = kb * KB;
+            qs0 = kv0;
+            nst = nsts[1];
+            kvw = kv0 + KBW * wv;
+            do_block(G1, std::true_type{});
+        }
+        tensor_wait<0>();
+        return;
+    }
 #if UNROLL2
     // two steps per loop trip with ping-pong P / dS buffers (X: even steps, Y: odd steps): no per-step copies of the
     // loop-carried P / dS of the previous step (LLVM moved ~66 VGPRs per step through v_mov at the step end)

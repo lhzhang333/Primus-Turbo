@@ -960,3 +960,15 @@ half the CUs, b1 h16).
   five shapes), time within noise (dkdv_mx8 1.039 -> 1.023, the unchanged b7 kernel moved +-1% in the same run). Package.
 - dkdv balance at full clocks (k_dkdv_mx, memprobe builds): full 829 us, TDM only 653 (79%), compute only 708 (85%):
   as at 1.3 GHz (83% / 87%): the TDM / L2 path scales with the GPU clock.
+- QONE (lab, off): the Q rows by one TDM op into 240-byte LDS rows (16 B of pad per 64 B): bitwise, but TDM-only 654 ->
+  668 us, full 832 -> 825 (noise): the Q op's cost per byte is not from the nope / rope split.
+- ATT at full clocks: k_dkdv_mx8 trip ~2505 cycles; per workgroup ~9.4k cycles before the loop (TDM first data ~3.7k,
+  K / V loads ~1.6k waiting, the peeled diagonal step ~2.5k) and ~3.1k after (TDM store wait ~1.4k): ~7k cycles of
+  waiting per block (~10% of dkdv). k_dqg_mx8 trip 1123 cycles (48 WMMA, 50 ds_load_b128 at 4.7 each), 87% in the loop;
+  forward (lab, LLVM order) trip 2080 cycles, 795 instructions (256 v_exp at 2.44, 100 WMMA at 5.2): issue-bound.
+- DKDV_PAIR (lab, WIP, default 0): kv blocks p and nkb - 1 - p per workgroup (grid (nkb / 2, H, B), 33 steps each),
+  TDM rounds running on across the blocks, block 1's K / V loaded before block 0's last dV / dK, epilogue staged in the
+  three freed stages (dK nope / dV / dK rope). Bitwise = unpaired at five shapes (scratch_mx/py/b8_ab.py 5P8e 5PW8),
+  but 1.37 vs 0.97 ms: the outer block loop spilled the K / V scale words (WMMA scale operands, v0..v255) into the step
+  loop (16 scratch loads per trip). Two straight copies of the block (no outer loop): still 12-30 scratch ops in the
+  kernel (not yet located); paused here (user, 11-10 ~07:00 UTC).
