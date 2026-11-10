@@ -950,3 +950,8 @@ half the CUs, b1 h16).
   recompute (b7: 35 dB) PASS. Package profile (fused-RoPE fwd + bwd per step, two interleaved rounds): b7 2.214 / 2.228
   -> **b8 2.060 / 2.079 ms (-6.8%)**: dqg 0.375 / 0.387 -> 0.268 / 0.280, dkdv 1.011 / 1.032 -> 0.987 / 0.999, forward
   0.389-0.409, qkv quantization 0.161, dO quantization 0.059.
+- Training gate **g120m** (b8, full clocks, gpulock-wrapped, no intruders): bf16 HK 739.3, hk_mx + fused RoPE 708.3 ms /
+  iteration (**-4.19%**; g120l at 1.3 GHz with b7: -2.79%), final-window loss 0.0818 both, grad-norm ratio max 1.037.
+- GPU jobs now run under the project's gpu-lock skill (`.claude/skills/gpu-lock/gpulock run -g 0`, locks in
+  /var/tmp/gpu-locks; scratch_mx/gx.sh and gate/gate1.sh take the old logs/gpu0.lock outside it during the move), with
+  the timeout inside the container.
