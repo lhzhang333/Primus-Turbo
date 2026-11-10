@@ -16,6 +16,7 @@ from config import (
     compute_snr,
     gen_attention_test_cases,
     gen_attention_varlen_test_cases,
+    gen_attention_window_test_cases,
     get_platform_info,
 )
 from tabulate import tabulate
@@ -658,8 +659,9 @@ def profile_varlen(segments, window_left, num_head_q, num_head_kv, head_dim, bac
 
 
 def _dense_cases():
-    """(batch, causal, Hq, Hkv, Dqk, Dv, Sq, Skv, window_left) for the model shapes."""
-    return [
+    """(batch, causal, Hq, Hkv, Dqk, Dv, Sq, Skv, window_left) for the model shapes: full
+    attention, causal and not, then the models' causal sliding windows."""
+    full = [
         (
             batch,
             causal,
@@ -675,6 +677,22 @@ def _dense_cases():
         for case in gen_attention_test_cases()
         for batch in BATCH_SIZE_LIST
     ]
+    windowed = [
+        (
+            batch,
+            True,
+            case["num_head_q"],
+            case["num_head_kv"],
+            case["head_dim_qk"],
+            case["head_dim_v"],
+            case["seqlen"],
+            case["seqlen"],
+            case["window_left"],
+        )
+        for case in gen_attention_window_test_cases()
+        for batch in BATCH_SIZE_LIST
+    ]
+    return full + windowed
 
 
 def _forward_only_cases():

@@ -98,8 +98,8 @@ class FlashAttnFunc(torch.autograd.Function):
     backward takes the same one. q/k/v arrive ``[b, s, h, d]``-shaped, so the sbhd-native
     kernels -- FlyDSL's gfx950 ones and HipKittens -- take their ``[s, b, h, d]`` permute (the
     original tensor, since only sbhd storage is eligible) and permute their results back.
-    FlyDSL's gfx1250 kernels (the DeepSeek-V3 MLA head dims, and head dim 128) take any byte
-    order."""
+    FlyDSL's gfx1250 kernels (the DeepSeek-V3 MLA head dims, and head dims 64 and 128) take any
+    byte order."""
 
     @staticmethod
     def forward(
@@ -188,8 +188,8 @@ class FlashAttnFunc(torch.autograd.Function):
                 raise ValueError("gfx1250 flydsl attention does not implement dropout, bias, alibi or sink")
             if return_softmax:
                 raise ValueError("gfx1250 flydsl attention cannot return the softmax matrix")
-            if int(window_size[0]) >= 0 or int(window_size[1]) > 0:
-                raise ValueError(f"gfx1250 flydsl attention has no sliding window, got {window_size}")
+            if int(window_size[1]) > 0:
+                raise ValueError(f"gfx1250 flydsl attention has no window on the right, got {window_size}")
             if softmax_scale is not None and (
                 not isinstance(softmax_scale, Real) or isinstance(softmax_scale, bool)
             ):
@@ -200,6 +200,10 @@ class FlashAttnFunc(torch.autograd.Function):
             # both passes.
             ctx.flydsl_gfx1250_mla = is_mla_head_dims(q, k, v)
             if ctx.flydsl_gfx1250_mla:
+                if int(window_size[0]) >= 0:
+                    raise ValueError(
+                        f"gfx1250 flydsl attention: the MLA kernels have no sliding window, got {window_size}"
+                    )
                 reason = flydsl_gfx1250_mla_unsupported_reason(q, k, v, causal)
                 if reason is not None:
                     raise ValueError(f"gfx1250 flydsl attention: {reason}")
@@ -207,21 +211,24 @@ class FlashAttnFunc(torch.autograd.Function):
                     q, k, v, softmax_scale=softmax_scale, causal=causal
                 )
             else:
-                # Same rule as the gate: a right bound of 0 is a causal mask, so it needs causal=True.
-                if int(window_size[1]) == 0 and not causal:
+                # Same rule as the gate: a right bound of 0 is a causal mask, so it needs
+                # causal=True, and so does a left window (causal makes a right bound of -1 0).
+                window_left = int(window_size[0])
+                if (int(window_size[1]) == 0 or window_left >= 0) and not causal:
                     raise ValueError(
-                        f"gfx1250 flydsl attention has no sliding window, got {window_size} (causal={causal})"
+                        f"gfx1250 flydsl attention has no non-causal window, got {window_size} (causal={causal})"
                     )
-                reason = flydsl_gfx1250_unsupported_reason(q, k, v, causal)
+                reason = flydsl_gfx1250_unsupported_reason(q, k, v, causal, window_left)
                 if reason is not None:
                     raise ValueError(f"gfx1250 flydsl attention: {reason}")
                 # [b, s, h, d] in any byte order; the adapter makes q/k/v contiguous BSHD and the
                 # backward consumes exactly those tensors and lse [B, Hq, Sq].
                 q_c, k_c, v_c = (t.contiguous() for t in (q, k, v))
                 out, lse = flash_attn_flydsl_gfx1250_forward_impl(
-                    q_c, k_c, v_c, softmax_scale=softmax_scale, causal=causal
+                    q_c, k_c, v_c, softmax_scale=softmax_scale, causal=causal, window_left=window_left
                 )
                 saved = (q_c, k_c, v_c, out, lse)
+                ctx.window_left = window_left
             if is_grad_enabled and _any_requires_grad(q, k, v):
                 ctx.save_for_backward(*saved)
                 ctx.softmax_scale = softmax_scale
@@ -385,6 +392,7 @@ class FlashAttnFunc(torch.autograd.Function):
                     softmax_scale=ctx.softmax_scale,
                     causal=ctx.causal,
                     deterministic=ctx.deterministic,
+                    window_left=ctx.window_left,
                 )
             return _flash_attn_grads(dq, dk, dv, None, None)
 
