@@ -64,7 +64,7 @@ _TABLE: dict = {
 
 
 # With a 16x16-preshuffled B the deep kpair-1 pipelines become usable (row-major B at kpair 1 is a 128-byte TDM row per
-# tile row): (M, N, K) -> config where that beats the row-major table (scratch_mxd/results/k1_bsh.json).
+# tile row): (M, N, K) -> config where that beats the row-major table (scratch_mxd/results/k1_perf.md).
 _TABLE_BSH: dict = {
     (8192, 1536, 7168): C(256, 256, 4, 1, 2, 2),  # q_down fwd    28.2 us (row-major B 31.0)
     (1536, 7168, 8192): C(256, 256, 4, 1, 2, 2),  # q_down wgrad  31.8 (36.2)
@@ -72,6 +72,7 @@ _TABLE_BSH: dict = {
     (24576, 1536, 8192): C(256, 256, 4, 1, 2, 2),  # q_up wgrad   97.5 (101.0)
     (8192, 7168, 576): C(256, 256, 3, 1, 2, 2),  # kv_down dgrad   22.6 (28.6)
     (8192, 7168, 16384): C(256, 256, 4, 1, 1, 4),  # o_proj fwd  263.9 (281.1)
+    (7168, 2048, 8192): C(256, 256, 4, 1, 1, 4),  # shared fc2 wgrad 35.6 (36.7)
 }
 
 
