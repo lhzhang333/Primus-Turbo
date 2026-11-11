@@ -25,8 +25,41 @@ class MXGemmConfig(NamedTuple):
 
 DEFAULT = MXGemmConfig()
 
-# (M, N, K) -> config, measured on MI455X (scratch_mxd/results/k1_*.md).
-_TABLE: dict = {}
+C = MXGemmConfig
+# (M, N, K) -> fastest measured config with packed scales, DSv3 at T = 8192 (MI455X, scratch_mxd/results/k1_perf.md);
+# fwd (T, N, K), dgrad (T, K, N), wgrad (N, K, T); experts: one expert of 2048 rows. Configs within ~2% are noise.
+_TABLE: dict = {
+    # MLA projections
+    (8192, 1536, 7168): C(256, 256, 2, 2, 2, 2),  # q_down fwd
+    (8192, 7168, 1536): C(256, 256, 2, 2, 2, 2),  # q_down dgrad
+    (1536, 7168, 8192): C(256, 256, 4, 1, 1, 1),  # q_down wgrad
+    (8192, 24576, 1536): C(256, 256, 2, 2, 2, 2),  # q_up fwd
+    (8192, 1536, 24576): C(256, 256, 2, 2, 2, 2),  # q_up dgrad
+    (24576, 1536, 8192): C(256, 256, 2, 2, 2, 2),  # q_up wgrad
+    (8192, 576, 7168): C(256, 128, 3, 2, 1, 1),  # kv_down fwd
+    (8192, 7168, 576): C(256, 256, 2, 2, 4, 1),  # kv_down dgrad
+    (576, 7168, 8192): C(128, 256, 3, 2, 1, 4),  # kv_down wgrad
+    (8192, 32768, 512): C(256, 256, 2, 2, 4, 1),  # kv_up fwd
+    (8192, 512, 32768): C(128, 128, 4, 2, 2, 2),  # kv_up dgrad
+    (32768, 512, 8192): C(256, 256, 2, 2, 2, 2),  # kv_up wgrad
+    (8192, 7168, 16384): C(256, 256, 2, 2, 2, 2),  # o_proj fwd
+    (8192, 16384, 7168): C(256, 256, 2, 2, 2, 2),  # o_proj dgrad
+    (7168, 16384, 8192): C(256, 256, 2, 2, 4, 1),  # o_proj wgrad
+    # shared expert
+    (8192, 4096, 7168): C(256, 256, 2, 2, 2, 2),  # fc1 fwd
+    (8192, 7168, 4096): C(256, 256, 2, 2, 2, 2),  # fc1 dgrad
+    (4096, 7168, 8192): C(256, 256, 2, 2, 2, 2),  # fc1 wgrad
+    (8192, 7168, 2048): C(256, 256, 2, 2, 2, 2),  # fc2 fwd
+    (8192, 2048, 7168): C(256, 256, 2, 2, 1, 4),  # fc2 dgrad
+    (7168, 2048, 8192): C(256, 256, 2, 2, 4, 1),  # fc2 wgrad
+    # one routed expert (2048 rows)
+    (2048, 4096, 7168): C(128, 256, 3, 2, 1, 4),  # fc1 fwd
+    (2048, 7168, 4096): C(256, 256, 2, 2, 2, 2),  # fc1 dgrad
+    (2048, 7168, 2048): C(256, 256, 2, 2, 2, 2),  # fc2 fwd
+    (2048, 2048, 7168): C(128, 128, 4, 2, 2, 2),  # fc2 dgrad
+    (4096, 7168, 2048): C(256, 256, 2, 2, 2, 2),  # fc1 wgrad
+    (7168, 2048, 2048): C(256, 256, 2, 2, 4, 1),  # fc2 wgrad
+}
 
 
 def pick_config(M: int, N: int, K: int, num_cus: int = 256) -> MXGemmConfig:
