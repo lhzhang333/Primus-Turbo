@@ -517,7 +517,7 @@ def gemm_mxfp8_gfx1250(
     _require_gfx1250(a.device)
     M, K = a.shape
     N = b.shape[0]
-    cfg = config or pick_config(M, N, K)
+    cfg = config or pick_config(M, N, K, b_preshuffled)
     cfg = cfg._replace(scale_4d=a_scale.dim() == 4, b_preshuffle=bool(b_preshuffled))
     if out_dtype != torch.bfloat16:
         raise NotImplementedError(f"gemm_mxfp8_gfx1250: out_dtype {out_dtype} (bf16 only)")

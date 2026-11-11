@@ -63,10 +63,15 @@ _TABLE: dict = {
 }
 
 
-def pick_config(M: int, N: int, K: int, num_cus: int = 256) -> MXGemmConfig:
+# With a 16x16-preshuffled B the deep kpair-1 pipelines become usable (row-major B at kpair 1 is a 128-byte TDM row per
+# tile row): (M, N, K) -> config where that beats the row-major table (scratch_mxd/results/k1_bsh.json).
+_TABLE_BSH: dict = {}
+
+
+def pick_config(M: int, N: int, K: int, b_preshuffled: bool = False, num_cus: int = 256) -> MXGemmConfig:
     """The measured config of (M, N, K), else by grid fill: 256x256 while it gives at least ~3/4 of a wave, then
     128x256, then 128x128 (two workgroups per CU). The entry point shrinks the cluster to what the grid divides."""
-    cfg = _TABLE.get((M, N, K))
+    cfg = (b_preshuffled and _TABLE_BSH.get((M, N, K))) or _TABLE.get((M, N, K))
     if cfg is not None:
         return cfg
     tiles = lambda tm, tn: -(-M // tm) * -(-N // tn)  # noqa: E731

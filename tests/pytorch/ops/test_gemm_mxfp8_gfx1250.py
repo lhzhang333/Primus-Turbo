@@ -26,7 +26,7 @@ if is_gfx1250():
     from primus_turbo.flydsl.gemm.gemm_mxfp8_gfx1250_configs import MXGemmConfig as C
     from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 import gemm_mxfp8_gfx1250
 
-    # scale_4d: the scales are passed packed (the fast layout) or raw
+    # 7th / 8th fields: scales passed packed (the fast layout) or raw; B passed 16x16-preshuffled
     CONFIGS = [
         C(256, 256, 2, 2, 1, 1, True),
         C(256, 256, 2, 2, 1, 4, True),
@@ -38,6 +38,8 @@ if is_gfx1250():
         C(128, 128, 4, 2, 1, 1, True),
         C(256, 256, 2, 2, 1, 4),
         C(128, 128, 4, 1, 1, 1),
+        C(256, 256, 4, 1, 2, 2, True, True),
+        C(128, 256, 3, 2, 1, 4, True, True),
     ]
 else:
     CONFIGS = [None]
@@ -46,7 +48,10 @@ else:
 def _run(a, sa, b, sb, cfg, out=None):
     if cfg.scale_4d:
         sa, sb = pack_scales(sa), pack_scales(sb)
-    return gemm_mxfp8_gfx1250(a, sa, b, sb, out=out, config=cfg)
+    if cfg.b_preshuffle:
+        N, K = b.shape
+        b = b.view(N // 16, 16, K // 16, 16).permute(0, 2, 1, 3).contiguous().view(N, K)
+    return gemm_mxfp8_gfx1250(a, sa, b, sb, out=out, config=cfg, b_preshuffled=cfg.b_preshuffle)
 
 
 @pytest.mark.parametrize("cfg", CONFIGS, ids=lambda c: "-".join(map(str, c)) if c else "none")
@@ -60,6 +65,8 @@ def _run(a, sa, b, sb, cfg, out=None):
     ],
 )
 def test_gemm_mxfp8_int_exact(cfg, M, N, K):
+    if cfg.b_preshuffle and N % 16:
+        pytest.skip("a preshuffled B needs N % 16 == 0")
     a, sa, b, sb = int_valued_operands(M, N, K, seed=M + N + K)
     out = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
     _run(a, sa, b, sb, cfg, out)
@@ -74,7 +81,7 @@ def test_gemm_mxfp8_random_snr():
     ref = gemm_ref(a, sa, b, sb)
     ref_bf16 = ref.to(torch.bfloat16)
     floor = snr_db(ref_bf16, ref)  # the bf16 output rounding alone: ~55.6 dB
-    for cfg in CONFIGS[1:2] + CONFIGS[-2:-1]:
+    for cfg in (CONFIGS[1], CONFIGS[8], CONFIGS[10]):  # packed, raw, preshuffled B
         out = _run(a, sa, b, sb, cfg)
         # the WMMA accumulation error is invisible next to the bf16 output rounding
         assert snr_db(out, ref) > floor - 0.05
@@ -85,7 +92,7 @@ def test_gemm_mxfp8_deterministic():
     g = torch.Generator(device="cuda").manual_seed(7)
     a, sa = quant_rows(torch.randn(M, K, device="cuda", generator=g))
     b, sb = quant_rows(torch.randn(N, K, device="cuda", generator=g))
-    for cfg in CONFIGS[1:2] + CONFIGS[3:4]:
+    for cfg in (CONFIGS[1], CONFIGS[3], CONFIGS[10]):
         first = _run(a, sa, b, sb, cfg).clone()
         out = torch.empty_like(first)
         same = 0
