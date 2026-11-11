@@ -42,6 +42,8 @@ to the last tile T_{N-1}):
   exit: tensorcnt 0 -> BARRIER -> the epilogue images overwrite the ring.
 """
 
+import math
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -88,6 +90,22 @@ ROWS3 = 32 * NKV3  # 96
 KH0_SALU = 2  # SALU per WMMA of a TDM-prep run
 SB_ALU = 0x002 | 0x004 | 0x400  # sched_barrier: VALU, SALU and transcendental may cross
 HEAD_GROUP = 32  # head-group target of the grid
+# Schedule of the 96-row body (all bitwise equal; b2 s4096 h128 hot ms on MI455X 11-11, HK LLVM k_dkdv96ds 1.429):
+#   0  per kv sub-tile: its S / dP WMMA chains, then its softmax (the HK LLVM order)                          1.573
+#   1  hh0's six chains k-step by k-step; hh1's WMMAs interleaved with hh0's softmax                         1.492
+#   2  1 + hh1's operands streamed in behind hh0's WMMAs of each k-step                                       1.595
+#   3  1 + hh1's chains sub-tile by sub-tile with the softmax of its first two sub-tiles interleaved too    1.501
+#   5  both halves k-step by k-step, dO^T under hh1's WMMAs, dV sub-tile by sub-tile under hh1's softmax      1.585
+#   6  1 + all 40 dV / dK A-operand tr16 right after hh1's WMMAs (into the dead S / dP operand registers,
+#      under hh1's softmax), so dV / dK run on loaded operands; the next tile's NL / ND load after the dV run   1.382
+#   7  3 + 6                                                                                                    1.434
+# (In 0 / 1 each Q^T tr16 of the dV run reused a register the previous dV WMMA still read: an expert-mode
+# s_wait_alu va_vdst(0) drain before almost every one.)
+SDP_SCHED = 6
+# 1: the HipKittens generator's numerics (NOT bitwise the FlyDSL backward): NL' = NL + log2(scale), ND' = ND / scale
+# (= -delta) start the dP chains, exp2(c1 S + NL') = scale * P, dS = (scale * P) (dP - delta) is one multiply, and dV
+# is scaled by 1 / scale once in the epilogue. The entry folds NL / ND itself (two small torch ops).
+NUMERICS = 0
 # dS scratch layout (HipKittens dslayout.h v2)
 DS_LAYOUT_VERSION = 2
 DSL_KV = 16
@@ -395,7 +413,7 @@ def _dkdv96_impl(
 
     zero8 = _ir(fx.Vector.filled(8, 0.0, fx.Float32))
 
-    # ---- dS^T export: DS is the scratch as bytes; the per-wave descriptor (base region bh0, row kt0) is built in
+    # ---- dS^T export: DS is the scratch (only its base address is used); the per-wave descriptor (base region bh0, row kt0) is built in
     # the body; ds_rc[kh] row constants; voffset lane * 16
     nqp = Sq // fx.Int32(DSL_Q)
     mm = cshift >> fx.Int32(5)
@@ -474,14 +492,28 @@ def _dkdv96_impl(
             )
 
         # ---- S / dP + softmax / dS of one (hh, kh)
-        def sdp_one(do_mask, hh, kh, qfr, dfr, pre, q0, ph, dh):
-            qb = q0 + fx.Int32(hh * 16) + half * fx.Int32(8)
+        def p_init(hh, pre):
+            """C init of a dP chain: +0, or (NUMERICS 1) ND' of this lane's 8 query rows of half hh."""
+            if const_expr(NUMERICS == 0):
+                return zero8
+            return _ir(fx.Vector(pre[hh * 4 + 2]).shuffle(fx.Vector(pre[hh * 4 + 3]), list(range(8))))
+
+        def sdp_mm(kh, qfr, dfr, hh, pre):
             s = zero8
-            p = zero8
+            p = p_init(hh, pre)
             for dt in range_constexpr(NDT_QK):
                 s = wmma(qfr[dt], kf[kh][dt], s)
                 if const_expr(dt < NDT_V):
                     p = wmma(dfr[dt], vf[kh][dt], p)
+            return s, p
+
+        def sdp_one(do_mask, hh, kh, qfr, dfr, pre, q0, ph, dh):
+            s, p = sdp_mm(kh, qfr, dfr, hh, pre)
+            smx(do_mask, hh, kh, s, p, pre, q0, ph, dh)
+
+        def smx(do_mask, hh, kh, s, p, pre, q0, ph, dh):
+            """softmax / dS of one (hh, kh) from its raw S / dP C fragments."""
+            qb = q0 + fx.Int32(hh * 16) + half * fx.Int32(8)
             sv, pv = fx.Vector(s), fx.Vector(p)
             kvl = kv0 + fx.Int32(kh * 16) + row
             for si in range_constexpr(8):
@@ -492,7 +524,10 @@ def _dkdv96_impl(
                     tt = (kvl > qb + fx.Int32(si) + cshift).select(fx.Float32(NEG), tt)
                 pf = _exp2(tt)
                 ph[kh][hh * 8 + si] = pf.to(fx.BFloat16)
-                dh[kh][hh * 8 + si] = (pf * fx.Float32(fx.fma(pv[si], scale, nd))).to(fx.BFloat16)
+                if const_expr(NUMERICS == 0):
+                    dh[kh][hh * 8 + si] = (pf * fx.Float32(fx.fma(pv[si], scale, nd))).to(fx.BFloat16)
+                else:
+                    dh[kh][hh * 8 + si] = (pf * fx.Float32(pv[si])).to(fx.BFloat16)
 
         def frags(ops):
             qfr = [cat(ops[dt * 2], ops[dt * 2 + 1]) for dt in range_constexpr(NDT_QK)]
@@ -514,21 +549,111 @@ def _dkdv96_impl(
                     sdp_one(do_mask, hh, kh, qfr, dfr, pre, q0, ph, dh)
             return pack(ph, dh)
 
-        def sdp3(do_mask, op0, rb1, pre, q0, after_burst):
+        def sdp3(do_mask, op0, rb1, pre, q0, after_burst, mid=None):
             """96-row body: hh0 from the carried readback op0; hh1's 20 entries read from rb1 as one burst at the
             top, under hh0's S / dP WMMAs."""
             ph = [[None] * 16 for _ in range_constexpr(NKV)]
             dh = [[None] * 16 for _ in range_constexpr(NKV)]
             qfr, dfr = frags(op0)
+            if const_expr(SDP_SCHED == 2):
+                # hh1's operands stream in k-step by k-step behind hh0's WMMAs of that k-step (into the registers
+                # they release); both halves run their chains k-step by k-step
+                rocdl.sched_barrier(0)
+                after_burst()
+                rocdl.sched_barrier(0)
+                s0, p0 = [zero8] * NKV, [p_init(0, pre)] * NKV
+                op1 = [None] * NHB
+                for dt in range_constexpr(NDT_QK):
+                    for kh in range_constexpr(NKV):
+                        s0[kh] = wmma(qfr[dt], kf[kh][dt], s0[kh])
+                        if const_expr(dt < NDT_V):
+                            p0[kh] = wmma(dfr[dt], vf[kh][dt], p0[kh])
+                    for u in range_constexpr(2):
+                        op1[dt * 2 + u] = _ld(rb1[0], QOFF + 16 * XK + dt * 64 + u * 32)
+                    if const_expr(dt < NDT_V):
+                        for u in range_constexpr(2):
+                            op1[NQE + dt * 2 + u] = _ld(rb1[1], 16 * XV + dt * 64 + u * 32)
+                    rocdl.sched_group_barrier(0x008, NKV * (2 if dt < NDT_V else 1), 0)
+                    rocdl.sched_group_barrier(0x100, 4 if dt < NDT_V else 2, 0)
+                rocdl.sched_barrier(0)
+                qfr1, dfr1 = frags(op1)
+                s1, p1 = [zero8] * NKV, [p_init(1, pre)] * NKV
+                for dt in range_constexpr(NDT_QK):
+                    for kh in range_constexpr(NKV):
+                        s1[kh] = wmma(qfr1[dt], kf[kh][dt], s1[kh])
+                        if const_expr(dt < NDT_V):
+                            p1[kh] = wmma(dfr1[dt], vf[kh][dt], p1[kh])
+                for kh in range_constexpr(NKV):
+                    smx(do_mask, 0, kh, s0[kh], p0[kh], pre, q0, ph, dh)
+                for _ in range_constexpr(NKV * (NDT_QK + NDT_V)):
+                    rocdl.sched_group_barrier(0x008, 1, 0)
+                    rocdl.sched_group_barrier(0x002, 2 if const_expr(not do_mask) else 4, 0)
+                    rocdl.sched_group_barrier(0x400, 1, 0)
+                rocdl.sched_barrier(0)
+                for kh in range_constexpr(NKV):
+                    smx(do_mask, 1, kh, s1[kh], p1[kh], pre, q0, ph, dh)
+                return pack(ph, dh)
             rocdl.sched_barrier(SB_ALU)
             op1 = rdqd_hh(rb1, 1)
             rocdl.sched_barrier(SB_ALU)
             after_burst()
-            for kh in range_constexpr(NKV):
-                sdp_one(do_mask, 0, kh, qfr, dfr, pre, q0, ph, dh)
+            if const_expr(SDP_SCHED == 0):
+                for kh in range_constexpr(NKV):
+                    sdp_one(do_mask, 0, kh, qfr, dfr, pre, q0, ph, dh)
+                qfr1, dfr1 = frags(op1)
+                for kh in range_constexpr(NKV):
+                    sdp_one(do_mask, 1, kh, qfr1, dfr1, pre, q0, ph, dh)
+                return pack(ph, dh)
+            if const_expr(SDP_SCHED in (3, 7)):
+                # hh0's chains k-step by k-step; then hh1's chains kv sub-tile by sub-tile with the softmax of hh0
+                # and of hh1's first NKV - 1 sub-tiles interleaved {1 WMMA, V VALU, 1 TRANS}; hh1's last softmax after
+                s0, p0 = [zero8] * NKV, [p_init(0, pre)] * NKV
+                for dt in range_constexpr(NDT_QK):
+                    for kh in range_constexpr(NKV):
+                        s0[kh] = wmma(qfr[dt], kf[kh][dt], s0[kh])
+                        if const_expr(dt < NDT_V):
+                            p0[kh] = wmma(dfr[dt], vf[kh][dt], p0[kh])
+                rocdl.sched_barrier(0)
+                qfr1, dfr1 = frags(op1)
+                mm1 = [sdp_mm(kh, qfr1, dfr1, 1, pre) for kh in range_constexpr(NKV)]
+                for kh in range_constexpr(NKV):
+                    smx(do_mask, 0, kh, s0[kh], p0[kh], pre, q0, ph, dh)
+                for kh in range_constexpr(NKV - 1):
+                    smx(do_mask, 1, kh, mm1[kh][0], mm1[kh][1], pre, q0, ph, dh)
+                nv = 3 if const_expr(not do_mask) else 5
+                for _ in range_constexpr(NKV * (NDT_QK + NDT_V)):
+                    rocdl.sched_group_barrier(0x008, 1, 0)
+                    rocdl.sched_group_barrier(0x002, nv, 0)
+                    rocdl.sched_group_barrier(0x400, 1, 0)
+                rocdl.sched_barrier(0)
+                if const_expr(mid is not None):
+                    mid()
+                    rocdl.sched_barrier(SB_ALU)
+                smx(do_mask, 1, NKV - 1, mm1[NKV - 1][0], mm1[NKV - 1][1], pre, q0, ph, dh)
+                return pack(ph, dh)
+            # hh0: the 2 NKV chains k-step by k-step (each WMMA's dependence 2 NKV - 1 WMMAs back)
+            s0, p0 = [zero8] * NKV, [p_init(0, pre)] * NKV
+            for dt in range_constexpr(NDT_QK):
+                for kh in range_constexpr(NKV):
+                    s0[kh] = wmma(qfr[dt], kf[kh][dt], s0[kh])
+                    if const_expr(dt < NDT_V):
+                        p0[kh] = wmma(dfr[dt], vf[kh][dt], p0[kh])
+            rocdl.sched_barrier(0)
+            # hh1's WMMAs (kh-major) with hh0's softmax / dS interleaved: {1 WMMA, 2 VALU, 1 TRANS}
             qfr1, dfr1 = frags(op1)
+            mm1 = [sdp_mm(kh, qfr1, dfr1, 1, pre) for kh in range_constexpr(NKV)]
             for kh in range_constexpr(NKV):
-                sdp_one(do_mask, 1, kh, qfr1, dfr1, pre, q0, ph, dh)
+                smx(do_mask, 0, kh, s0[kh], p0[kh], pre, q0, ph, dh)
+            for _ in range_constexpr(NKV * (NDT_QK + NDT_V)):
+                rocdl.sched_group_barrier(0x008, 1, 0)
+                rocdl.sched_group_barrier(0x002, 2 if const_expr(not do_mask) else 4, 0)
+                rocdl.sched_group_barrier(0x400, 1, 0)
+            rocdl.sched_barrier(0)
+            if const_expr(mid is not None):
+                mid()
+                rocdl.sched_barrier(SB_ALU)
+            for kh in range_constexpr(NKV):
+                smx(do_mask, 1, kh, mm1[kh][0], mm1[kh][1], pre, q0, ph, dh)
             return pack(ph, dh)
 
         def dv_kh(kh, acc, b_do, a_pk):
@@ -608,11 +733,132 @@ def _dkdv96_impl(
             acc = list(acc)
             ncur = _ncur(cur)
             rocdl.sched_barrier(0)
-            nxt = ldl(qbase + clampn(ii + one, n))
+            if const_expr(not (K3 and SDP_SCHED in (6, 7))):
+                nxt = ldl(qbase + clampn(ii + one, n))
             pft = qbase + clampn(ii + fx.Int32(3), n)
             qt = qbase + ii
             q0 = qt * fx.Int32(32)
-            if const_expr(K3):
+            if const_expr(K3 and SDP_SCHED == 5):
+                # S / dP of both halves k-step by k-step; hh0's softmax and the dO^T burst under hh1's WMMAs; then
+                # dV kv sub-tile by sub-tile with hh1's softmax of the next sub-tile and the Q^T burst under it
+                tv, tk = tr_base(cur, False), tr_base(cur, True)
+                rbb = rd_base(ncur)
+                ph = [[None] * 16 for _ in range_constexpr(NKV)]
+                dh = [[None] * 16 for _ in range_constexpr(NKV)]
+                qfr, dfr = frags(qd_)
+                rocdl.sched_barrier(SB_ALU)
+                op1 = rdqd_hh(rd_base(cur), 1)
+                rocdl.sched_barrier(SB_ALU)
+                tdm_issue(tdp_)
+                s0, p0 = [zero8] * NKV, [p_init(0, pre)] * NKV
+                for dt in range_constexpr(NDT_QK):
+                    for kh in range_constexpr(NKV):
+                        s0[kh] = wmma(qfr[dt], kf[kh][dt], s0[kh])
+                        if const_expr(dt < NDT_V):
+                            p0[kh] = wmma(dfr[dt], vf[kh][dt], p0[kh])
+                rocdl.sched_barrier(0)
+                qfr1, dfr1 = frags(op1)
+                s1, p1 = [zero8] * NKV, [p_init(1, pre)] * NKV
+                for dt in range_constexpr(NDT_QK):
+                    for kh in range_constexpr(NKV):
+                        s1[kh] = wmma(qfr1[dt], kf[kh][dt], s1[kh])
+                        if const_expr(dt < NDT_V):
+                            p1[kh] = wmma(dfr1[dt], vf[kh][dt], p1[kh])
+                for kh in range_constexpr(NKV):
+                    smx(do_mask, 0, kh, s0[kh], p0[kh], pre, q0, ph, dh)
+                b_do = [tr(tv, False, d) for d in range_constexpr(NDO_V)]
+                nv = 2 if const_expr(not do_mask) else 4
+                for i in range_constexpr(NKV * (NDT_QK + NDT_V)):
+                    rocdl.sched_group_barrier(0x008, 1, 0)
+                    rocdl.sched_group_barrier(0x002, nv, 0)
+                    rocdl.sched_group_barrier(0x400, 1, 0)
+                    if const_expr(i >= 14):
+                        rocdl.sched_group_barrier(0x100, 1, 0)
+                rocdl.sched_barrier(0)
+                smx(do_mask, 1, 0, s1[0], p1[0], pre, q0, ph, dh)
+                rocdl.sched_barrier(0)
+                a_pk, a_dsk = [None] * NKV, [None] * NKV
+                b_q = [None] * NDO_QK
+                for kh in range_constexpr(NKV):
+                    a_pk[kh] = _ir(fx.Vector.from_elements(ph[kh], dtype=fx.BFloat16))
+                    a_dsk[kh] = _ir(fx.Vector.from_elements(dh[kh], dtype=fx.BFloat16))
+                    dv_kh(kh, acc, b_do, a_pk)
+                    if const_expr(kh + 1 < NKV):
+                        smx(do_mask, 1, kh + 1, s1[kh + 1], p1[kh + 1], pre, q0, ph, dh)
+                    for d in range_constexpr(kh * 4, (kh + 1) * 4):
+                        b_q[d] = tr(tk, True, d)
+                    for _ in range_constexpr(NDO_V):
+                        rocdl.sched_group_barrier(0x008, 1, 0)
+                        rocdl.sched_group_barrier(0x002, nv + 1, 0)
+                        rocdl.sched_group_barrier(0x400, 1, 0)
+                        rocdl.sched_group_barrier(0x100, 1, 0)
+                    rocdl.sched_barrier(0)
+                if const_expr(not do_mask):
+                    so = qt * fx.Int32(DSL_BLK_B)
+                    for kh in range_constexpr(NKV):
+                        ds_store(a_dsk[kh], so + ds_rc[kh])
+                    rocdl.sched_barrier(0)
+                tdp_n = tdm_prep(pft, cur)
+                dk_kh(0, acc, b_q, a_dsk)
+                for _ in range_constexpr(NDO_QK):
+                    rocdl.sched_group_barrier(0x008, 1, 0)
+                    rocdl.sched_group_barrier(0x004, KH0_SALU, 0)
+                rocdl.sched_barrier(0)
+                tdm_ops.tensor_wait(TW)
+                rocdl.sched_barrier(0)
+                _lds_arrive()
+                rocdl.sched_barrier(0)
+                for kh in range_constexpr(1, NKV):
+                    dk_kh(kh, acc, b_q, a_dsk)
+                rocdl.sched_barrier(0)
+                _lds_wait()
+                rocdl.sched_barrier(0)
+                qd_ = rdqd_hh(rbb, 0)
+                rocdl.sched_barrier(0)
+            elif const_expr(K3 and SDP_SCHED in (6, 7)):
+                # the s1 schedule, but all 40 dV / dK A-operand tr16 issue right after hh1's S / dP WMMAs (into the
+                # registers of the dead S / dP operands) under hh1's softmax; dV and dK then run on loaded operands;
+                # NL / ND of the next tile load after the dV run (register room)
+                tv, tk = tr_base(cur, False), tr_base(cur, True)
+                rbb = rd_base(ncur)
+                ops = {}
+
+                def mid():
+                    ops["do"] = [tr(tv, False, d) for d in range_constexpr(NDO_V)]
+                    ops["q"] = [tr(tk, True, d) for d in range_constexpr(NDO_QK)]
+
+                a_pk, a_dsk = sdp3(do_mask, qd_, rd_base(cur), pre, q0, lambda: tdm_issue(tdp_), mid)
+                b_do, b_q = ops["do"], ops["q"]
+                rocdl.sched_barrier(0)
+                if const_expr(not do_mask):
+                    so = qt * fx.Int32(DSL_BLK_B)
+                    for kh in range_constexpr(NKV):
+                        ds_store(a_dsk[kh], so + ds_rc[kh])
+                    rocdl.sched_barrier(0)
+                tdp_n = tdm_prep(pft, cur)
+                for d in range_constexpr(NDO_V):
+                    for kh in range_constexpr(NKV):
+                        acc[kh * NDO_V + d] = wmma(b_do[d], a_pk[kh], acc[kh * NDO_V + d], ra=(kh > 0))
+                for i in range_constexpr(NKV * NDO_V):
+                    rocdl.sched_group_barrier(0x008, 1, 0)
+                    rocdl.sched_group_barrier(0x004, KH0_SALU, 0)
+                rocdl.sched_barrier(0)
+                nxt = ldl(qbase + clampn(ii + one, n))
+                rocdl.sched_barrier(0)
+                dk_kh(0, acc, b_q, a_dsk)
+                rocdl.sched_barrier(0)
+                tdm_ops.tensor_wait(TW)
+                rocdl.sched_barrier(0)
+                _lds_arrive()
+                rocdl.sched_barrier(0)
+                for kh in range_constexpr(1, NKV):
+                    dk_kh(kh, acc, b_q, a_dsk)
+                rocdl.sched_barrier(0)
+                _lds_wait()
+                rocdl.sched_barrier(0)
+                qd_ = rdqd_hh(rbb, 0)
+                rocdl.sched_barrier(0)
+            elif const_expr(K3):
                 a_pk, a_dsk = sdp3(do_mask, qd_, rd_base(cur), pre, q0, lambda: tdm_issue(tdp_))
                 tv, tk = tr_base(cur, False), tr_base(cur, True)
                 rbb = rd_base(ncur)
@@ -743,6 +989,8 @@ def _dkdv96_impl(
         rocdl.sched_barrier(0)
 
         # ---- epilogue: C fragments -> this wave's row-major dV / dK images -> whole-line stores
+        if const_expr(NUMERICS != 0):
+            inv_scale8 = fx.Vector.from_elements([fx.Float32(1.0) / scale], fx.Float32).broadcast_to(8)
         EPI_W = 16 * NKV * (XV + XK)
         EPI_DK = 16 * NKV * XV
         wr = lds_ptr(lds0 + wv * fx.Int32(EPI_W) + row * fx.Int32(XV) + half * fx.Int32(16))
@@ -753,8 +1001,11 @@ def _dkdv96_impl(
             for d in range_constexpr(NDO_QK):
                 if const_expr(d < NDO_V):
                     o = kh * 16 * XV + d * 32
+                    dvv = fx.Vector(acc[kh * NDO_V + d])
+                    if const_expr(NUMERICS != 0):
+                        dvv = dvv * inv_scale8
                     llvm.store(
-                        _ir(fx.Vector(acc[kh * NDO_V + d]).to(fx.BFloat16)),
+                        _ir(dvv.to(fx.BFloat16)),
                         wr if o == 0 else get_element_ptr(wr, static_byte_offset=o),
                     )
                 o = kh * 16 * XK + d * 32
@@ -921,6 +1172,9 @@ def dkdv96ds(q, k, v, do, nl, nd, scale, causal=True, ds=None, ds_mode=1):
     elif ds.numel() * ds.element_size() < nbytes:
         raise ValueError(f"dS scratch too small: {ds.numel() * ds.element_size()} < {nbytes} bytes")
     dk, dv = torch.empty_like(k), torch.empty_like(v)
+    if NUMERICS != 0:  # the folded row constants (production: k_delta would write them)
+        nl = nl + math.log2(float(scale))
+        nd = nd * (1.0 / float(scale))
     hg = head_group(hkv)
     # the kernel only takes the scratch's base address; a [blocks, 512] view keeps FlyDSL's 32-bit shape fields
     ds_k = ds.view(-1)[: nbytes // 2].view(-1, DSL_BLK_B // 2)
