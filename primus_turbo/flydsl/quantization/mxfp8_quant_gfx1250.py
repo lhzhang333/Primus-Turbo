@@ -186,30 +186,35 @@ def _tdm_load(lds, gaddr, cols, rows, stride, cm=0):
 
 
 def _group_scan(arg_go, mc0, G, lane):
-    """Expert of the column-copy tile at padded token ``mc0`` (experts padded to 128 tokens), lane-
-    parallel: lane l of chunk c takes expert 32 c + l, a DPP prefix sum gives the padded offsets, a
-    ballot the tile's expert. Returns (first input row, real rows, [(lane's expert, padded len,
-    padded offset)] per chunk); expert G's offset is the padded total."""
+    """Expert of the column-copy tile at padded token ``mc0``, lane-parallel: lane l of chunk c takes
+    expert 32 c + l, DPP prefix sums give the offsets of the column copy (experts padded to 128 tokens)
+    and of the row copy (to 32 rows), a ballot the tile's expert. Returns (first input row, real rows,
+    first row-copy row, [(lane's expert, (len, offset) of the column copy, (len, offset) of the rows)]
+    per chunk); expert G's offsets are the padded totals."""
     rs = _rsrc(_addr(arg_go), I32(8 * (G + 1)))
-    acc, in0, nreal, per = I32(0), I32(0), I32(0), []
+    acc, acc32, in0, nreal, rb32, per = I32(0), I32(0), I32(0), I32(0), I32(0), []
+
+    def scan(v):  # inclusive prefix over the wave: row_shr within 16-lane rows, then row 0's total
+        for k in (1, 2, 4, 8):
+            v = v + I32(_rocdl.update_dpp(T.i32, _raw(I32(0)), _raw(v), 0x110 + k, 0xF, 0xF, True))
+        return v + (lane >= I32(16)).select(I32(rocdl.readlane(T.i32, v, 15)), I32(0))
+
     for ch in range_constexpr(G // 32 + 1):
         g = I32(ch * 32) + lane
         o0 = I32(buffer_load(rs, g * I32(2), vec_width=1, dtype=T.i32))
         ln = (g < I32(G)).select(I32(buffer_load(rs, g * I32(2) + I32(2), vec_width=1, dtype=T.i32)) - o0, I32(0))
-        pl = ((ln + I32(BM - 1)) >> I32(7)) << I32(7)
-        x = pl
-        for k in (1, 2, 4, 8):  # row_shr k: inclusive sums within each 16-lane row
-            x = x + I32(_rocdl.update_dpp(T.i32, _raw(I32(0)), _raw(x), 0x110 + k, 0xF, 0xF, True))
-        x = x + (lane >= I32(16)).select(I32(rocdl.readlane(T.i32, x, 15)), I32(0))
-        excl = acc + x - pl
+        pl, pl32 = ((ln + I32(127)) >> I32(7)) << I32(7), ((ln + I32(31)) >> I32(5)) << I32(5)
+        x, x32 = scan(pl), scan(pl32)
+        excl, excl32 = acc + x - pl, acc32 + x32 - pl32
         hit = rocdl.ballot(T.i32, (mc0 >= excl) & (mc0 < excl + pl))
         src = I32(_llvm.call_intrinsic(T.i32, "llvm.cttz.i32", [_raw(I32(hit)), _raw(fx.Boolean(False))], [], []))
         found = I32(hit) != I32(0)
         in0 = found.select(I32(rocdl.readlane(T.i32, o0 + mc0 - excl, src)), in0)
         nreal = found.select(I32(rocdl.readlane(T.i32, ln - (mc0 - excl), src)), nreal)
-        per.append((g, pl, excl))
-        acc = acc + I32(rocdl.readlane(T.i32, x, 31))
-    return in0, nreal, per
+        rb32 = found.select(I32(rocdl.readlane(T.i32, excl32 + mc0 - excl, src)), rb32)
+        per.append((g, (pl, excl), (pl32, excl32)))
+        acc, acc32 = acc + I32(rocdl.readlane(T.i32, x, 31)), acc32 + I32(rocdl.readlane(T.i32, x32, 31))
+    return in0, nreal, rb32, per
 
 
 def _act8(g, u, prob, act, clamp):
@@ -276,6 +281,7 @@ def _launch(
     ACT: Constexpr[str],
     CLAMP: Constexpr[float],
     AUX: Constexpr[int],
+    LAY: Constexpr[int],
 ):
     NKT = (K + BK - 1) // BK
     EXP = PROD != P_DENSE  # expert-padded column copy
@@ -290,6 +296,10 @@ def _launch(
     O_SC, O_TAB = O_SR + BM * 4, O_SR + (BM + BK) * 4
     CST = CPOL & 31  # output stores' cache policy (gfx12 TH | SCOPE << 3); CPOL >> 5: the TDM loads'
     FULLM = EXP or PADM  # the column copy holds whole 128-token tiles
+    # LAY: packed scales [rows/32][K/128][32][4] for the row (1) / column (2) copy, 16x16-preshuffled codes
+    # [rows/16][K/16][16][16] for the row (4) / column (8) copy (the gfx1250 MX GEMM's fast layouts)
+    PR, PC, SR, SC = (LAY & 1, LAY & 2, LAY & 4, LAY & 8)
+    RT = (OW + BK - 1) // BK  # 128-column steps of the row copy (packed scales)
 
     @flyc.kernel(name=f"mxfp8_quant_gfx1250_p{PROD}o{OUT}", known_block_size=[NT, 1, 1])
     def kern(
@@ -323,14 +333,17 @@ def _launch(
         k0 = kt * I32(BK)
         mc0 = mt * I32(BM)  # the tile's first row in the column copy's token space
         if const_expr(EXP):
-            in0, nreal, per = _group_scan(arg_go, mc0, G, lane)
-            if (pid == I32(0)) & (wave == I32(0)):  # the padded lens / offsets of the column copy (int64)
-                lc, oc = _rsrc(_addr(arg_lc), I32(8 * G)), _rsrc(_addr(arg_oc), I32(8 * G + 8))
-                for g, pl, excl in per:
-                    buffer_store(Vec.from_elements([pl, I32(0)], I32), lc, g * I32(2), mask=g < I32(G))
-                    buffer_store(Vec.from_elements([excl, I32(0)], I32), oc, g * I32(2), mask=g <= I32(G))
+            in0, nreal, rb32, per = _group_scan(arg_go, mc0, G, lane)
+            if (pid == I32(0)) & (wave == I32(0)):  # padded lens / offsets (int64 [2, G + 1]) of both copies
+                for a, w in ((arg_lc, 1), (arg_oc, 2)):  # column copy (128 tokens), row copy (32 rows)
+                    lo = _rsrc(_addr(a), I32(16 * (G + 1)))
+                    for g, *pairs in per:
+                        ln, ex = pairs[w - 1]
+                        buffer_store(Vec.from_elements([ln, I32(0)], I32), lo, g * I32(2), mask=g < I32(G))
+                        buffer_store(Vec.from_elements([ex, I32(0)], I32), lo, (g + I32(G + 1)) * I32(2),
+                                     mask=g <= I32(G))
         else:
-            in0 = mc0
+            in0, rb32 = mc0, I32(0)
             nreal = i32_m - mc0
         nreal = (nreal > I32(BM)).select(I32(BM), nreal)
         if nreal > I32(0):
@@ -409,9 +422,12 @@ def _launch(
                 sb = base + I32((2 - 2 * hf if PROD == P_DGLU else 0) * TILE)  # a consumed tile: the stage
                 ocol = I32(hf * K)  # the half's first column of the row copy / row of the column copy
                 # ---- rows phase: lane = (row, 32-block kb, half h), 4 rows per wave and pass; codes
-                # straight to q_row (8 lanes = one 128-byte line), scale bytes to LDS
+                # straight to q_row (8 lanes = one 128-byte line), scale bytes to LDS. Expert row copies hold
+                # whole 32-row groups: rows past the tokens are zero codes, scale 127.
+                nrows = ((nreal + I32(31)) >> I32(5)) << I32(5) if EXP else nreal
+                rowbase = I64(rb32) if EXP else I64(bat) * I64(i32_m) + I64(in0)
                 if const_expr(OUT & O_ROWS):
-                    qr = _rsrc(_addr(arg_qr) + row0 * I64(OW), nreal * I32(OW))
+                    qr = _rsrc(_addr(arg_qr) + rowbase * I64(OW), nrows * I32(OW))
                     kb, h = (lane % I32(8)) // I32(2), lane % I32(2)
                     col = k0 + kb * I32(32) + h * I32(16)
                     for p in range_constexpr(BM // 32):
@@ -419,9 +435,15 @@ def _launch(
                         a0 = tb + r * I32(PITCH) + (kb * I32(2) + h) * I32(32)
                         words = [_lds_v4(a0), _lds_v4(a0 + I32(16))]
                         byte = _e8m0(blk_amax(words, (r // I32(32)) * I32(4) + kb, 0xB1), RULE_C)
+                        if const_expr(EXP):
+                            byte = ((r >= nreal) & (k0 + kb * I32(32) < I32(KV))).select(I32(PAD_SCALE), byte)
                         codes = _cvt16(words, byte, RULE_C)
-                        ok = (r < nreal) & (col < I32(KV))
-                        _store16(qr, r * I32(OW) + ocol + col, codes, ok, I32(KV) - col, WK, CST)
+                        ok = (r < nrows) & (col < I32(KV))
+                        if const_expr(SR):
+                            off = ((r >> I32(4)) * I32(OW // 16) + ((ocol + col) >> I32(4))) * I32(256) + (r & I32(15)) * I32(16)
+                            _store16(qr, off, codes, ok, I32(16), 16, CST)
+                        else:
+                            _store16(qr, r * I32(OW) + ocol + col, codes, ok, I32(KV) - col, WK, CST)
                         if h == I32(0):
                             _lds_st(base + I32(O_SR) + r * I32(4) + kb, ArithValue(_raw(byte)).trunci(T.i8), 1)
                 # ---- cols phase: lane = (column of an 8-column chunk, 16 rows of a 64-row slab); codes and
@@ -450,7 +472,8 @@ def _launch(
                             _lds_st(base + I32(O_SC) + so, ArithValue(_raw(byte)).trunci(T.i8), 1)
                 gpu.barrier()
 
-                # ---- stores from LDS: the column copy by whole 128-byte lines, scales one row per lane
+                # ---- stores from LDS: the column copy by whole 128-byte lines (16x16 blocks: 256 bytes),
+                # scales one row per lane (packed: a 32-row group's 128 bytes per 32 lanes)
                 ncol = I32(K) - k0
                 ncol = (ncol > I32(BK)).select(I32(BK), ncol)
                 mcb = (i32_mc + I32(31)) // I32(32)
@@ -459,31 +482,53 @@ def _launch(
                     qc = _rsrc(_addr(arg_qc) + cbase * I64(i32_mc), ncol * i32_mc)
                     width, mroom = (16, I32(BM)) if FULLM else (WM, nreal)
                     for i in range_constexpr(BK * BM // 16 // NT):
-                        c, q16 = (t + I32(i * NT)) // I32(8), (t % I32(8)) * I32(16)
+                        idx = t + I32(i * NT)
+                        if const_expr(SC):  # 16 lanes per 16x16 block: 256 contiguous bytes
+                            c, q16 = (idx // I32(128)) * I32(16) + idx % I32(16), ((idx // I32(16)) % I32(8)) * I32(16)
+                            off = ((c >> I32(4)) * (i32_mc >> I32(4)) + ((mc0 + q16) >> I32(4))) * I32(256) + (c & I32(15)) * I32(16)
+                            w = 16
+                        else:
+                            c, q16 = idx // I32(8), (idx % I32(8)) * I32(16)
+                            off, w = c * i32_mc + mc0 + q16, width
                         v = _lds_v4(sb + c * I32(CPITCH) + q16)
-                        _store16(qc, c * i32_mc + mc0 + q16, v, (c < ncol) & (q16 < mroom), mroom - q16, width, CST)
+                        _store16(qc, off, v, (c < ncol) & (q16 < mroom), mroom - q16, w, CST)
                 rs = t % I32(BM)  # lanes 0..127: row rs of the row copy's scales; 128..255: of the column copy's
                 sbyte = I32(_llvm.LoadOp(T.i32, _lds_ptr(base + I32(O_SR) + t * I32(4)), alignment=4).result)
                 if t < I32(BM):
                     if const_expr(OUT & O_ROWS):
-                        sr = _rsrc(_addr(arg_sr) + row0 * I64(KBO), nreal * I32(KBO))
                         kbg = (ocol + k0) // I32(32)
-                        if const_expr(OW % BK == 0 and KV % BK == 0):  # 4 whole, dword-aligned bytes per row
-                            buffer_store(sbyte, sr, rs * I32(KBO) + kbg, mask=rs < nreal, offset_is_bytes=True,
+                        if const_expr(PR):
+                            gbase = I64(rb32 >> I32(5)) if EXP else I64(bat) * I64((i32_m + I32(31)) >> I32(5)) + I64(in0 >> I32(5))
+                            n32 = ((nreal + I32(31)) >> I32(5)) << I32(5)
+                            sr = _rsrc(_addr(arg_sr) + gbase * I64(RT * 128), (n32 >> I32(5)) * I32(RT * 128))
+                            off = ((rs >> I32(5)) * I32(RT) + kbg // I32(4)) * I32(128) + (rs & I32(31)) * I32(4)
+                            buffer_store(sbyte, sr, off, mask=rs < n32, offset_is_bytes=True, cache_modifier=CST)
+                        else:
+                            sr = _rsrc(_addr(arg_sr) + rowbase * I64(KBO), nrows * I32(KBO))
+                            if const_expr(OW % BK == 0 and KV % BK == 0):  # 4 whole, dword-aligned bytes per row
+                                buffer_store(sbyte, sr, rs * I32(KBO) + kbg, mask=rs < nrows, offset_is_bytes=True,
+                                             cache_modifier=CST)
+                            else:
+                                for b in range_constexpr(4):
+                                    ok = (rs < nrows) & ((k0 + I32(32 * b)) < I32(KV))
+                                    _store_byte(sr, rs * I32(KBO) + kbg + I32(b), sbyte >> I32(8 * b), ok, CST)
+                elif const_expr(OUT & O_COLS):
+                    if const_expr(PC):
+                        ct = (mcb + I32(3)) >> I32(2)  # 128-token steps of the column copy
+                        gbase = I64(bat) * I64((HALVES * K + 31) // 32) + I64((ocol + k0) >> I32(5))
+                        c32 = ((ncol + I32(31)) >> I32(5)) << I32(5)
+                        sc = _rsrc(_addr(arg_sc) + gbase * I64(ct) * I64(128), (c32 >> I32(5)) * ct * I32(128))
+                        off = ((rs >> I32(5)) * ct + mt) * I32(128) + (rs & I32(31)) * I32(4)
+                        buffer_store(sbyte, sc, off, mask=rs < c32, offset_is_bytes=True, cache_modifier=CST)
+                    else:
+                        sc = _rsrc(_addr(arg_sc) + cbase * I64(mcb), ncol * mcb)
+                        if (mcb % I32(4) == I32(0)) & ((nreal == I32(BM)) | fx.Boolean(bool(FULLM))):
+                            buffer_store(sbyte, sc, rs * mcb + mt * I32(4), mask=rs < ncol, offset_is_bytes=True,
                                          cache_modifier=CST)
                         else:
                             for b in range_constexpr(4):
-                                ok = (rs < nreal) & ((k0 + I32(32 * b)) < I32(KV))
-                                _store_byte(sr, rs * I32(KBO) + kbg + I32(b), sbyte >> I32(8 * b), ok, CST)
-                elif const_expr(OUT & O_COLS):
-                    sc = _rsrc(_addr(arg_sc) + cbase * I64(mcb), ncol * mcb)
-                    if (mcb % I32(4) == I32(0)) & ((nreal == I32(BM)) | fx.Boolean(bool(FULLM))):
-                        buffer_store(sbyte, sc, rs * mcb + mt * I32(4), mask=rs < ncol, offset_is_bytes=True,
-                                     cache_modifier=CST)
-                    else:
-                        for b in range_constexpr(4):
-                            ok = (rs < ncol) & (I32(32 * b) < (I32(BM) if FULLM else nreal))
-                            _store_byte(sc, rs * mcb + mt * I32(4) + I32(b), sbyte >> I32(8 * b), ok, CST)
+                                ok = (rs < ncol) & (I32(32 * b) < (I32(BM) if FULLM else nreal))
+                                _store_byte(sc, rs * mcb + mt * I32(4) + I32(b), sbyte >> I32(8 * b), ok, CST)
                 if const_expr(hf + 1 < HALVES):
                     gpu.barrier()  # the scale bytes and the stage are rewritten by the next half
 
