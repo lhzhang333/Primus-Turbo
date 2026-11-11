@@ -65,7 +65,14 @@ _TABLE: dict = {
 
 # With a 16x16-preshuffled B the deep kpair-1 pipelines become usable (row-major B at kpair 1 is a 128-byte TDM row per
 # tile row): (M, N, K) -> config where that beats the row-major table (scratch_mxd/results/k1_bsh.json).
-_TABLE_BSH: dict = {}
+_TABLE_BSH: dict = {
+    (8192, 1536, 7168): C(256, 256, 4, 1, 2, 2),  # q_down fwd    28.2 us (row-major B 31.0)
+    (1536, 7168, 8192): C(256, 256, 4, 1, 2, 2),  # q_down wgrad  31.8 (36.2)
+    (8192, 1536, 24576): C(256, 256, 4, 1, 2, 2),  # q_up dgrad   88.7 (97.8)
+    (24576, 1536, 8192): C(256, 256, 4, 1, 2, 2),  # q_up wgrad   97.5 (101.0)
+    (8192, 7168, 576): C(256, 256, 3, 1, 2, 2),  # kv_down dgrad   22.6 (28.6)
+    (8192, 7168, 16384): C(256, 256, 4, 1, 1, 4),  # o_proj fwd  263.9 (281.1)
+}
 
 
 def pick_config(M: int, N: int, K: int, b_preshuffled: bool = False, num_cus: int = 256) -> MXGemmConfig:
@@ -76,7 +83,8 @@ def pick_config(M: int, N: int, K: int, b_preshuffled: bool = False, num_cus: in
         return cfg
     tiles = lambda tm, tn: -(-M // tm) * -(-N // tn)  # noqa: E731
     if tiles(256, 256) >= 3 * num_cus // 4:
-        return DEFAULT
+        # long K with a preshuffled B: the deep kpair-1 pipeline (2-4% on the 32-expert-as-one-GEMM shapes)
+        return MXGemmConfig(256, 256, 4, 1, 2, 2) if b_preshuffled and K >= 4096 else DEFAULT
     if tiles(128, 256) >= 3 * num_cus // 4:
         return MXGemmConfig(128, 256, 3, 2, 1, 4)
     return MXGemmConfig(128, 128, 2, 2, 1, 1)
