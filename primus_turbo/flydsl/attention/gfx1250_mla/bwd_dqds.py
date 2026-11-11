@@ -256,7 +256,9 @@ def _dqds_body(nqw, DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q0g, H
     gx = fx.Int32(fx.block_idx.x)
     gz = fx.Int32(fx.block_idx.z)
     # HG % 8 == 0: every head's workgroups run on XCD x % 8, each XCD gets a contiguous range of heads
-    xr = (HG % fx.Int32(8) == fx.Int32(0)).select((gx % fx.Int32(8)) * (HG // fx.Int32(8)) + gx // fx.Int32(8), gx)
+    xr = (HG % fx.Int32(8) == fx.Int32(0)).select(
+        (gx % fx.Int32(8)) * (HG // fx.Int32(8)) + gx // fx.Int32(8), gx
+    )
     hb = gz * HG + xr  # bat * Hq + qh = the dS region
     bat = hb // Hq
     qh = hb - bat * Hq
@@ -336,9 +338,9 @@ def _dqds_body(nqw, DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q0g, H
         nv = qp0g + fx.Int32(nb_g) - fx.max(qp0g, f2r)
         t = fx.Int64(is_causal.select(fx.max(r - mshift - fx.Int32(1), fx.Int32(0)), fx.Int32(0)))
         row_off = fx.Int64(r) * fx.Int64(2) * fx.Int64(nqp) - t * (t + fx.Int64(1))
-        src = (fx.Int64(hb) * fx.Int64(nblk) + row_off + fx.Int64(fx.max(qp0g - f2r, fx.Int32(0)))) * fx.Int64(
-            DS_BLK_EL
-        )
+        src = (
+            fx.Int64(hb) * fx.Int64(nblk) + row_off + fx.Int64(fx.max(qp0g - f2r, fx.Int32(0)))
+        ) * fx.Int64(DS_BLK_EL)
         ds_stride = fx.Int64(nqp - f2r) * fx.Int64(DS_BLK_EL)
         ds_lds = slot + (fx.Int32(nb_g) - nv) * fx.Int32(DSI_BLK_B)
         ds_ga = ga_ds + src * fx.Int64(2)
@@ -387,7 +389,10 @@ def _dqds_body(nqw, DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q0g, H
         """The burst of kv32 row 2u + h (u traced, h a Python int)."""
         us = u % fx.Int32(3)
         kb = lds0 + us * fx.Int32(C_KSTG_B) + fx.Int32(h * C_KHALF_B) + k_lane
-        kt = [_cat(_tr16(kb + fx.Int32(_k_imm(dt, 0))), _tr16(kb + fx.Int32(_k_imm(dt, 1)))) for dt in range(NDT)]
+        kt = [
+            _cat(_tr16(kb + fx.Int32(_k_imm(dt, 0))), _tr16(kb + fx.Int32(_k_imm(dt, 1))))
+            for dt in range(NDT)
+        ]
         r = u * fx.Int32(2) + fx.Int32(h)
         f2r = is_causal.select(fx.max(r - mshift, fx.Int32(0)), fx.Int32(0))
         nv = qp0g + fx.Int32(nb_g) - fx.max(qp0g, f2r)
@@ -631,7 +636,13 @@ def k_dqds(
     if gy < ntile:
         # the 384-query tiles of [q_off, Sq), longest first
         _dqds_body(
-            MAIN_NQW, *args, q_off + (ntile - fx.Int32(1) - gy) * fx.Int32(MAIN_ROWS), HG, nblk, dq_bytes, lds0
+            MAIN_NQW,
+            *args,
+            q_off + (ntile - fx.Int32(1) - gy) * fx.Int32(MAIN_ROWS),
+            HG,
+            nblk,
+            dq_bytes,
+            lds0,
         )
     else:
         # the head [0, q_off) = [0, 256)
