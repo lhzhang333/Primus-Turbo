@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_AUTO_TUNE: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
     PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT: bool = False
+    PRIMUS_TURBO_MXFP8_SCALE_RULE: str = "nosat"
     PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM: bool = False
     PRIMUS_TURBO_JAX_DEEPEP_MODE: str | None = None
     PT_MEGA_FP8_COMBINE_AUTOTUNE: bool = True
@@ -143,6 +144,15 @@ def _mla_bwd_impl() -> str:
     return value
 
 
+def _mxfp8_scale_rule() -> str:
+    """PRIMUS_TURBO_MXFP8_SCALE_RULE: "nosat" (also unset or blank) or "even", any case."""
+    raw = os.getenv("PRIMUS_TURBO_MXFP8_SCALE_RULE", "")
+    value = raw.strip().lower() or "nosat"
+    if value not in ("nosat", "even"):
+        raise ValueError(f"PRIMUS_TURBO_MXFP8_SCALE_RULE={raw!r}: expected nosat or even")
+    return value
+
+
 def _deepep_cpu_timeout() -> int:
     raw = os.getenv("PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT")
     if not raw:
@@ -199,6 +209,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT": lambda: (
         os.getenv("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") == "1"
     ),
+    # E8M0 scale rule of the gfx1250 MXFP8 quantizers (primus_turbo/flydsl/quantization/
+    # mxfp8_quant_gfx1250.py): "nosat" (the default: the smallest 2^e with amax / 2^e <= 448, nothing
+    # saturates) or "even" (the HIP / CDNA4 rule, for parity tests). Other archs ignore it. Read at the
+    # first MXFP8 quantization on gfx1250; another value raises ValueError.
+    "PRIMUS_TURBO_MXFP8_SCALE_RULE": _mxfp8_scale_rule,
     # ================== Expert parallel ==================
     # A non-zero integer runs the EP dispatch/combine kernels on the caller's current stream
     # instead of the Buffer's comm stream. Parsed as C++ does (``is_ep_force_current_stream`` in

@@ -138,3 +138,168 @@ def test_special_blocks(Q):
     for rule in RULES:
         for got, ref, what in zip(Q.quant_mxfp8_raw(x, rule=rule), R.quant_dual(x.cpu(), rule), ("qr", "sr", "qc", "sc")):
             _eq(got, ref, f"{rule} {what}")
+
+
+# ---- fused producers: GLU / dGLU (gfx950 phase-2 math) and gather (permute), MoE dual cast
+def _ulp_close(got, ref, what):
+    """bf16 within one ulp of the torch math (the kernels use the hardware exp2 / reciprocal), and
+    nearly all exactly equal."""
+    a, b = got.cpu().view(torch.int16).int(), ref.cpu().view(torch.int16).int()
+    near = ((a - b).abs() <= 1) | ((got.cpu().float() - ref.cpu().float()).abs() <= 1e-35)
+    assert near.all(), f"{what}: {int((~near).sum())} values more than an ulp off"
+    assert (a == b).float().mean() > 0.995, f"{what}: only {float((a == b).float().mean()):.4f} exact"
+
+
+def _moe_lens(case, seed):
+    if case == "skew":  # one hot expert, empties, a single token
+        return torch.tensor([1500, 0, 1, 300, 0, 0, 77, 640, 0, 2, 129, 0, 31, 0, 0, 256])
+    return _lens(case, seed)
+
+
+def _check_grouped(out, ref_vals, lens, rule, M):
+    q_row, s_row, q_col, s_col, lens_c, offs_c = R.quant_grouped(ref_vals.cpu(), lens, rule)
+    _eq(out[0], q_row, "q_row")
+    _eq(out[1], s_row, "s_row")
+    assert torch.equal(out[6].cpu(), lens_c) and torch.equal(out[7].cpu(), offs_c), "col lens / offs"
+    Mc = int(offs_c[-1])
+    _eq(out[2][:, :Mc], q_col, "q_col")
+    _eq(out[3][:, : Mc // 32], s_col, "s_col")
+
+
+@pytest.mark.parametrize("rule", RULES)
+@pytest.mark.parametrize("act,clamp", [("silu", None), ("silu", 7.0), ("gelu", None), ("gelu", 7.0)])
+@pytest.mark.parametrize("I", [96, 2048])
+@pytest.mark.parametrize("case", [[0, 5, 0], [31, 32, 33, 1, 0, 127, 128, 129], "random", "skew"])
+def test_glu(Q, case, I, act, clamp, rule):
+    lens = _moe_lens(case, I)
+    M = int(lens.sum())
+    g = torch.Generator(device="cuda").manual_seed(M + I)
+    l1 = (torch.randn(M, 2 * I, generator=g, device="cuda") * 3).to(torch.bfloat16)
+    probs = torch.rand(M, generator=g, device="cuda")
+    probs[::17] = 0
+    lens_d = lens.cuda()
+    offs = torch.nn.functional.pad(torch.cumsum(lens_d, 0), (1, 0))
+    act_v = torch.full((M, I), float("nan"), dtype=torch.bfloat16, device="cuda")
+    out = Q.grouped_glu_quant_mxfp8(l1, probs, lens_d, offs, act, clamp, rule=rule, act_out=act_v)
+    _ulp_close(act_v, R.glu_ref(l1.cpu(), probs.cpu(), act, clamp), "act")
+    _check_grouped(out, act_v, lens, rule, M)
+
+
+@pytest.mark.parametrize("rule", RULES)
+@pytest.mark.parametrize("act,clamp", [("silu", None), ("silu", 7.0), ("gelu", None), ("gelu", 7.0)])
+@pytest.mark.parametrize("I", [96, 2048])
+@pytest.mark.parametrize("case", [[0, 5, 0], [31, 32, 33, 1, 0, 127, 128, 129], "random", "skew"])
+def test_dglu(Q, case, I, act, clamp, rule):
+    lens = _moe_lens(case, I + 1)
+    M = int(lens.sum())
+    g = torch.Generator(device="cuda").manual_seed(M + 3 * I)
+    l1 = (torch.randn(M, 2 * I, generator=g, device="cuda") * 3).to(torch.bfloat16)
+    dact = torch.randn(M, I, generator=g, device="cuda").to(torch.bfloat16)
+    probs = torch.rand(M, generator=g, device="cuda")
+    lens_d = lens.cuda()
+    offs = torch.nn.functional.pad(torch.cumsum(lens_d, 0), (1, 0))
+    grad_v = torch.full((M, 2 * I), float("nan"), dtype=torch.bfloat16, device="cuda")
+    gp, *out = Q.grouped_dglu_quant_mxfp8(dact, l1, probs, lens_d, offs, act, clamp, rule=rule, grad_out=grad_v)
+    ref_grad, ref_gp = R.dglu_ref(dact.cpu(), l1.cpu(), probs.cpu(), act, clamp)
+    _ulp_close(grad_v, ref_grad, "grad_l1")
+    torch.testing.assert_close(gp.cpu(), ref_gp, rtol=1e-4, atol=1e-4 * float(ref_gp.abs().max() + 1))
+    _check_grouped(out, grad_v, lens, rule, M)
+
+
+@pytest.mark.parametrize("rule", RULES)
+@pytest.mark.parametrize("H", [64, 200, 7168])
+@pytest.mark.parametrize("case", [[0, 5, 0], [31, 32, 33, 1, 0, 127, 128, 129], "random", "skew"])
+@pytest.mark.parametrize("with_probs", [True, False])
+def test_gather(Q, case, H, with_probs, rule):
+    lens = _moe_lens(case, H)
+    M = int(lens.sum())
+    T = max(1, M // 3)
+    g = torch.Generator(device="cuda").manual_seed(M + H)
+    x = _x(T, H, seed=H)
+    d2s = torch.randint(0, T, (M,), generator=g, device="cuda", dtype=torch.int32)
+    if M > 4:
+        d2s[1::9], d2s[3] = -1, T + 5  # rows of no token
+    pp = torch.rand(M, generator=g, device="cuda") if with_probs else None
+    if pp is not None:
+        pp[::7] = 0
+    lens_d = lens.cuda()
+    offs = torch.nn.functional.pad(torch.cumsum(lens_d, 0), (1, 0))
+    out = Q.grouped_gather_quant_mxfp8(x, d2s, lens_d, offs, pp, rule=rule)
+    _check_grouped(out, R.gather_rows(x.cpu(), d2s.cpu(), None if pp is None else pp.cpu()), lens, rule, M)
+
+
+# ---- wiring: quantization_impl on gfx1250 (HIP layouts: K / M padded to 128, zero codes, byte-0 scales)
+def _padded(t, shape):
+    out = torch.zeros(shape, dtype=torch.uint8)
+    out[tuple(slice(0, d) for d in t.shape)] = t.cpu().view(torch.uint8)
+    return out
+
+
+@pytest.mark.parametrize("rule", RULES)
+def test_dispatch(rule):
+    import primus_turbo.common.envs as envs
+    from primus_turbo.pytorch.core.low_precision import (
+        Float8QuantConfig,
+        Format,
+        ScaleDtype,
+        ScalingGranularity,
+        ScalingRecipe,
+    )
+    from primus_turbo.pytorch.core.quantized_tensor import (
+        QuantizedTensor,
+        create_quantized_weight,
+    )
+    from primus_turbo.pytorch.ops.quantization import (
+        grouped_quantize_fp8_with_trans,
+        quantize_fp8,
+        quantize_fp8_with_trans,
+    )
+
+    MX, E4 = ScalingGranularity.MX_BLOCKWISE, torch.float8_e4m3fn
+    envs.set_env("PRIMUS_TURBO_MXFP8_SCALE_RULE", rule)
+    try:
+        x = _x(200, 330, seed=5)
+        Mp, Kp = 256, 384
+        qr, sr, qc, sc = quantize_fp8_with_trans(x, E4, MX, block_size=32)
+        rq, rs, rqc, rsc = R.quant_dual(x.cpu(), rule)
+        for got, ref, shape, what in ((qr, rq, (200, Kp), "q_row"), (sr, rs, (200, Kp // 32), "s_row"),
+                                      (qc, rqc, (330, Mp), "q_col"), (sc, rsc, (330, Mp // 32), "s_col")):
+            _eq(got, _padded(ref, shape), what)
+        for axis, ref, what in ((1, (rq, rs), "rows"), (0, (rqc, rsc), "cols")):
+            got = quantize_fp8(x, E4, MX, block_size=32, axis=axis, scaling_recipe=ScalingRecipe())
+            _eq(got[0], _padded(ref[0], got[0].shape), f"{what} q")
+            _eq(got[1], _padded(ref[1], got[1].shape), f"{what} s")
+        w = _x(3, 96, 200, seed=6)
+        r2 = ScalingRecipe(use_2d_block=True)
+        out = quantize_fp8_with_trans(w, E4, MX, block_size=32, scaling_recipe=r2, scaling_recipe_for_trans=r2)
+        for b in range(3):
+            for got, ref, what in zip(out, R.quant_2d(w[b].cpu(), rule), ("q", "s_row", "q_t", "s_t")):
+                _eq(got[b], _padded(ref, got[b].shape), f"2d {what}[{b}]")
+        cfg = Float8QuantConfig(format=Format.E4M3, granularity=MX, scale_dtype=ScaleDtype.E8M0, block_size=32)
+        qw, qw_t = create_quantized_weight(w, E4, cfg, need_weight_transpose_cache=True)
+        for qt_, axis in ((qw, -1), (qw_t, -2)):
+            two = QuantizedTensor.quantize(w, E4, MX, block_size=32, scaling_recipe=r2, axis=axis)
+            _eq(qt_.qdata, two.qdata, f"one-pass weight {axis}")
+            _eq(qt_.scale_inv, two.scale_inv, f"one-pass weight scale {axis}")
+        lens = torch.tensor([0, 37, 1, 200, 0, 129])
+        lens_d = lens.cuda()
+        offs = torch.nn.functional.pad(torch.cumsum(lens_d, 0), (1, 0))
+        xg = _x(int(lens.sum()), 330, seed=7)
+        out = grouped_quantize_fp8_with_trans(xg, E4, MX, lens_d, offs, block_size=32)
+        ref = R.quant_grouped(xg.cpu(), lens, rule)
+        _eq(out[0], _padded(ref[0], out[0].shape), "grouped q_row")
+        _eq(out[1], _padded(ref[1], out[1].shape), "grouped s_row")
+        Mc = int(ref[5][-1])
+        _eq(out[2][:, :Mc], ref[2], "grouped q_col")
+        assert torch.equal(out[5].cpu(), offs.cpu()) and torch.equal(out[7].cpu(), ref[5]), "grouped offs"
+        src = _x(100, 330, seed=8)
+        d2s = torch.randint(0, 100, (int(lens.sum()),), device="cuda", dtype=torch.int32)
+        pp = torch.rand(d2s.numel(), device="cuda")
+        pp[::5] = 0
+        out = grouped_quantize_fp8_with_trans(src, E4, MX, lens_d, offs, block_size=32, dest2src=d2s,
+                                              permuted_probs=pp, total_m=d2s.numel())
+        ref = R.quant_grouped(R.gather_rows(src.cpu(), d2s.cpu(), pp.cpu()), lens, rule)
+        _eq(out[0], _padded(ref[0], out[0].shape), "gathered q_row")
+        _eq(out[2][:, :Mc], ref[2], "gathered q_col")
+    finally:
+        envs.set_env("PRIMUS_TURBO_MXFP8_SCALE_RULE", None)
