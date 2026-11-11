@@ -18,8 +18,8 @@ class MXGemmConfig(NamedTuple):
     tile_n: int = 256
     num_buffers: int = 2
     kpair: int = 2
-    cluster_m: int = 1
-    cluster_n: int = 4
+    cluster_m: int = 2
+    cluster_n: int = 2
     scale_4d: bool = False
 
 
@@ -29,10 +29,15 @@ DEFAULT = MXGemmConfig()
 _TABLE: dict = {}
 
 
-def pick_config(M: int, N: int, K: int) -> MXGemmConfig:
+def pick_config(M: int, N: int, K: int, num_cus: int = 256) -> MXGemmConfig:
+    """The measured config of (M, N, K), else by grid fill: 256x256 while it gives at least ~3/4 of a wave, then
+    128x256, then 128x128 (two workgroups per CU). The entry point shrinks the cluster to what the grid divides."""
     cfg = _TABLE.get((M, N, K))
     if cfg is not None:
         return cfg
-    if N <= 1024 or M <= 1024:
-        return MXGemmConfig(cluster_n=1)
-    return DEFAULT
+    tiles = lambda tm, tn: -(-M // tm) * -(-N // tn)  # noqa: E731
+    if tiles(256, 256) >= 3 * num_cus // 4:
+        return DEFAULT
+    if tiles(128, 256) >= 3 * num_cus // 4:
+        return MXGemmConfig(128, 256, 3, 2, 1, 4)
+    return MXGemmConfig(128, 128, 2, 2, 1, 1)

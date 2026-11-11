@@ -29,8 +29,6 @@ workgroup past M or N runs with zero extents and drops its stores.
 
 from __future__ import annotations
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -120,7 +118,6 @@ def _launch_gemm_mxfp8(
     k_tail: Constexpr[bool],
 ):
     cfg = MXGemmConfig(tile_m, tile_n, num_buffers, kpair, cluster_m, cluster_n, scale_4d)
-    LAB = os.environ.get("PT_MXG_LAB", "").split(",")  # lab A/B switches (run with the JIT cache off)
     LDS_ROW, STAGE, BASE, ARENA = geometry(cfg)
     assert tile_m in (128, 256) and tile_n in (128, 256) and kpair in (1, 2) and num_buffers in (2, 3, 4)
     assert ARENA <= LDS_BYTES, f"{cfg} needs {ARENA} B of LDS"
@@ -355,8 +352,7 @@ def _launch_gemm_mxfp8(
 
             def _wait_refill():
                 if const_expr(boundary and has_next):
-                    if const_expr("splitbar" in LAB):
-                        rocdl.sched_barrier(0)  # keep the slack WMMAs between signal and wait
+                    # LLVM hoists the wait above the slack WMMAs; pinning them in between measured +0.2% (noise)
                     rocdl.s_barrier_wait(_WG_BARRIER)
                     if const_expr(refill):
                         tdm_ops.tensor_load_2d(prepared)
