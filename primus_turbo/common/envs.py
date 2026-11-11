@@ -280,7 +280,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MXFP8 strict mode (tests, gates): an MX op raises instead of taking a silent fallback
     # (``low_precision.mx_strict``). 1: a GEMM backend other than the default or pinned one, and a
     # quantized operand re-quantized from its dequantized values because its transposed copy is
-    # missing; 2: also the HIP MXFP8 quantization on gfx1250. Unset, 0 or a non-integer: off.
+    # missing; 2: also the HIP MXFP8 quantization on gfx1250 (the check belongs to the gfx1250
+    # quantization dispatch, added with the FlyDSL gfx1250 quantization). Unset, 0 or a non-integer: off.
     # Clamped to [0, 2]. Read at the first MX op that could fall back.
     "PRIMUS_TURBO_MX_STRICT": env_clamped_int("PRIMUS_TURBO_MX_STRICT", 0, 0, 2),
 }
