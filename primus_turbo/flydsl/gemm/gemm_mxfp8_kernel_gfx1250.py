@@ -63,7 +63,7 @@ def geometry(c: MXGemmConfig):
     super_k = WMMA_K * c.kpair
     row = super_k + LDS_PAD
     sc = (lambda r: r // 32 * super_k) if c.scale_4d else (lambda r: r * 4 * c.kpair)
-    st = (c.tile_m * row, c.tile_n * row, sc(c.tile_m), sc(c.tile_n))
+    st = (c.tile_m * row, c.tile_n * (super_k if c.b_preshuffle else row), sc(c.tile_m), sc(c.tile_n))
     nb = c.num_buffers
     base_b = 0  # B first, as aiter (64 KiB aligned base)
     base_a = base_b + nb * st[1]
@@ -115,9 +115,10 @@ def _launch_gemm_mxfp8(
     cluster_m: Constexpr[int],
     cluster_n: Constexpr[int],
     scale_4d: Constexpr[bool],
+    b_shuf: Constexpr[bool],
     k_tail: Constexpr[bool],
 ):
-    cfg = MXGemmConfig(tile_m, tile_n, num_buffers, kpair, cluster_m, cluster_n, scale_4d)
+    cfg = MXGemmConfig(tile_m, tile_n, num_buffers, kpair, cluster_m, cluster_n, scale_4d, b_shuf)
     LDS_ROW, STAGE, BASE, ARENA = geometry(cfg)
     assert tile_m in (128, 256) and tile_n in (128, 256) and kpair in (1, 2) and num_buffers in (2, 3, 4)
     assert ARENA <= LDS_BYTES, f"{cfg} needs {ARENA} B of LDS"
@@ -136,9 +137,13 @@ def _launch_gemm_mxfp8(
     SC_PAR, SC_SM = (WMMA_K, SUPER_K) if scale_4d else (4, 32 * 4 * KPAIR)
     SC_TILE = (lambda rows: (rows // 32, SUPER_K)) if scale_4d else (lambda rows: (rows, 4 * KPAIR))
     C_ROW = tile_n + C_PAD
+    # fragment geometry (16-row step, 16-byte K-chunk step, K-step offset): row-major rows, or aiter's 16x16
+    # preshuffled B (per 16 rows [K/16][16 rows][16 B]: one TDM row of SUPER_K * 16 bytes per 16 rows)
+    GEO_A = (16 * LDS_ROW, 32, WMMA_K)
+    GEO_B = (SUPER_K * 16, 512, WMMA_K * 16) if b_shuf else GEO_A
     kname = f"gemm_mxfp8_gfx1250_t{tile_m}x{tile_n}_nb{NB}_kp{KPAIR}_c{cluster_m}x{cluster_n}" + (
         "_s4d" if scale_4d else ""
-    ) + ("_kt" if k_tail else "")
+    ) + ("_bsh" if b_shuf else "") + ("_kt" if k_tail else "")
 
     @flyc.kernel(name=kname, known_block_size=[BLOCK, 1, 1])
     def kernel_gemm_mxfp8(
@@ -189,7 +194,11 @@ def _launch_gemm_mxfp8(
             ld, ptr, mask = ((i32_lda, arg_a, a_mask), (i32_ldb, arg_b, b_mask), (i32_ldsa, arg_sa, a_mask),
                              (i32_ldsb, arg_sb, b_mask))[w]
             pad = LDS_PAD if w < 2 else 0
-            if const_expr(w < 2):
+            if const_expr(w == 1 and b_shuf):  # [N/16][K * 16]
+                rows, inner, step, total, row0, ld, pad = tile_n // 16, SUPER_K * 16, SUPER_K * 16, i32_k * 16, \
+                    blk // 16, i32_ldb * 16, 0
+                rows_valid = (rows_valid + 15) // 16
+            elif const_expr(w < 2):
                 inner, step, total, row0 = SUPER_K, SUPER_K, i32_k, blk
             elif const_expr(scale_4d):
                 (rows, inner), step, total, row0 = SC_TILE(rows), SUPER_K, (i32_k + 127) // 128 * 128, blk // 32
@@ -232,7 +241,7 @@ def _launch_gemm_mxfp8(
 
         # ---- fragment / scale read addresses per unrolled stage (displacements stay DS immediates) ----
         a_byte = (wmb + lane16) * LDS_ROW + kgrp * 16
-        b_byte = (wnb + lane16) * LDS_ROW + kgrp * 16
+        b_byte = (wnb // 16) * GEO_B[0] + kgrp * 256 + lane16 * 16 if b_shuf else (wnb + lane16) * LDS_ROW + kgrp * 16
         if const_expr(scale_4d):
             sa_byte, sb_byte = (wmb // 32) * SUPER_K + lane * 4, (wnb // 32) * SUPER_K + lane * 4
         else:
@@ -246,15 +255,15 @@ def _launch_gemm_mxfp8(
         for st in range_constexpr(UNROLL):
             slot, par = st // KPAIR, st % KPAIR
             addr_a.append(_planar(BASE[0] + slot * STAGE[0] + par * WMMA_K, a_byte))
-            addr_b.append(_planar(BASE[1] + slot * STAGE[1] + par * WMMA_K, b_byte))
+            addr_b.append(_planar(BASE[1] + slot * STAGE[1] + par * GEO_B[2], b_byte))
             addr_sa.append(_planar(BASE[2] + slot * STAGE[2] + par * SC_PAR, sa_byte))
             addr_sb.append(_planar(BASE[3] + slot * STAGE[3] + par * SC_PAR, sb_byte))
 
         def _join(v):
             return v[0].shuffle(v[1], list(range(8))).shuffle(v[2].shuffle(v[3], list(range(8))), list(range(16)))
 
-        def _load_frag(addr, idx):
-            return _join([Vec(lds_load_b128(addr, idx * 16 * LDS_ROW + 32 * j)) for j in range_constexpr(4)])
+        def _load_frag(addr, idx, geo=GEO_A):
+            return _join([Vec(lds_load_b128(addr, idx * geo[0] + geo[1] * j)) for j in range_constexpr(4)])
 
         def _rmem(n, v):
             t = fx.make_rmem_tensor(n, fx.Int32)
@@ -298,7 +307,7 @@ def _launch_gemm_mxfp8(
                 for i in range_constexpr(N_SB)
             ]
             a_th = [(lambda i=i: seed_a[i].store(_load_frag(addr_a[stage], i))) for i in range_constexpr(half_m)]
-            b_th = [(lambda i=i: seed_b[i].store(_load_frag(addr_b[stage], i))) for i in range_constexpr(half_n)]
+            b_th = [(lambda i=i: seed_b[i].store(_load_frag(addr_b[stage], i, GEO_B))) for i in range_constexpr(half_n)]
             return (head + a_th, b_th) if parity == 0 else (head + b_th, a_th)
 
         def _chain(d, pos, t):
@@ -333,11 +342,11 @@ def _launch_gemm_mxfp8(
 
             def _mk(kind, key):
                 n = half_m if kind == "a" else half_n
-                addr = addr_a[stage] if kind == "a" else addr_b[stage]
+                addr, geo = (addr_a[stage], GEO_A) if kind == "a" else (addr_b[stage], GEO_B)
                 nxt[key] = [None] * n
 
                 def _go(i):
-                    nxt[key][i] = _rmem(16, _load_frag(addr, n + i))
+                    nxt[key][i] = _rmem(16, _load_frag(addr, n + i, geo))
 
                 return {i: (lambda i=i: _go(i)) for i in range_constexpr(n)}
 
@@ -496,17 +505,20 @@ def gemm_mxfp8_gfx1250(
     out_dtype: torch.dtype = torch.bfloat16,
     out: torch.Tensor | None = None,
     config: MXGemmConfig | None = None,
+    b_preshuffled: bool = False,
 ) -> torch.Tensor:
     """``out[M, N] = (a * a_scale) @ (b * b_scale)^T`` with E4M3 ``a [M, K]``, ``b [N, K]`` (K contiguous, row
     stride a multiple of 16 bytes) and E8M0 scales (uint8 or float8_e8m0fnu), either both raw ``[rows, ceil(K/32)]``
     (K/32 contiguous) or both packed ``[ceil(rows/32), ceil(K/128), 32, 4]`` (``mxfp8_ref.pack_scales``). Packed is
     the fast layout: a raw scale slot is one 4 * kpair-byte TDM row per tile row, which costs 20-45% on the DSv3
-    shapes. bf16 ``out``, N a multiple of 8. ``config`` overrides the static per-shape table."""
+    shapes. ``b_preshuffled``: ``b`` in aiter's 16x16 order (``[N/16][K/16][16][16]``; N, K % 16 == 0, dense rows),
+    which needs 16x fewer TDM rows than row-major B. bf16 ``out``, N a multiple of 8. ``config`` overrides the
+    static per-shape table."""
     _require_gfx1250(a.device)
     M, K = a.shape
     N = b.shape[0]
     cfg = config or pick_config(M, N, K)
-    cfg = cfg._replace(scale_4d=a_scale.dim() == 4)
+    cfg = cfg._replace(scale_4d=a_scale.dim() == 4, b_preshuffle=bool(b_preshuffled))
     if out_dtype != torch.bfloat16:
         raise NotImplementedError(f"gemm_mxfp8_gfx1250: out_dtype {out_dtype} (bf16 only)")
     if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn or b.shape[1] != K:
@@ -548,7 +560,9 @@ def gemm_mxfp8_gfx1250(
     cm = _divisor_cluster((M + cfg.tile_m - 1) // cfg.tile_m, cfg.cluster_m)
     cn = _divisor_cluster((N + cfg.tile_n - 1) // cfg.tile_n, cfg.cluster_n)
     k_tail = K % (WMMA_K * cfg.kpair) != 0
-    const = (cfg.tile_m, cfg.tile_n, cfg.num_buffers, cfg.kpair, cm, cn, bool(cfg.scale_4d), k_tail)
+    if cfg.b_preshuffle and (N % 16 or b.stride(0) != K):
+        raise ValueError("gemm_mxfp8_gfx1250: a preshuffled b needs N % 16 == 0 and dense rows")
+    const = (cfg.tile_m, cfg.tile_n, cfg.num_buffers, cfg.kpair, cm, cn, bool(cfg.scale_4d), cfg.b_preshuffle, k_tail)
     args = (
         out.data_ptr(), a.data_ptr(), b.data_ptr(), a_scale.data_ptr(), b_scale.data_ptr(),
         M, N, K, a.stride(0), b.stride(0), out.stride(0), ldsa, ldsb, torch.cuda.current_stream(), *const,

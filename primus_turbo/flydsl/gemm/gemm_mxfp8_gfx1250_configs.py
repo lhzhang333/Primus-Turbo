@@ -11,8 +11,8 @@ from typing import NamedTuple
 class MXGemmConfig(NamedTuple):
     """One kernel instance: a ``tile_m x tile_n`` block per workgroup of 2x2 waves, ``num_buffers`` LDS slots of
     ``kpair`` 128-wide K steps each, and a ``cluster_m x cluster_n`` workgroup cluster that multicasts the shared
-    A (along N) and B (along M) tiles; 1x1 is the no-multicast config. ``scale_4d`` describes the input (the entry
-    point sets it from the scale tensors' rank)."""
+    A (along N) and B (along M) tiles; 1x1 is the no-multicast config. ``scale_4d`` / ``b_preshuffle`` describe the
+    inputs (the entry point sets them from the scale tensors' rank and its ``b_preshuffled`` flag)."""
 
     tile_m: int = 256
     tile_n: int = 256
@@ -21,6 +21,7 @@ class MXGemmConfig(NamedTuple):
     cluster_m: int = 2
     cluster_n: int = 2
     scale_4d: bool = False
+    b_preshuffle: bool = False
 
 
 DEFAULT = MXGemmConfig()
