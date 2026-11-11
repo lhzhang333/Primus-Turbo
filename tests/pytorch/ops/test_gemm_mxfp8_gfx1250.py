@@ -26,16 +26,18 @@ if is_gfx1250():
     from primus_turbo.flydsl.gemm.gemm_mxfp8_gfx1250_configs import MXGemmConfig as C
     from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 import gemm_mxfp8_gfx1250
 
+    # scale_4d: the scales are passed packed (the fast layout) or raw
     CONFIGS = [
-        C(256, 256, 2, 2, 1, 1),
-        C(256, 256, 2, 2, 1, 4),
-        C(256, 256, 2, 2, 2, 2),
-        C(256, 256, 4, 1, 1, 1),
-        C(256, 256, 3, 1, 1, 2),
-        C(128, 256, 4, 1, 1, 4),
-        C(256, 128, 4, 1, 4, 1),
-        C(128, 128, 4, 2, 1, 1),
+        C(256, 256, 2, 2, 1, 1, True),
         C(256, 256, 2, 2, 1, 4, True),
+        C(256, 256, 2, 2, 2, 2, True),
+        C(256, 256, 4, 1, 1, 1, True),
+        C(256, 256, 3, 1, 1, 2, True),
+        C(128, 256, 3, 2, 1, 4, True),
+        C(256, 128, 4, 1, 4, 1, True),
+        C(128, 128, 4, 2, 1, 1, True),
+        C(256, 256, 2, 2, 1, 4),
+        C(128, 128, 4, 1, 1, 1),
     ]
 else:
     CONFIGS = [None]
@@ -72,7 +74,7 @@ def test_gemm_mxfp8_random_snr():
     ref = gemm_ref(a, sa, b, sb)
     ref_bf16 = ref.to(torch.bfloat16)
     floor = snr_db(ref_bf16, ref)  # the bf16 output rounding alone: ~55.6 dB
-    for cfg in CONFIGS[:2]:
+    for cfg in CONFIGS[1:2] + CONFIGS[-2:-1]:
         out = _run(a, sa, b, sb, cfg)
         # the WMMA accumulation error is invisible next to the bf16 output rounding
         assert snr_db(out, ref) > floor - 0.05
@@ -83,7 +85,7 @@ def test_gemm_mxfp8_deterministic():
     g = torch.Generator(device="cuda").manual_seed(7)
     a, sa = quant_rows(torch.randn(M, K, device="cuda", generator=g))
     b, sb = quant_rows(torch.randn(N, K, device="cuda", generator=g))
-    for cfg in CONFIGS[:2]:
+    for cfg in CONFIGS[1:2] + CONFIGS[3:4]:
         first = _run(a, sa, b, sb, cfg).clone()
         out = torch.empty_like(first)
         same = 0
