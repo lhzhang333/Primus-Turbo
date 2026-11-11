@@ -509,15 +509,18 @@ def gemm_mxfp8_gfx1250(
     out_dtype: torch.dtype = torch.bfloat16,
     out: torch.Tensor | None = None,
     config: MXGemmConfig | None = None,
+    b_preshuffled: bool = False,
 ) -> torch.Tensor:
     """``out[M, N] = (a * a_scale) @ (b * b_scale)^T`` with E4M3 ``a [M, K]``, ``b [N, K]`` (K contiguous, row
-    stride a multiple of 16 bytes) and E8M0 ``a_scale [M, ceil(K/32)]``, ``b_scale [N, ceil(K/32)]`` (uint8 or
-    float8_e8m0fnu, K/32 contiguous; ``config.scale_4d``: the packed ``[ceil(R/32), ceil(K/128), 32, 4]``).
-    bf16 ``out``, N a multiple of 8. ``config`` overrides the static per-shape table."""
+    stride a multiple of 16 bytes) and E8M0 scales (uint8 or float8_e8m0fnu), either both raw ``[rows, ceil(K/32)]``
+    (K/32 contiguous) or both packed ``[ceil(rows/32), ceil(K/128), 32, 4]`` (``mxfp8_ref.pack_scales``; fewer and
+    larger TDM rows). ``b_preshuffled``: ``b`` in aiter's 16x16 preshuffled order (N % 16 == 0). bf16 ``out``,
+    N a multiple of 8. ``config`` overrides the static per-shape table."""
     _require_gfx1250(a.device)
     M, K = a.shape
     N = b.shape[0]
     cfg = config or pick_config(M, N, K)
+    cfg = cfg._replace(scale_4d=a_scale.dim() == 4, b_preshuffle=bool(b_preshuffled or cfg.b_preshuffle))
     if out_dtype != torch.bfloat16:
         raise NotImplementedError(f"gemm_mxfp8_gfx1250: out_dtype {out_dtype} (bf16 only)")
     if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn or b.shape[1] != K:
@@ -528,9 +531,10 @@ def gemm_mxfp8_gfx1250(
     if cfg.scale_4d:
         want_a, want_b = ((M + 31) // 32, (K + 127) // 128, 32, 4), ((N + 31) // 32, (K + 127) // 128, 32, 4)
         if tuple(a_scale.shape) != want_a or tuple(b_scale.shape) != want_b:
-            raise ValueError(f"gemm_mxfp8_gfx1250: 4-D scales must be {want_a}, {want_b}")
+            raise ValueError(f"gemm_mxfp8_gfx1250: packed scales must be {want_a}, {want_b}, got "
+                             f"{tuple(a_scale.shape)}, {tuple(b_scale.shape)}")
         if not (a_scale.is_contiguous() and b_scale.is_contiguous()):
-            raise ValueError("gemm_mxfp8_gfx1250: 4-D scales must be contiguous")
+            raise ValueError("gemm_mxfp8_gfx1250: packed scales must be contiguous")
         ldsa = ldsb = (K + 127) // 128 * 128
     else:
         if tuple(a_scale.shape) != (M, kb) or tuple(b_scale.shape) != (N, kb):
