@@ -53,6 +53,8 @@ _GFX1250_ENABLED_TESTS = (
     # The kwargs-mode shape keys of the same kernel (the MiniMax-M3 shapes): which calls get a key's
     # whole argument set, and that the keyed result is bit-identical to the untuned one.
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_kwargs_keys.py",
+    # MXFP8 strict mode (PRIMUS_TURBO_MX_STRICT): dispatcher fallbacks and re-quantization refused.
+    "tests/pytorch/core/test_mx_strict.py",
     # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250_mla).
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
     # HipKittens kernels of its backward (csrc/kernels/attention/hipkittens/gfx1250_mla).

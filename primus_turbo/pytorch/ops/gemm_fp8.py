@@ -16,6 +16,7 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp8_support,
+    mx_strict,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
@@ -586,6 +587,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             check_quantized_tensor(a, config, axis=-1, scaling_recipe=a_scaling_recipe)
             a_row, a_row_scale = a.qdata, a.scale_inv
             if a_t is None:
+                mx_strict("gemm_fp8 (MXFP8): a has no transposed copy (a_t); re-quantizing it from its dequantized values")
                 a_t = QuantizedTensor.quantize(
                     a.dequantize(),
                     a.real_dtype,
@@ -611,6 +613,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             check_quantized_tensor(b, config, axis=-1, scaling_recipe=b_scaling_recipe)
             b_row, b_row_scale = b.qdata, b.scale_inv
             if b_t is None:
+                mx_strict("gemm_fp8 (MXFP8): b has no transposed copy (b_t); re-quantizing it from its dequantized values")
                 b_t = QuantizedTensor.quantize(
                     b.dequantize(),
                     b.real_dtype,

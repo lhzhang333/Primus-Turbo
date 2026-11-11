@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_ODC_GDA_PIPE: int = 1
     PRIMUS_TURBO_ODC_GDA_NUM_QP: int = 1
     PRIMUS_TURBO_DGATE_ACC_ATOMIC: bool = True
+    PRIMUS_TURBO_MX_STRICT: int = 0
 
 
 def backend_spec(name: str) -> Callable[[], str | None]:
@@ -275,6 +276,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "0" makes the Flux dgate epilogue accumulate without atomics. Unset and any other value
     # keep the atomic path. Read once, when the MXFP4 quant kernel module is imported.
     "PRIMUS_TURBO_DGATE_ACC_ATOMIC": lambda: os.getenv("PRIMUS_TURBO_DGATE_ACC_ATOMIC", "1") != "0",
+    # ================== MXFP8 ==================
+    # MXFP8 strict mode (tests, gates): an MX op raises instead of taking a silent fallback
+    # (``low_precision.mx_strict``). 1: a GEMM backend other than the default or pinned one, and a
+    # quantized operand re-quantized from its dequantized values because its transposed copy is
+    # missing; 2: also the HIP MXFP8 quantization on gfx1250. Unset, 0 or a non-integer: off.
+    # Clamped to [0, 2]. Read at the first MX op that could fall back.
+    "PRIMUS_TURBO_MX_STRICT": env_clamped_int("PRIMUS_TURBO_MX_STRICT", 0, 0, 2),
 }
 
 

@@ -22,6 +22,7 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
+    mx_strict,
 )
 from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.triton.quantization.quant_blockwise import (
@@ -558,6 +559,8 @@ def quantize_mxfp8_impl(
             if x.ndim == 3:
                 return quant_mxfp8_raw_batched(x, out_dtype, row_2d=row_2d, col_2d=col_2d)
             return quant_mxfp8_raw(x, out_dtype, row_2d=row_2d, col_2d=col_2d)
+        if is_gfx1250():
+            mx_strict("MXFP8 quantization (rows + cols) runs the HIP kernels on gfx1250", level=2)
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8_dual(
             x,
             out_dtype,
@@ -570,6 +573,8 @@ def quantize_mxfp8_impl(
             scaling_recipe_for_trans.shuffle_out,
         )
     else:
+        if is_gfx1250():
+            mx_strict("MXFP8 quantization runs the HIP kernels on gfx1250", level=2)
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp8(
             x,
             out_dtype,
@@ -639,6 +644,8 @@ def grouped_quantize_mxfp8_impl(
         )
         if fly_ok:
             return grouped_quant_mxfp8_raw(x.contiguous(), group_lens, group_offs, out_dtype)
+        if is_gfx1250():
+            mx_strict("grouped MXFP8 quantization (rows + cols) runs the HIP kernels on gfx1250", level=2)
         return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8_dual(
             x,
             group_lens,
@@ -653,6 +660,8 @@ def grouped_quantize_mxfp8_impl(
         )
     else:
         assert axis in (0, 1), "The axis must be 0 or 1 when with_trans is False."
+        if is_gfx1250():
+            mx_strict("grouped MXFP8 quantization runs the HIP kernels on gfx1250", level=2)
         return torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp8(
             x,
             group_lens,
