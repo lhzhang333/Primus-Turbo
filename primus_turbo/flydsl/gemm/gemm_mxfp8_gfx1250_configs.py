@@ -89,3 +89,11 @@ def pick_config(M: int, N: int, K: int, b_preshuffled: bool = False, num_cus: in
     if tiles(128, 256) >= 3 * num_cus // 4:
         return MXGemmConfig(128, 256, 3, 2, 1, 4)
     return MXGemmConfig(128, 128, 2, 2, 1, 1)
+
+
+def pick_grouped_config(mode: int, M: int, N: int, K: int, b_preshuffled: bool = True) -> MXGemmConfig:
+    """Routed experts. ``mode`` 1 (grouped-M fwd / dgrad: M = rows per expert, multicast along N only) or 2
+    (variable-K wgrad: K = tokens per expert)."""
+    if mode == 1:
+        return MXGemmConfig(256, 256, 4, 1, 1, 4) if b_preshuffled and K >= 4096 else MXGemmConfig(256, 256, 2, 2, 1, 4)
+    return MXGemmConfig(256, 256, 2, 2, 2, 2)

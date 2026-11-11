@@ -12,19 +12,28 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""MXFP8 dense NT GEMM for gfx1250: ``out[M, N] = (a * sa)[M, K] @ (b * sb)[N, K]^T``.
+"""MXFP8 NT GEMMs for gfx1250, one mainloop for three modes, fp32 accumulation, ``out`` bf16 or fp32, optionally
+``out += result`` (beta = 1, rounded once):
 
-``a``, ``b``: E4M3 rows, K contiguous (row-major, no preshuffle). ``sa``, ``sb``: one E8M0 byte per 32 K elements of a
-row, packed in aiter's ``[ceil(R/32)][ceil(K/128)][32][4]`` (fast) or raw ``[rows, ceil(K/32)]``. bf16 out, fp32 acc.
+* dense: ``out[M, N] = (a * sa)[M, K] @ (b * sb)[N, K]^T``;
+* grouped-M (routed experts fwd / dgrad): ``out[rows_g] = a[rows_g] @ b[g]^T``, a's rows of expert g padded to 32
+  (``offs_pad``), out tight (``offs``);
+* variable-K (routed experts wgrad): ``out[g] (+)= a[:, k_g] @ b[:, k_g]^T`` over each expert's token range ``k_g``
+  (``offs``, multiples of 128).
+
+Operands: E4M3, K contiguous. Scales: one E8M0 byte per 32 K, packed ``[ceil(R/32)][ceil(K/128)][32][4]`` (fast) or
+raw ``[rows, ceil(K/32)]`` (one 4 * kpair-byte TDM row per tile row: 20-45% slower). B: 16x16-preshuffled
+``[N/16][K/16][16][16]`` (what the quantizers emit: the deep kpair-1 pipelines need it) or row-major (fallback; the
+same speed at kpair 2).
 
 The mainloop is aiter's compute-bound gfx1250 tile: 2x2 waves of up to 128x128, ``v_wmma_scale_f32_16x16x128_f8f6f4``
 with one scale VGPR feeding two WMMAs (ROW0 / ROW1 lane halves), ``num_buffers`` LDS slots of ``kpair`` 128-wide K
 steps filled by persistent per-wave TDM descriptors (wave 0: A, 1: B, 2: A scales, 3: B scales), a split
-signal / wait barrier per slot, cluster multicast of the shared tiles. Changes: B is row-major like A (padded LDS
-rows instead of the 16x16 preshuffle: measured the same), mx32 scales, M / N / K tails by TDM out-of-bounds zero fill
-(no padding of the data; K tails clamp the inner extent of every load), an LDS-staged epilogue with 16-byte buffer
-stores (no TDM store: the suspect of the grouped kernel's rare silent error). No branch skips the TDM pipeline: a
-workgroup past M or N runs with zero extents and drops its stores.
+signal / wait barrier per slot, cluster multicast of the shared tiles. Changes: row-major A (and B when not
+preshuffled) in padded LDS rows, mx32 scales, M / N / K tails by TDM out-of-bounds zero fill (no padding of the data;
+K tails clamp the inner extent of every load), an LDS-staged epilogue with 16-byte buffer stores (no TDM store: the
+suspect of the grouped kernel's rare silent error). No branch skips the TDM pipeline: a dead tile (past the
+experts' tiles) runs one zero-extent K step and drops its stores; a cluster never mixes experts.
 """
 
 from __future__ import annotations
@@ -38,12 +47,17 @@ from flydsl.expr.rocdl import cluster, tdm_ops
 from flydsl.expr.typing import Constexpr, T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
 
-from primus_turbo.flydsl.gemm.gemm_mxfp8_gfx1250_configs import MXGemmConfig, pick_config
+from primus_turbo.flydsl.gemm.gemm_mxfp8_gfx1250_configs import (
+    MXGemmConfig,
+    pick_config,
+    pick_grouped_config,
+)
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
     _make_lds_copy_ops,
     _require_gfx1250,
 )
 from primus_turbo.flydsl.utils.buffer_ops import (
+    buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
 )
@@ -51,15 +65,17 @@ from primus_turbo.flydsl.utils.buffer_ops import (
 WAVE = 32
 WMMA_K = 128  # K per WMMA = per scale word (4 E8M0 bytes)
 LDS_PAD = 16  # bytes after every A / B LDS row: conflict-free ds_load_b128 fragment reads
-C_PAD = 8  # bf16 elements after every row of the epilogue's C staging
+C_PAD_B = 16  # bytes after every row of the epilogue's C staging
+DENSE, GROUPED_M, VARIABLE_K = 0, 1, 2
 LDS_BYTES = 320 * 1024
 CLUSTER_SYNC_REVS = 8  # a cluster barrier every this many pipeline revolutions keeps multicast partners close
 _WG_BARRIER = -1
 _E8M0 = (torch.uint8, getattr(torch, "float8_e8m0fnu", torch.uint8))
 
 
-def geometry(c: MXGemmConfig):
-    """LDS plan of a config: (row bytes, stage bytes of A / B / SA / SB, base offsets of the four regions, arena)."""
+def geometry(c: MXGemmConfig, stage_f32: bool = False):
+    """LDS plan of a config: (row bytes, stage bytes of A / B / SA / SB, base offsets of the four regions, arena);
+    ``stage_f32``: the epilogue stages fp32 (fp32 out or beta = 1) instead of bf16."""
     super_k = WMMA_K * c.kpair
     row = super_k + LDS_PAD
     sc = (lambda r: r // 32 * super_k) if c.scale_4d else (lambda r: r * 4 * c.kpair)
@@ -69,7 +85,7 @@ def geometry(c: MXGemmConfig):
     base_a = base_b + nb * st[1]
     base_sa = base_a + nb * st[0]
     base_sb = base_sa + nb * st[2]
-    arena = max(base_sb + nb * st[3], c.tile_m * (c.tile_n + C_PAD) * 2)
+    arena = max(base_sb + nb * st[3], c.tile_m * (c.tile_n * (4 if stage_f32 else 2) + C_PAD_B))
     return row, st, (base_a, base_b, base_sa, base_sb), arena
 
 
@@ -92,6 +108,16 @@ def _tdm_group1(mask, tile0: int, tile1: int, dim0, dim1, stride, pad: int):
     ]
 
 
+def _i64_table(arg, n: int):
+    """The low words of an int64 table of ``n`` entries as uniform values (scalar buffer loads)."""
+    rsrc = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg)), num_records_bytes=8 * n)
+    vals = []
+    for q in range_constexpr((2 * n + 3) // 4):
+        v = Vec(buffer_load(rsrc, fx.Int32(4 * q), vec_width=4, is_scalar=True))
+        vals += [fx.Int32(v[0]), fx.Int32(v[2])]
+    return vals[:n]
+
+
 @flyc.jit
 def _launch_gemm_mxfp8(
     arg_c: fx.Pointer,
@@ -99,6 +125,8 @@ def _launch_gemm_mxfp8(
     arg_b: fx.Pointer,
     arg_sa: fx.Pointer,
     arg_sb: fx.Pointer,
+    arg_g0: fx.Pointer,
+    arg_g1: fx.Pointer,
     i32_m: fx.Int32,
     i32_n: fx.Int32,
     i32_k: fx.Int32,
@@ -117,9 +145,18 @@ def _launch_gemm_mxfp8(
     scale_4d: Constexpr[bool],
     b_shuf: Constexpr[bool],
     k_tail: Constexpr[bool],
+    mode: Constexpr[int],
+    n_groups: Constexpr[int],
+    out_f32: Constexpr[bool],
+    beta1: Constexpr[bool],
 ):
+    """``arg_g0`` / ``arg_g1``: grouped-M: the tight and the 32-padded row offsets of the experts (int64, G + 1);
+    variable-K: the 128-padded token offsets (``arg_g0``). Unused in dense mode."""
     cfg = MXGemmConfig(tile_m, tile_n, num_buffers, kpair, cluster_m, cluster_n, scale_4d, b_shuf)
-    LDS_ROW, STAGE, BASE, ARENA = geometry(cfg)
+    STG = 4 if out_f32 or beta1 else 2  # bytes per staged output element
+    OB = 4 if out_f32 else 2  # bytes per output element
+    LDS_ROW, STAGE, BASE, ARENA = geometry(cfg, STG == 4)
+    G = n_groups
     assert tile_m in (128, 256) and tile_n in (128, 256) and kpair in (1, 2) and num_buffers in (2, 3, 4)
     assert ARENA <= LDS_BYTES, f"{cfg} needs {ARENA} B of LDS"
     use_cluster = cluster_m * cluster_n > 1
@@ -136,14 +173,14 @@ def _launch_gemm_mxfp8(
     # scale slot: raw [R, K/32] -> tile rows of 4 * KPAIR bytes; 4-D [R/32][K/128][32][4] -> tile/32 rows of SUPER_K
     SC_PAR, SC_SM = (WMMA_K, SUPER_K) if scale_4d else (4, 32 * 4 * KPAIR)
     SC_TILE = (lambda rows: (rows // 32, SUPER_K)) if scale_4d else (lambda rows: (rows, 4 * KPAIR))
-    C_ROW = tile_n + C_PAD
+    C_ROW_B = tile_n * STG + C_PAD_B
     # fragment geometry (16-row step, 16-byte K-chunk step, K-step offset): row-major rows, or aiter's 16x16
     # preshuffled B (per 16 rows [K/16][16 rows][16 B]: one TDM row of SUPER_K * 16 bytes per 16 rows)
     GEO_A = (16 * LDS_ROW, 32, WMMA_K)
     GEO_B = (SUPER_K * 16, 512, WMMA_K * 16) if b_shuf else GEO_A
-    kname = f"gemm_mxfp8_gfx1250_t{tile_m}x{tile_n}_nb{NB}_kp{KPAIR}_c{cluster_m}x{cluster_n}" + (
-        "_s4d" if scale_4d else ""
-    ) + ("_bsh" if b_shuf else "") + ("_kt" if k_tail else "")
+    kname = f"gemm_mxfp8_gfx1250_{('dense', f'grouped{G}', f'vark{G}')[mode]}_t{tile_m}x{tile_n}_nb{NB}_kp{KPAIR}" \
+        f"_c{cluster_m}x{cluster_n}" + ("_s4d" if scale_4d else "") + ("_bsh" if b_shuf else "") + \
+        ("_kt" if k_tail else "") + ("_f32" if out_f32 else "") + ("_acc" if beta1 else "")
 
     @flyc.kernel(name=kname, known_block_size=[BLOCK, 1, 1])
     def kernel_gemm_mxfp8(
@@ -152,6 +189,8 @@ def _launch_gemm_mxfp8(
         arg_b: fx.Pointer,
         arg_sa: fx.Pointer,
         arg_sb: fx.Pointer,
+        arg_g0: fx.Pointer,
+        arg_g1: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         i32_k: fx.Int32,
@@ -167,11 +206,41 @@ def _launch_gemm_mxfp8(
         lane = tid % WAVE
         lane16, kgrp = lane % 16, lane // 16
         wave_m, wave_n = wave // 2, wave % 2
-        blk_m = (fx.Int32(bid_z) * fx.Int32(fx.grid_dim.x) + fx.Int32(bid_x)) * tile_m
-        blk_n = fx.Int32(bid_y) * tile_n
-        m_valid, n_valid = i32_m - blk_m, i32_n - blk_n  # <= 0 for a workgroup past the edge
         zero = fx.Int32(0)
-        supers = (i32_k + (SUPER_K - 1)) // SUPER_K
+        blk_n = fx.Int32(bid_y) * tile_n
+        n_valid = i32_n - blk_n
+        expert, k0, klen = zero, zero, i32_k
+        if const_expr(mode == DENSE):
+            blk_m = (fx.Int32(bid_z) * fx.Int32(fx.grid_dim.x) + fx.Int32(bid_x)) * tile_m
+            a_row0, out_row0, m_valid = blk_m, blk_m, i32_m - blk_m  # <= 0 for a workgroup past the edge
+            supers = (i32_k + (SUPER_K - 1)) // SUPER_K
+        elif const_expr(mode == GROUPED_M):
+            # m-tile t of the experts' tiles in order (ceil(len_g / tile_m) each); a tile past them is dead
+            t = fx.Int32(bid_z) * fx.Int32(fx.grid_dim.x) + fx.Int32(bid_x)
+            offs, offs_pad = _i64_table(arg_g0, G + 1), _i64_table(arg_g1, G + 1)
+            acc, first, len_g, in0, out0 = zero, zero, zero, zero, zero
+            for g in range_constexpr(G):
+                n_g = (offs[g + 1] - offs[g] + (tile_m - 1)) // tile_m
+                hit = (t >= acc) & (t < acc + n_g)
+                expert, first = hit.select(fx.Int32(g), expert), hit.select(acc, first)
+                len_g = hit.select(offs[g + 1] - offs[g], len_g)
+                in0, out0 = hit.select(offs_pad[g], in0), hit.select(offs[g], out0)
+                acc = acc + n_g
+            local = (t - first) * tile_m
+            rows = len_g - local
+            m_valid = (rows < tile_m).select(rows, fx.Int32(tile_m))
+            m_valid = (t < acc).select(m_valid, zero)  # dead: no row
+            a_row0, out_row0 = in0 + local, out0 + local
+            supers = (t < acc).select((i32_k + (SUPER_K - 1)) // SUPER_K, fx.Int32(1))
+        else:  # VARIABLE_K: workgroup (x, y, g) = output tile of expert g over its tokens [offs[g], offs[g + 1])
+            blk_m = fx.Int32(bid_x) * tile_m
+            a_row0, out_row0, m_valid = blk_m, blk_m, i32_m - blk_m
+            expert = fx.Int32(bid_z)
+            rsrc = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg_g0)), num_records_bytes=8 * (G + 1))
+            o2 = Vec(buffer_load(rsrc, expert * 2, vec_width=4, is_scalar=True))
+            k0, klen = fx.Int32(o2[0]), fx.Int32(o2[2]) - fx.Int32(o2[0])
+            supers = (klen + (SUPER_K - 1)) // SUPER_K
+            supers = (supers > zero).select(supers, fx.Int32(1))  # an empty expert: one zero K step
         a_mask = b_mask = 0
         if const_expr(use_cluster):
             lx = fx.Int32(rocdl.cluster_workgroup_id_x())
@@ -189,24 +258,27 @@ def _launch_gemm_mxfp8(
         def _owner(w):
             """[addr lo, addr hi | type, LDS slot 0, slot step, K step, inner extent, GROUP1 words 0, 2 (dim1
             half), 3, 4, 5] of operand ``w``; the K step and inner extent are in the operand's bytes."""
-            rows_valid, blk = (m_valid, blk_m) if w % 2 == 0 else (n_valid, blk_n)
+            rows_valid, blk = (m_valid, a_row0) if w % 2 == 0 else (n_valid, blk_n)
             rows = tile_m if w % 2 == 0 else tile_n
             ld, ptr, mask = ((i32_lda, arg_a, a_mask), (i32_ldb, arg_b, b_mask), (i32_ldsa, arg_sa, a_mask),
                              (i32_ldsb, arg_sb, b_mask))[w]
             pad = LDS_PAD if w < 2 else 0
+            eoff = fx.Int64(0)
+            if const_expr(mode == GROUPED_M and w % 2 == 1):  # b [G, N, K], its scales [G, N(/32), ...]
+                eoff = fx.Int64(expert) * fx.Int64(i32_n // (32 if w == 3 and scale_4d else 1)) * fx.Int64(ld)
             if const_expr(w == 1 and b_shuf):  # [N/16][K * 16]
-                rows, inner, step, total, row0, ld, pad = tile_n // 16, SUPER_K * 16, SUPER_K * 16, i32_k * 16, \
-                    blk // 16, i32_ldb * 16, 0
+                rows, inner, step, total, row0, ld, pad, kb = tile_n // 16, SUPER_K * 16, SUPER_K * 16, klen * 16, \
+                    blk // 16, i32_ldb * 16, 0, k0 * 16
                 rows_valid = (rows_valid + 15) // 16
             elif const_expr(w < 2):
-                inner, step, total, row0 = SUPER_K, SUPER_K, i32_k, blk
-            elif const_expr(scale_4d):
-                (rows, inner), step, total, row0 = SC_TILE(rows), SUPER_K, (i32_k + 127) // 128 * 128, blk // 32
-                rows_valid = (rows_valid + 31) // 32
+                inner, step, total, row0, kb = SUPER_K, SUPER_K, klen, blk, k0
+            elif const_expr(scale_4d):  # (variable-K token offsets are multiples of 128)
+                (rows, inner), step, total, row0 = SC_TILE(rows), SUPER_K, (klen + 127) // 128 * 128, blk // 32
+                rows_valid, kb = (rows_valid + 31) // 32, k0
             else:
-                (rows, inner), step, total, row0 = SC_TILE(rows), 4 * KPAIR, (i32_k + 31) // 32, blk
+                (rows, inner), step, total, row0, kb = SC_TILE(rows), 4 * KPAIR, (klen + 31) // 32, blk, k0 // 32
             ext1 = (rows_valid > zero).select(rows_valid, zero)
-            addr = fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(row0) * fx.Int64(ld)
+            addr = fx.Int64(fx.ptrtoint(ptr)) + eoff + fx.Int64(row0) * fx.Int64(ld) + fx.Int64(kb)
             g1 = _tdm_group1(mask, inner, rows, total, ext1, ld, pad)
             return [fx.Int32(addr), fx.Int32(addr >> 32) | fx.Int32(-(1 << 31)), lds0 + BASE[w], fx.Int32(STAGE[w]),
                     fx.Int32(step), total, g1[0], g1[2] & fx.Int32(-65536), g1[3], g1[4], g1[5]]
@@ -430,7 +502,8 @@ def _launch_gemm_mxfp8(
                 _stage(g, (g + 1) % UNROLL, g // KPAIR, None, NB - 2 - g // KPAIR, g < UNROLL - 1,
                        g % KPAIR == KPAIR - 1)
 
-        # ---- epilogue: accumulators -> bf16 rows in LDS -> 16-byte buffer stores, rows / columns past M / N dropped
+        # ---- epilogue: accumulators -> rows in LDS (bf16, or fp32 for fp32 out / beta = 1) -> 16-byte buffer
+        # stores (beta = 1: + the old C, read at the same offset, rounded once); rows / columns past M / N dropped
         accs = [c_frags[i].load() for i in range_constexpr(n_acc)]
         tdm_ops.tensor_wait(0)
         if const_expr(use_cluster):
@@ -439,42 +512,60 @@ def _launch_gemm_mxfp8(
             gpu.barrier()
         for wm in range_constexpr(m_rep):
             for wn in range_constexpr(n_rep):
-                h = accs[wm * n_rep + wn].to(fx.BFloat16)
+                h = accs[wm * n_rep + wn] if const_expr(STG == 4) else accs[wm * n_rep + wn].to(fx.BFloat16)
                 row, col = wmb + wm * 16 + lane16, wnb + wn * 16 + kgrp * 8
-                fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row * C_ROW + col) * 2)
+                fx.ptr_store(h.bitcast(fx.Int8), base_ptr + row * C_ROW_B + col * STG)
         gpu.barrier()
         m_ext = (m_valid < tile_m).select(m_valid, fx.Int32(tile_m))
         m_ext = (m_ext > zero).select(m_ext, zero)
         n_ext = (n_valid < tile_n).select(n_valid, fx.Int32(tile_n))
-        c_addr = fx.Int64(fx.ptrtoint(arg_c)) + (fx.Int64(blk_m) * fx.Int64(i32_ldc) + fx.Int64(blk_n)) * 2
-        ldc_b = i32_ldc * 2
+        c_addr = fx.Int64(fx.ptrtoint(arg_c)) + (fx.Int64(out_row0) * fx.Int64(i32_ldc) + fx.Int64(blk_n)) * OB
+        if const_expr(mode == VARIABLE_K):  # out [G, M, ldc]
+            c_addr = c_addr + fx.Int64(expert) * fx.Int64(i32_m) * fx.Int64(i32_ldc) * OB
+        ldc_b = i32_ldc * OB
         c_res = create_buffer_resource_from_addr(c_addr, num_records_bytes=m_ext * ldc_b)
         # lane tid stores 16-byte chunk tid % CH of rows tid // CH + i * RPI: one column per lane, so the column mask
         # is folded into the lane's base (past num_records, and every later row of it too: dropped)
-        CH = tile_n * 2 // 16
+        EPC = 16 // OB  # output elements per chunk
+        CH = tile_n // EPC
         RPI = BLOCK // CH
         c16, r0 = tid % CH, tid // CH
-        lane_b = (c16 * 8 < n_ext).select(r0 * ldc_b + c16 * 16, m_ext * ldc_b)
+        lane_b = (c16 * EPC < n_ext).select(r0 * ldc_b + c16 * 16, m_ext * ldc_b)
         step_b = RPI * ldc_b
-        GRP = 65536 // (RPI * C_ROW * 2)  # iterations per LDS base: displacements stay 16-bit DS offsets
+        GRP = 65536 // (RPI * C_ROW_B)  # iterations per LDS base: displacements stay 16-bit DS offsets
         for i in range_constexpr(tile_m // RPI):
             if const_expr(i % GRP == 0):
-                rd = _planar(i * RPI * C_ROW * 2, r0 * (C_ROW * 2) + c16 * 16)
-            v = lds_load_b128(rd, (i % GRP) * RPI * C_ROW * 2)
-            buffer_store(v, c_res, lane_b + step_b * i, offset_is_bytes=True)
+                rd = _planar(i * RPI * C_ROW_B, r0 * C_ROW_B + c16 * EPC * STG)
+            off = lane_b + step_b * i
+            if const_expr(STG == 2):
+                v = lds_load_b128(rd, (i % GRP) * RPI * C_ROW_B)
+            else:
+                acc_v = [Vec(lds_load_b128(rd, (i % GRP) * RPI * C_ROW_B + 16 * j)) for j in range_constexpr(STG // OB)]
+                acc_v = acc_v[0].shuffle(acc_v[1], list(range(8))) if const_expr(OB == 2) else acc_v[0]
+                acc_v = acc_v.bitcast(fx.Float32)
+                if const_expr(beta1):
+                    old = Vec(buffer_load(c_res, off // 4, vec_width=4, dtype=fx.Int32))
+                    acc_v = acc_v + (old.bitcast(fx.BFloat16).to(fx.Float32) if const_expr(OB == 2)
+                                     else old.bitcast(fx.Float32))
+                v = (acc_v.to(fx.BFloat16) if const_expr(OB == 2) else acc_v).bitcast(fx.Int32)
+            buffer_store(v, c_res, off, offset_is_bytes=True)
 
-    # Launch: grid.x runs up to 32 M tiles (a power of two dividing them), grid.y the N tiles, grid.z the M chunks.
-    gx = ((i32_m + (tile_m - 1)) // tile_m + (cluster_m - 1)) // cluster_m * cluster_m
+    # Launch: grid.x runs up to 32 M tiles (a power of two dividing them), grid.y the N tiles, grid.z the M chunks
+    # (grouped-M: the m tiles of all experts, at most ceil(M / tile_m) + G; variable-K: grid.z = the expert).
+    gx = (i32_m + (tile_m - 1)) // tile_m + (G if mode == GROUPED_M else 0)
+    gx = (gx + (cluster_m - 1)) // cluster_m * cluster_m
     gy = ((i32_n + (tile_n - 1)) // tile_n + (cluster_n - 1)) // cluster_n * cluster_n
     pow2 = gx & -gx
     capped = (pow2 < 32).select(pow2, fx.Int32(32))
     m_run = ((gx > 32) & (pow2 >= 8) & ((capped % cluster_m) == 0)).select(capped, gx)
+    if const_expr(mode == VARIABLE_K):
+        m_run = gx
     attrs = {"rocdl.cluster_dims": f"{cluster_m},{cluster_n},1"} if use_cluster else {}
     kernel_gemm_mxfp8(
-        arg_c, arg_a, arg_b, arg_sa, arg_sb, i32_m, i32_n, i32_k, i32_lda, i32_ldb, i32_ldc, i32_ldsa, i32_ldsb,
-        value_attrs=attrs,
+        arg_c, arg_a, arg_b, arg_sa, arg_sb, arg_g0, arg_g1, i32_m, i32_n, i32_k, i32_lda, i32_ldb, i32_ldc,
+        i32_ldsa, i32_ldsb, value_attrs=attrs,
     ).launch(
-        grid=(m_run, gy, gx // m_run),
+        grid=(m_run, gy, G if mode == VARIABLE_K else gx // m_run),
         block=(BLOCK, 1, 1),
         stream=stream,
         cluster=(cluster_m, cluster_n, 1) if use_cluster else None,
@@ -488,6 +579,7 @@ _launch_gemm_mxfp8.compile_hints["llvm_options"] = {
 }
 
 _COMPILED: dict = {}
+_F16_OUT = {torch.bfloat16: False, torch.float32: True}
 
 
 def _divisor_cluster(tiles: int, c: int) -> int:
@@ -495,6 +587,74 @@ def _divisor_cluster(tiles: int, c: int) -> int:
     while tiles % c:
         c //= 2
     return c
+
+
+def _check_scales(sa, sb, a_rows: int, b_rows: int, K: int, who: str, b_batch: tuple = ()):
+    """Both raw ``[rows, ceil(K/32)]`` (K/32 contiguous) or both packed ``[ceil(rows/32), ceil(K/128), 32, 4]``
+    (contiguous); ``b_batch``: leading expert dims of b's scales. Returns (packed, ld_sa, ld_sb)."""
+    if sa.dtype not in _E8M0 or sb.dtype not in _E8M0:
+        raise ValueError(f"{who}: scales must be E8M0 bytes, got {sa.dtype}, {sb.dtype}")
+    packed = sa.dim() == 4
+    if packed:
+        kb4 = (K + 127) // 128
+        want_a, want_b = ((a_rows + 31) // 32, kb4, 32, 4), b_batch + ((b_rows + 31) // 32, kb4, 32, 4)
+        if tuple(sa.shape) != want_a or tuple(sb.shape) != want_b or not (sa.is_contiguous() and sb.is_contiguous()):
+            raise ValueError(f"{who}: packed scales must be contiguous {want_a}, {want_b}, got "
+                             f"{tuple(sa.shape)}, {tuple(sb.shape)}")
+        return True, kb4 * 128, kb4 * 128
+    kb = (K + 31) // 32
+    if tuple(sa.shape) != (a_rows, kb) or tuple(sb.shape) != b_batch + (b_rows, kb) or sa.stride(-1) != 1 \
+            or sb.stride(-1) != 1 or (b_batch and not sb.is_contiguous()):
+        raise ValueError(f"{who}: scales must be [{a_rows}, {kb}], {b_batch + (b_rows, kb)} (K/32 contiguous), got "
+                         f"{tuple(sa.shape)}, {tuple(sb.shape)}")
+    return False, sa.stride(0), sb.stride(-2)
+
+
+def _launch(who, mode, cfg, out, a, b, sa, sb, g0, g1, M, N, K, lda, ldb, ldsa, ldsb, G, b_preshuffled, beta1,
+            k_tail):
+    """Validate the common layout rules, then run the cached compiled launcher of this constexpr tuple."""
+    if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"{who}: a / b must be float8_e4m3fn, got {a.dtype}, {b.dtype}")
+    if a.stride(-1) != 1 or b.stride(-1) != 1 or lda % 16 or ldb % 16 or K % 16:
+        raise ValueError(f"{who}: K ({K}) and the a / b row strides must be multiples of 16 bytes, K contiguous")
+    if N % 8 or out.stride(-1) != 1 or out.stride(-2) % 8:
+        raise ValueError(f"{who}: N ({N}) and the out row stride must be multiples of 8 (16-byte output rows)")
+    if b_preshuffled and (N % 16 or ldb != K):
+        raise ValueError(f"{who}: a preshuffled b needs N % 16 == 0 and dense [N/16][K/16][16][16] blocks")
+    for t in (a, b, out):
+        if t.data_ptr() % 16:
+            raise ValueError(f"{who}: a, b and out must be 16-byte aligned")
+    # a cluster must tile the grid exactly: a workgroup wholly past M or N would sit in a multicast group;
+    # grouped-M m tiles belong to different experts, so it multicasts A along N only
+    cm = 1 if mode == GROUPED_M else _divisor_cluster((M + cfg.tile_m - 1) // cfg.tile_m, cfg.cluster_m)
+    cn = _divisor_cluster((N + cfg.tile_n - 1) // cfg.tile_n, cfg.cluster_n)
+    const = (cfg.tile_m, cfg.tile_n, cfg.num_buffers, cfg.kpair, cm, cn, bool(sa.dim() == 4), bool(b_preshuffled),
+             bool(k_tail), mode, G, _F16_OUT[out.dtype], bool(beta1))
+    tabs = (g0 if g0 is not None else out, g1 if g1 is not None else out)
+    args = (out.data_ptr(), a.data_ptr(), b.data_ptr(), sa.data_ptr(), sb.data_ptr(), tabs[0].data_ptr(),
+            tabs[1].data_ptr(), M, N, K, lda, ldb, out.stride(-2), ldsa, ldsb, torch.cuda.current_stream(), *const)
+    fn = _COMPILED.get(const)
+    if fn is None:
+        ptr = lambda t: flyc.from_c_void_p(fx.Int8, t.data_ptr(), assumed_align=16)  # noqa: E731
+        first = (ptr(out), ptr(a), ptr(b), ptr(sa), ptr(sb), ptr(tabs[0]), ptr(tabs[1])) + args[7:]
+        fn = flyc.compile(_launch_gemm_mxfp8, *first)  # compiles and runs this call
+        if fn is not None:
+            _COMPILED[const] = fn
+        return out
+    fn(*args)
+    return out
+
+
+def _out(out, shape, out_dtype, accumulate, device, who):
+    if out_dtype not in _F16_OUT:
+        raise NotImplementedError(f"{who}: out_dtype {out_dtype} (bf16 or fp32)")
+    if out is None:
+        if accumulate:
+            raise ValueError(f"{who}: accumulate=True needs out")
+        return torch.empty(shape, dtype=out_dtype, device=device)
+    if out.dtype != out_dtype or tuple(out.shape) != tuple(shape):
+        raise ValueError(f"{who}: out must be {out_dtype} {tuple(shape)}, got {out.dtype} {tuple(out.shape)}")
+    return out
 
 
 def gemm_mxfp8_gfx1250(
@@ -506,74 +666,101 @@ def gemm_mxfp8_gfx1250(
     out: torch.Tensor | None = None,
     config: MXGemmConfig | None = None,
     b_preshuffled: bool = False,
+    accumulate: bool = False,
 ) -> torch.Tensor:
-    """``out[M, N] = (a * a_scale) @ (b * b_scale)^T`` with E4M3 ``a [M, K]``, ``b [N, K]`` (K contiguous, row
-    stride a multiple of 16 bytes) and E8M0 scales (uint8 or float8_e8m0fnu), either both raw ``[rows, ceil(K/32)]``
-    (K/32 contiguous) or both packed ``[ceil(rows/32), ceil(K/128), 32, 4]`` (``mxfp8_ref.pack_scales``). Packed is
-    the fast layout: a raw scale slot is one 4 * kpair-byte TDM row per tile row, which costs 20-45% on the DSv3
-    shapes. ``b_preshuffled``: ``b`` in aiter's 16x16 order (``[N/16][K/16][16][16]``; N, K % 16 == 0, dense rows),
-    which needs 16x fewer TDM rows than row-major B. bf16 ``out``, N a multiple of 8. ``config`` overrides the
-    static per-shape table."""
+    """``out[M, N] (+)= (a * a_scale) @ (b * b_scale)^T`` with E4M3 ``a [M, K]``, ``b [N, K]`` (K contiguous, row
+    strides multiples of 16 bytes) and E8M0 scales (uint8 or float8_e8m0fnu), both packed
+    ``[ceil(rows/32), ceil(K/128), 32, 4]`` (``mxfp8_ref.pack_scales``, the fast layout) or both raw
+    ``[rows, ceil(K/32)]``. ``b_preshuffled``: ``b`` in the 16x16 order ``[N/16][K/16][16][16]`` (N, K % 16 == 0).
+    ``out`` bf16 or fp32, N a multiple of 8; ``accumulate``: ``out = round(out + fp32 result)``.
+    ``config`` overrides the static per-shape table."""
     _require_gfx1250(a.device)
     M, K = a.shape
     N = b.shape[0]
-    cfg = config or pick_config(M, N, K, b_preshuffled)
-    cfg = cfg._replace(scale_4d=a_scale.dim() == 4, b_preshuffle=bool(b_preshuffled))
-    if out_dtype != torch.bfloat16:
-        raise NotImplementedError(f"gemm_mxfp8_gfx1250: out_dtype {out_dtype} (bf16 only)")
-    if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn or b.shape[1] != K:
-        raise ValueError(f"gemm_mxfp8_gfx1250: a {a.dtype} {tuple(a.shape)}, b {b.dtype} {tuple(b.shape)}")
-    if a_scale.dtype not in _E8M0 or b_scale.dtype not in _E8M0:
-        raise ValueError(f"gemm_mxfp8_gfx1250: scales must be E8M0 bytes, got {a_scale.dtype}, {b_scale.dtype}")
-    kb = (K + 31) // 32
-    if cfg.scale_4d:
-        want_a, want_b = ((M + 31) // 32, (K + 127) // 128, 32, 4), ((N + 31) // 32, (K + 127) // 128, 32, 4)
-        if tuple(a_scale.shape) != want_a or tuple(b_scale.shape) != want_b:
-            raise ValueError(f"gemm_mxfp8_gfx1250: packed scales must be {want_a}, {want_b}, got "
-                             f"{tuple(a_scale.shape)}, {tuple(b_scale.shape)}")
-        if not (a_scale.is_contiguous() and b_scale.is_contiguous()):
-            raise ValueError("gemm_mxfp8_gfx1250: packed scales must be contiguous")
-        ldsa = ldsb = (K + 127) // 128 * 128
-    else:
-        if tuple(a_scale.shape) != (M, kb) or tuple(b_scale.shape) != (N, kb):
-            raise ValueError(f"gemm_mxfp8_gfx1250: scales must be [M, {kb}], [N, {kb}], got "
-                             f"{tuple(a_scale.shape)}, {tuple(b_scale.shape)}")
-        if a_scale.stride(1) != 1 or b_scale.stride(1) != 1:
-            raise ValueError("gemm_mxfp8_gfx1250: scale rows must be contiguous")
-        ldsa, ldsb = a_scale.stride(0), b_scale.stride(0)
-    if a.stride(1) != 1 or b.stride(1) != 1 or a.stride(0) % 16 or b.stride(0) % 16 or K % 16:
-        raise ValueError(f"gemm_mxfp8_gfx1250: K ({K}) and the a / b row strides must be multiples of 16 bytes")
-    if N % 8:
-        raise ValueError(f"gemm_mxfp8_gfx1250: N ({N}) must be a multiple of 8 (16-byte output rows)")
-    if out is None:
-        out = torch.empty(M, N, dtype=torch.bfloat16, device=a.device)
-    elif out.dtype != torch.bfloat16 or tuple(out.shape) != (M, N) or out.stride(1) != 1 or out.stride(0) % 8:
-        raise ValueError(f"gemm_mxfp8_gfx1250: out must be bf16 [{M}, {N}] with a row stride multiple of 8")
-    for t in (a, b, out):
-        if t.data_ptr() % 16:
-            raise ValueError("gemm_mxfp8_gfx1250: a, b and out must be 16-byte aligned")
+    if b.shape[1] != K:
+        raise ValueError(f"gemm_mxfp8_gfx1250: a {tuple(a.shape)} and b {tuple(b.shape)} disagree on K")
+    out = _out(out, (M, N), out_dtype, accumulate, a.device, "gemm_mxfp8_gfx1250")
     if M == 0 or N == 0:
         return out
     if K == 0:
-        return out.zero_()
-    # a cluster must tile the grid exactly: a workgroup wholly past M or N would sit in a multicast group
-    cm = _divisor_cluster((M + cfg.tile_m - 1) // cfg.tile_m, cfg.cluster_m)
-    cn = _divisor_cluster((N + cfg.tile_n - 1) // cfg.tile_n, cfg.cluster_n)
+        return out if accumulate else out.zero_()
+    cfg = config or pick_config(M, N, K, b_preshuffled)
+    packed, ldsa, ldsb = _check_scales(a_scale, b_scale, M, N, K, "gemm_mxfp8_gfx1250")
     k_tail = K % (WMMA_K * cfg.kpair) != 0
-    if cfg.b_preshuffle and (N % 16 or b.stride(0) != K):
-        raise ValueError("gemm_mxfp8_gfx1250: a preshuffled b needs N % 16 == 0 and dense rows")
-    const = (cfg.tile_m, cfg.tile_n, cfg.num_buffers, cfg.kpair, cm, cn, bool(cfg.scale_4d), cfg.b_preshuffle, k_tail)
-    args = (
-        out.data_ptr(), a.data_ptr(), b.data_ptr(), a_scale.data_ptr(), b_scale.data_ptr(),
-        M, N, K, a.stride(0), b.stride(0), out.stride(0), ldsa, ldsb, torch.cuda.current_stream(), *const,
-    )
-    fn = _COMPILED.get(const)
-    if fn is None:
-        ptr = lambda t: flyc.from_c_void_p(fx.Int8, t.data_ptr(), assumed_align=16)  # noqa: E731
-        first = (ptr(out), ptr(a), ptr(b), ptr(a_scale), ptr(b_scale)) + args[5:]
-        fn = flyc.compile(_launch_gemm_mxfp8, *first)  # compiles and runs this call
-        if fn is not None:
-            _COMPILED[const] = fn
+    return _launch("gemm_mxfp8_gfx1250", DENSE, cfg, out, a, b, a_scale, b_scale, None, None, M, N, K, a.stride(0),
+                   b.stride(0), ldsa, ldsb, 1, b_preshuffled, accumulate, k_tail)
+
+
+def grouped_gemm_mxfp8_gfx1250(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    group_offs: torch.Tensor,
+    group_offs_padded: torch.Tensor,
+    m_out: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: torch.Tensor | None = None,
+    config: MXGemmConfig | None = None,
+    b_preshuffled: bool = True,
+) -> torch.Tensor:
+    """Routed experts fwd / dgrad: ``out[offs[g] + i] = a[offs_pad[g] + i] @ b[g]^T`` for ``i < offs[g + 1] -
+    offs[g]``. ``a [M_pad, K]`` holds each expert's rows from ``group_offs_padded[g]`` (int64 [G + 1], multiples of
+    32: Turbo's rowwise-padded MX layout), ``b [G, N, K]`` (16x16-preshuffled per expert by default), scales packed
+    ``[ceil(M_pad/32), ..]`` / ``[G, N/32, ..]`` (or raw), ``group_offs`` (int64 [G + 1]) the tight offsets of the
+    ``m_out`` output rows. Device tables only: no host sync."""
+    _require_gfx1250(a.device)
+    who = "grouped_gemm_mxfp8_gfx1250"
+    G, N, K = b.shape
+    if a.shape[1] != K or group_offs.numel() != G + 1 or group_offs_padded.numel() != G + 1:
+        raise ValueError(f"{who}: a {tuple(a.shape)}, b {tuple(b.shape)}, offsets {group_offs.numel()} / "
+                         f"{group_offs_padded.numel()} entries")
+    if group_offs.dtype != torch.int64 or group_offs_padded.dtype != torch.int64:
+        raise ValueError(f"{who}: group offsets must be int64")
+    if not b.is_contiguous():
+        raise ValueError(f"{who}: b must be contiguous [G, N, K]")
+    out = _out(out, (m_out, N), out_dtype, False, a.device, who)
+    if m_out == 0 or N == 0:
         return out
-    fn(*args)
-    return out
+    if K == 0:
+        return out.zero_()
+    cfg = config or pick_grouped_config(GROUPED_M, m_out // max(G, 1), N, K, b_preshuffled)
+    packed, ldsa, ldsb = _check_scales(a_scale, b_scale, a.shape[0], N, K, who, (G,))
+    if packed and N % 32:
+        raise ValueError(f"{who}: packed b scales need N % 32 == 0")
+    return _launch(who, GROUPED_M, cfg, out, a, b, a_scale, b_scale, group_offs, group_offs_padded, m_out, N, K,
+                   a.stride(0), b.stride(1), ldsa, ldsb, G, b_preshuffled, False, K % (WMMA_K * cfg.kpair) != 0)
+
+
+def grouped_gemm_mxfp8_variable_k_gfx1250(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    group_offs: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: torch.Tensor | None = None,
+    accumulate: bool = False,
+    config: MXGemmConfig | None = None,
+    b_preshuffled: bool = True,
+) -> torch.Tensor:
+    """Routed experts wgrad: ``out[g] (+)= a[:, T_g] @ b[:, T_g]^T`` over expert g's tokens
+    ``T_g = [group_offs[g], group_offs[g + 1])`` (int64 [G + 1], multiples of 128: the column copies' layout).
+    ``a [M, T]`` (dY^T), ``b [N, T]`` (X^T, 16x16-preshuffled by default), scales packed ``[M/32, T/128, 32, 4]`` /
+    ``[N/32, ..]`` (or raw); ``out [G, M, N]`` bf16 or fp32, ``accumulate``: ``out[g] = round(out[g] + result)``
+    (the fused main_grad update; an empty expert leaves its slice unchanged, or zero without ``accumulate``)."""
+    _require_gfx1250(a.device)
+    who = "grouped_gemm_mxfp8_variable_k_gfx1250"
+    (M, T), N = a.shape, b.shape[0]
+    G = group_offs.numel() - 1
+    if b.shape[1] != T or group_offs.dtype != torch.int64 or T % 128:
+        raise ValueError(f"{who}: a {tuple(a.shape)}, b {tuple(b.shape)}, token count a multiple of 128, int64 offsets")
+    out = _out(out, (G, M, N), out_dtype, accumulate, a.device, who)
+    if out.stride(0) != M * out.stride(1):
+        raise ValueError(f"{who}: out must be [G, M, ldc] with expert stride M * ldc")
+    if M == 0 or N == 0 or G == 0:
+        return out
+    cfg = config or pick_grouped_config(VARIABLE_K, M, N, T // max(G, 1), b_preshuffled)
+    packed, ldsa, ldsb = _check_scales(a_scale, b_scale, M, N, T, who)
+    return _launch(who, VARIABLE_K, cfg, out, a, b, a_scale, b_scale, group_offs, None, M, N, T, a.stride(0),
+                   b.stride(0), ldsa, ldsb, G, b_preshuffled, accumulate, True)
