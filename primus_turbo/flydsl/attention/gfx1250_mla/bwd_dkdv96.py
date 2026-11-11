@@ -89,7 +89,10 @@ NKV3 = 3
 ROWS3 = 32 * NKV3  # 96
 KH0_SALU = 2  # SALU per WMMA of a TDM-prep run
 SB_ALU = 0x002 | 0x004 | 0x400  # sched_barrier: VALU, SALU and transcendental may cross
-HEAD_GROUP = 32  # head-group target of the grid
+# head-group target of the grid (x = the heads of a group, fastest): 8 = the XCD count, so under the round-robin
+# dispatch each XCD runs one head's kv blocks at a time and that head's Q / dO stay in its L2 (b2 s4096 h128 hot:
+# 8 1.329, 16 1.339, 32 1.356, 64 1.369, 128 1.403 ms)
+HEAD_GROUP = 8
 # Schedule of the 96-row body (all bitwise equal; b2 s4096 h128 hot ms on MI455X 11-11, HK LLVM k_dkdv96ds 1.429):
 #   0  per kv sub-tile: its S / dP WMMA chains, then its softmax (the HK LLVM order)                          1.573
 #   1  hh0's six chains k-step by k-step; hh1's WMMAs interleaved with hh0's softmax                         1.492
@@ -121,6 +124,15 @@ SMX_BF = 1
 WIN_HH1 = 0
 # 1: the prologue issues the first two Q / dO tiles and NL / ND before the K / V fragment loads and the dS descriptor
 PRO_TDM_FIRST = 0
+# 1: the next stage's hh1 operands are read back with its hh0 operands under dK kh2's WMMAs and carried across the
+# back edge (both halves carried), instead of burst-read at the top of the next tile (SDP_SCHED 9)
+NEXT_HH1 = 0
+# 1: the epilogue reads all image lines back first, then issues all global stores (no store data register reused
+# while its transfer is pending: no s_wait_xcnt between them)
+EPI_BATCH = 0
+# 1: a prefetch past the last tile of the sequence goes out as the NULL TDM descriptor (count 0: moves nothing, still
+# counted) instead of reloading the last tile
+NULL_PF = 0
 # dS scratch layout (HipKittens dslayout.h v2)
 DS_LAYOUT_VERSION = 2
 DSL_KV = 16
@@ -340,8 +352,12 @@ def _dkdv96_impl(
     z4 = _ir(fx.Vector.filled(4, 0, fx.Int32))
     z8 = _ir(fx.Vector.filled(8, 0, fx.Int32))
 
-    def tdm_prep(qt, stage_off):
-        """Group 0 of the 3 ops of tile (q pair qt) into the stage at stage_off (this wave's rows)."""
+    def tdm_prep(qt, stage_off, live=None):
+        """Group 0 of the 3 ops of tile (q pair qt) into the stage at stage_off (this wave's rows); NULL_PF: the NULL
+        descriptor unless `live`."""
+        cnt = fx.Int32(1)
+        if const_expr(NULL_PF and live is not None):
+            cnt = live.select(fx.Int32(1), fx.Int32(0))
         out = []
         for op in range_constexpr(3):
             ga = gb[op] + fx.Int64(qt) * gsq[op]
@@ -349,7 +365,7 @@ def _dkdv96_impl(
                 _ir(
                     fx.Vector.from_elements(
                         [
-                            fx.Int32(1),
+                            cnt,
                             ldsb[op] + stage_off,
                             fx.Int32(ga),
                             fx.Int32(ga >> fx.Int64(32)) | _i32(0x80000000),
@@ -364,8 +380,8 @@ def _dkdv96_impl(
         for op in range_constexpr(3):
             rocdl.tensor_load_to_lds(g0s[op], _ir(g1[op]), z4, z4, z8, cache_policy=0)
 
-    def tdm_tile(qt, stage_off):
-        tdm_issue(tdm_prep(qt, stage_off))
+    def tdm_tile(qt, stage_off, live=None):
+        tdm_issue(tdm_prep(qt, stage_off, live))
 
     # ---- NL / ND: 8 vec4 loads of (q pair qt); voffset 32 half + constant, soffset uniform
     voff_l = half * fx.Int32(32)
@@ -439,7 +455,7 @@ def _dkdv96_impl(
         ROWS = 32 * NKV
         NST = NKV * (NDO_V + NDO_QK)
         DK0 = NKV * NDO_V
-        NCAR = NHB if K3 else NRB
+        NCAR = NHB if (K3 and not NEXT_HH1) else NRB
         kv0g = _sel(bid < n96, bid * fx.Int32(ROWS3), n96 * fx.Int32(ROWS3) + (bid - n96) * fx.Int32(64))
         kv0 = kv0g + wv * fx.Int32(16 * NKV)
 
@@ -465,7 +481,7 @@ def _dkdv96_impl(
         def pro_issue():
             rocdl.sched_barrier(0)
             tdm_tile(_clampqt(qp_start, nqt2), s0)
-            tdm_tile(_clampqt(qp_start + clampn(one, n_seq), nqt2), s1)
+            tdm_tile(_clampqt(qp_start + clampn(one, n_seq), nqt2), s1, one < n_seq)
             preA = ldl(_clampqt(qp_start, nqt2))
             rocdl.sched_barrier(0)
             return preA
@@ -665,7 +681,14 @@ def _dkdv96_impl(
                 for kh in range_constexpr(NKV):
                     smx(do_mask, 1, kh, s1[kh], p1[kh], pre, q0, ph, dh)
                 return pack(ph, dh)
-            if const_expr(BURST_IL and SDP_SCHED not in (0, 3, 7)):
+            if const_expr(NEXT_HH1):
+                op1 = list(op0[NHB:])
+                op0 = list(op0[:NHB])
+                qfr, dfr = frags(op0)
+                rocdl.sched_barrier(0)
+                after_burst()
+                rocdl.sched_barrier(0)
+            elif const_expr(BURST_IL and SDP_SCHED not in (0, 3, 7)):
                 rocdl.sched_barrier(0)
                 after_burst()
                 rocdl.sched_barrier(0)
@@ -774,13 +797,15 @@ def _dkdv96_impl(
         t2 = _clampqt(qp_start + clampn(fx.Int32(2), n_seq), nqt2)
         if const_expr(K3):
             qd = rdqd_hh(rd_base(s0), 0)
+            if const_expr(NEXT_HH1):
+                qd = qd + rdqd_hh(rd_base(s0), 1)
             rocdl.sched_barrier(0)
-            tdp = tdm_prep(t2, s2)  # issued at the top of iteration 0
+            tdp = tdm_prep(t2, s2, fx.Int32(2) < n_seq)  # issued at the top of iteration 0
         else:
             rb0 = rd_base(s0)
             qd = rdqd_hh(rb0, 0) + rdqd_hh(rb0, 1)
             rocdl.sched_barrier(0)
-            tdm_tile(t2, s2)
+            tdm_tile(t2, s2, fx.Int32(2) < n_seq)
             tdp = []
         rocdl.sched_barrier(0)
 
@@ -813,6 +838,7 @@ def _dkdv96_impl(
             if const_expr(not (K3 and SDP_SCHED in (6, 7, 8, 9, 10, 12))):
                 nxt = ldl(qbase + clampn(ii + one, n))
             pft = qbase + clampn(ii + fx.Int32(3), n)
+            pf_live = ii + fx.Int32(3) < n
             qt = qbase + ii
             q0 = qt * fx.Int32(32)
             if const_expr(K3 and SDP_SCHED == 5):
@@ -875,7 +901,7 @@ def _dkdv96_impl(
                     for kh in range_constexpr(NKV):
                         ds_store(a_dsk[kh], so + ds_rc[kh])
                     rocdl.sched_barrier(0)
-                tdp_n = tdm_prep(pft, cur)
+                tdp_n = tdm_prep(pft, cur, pf_live)
                 dk_kh(0, acc, b_q, a_dsk)
                 for _ in range_constexpr(NDO_QK):
                     rocdl.sched_group_barrier(0x008, 1, 0)
@@ -936,7 +962,7 @@ def _dkdv96_impl(
                         for kh in range_constexpr(NKV):
                             ds_store(a_dsk[kh], so + ds_rc[kh])
                         rocdl.sched_barrier(0)
-                    tdp_n = tdm_prep(pft, cur)
+                    tdp_n = tdm_prep(pft, cur, pf_live)
                 else:
                     a_pk, a_dsk = sdp3(
                         do_mask,
@@ -955,7 +981,7 @@ def _dkdv96_impl(
                         for kh in range_constexpr(NKV):
                             ds_store(a_dsk[kh], so + ds_rc[kh])
                         rocdl.sched_barrier(0)
-                    tdp_n = tdm_prep(pft, cur)
+                    tdp_n = tdm_prep(pft, cur, pf_live)
                     for d in range_constexpr(NDO_V):
                         for kh in range_constexpr(NKV):
                             acc[kh * NDO_V + d] = wmma(b_do[d], a_pk[kh], acc[kh * NDO_V + d], ra=(kh > 0))
@@ -981,10 +1007,12 @@ def _dkdv96_impl(
                     _lds_wait()
                     rocdl.sched_barrier(0)
                     qd_ = rdqd_hh(rbb, 0)
+                    if const_expr(NEXT_HH1):
+                        qd_ = qd_ + rdqd_hh(rbb, 1)
                     dk_kh(2, acc, b_q, a_dsk)
                     for _ in range_constexpr(NDO_QK - 2):
                         rocdl.sched_group_barrier(0x008, 1, 0)
-                        rocdl.sched_group_barrier(0x100, 2, 0)
+                        rocdl.sched_group_barrier(0x100, 4 if const_expr(NEXT_HH1) else 2, 0)
                     rocdl.sched_barrier(0)
                 else:
                     for kh in range_constexpr(1, NKV):
@@ -1014,7 +1042,7 @@ def _dkdv96_impl(
                     for kh in range_constexpr(NKV):
                         ds_store(a_dsk[kh], so + ds_rc[kh])
                     rocdl.sched_barrier(0)
-                tdp_n = tdm_prep(pft, cur)
+                tdp_n = tdm_prep(pft, cur, pf_live)
                 for d in range_constexpr(NDO_V):
                     for kh in range_constexpr(NKV):
                         acc[kh * NDO_V + d] = wmma(b_do[d], a_pk[kh], acc[kh * NDO_V + d], ra=(kh > 0))
@@ -1050,7 +1078,7 @@ def _dkdv96_impl(
                     for kh in range_constexpr(NKV):
                         ds_store(a_dsk[kh], so + ds_rc[kh])
                     rocdl.sched_barrier(0)
-                tdp_n = tdm_prep(pft, cur)
+                tdp_n = tdm_prep(pft, cur, pf_live)
                 for d in range_constexpr(NDO_V):
                     for kh in range_constexpr(NKV):
                         acc[kh * NDO_V + d] = wmma(b_do[d], a_pk[kh], acc[kh * NDO_V + d], ra=(kh > 0))
@@ -1083,7 +1111,7 @@ def _dkdv96_impl(
                 rocdl.sched_barrier(0)
                 b_q = [tr(tk, True, d) for d in range_constexpr(NDO_QK)]
                 rocdl.sched_barrier(0)
-                tdp_c = tdm_prep(pft, cur)
+                tdp_c = tdm_prep(pft, cur, pf_live)
                 dv_kh(0, acc, b_do, a_pk)
                 dk_kh(0, acc, b_q, a_dsk)
                 for _ in range_constexpr(NDO_V + NDO_QK):
@@ -1201,25 +1229,46 @@ def _dkdv96_impl(
         rdk = lds_ptr(lds0 + wv * fx.Int32(EPI_W) + fx.Int32(EPI_DK) + lr * fx.Int32(XK) + lc * fx.Int32(16))
         gv = vbase + (kv0 + lr) * rs_v + lc
         gk = kbase + (kv0 + lr) * rs_k + lc
-        for rb in range_constexpr(4 * NKV):
-            for li in range_constexpr(D_V * 2 // 128):
-                o = rb * 4 * XV + li * 128
-                vv = llvm.load(v8b, rdv if o == 0 else get_element_ptr(rdv, static_byte_offset=o))
-                buffer_store(
-                    vv,
-                    r_dv,
-                    (gv + fx.Int32(rb * 4) * rs_v + fx.Int32(li * 8)) * fx.Int32(16),
-                    offset_is_bytes=True,
-                )
-            for li in range_constexpr(D_QK * 2 // 128):
-                o = rb * 4 * XK + li * 128
-                kk = llvm.load(v8b, rdk if o == 0 else get_element_ptr(rdk, static_byte_offset=o))
-                buffer_store(
-                    kk,
-                    r_dk,
-                    (gk + fx.Int32(rb * 4) * rs_k + fx.Int32(li * 8)) * fx.Int32(16),
-                    offset_is_bytes=True,
-                )
+        if const_expr(EPI_BATCH):
+            lines = []
+            for rb in range_constexpr(4 * NKV):
+                for li in range_constexpr(D_V * 2 // 128):
+                    o = rb * 4 * XV + li * 128
+                    lines.append(
+                        (r_dv, (gv + fx.Int32(rb * 4) * rs_v + fx.Int32(li * 8)) * fx.Int32(16), rdv, o)
+                    )
+                for li in range_constexpr(D_QK * 2 // 128):
+                    o = rb * 4 * XK + li * 128
+                    lines.append(
+                        (r_dk, (gk + fx.Int32(rb * 4) * rs_k + fx.Int32(li * 8)) * fx.Int32(16), rdk, o)
+                    )
+            vals = [
+                llvm.load(v8b, rb_ if o == 0 else get_element_ptr(rb_, static_byte_offset=o))
+                for _, _, rb_, o in lines
+            ]
+            rocdl.sched_barrier(0)
+            for (rs_, go, _, _), vv in zip(lines, vals):
+                buffer_store(vv, rs_, go, offset_is_bytes=True)
+        else:
+            for rb in range_constexpr(4 * NKV):
+                for li in range_constexpr(D_V * 2 // 128):
+                    o = rb * 4 * XV + li * 128
+                    vv = llvm.load(v8b, rdv if o == 0 else get_element_ptr(rdv, static_byte_offset=o))
+                    buffer_store(
+                        vv,
+                        r_dv,
+                        (gv + fx.Int32(rb * 4) * rs_v + fx.Int32(li * 8)) * fx.Int32(16),
+                        offset_is_bytes=True,
+                    )
+                for li in range_constexpr(D_QK * 2 // 128):
+                    o = rb * 4 * XK + li * 128
+                    kk = llvm.load(v8b, rdk if o == 0 else get_element_ptr(rdk, static_byte_offset=o))
+                    buffer_store(
+                        kk,
+                        r_dk,
+                        (gk + fx.Int32(rb * 4) * rs_k + fx.Int32(li * 8)) * fx.Int32(16),
+                        offset_is_bytes=True,
+                    )
 
     @flyc.jit
     def by_height(is96):
