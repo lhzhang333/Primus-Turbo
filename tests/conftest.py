@@ -77,6 +77,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe.py",
     # The same op across every visible GPU (EP2+).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe_ep.py",
+    # The MXFP8 dense GEMM (primus_turbo/flydsl/gemm/gemm_mxfp8_kernel_gfx1250.py).
+    "tests/pytorch/ops/test_gemm_mxfp8_gfx1250.py",
 )
 
 
