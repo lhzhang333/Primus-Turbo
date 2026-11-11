@@ -135,9 +135,8 @@ def _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
 
 def ds_plan_unsupported_reason(batch: int, seqlen_q: int, seqlen_kv: int, num_heads: int) -> Optional[str]:
     """Why the dS plan cannot take these MHA sizes (the recompute plan then runs), or None."""
-    return _d.unsupported_reason(batch, seqlen_q, seqlen_kv, num_heads, num_heads) or _q.dqds_unsupported_reason(
-        batch, seqlen_q, seqlen_kv, num_heads, num_heads
-    )
+    reason = _d.unsupported_reason(batch, seqlen_q, seqlen_kv, num_heads, num_heads)
+    return reason or _q.dqds_unsupported_reason(batch, seqlen_q, seqlen_kv, num_heads, num_heads)
 
 
 def _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
@@ -166,24 +165,14 @@ def _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
     dq, dk, dv = q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
     hg_kv, hg_q = _d.head_group(h), _q.head_group(h)
     q_off, nhead, ntile = _q.dq_split(sq)
+    delta_args = (dout, out, delta, lse, nl, nd, scale, sq, h, b * sq * h, sq // _k.ROWS_DELTA, b * h, stream)
     # Hq, Hkv, G = h, h, 1: MHA. The kernels take only the scratch's base address: k_dkdv96ds gets a [blocks, 512]
     # view (FlyDSL packs tensor sizes as int32), k_dqds the address itself.
-    launches = [
-        (
-            _k.launch_delta,
-            (dout, out, delta, lse, nl, nd, scale, sq, h, b * sq * h, sq // _k.ROWS_DELTA, b * h, stream),
-        ),
-        (
-            _d.launch_dkdv96ds,
-            (q, k, v, dout, nl, nd, dv, dk, ds.view(-1, 512), scale, sq, skv, h, h, 1, sq // 16, skv - sq, c, b, hg_kv, 1)
-            + (_d.nblk96(skv), b * h // hg_kv, stream),
-        ),
-        (
-            _q.launch_dqds,
-            (ds.data_ptr(), k, dq, sq, skv, h, h, 1, skv // _q.KV32, skv - sq, c, q_off, ntile, hg_q)
-            + (_q.ds_blocks_per_head(sq, skv, c), b * sq * h * _k.D_QK * 2, ntile + nhead, b * h // hg_q, stream),
-        ),
-    ]
+    dkdv = (q, k, v, dout, nl, nd, dv, dk, ds.view(-1, 512), scale, sq, skv, h, h, 1, sq // 16, skv - sq)
+    dkdv += (c, b, hg_kv, 1, _d.nblk96(skv), b * h // hg_kv, stream)  # ds_mode 1: the dS^T stores on
+    dqa = (ds.data_ptr(), k, dq, sq, skv, h, h, 1, skv // _q.KV32, skv - sq, c, q_off, ntile, hg_q)
+    dqa += (_q.ds_blocks_per_head(sq, skv, c), b * sq * h * _k.D_QK * 2, ntile + nhead, b * h // hg_q, stream)
+    launches = [(_k.launch_delta, delta_args), (_d.launch_dkdv96ds, dkdv), (_q.launch_dqds, dqa)]
     return launches, (dq, dk, dv)
 
 
@@ -248,7 +237,9 @@ def flash_attn_mla_bwd(
     plan = None
     if DS_PLAN and ds_plan_unsupported_reason(b, sq, skv, h) is None:
         plan = _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream)
-    launches, grads = plan if plan is not None else _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream)
+    if plan is None:
+        plan = _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream)
+    launches, grads = plan
     for launcher, args in launches:
         _launch(launcher, args)
     return grads
