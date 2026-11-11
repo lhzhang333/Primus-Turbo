@@ -11,13 +11,28 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Host side of the gfx1250 MLA flash-attention backward: shape rules, launch plan, entry point."""
+"""Host side of the gfx1250 MLA flash-attention backward: shape rules, launch plans, entry point.
 
+Two launch plans; their gradients are bitwise the same:
+  dS plan, where it applies: k_delta_bshd (the row constants NL / ND), k_dkdv96ds (bwd_dkdv96: dK and dV over 96-row kv
+    blocks, and every bf16 dS^T tile it feeds its dK WMMA also into a scratch laid out as dslayout v2), then k_dqds
+    (bwd_dqds: dQ = dS K from that scratch, so S and dP are computed once). It takes seqlen_q % 384 in {0, 256},
+    seqlen_kv % 32 == 0 and the scratch, about batch * heads * seqlen_q * seqlen_kv / 2 bytes under the causal mask
+    (4.33 GB at b2 s4096 h128), from the caching allocator on the current stream.
+  recompute plan, for every other shape and when the scratch cannot be allocated: k_delta_bshd, k_dkdv64 / k_dkdv and
+    k_dqg96 / k_dqg, whose dQ kernels recompute S and dP.
+"""
+
+import math
 from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
 import torch
 
+from primus_turbo.common.logger import logger
+
+from . import bwd_dkdv96 as _d
+from . import bwd_dqds as _q
 from . import bwd_kernels as _k
 
 _NUM_CU = 256  # MI455X
@@ -29,6 +44,12 @@ SMALL_GRID_WAVES = {"dkdv": 4 * _NUM_CU, "dq": 8 * _NUM_CU}
 # in flight, so a Q/dO or K/V tile fetched by one workgroup is more often still in L2 for the next.
 _HEAD_GROUP = 64
 _DQ_SPLITS = (0, 32, 64)  # one of these leaves a multiple of 96 queries for any Sq % 32 == 0
+
+# The dS plan where it applies (tests patch this to force the recompute plan).
+DS_PLAN = True
+# device -> the smallest dS scratch whose allocation failed there: a failed allocation costs the caching allocator a
+# synchronize and its whole cache, so a scratch at least as large is not tried there again.
+_DS_OOM_BYTES = {}
 
 # flyc.compile's CompiledFunction per (launcher, tensor dtypes/ranks, device). Launching through it
 # skips FlyDSL's per-call key derivation; all shape-dependent kernel arguments are runtime scalars.
@@ -112,12 +133,63 @@ def _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
     return launches, (dq, dk, dv)
 
 
-def _launch(launcher, args):
-    key = (
-        launcher,
-        tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor)),
-        args[0].device.index,
+def ds_plan_unsupported_reason(batch: int, seqlen_q: int, seqlen_kv: int, num_heads: int) -> Optional[str]:
+    """Why the dS plan cannot take these MHA sizes (the recompute plan then runs), or None."""
+    return _d.unsupported_reason(batch, seqlen_q, seqlen_kv, num_heads, num_heads) or _q.dqds_unsupported_reason(
+        batch, seqlen_q, seqlen_kv, num_heads, num_heads
     )
+
+
+def _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
+    """The dS plan's (launcher, args) in issue order and the (dq, dk, dv) they write, or None when its scratch cannot
+    be allocated. The caller checked ds_plan_unsupported_reason."""
+    b, sq, h, _ = q.shape
+    skv = k.shape[1]
+    c = int(bool(causal))
+    nbytes = _d.ds_layout_bytes(b, sq, skv, h, c)
+    if nbytes >= _DS_OOM_BYTES.get(q.device, math.inf):
+        return None
+    try:
+        ds = torch.empty((nbytes // 2,), device=q.device, dtype=torch.bfloat16)
+    except torch.OutOfMemoryError:
+        _DS_OOM_BYTES[q.device] = nbytes
+        logger.warning(
+            f"MLA backward: no memory for a {nbytes}-byte dS scratch on {q.device}; the recompute plan runs "
+            "(not tried again for a scratch at least as large)",
+            once=True,
+        )
+        return None
+    scale = float(softmax_scale)
+    delta = torch.empty((b, h, sq), device=q.device, dtype=torch.float32)
+    nl = torch.empty_like(delta)  # -LOG2E * lse
+    nd = torch.empty_like(delta)  # -scale * delta
+    dq, dk, dv = q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
+    hg_kv, hg_q = _d.head_group(h), _q.head_group(h)
+    q_off, nhead, ntile = _q.dq_split(sq)
+    # Hq, Hkv, G = h, h, 1: MHA. The kernels take only the scratch's base address: k_dkdv96ds gets a [blocks, 512]
+    # view (FlyDSL packs tensor sizes as int32), k_dqds the address itself.
+    launches = [
+        (
+            _k.launch_delta,
+            (dout, out, delta, lse, nl, nd, scale, sq, h, b * sq * h, sq // _k.ROWS_DELTA, b * h, stream),
+        ),
+        (
+            _d.launch_dkdv96ds,
+            (q, k, v, dout, nl, nd, dv, dk, ds.view(-1, 512), scale, sq, skv, h, h, 1, sq // 16, skv - sq, c, b, hg_kv, 1)
+            + (_d.nblk96(skv), b * h // hg_kv, stream),
+        ),
+        (
+            _q.launch_dqds,
+            (ds.data_ptr(), k, dq, sq, skv, h, h, 1, skv // _q.KV32, skv - sq, c, q_off, ntile, hg_q)
+            + (_q.ds_blocks_per_head(sq, skv, c), b * sq * h * _k.D_QK * 2, ntile + nhead, b * h // hg_q, stream),
+        ),
+    ]
+    return launches, (dq, dk, dv)
+
+
+def _launch(launcher, args):
+    tensors = [a for a in args if isinstance(a, torch.Tensor)]
+    key = (launcher, tuple((a.dtype, a.dim()) for a in tensors), tensors[0].device.index)
     fn = _COMPILED.get(key)
     if fn is not None:
         fn(*args)
@@ -172,7 +244,11 @@ def flash_attn_mla_bwd(
     if reason is not None:
         raise ValueError(reason)
     lse = lse.contiguous().float()
-    launches, grads = _launches(dout, q, k, v, out, lse, softmax_scale, causal, torch.cuda.current_stream())
+    stream = torch.cuda.current_stream()
+    plan = None
+    if DS_PLAN and ds_plan_unsupported_reason(b, sq, skv, h) is None:
+        plan = _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream)
+    launches, grads = plan if plan is not None else _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream)
     for launcher, args in launches:
         _launch(launcher, args)
     return grads
