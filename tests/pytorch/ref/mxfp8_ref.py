@@ -14,7 +14,8 @@ Scale rules (``rule``):
 
 * ``"nosat"``: the smallest 2^e with amax / 2^e <= 448, so nothing saturates (the MXFP8 attention's
   rule). E8M0 byte = exp_field(amax) - 8 + (mantissa(amax) > 0x600000), clamped to >= 0; amax = 0
-  gives byte 0 (2^-127); a non-finite amax gives 0xFF (NaN), so Inf / NaN inputs come out as NaN.
+  gives byte 0 (2^-127); a non-finite amax gives 0xFF (NaN), so Inf / NaN inputs come out as NaN
+  (every code of such a block is 0xFF, what gfx1250's scaled conversion makes of a NaN scale).
 * ``"even"``: Turbo's HIP / FlyDSL CDNA4 rule (torchao's "EVEN"): amax rounded half-up to 3 mantissa
   bits, exponent - 8, scaled values clamped to +-448. The exponent only moves up at mantissa >= 1.9375,
   so scaled block maxima in (448, 496) clip.
@@ -22,6 +23,9 @@ Scale rules (``rule``):
 Scale layout of the GEMM (aiter's mx32 layout): ``[ceil(R/32), ceil(K/128), 32, 4]`` uint8, where
 ``s4[g, t, r, j]`` scales row ``32 g + r`` over K block ``4 t + j`` (elements ``128 t + 32 j ..``).
 One int32 of it is the WMMA scale operand of one row for one 128-wide K step. Pad bytes are 0x00.
+
+MoE (``quant_grouped``): rows as ``quant_rows``; the column copy per expert, padded to 128 tokens,
+blocks without a token get scale ``PAD_SCALE`` (127).
 """
 
 import torch
@@ -46,19 +50,30 @@ def _e8m0_bytes(amax: torch.Tensor, rule: str) -> torch.Tensor:
     return torch.where(exp == 0xFF, torch.full_like(byte, 0xFF), byte)
 
 
+def _pow2(e: torch.Tensor) -> torch.Tensor:
+    """2^e as float32 built from its bits, exact (no pow / ldexp, which need not be exact on a GPU); e >= -127."""
+    e = e.to(torch.int32)
+    bits = torch.where(e > -127, (e + 127) << 23, torch.full_like(e, 0x400000))
+    return bits.view(torch.float32)
+
+
 def _scale_of(byte: torch.Tensor) -> torch.Tensor:
     """2^(byte - 127) as float32 (byte 0xFF -> NaN)."""
-    s = torch.ldexp(torch.ones_like(byte, dtype=torch.float32), (byte - 127).to(torch.float32))
+    s = _pow2(byte.to(torch.int32).clamp(max=254) - 127)
     return torch.where(byte == 0xFF, torch.full_like(s, float("nan")), s)
 
 
 def _quant_blocks(xb: torch.Tensor, amax: torch.Tensor, rule: str):
     """xb [..., 32] float32 with its block amax [...] -> (fp8 [..., 32], E8M0 bytes [...] uint8)."""
     byte = _e8m0_bytes(amax, rule)
-    v = xb / _scale_of(byte).unsqueeze(-1)  # exact: power-of-two scale
+    # x * 2^(127 - byte): exact, and a normal float for every finite byte (<= 247), so no denormal
+    # arithmetic on any device; non-finite blocks are overwritten below
+    v = xb * _pow2(127 - byte.clamp(max=247)).unsqueeze(-1)
     if rule == "even":
         v = v.clamp(-E4M3_MAX, E4M3_MAX)
-    return v.to(torch.float8_e4m3fn), byte.to(torch.uint8)
+    q = v.to(torch.float8_e4m3fn).view(torch.uint8)
+    q = torch.where((byte == 0xFF).unsqueeze(-1), torch.full_like(q, 0xFF), q)  # NaN scale: NaN codes
+    return q.view(torch.float8_e4m3fn), byte.to(torch.uint8)
 
 
 def quant_rows(x: torch.Tensor, rule: str = "nosat"):
@@ -93,6 +108,40 @@ def quant_2d(w: torch.Tensor, rule: str = "nosat"):
     s_row = s.repeat_interleave(MX, 0)[:N]  # [N, K/32]
     s_t = s.t().repeat_interleave(MX, 0)[:K]  # [K, N/32]
     return q, s_row, q.t().contiguous(), s_t.contiguous()
+
+
+PAD_SCALE = 127  # E8M0 byte of a column block that holds no token (padding only): 1.0
+
+
+def quant_grouped(x: torch.Tensor, group_lens: torch.Tensor, rule: str = "nosat", align: int = 128):
+    """MoE activation / gradient ``x [M, C]`` in expert order, ``group_lens [G]`` tokens per expert.
+
+    Rows: ``quant_rows(x)``, no padding (``offs_row = group_offs``). Columns: per expert, its tokens
+    transposed and zero-padded to a multiple of ``align``, so no 32-block straddles two experts:
+    ``q_col [C, sum(pad_g)]``, ``s_col [C, sum(pad_g) / 32]``. A column block holding no token gets
+    ``PAD_SCALE`` (127 = 1.0: Turbo's grouped contract, ``grouped_gemm_fp8_impl._alloc_mx_act_buffers``,
+    whose quantizer gives every zero block 1.0); a block with tokens is quantized normally (all-zero
+    tokens: byte 0, like any zero block). Codes of padding are 0.
+
+    Returns (q_row, s_row, q_col, s_col, lens_col [G] int64, offs_col [G + 1] int64)."""
+    q_row, s_row = quant_rows(x, rule)
+    lens = [int(n) for n in group_lens.tolist()]
+    pads = [-(-n // align) * align for n in lens]
+    q_col = torch.zeros(x.shape[1], sum(pads), dtype=torch.uint8, device=x.device)
+    s_col = torch.zeros(x.shape[1], sum(pads) // MX, dtype=torch.uint8, device=x.device)
+    o = oc = 0
+    for n, pn in zip(lens, pads):
+        if pn:
+            xg = torch.zeros(pn, x.shape[1], dtype=x.dtype, device=x.device)
+            xg[:n] = x[o : o + n]
+            q, s = quant_rows(xg.t(), rule)
+            s[:, -(-n // MX) :] = PAD_SCALE
+            q_col[:, oc : oc + pn] = q.view(torch.uint8)
+            s_col[:, oc // MX : (oc + pn) // MX] = s
+        o, oc = o + n, oc + pn
+    lens_col = torch.tensor(pads, dtype=torch.int64, device=x.device)
+    offs_col = torch.nn.functional.pad(torch.cumsum(lens_col, 0), (1, 0))
+    return q_row, s_row, q_col.view(torch.float8_e4m3fn), s_col, lens_col, offs_col
 
 
 def pack_scales(s: torch.Tensor) -> torch.Tensor:
