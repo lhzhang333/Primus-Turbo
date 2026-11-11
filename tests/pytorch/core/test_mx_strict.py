@@ -23,6 +23,7 @@ from primus_turbo.pytorch.core.low_precision import (
     Format,
     ScaleDtype,
     ScalingGranularity,
+    ScalingRecipe,
     check_mxfp8_support,
     float8_e4m3,
     mx_strict,
@@ -115,7 +116,9 @@ def test_requantize_raises(strict):
 
     a = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
-    qa = QuantizedTensor.quantize(a, float8_e4m3, ScalingGranularity.MX_BLOCKWISE, axis=-1, block_size=32)
+    qa = QuantizedTensor.quantize(
+        a, float8_e4m3, ScalingGranularity.MX_BLOCKWISE, axis=-1, block_size=32, scaling_recipe=ScalingRecipe()
+    )
     strict(1)
     with pytest.raises(RuntimeError, match="a has no transposed copy"):
         gemm_fp8(qa, b, trans_b=True, out_dtype=torch.bfloat16, config=MX)
