@@ -100,18 +100,11 @@ HEAD_GROUP = 8
 # row 1.329. Measured and dropped: hh1 operands streamed behind hh0's WMMAs, dV sub-tile by sub-tile under hh1's
 # softmax, part of hh1's softmax inside its WMMA window, the hh1 burst interleaved with hh0's WMMAs or carried from
 # the previous tile, the prologue's TDM issued first, the HipKittens generator's folded numerics (slower here).
-# Experimental switches (off):
-# SMX_BF 2: the dP fmas first in the stage-by-stage softmax (the dP chains finish two k-steps before the S chains)
-SMX_BF = 1
-# EPI_BATCH 1: the epilogue reads all image lines back first, then issues all global stores (no store data register
-# reused while its transfer is pending: no s_wait_xcnt between them)
-EPI_BATCH = 0
-# NULL_PF 1: a prefetch past the last tile goes out as the NULL TDM descriptor (count 0: moves nothing, still counted)
-NULL_PF = 0
-# cache policy (gfx12 TH field, the aux operand's low bits; 1 = non-temporal) of the dS^T stores and the K / V
-# fragment loads (both touch their bytes once)
-DS_TH = 0
-KV_TH = 0
+# Also measured and dropped: the dS windows by kv sub-tile instead of by query half (spills), the epilogue's line
+# readbacks batched ahead of its stores, non-temporal K / V fragment loads (+9.5%), the dP fmas first in the softmax.
+# The dS^T stores are non-temporal (written once, read by the dQ kernel later: they need not stay in L2; -0.8%) and
+# a prefetch past the last tile is the NULL TDM descriptor (count 0: moves nothing, still counted; -0.6%).
+DS_TH = 1  # gfx12 TH_STORE_NT in the buffer stores' aux (cache policy) operand
 # dS scratch layout (HipKittens dslayout.h v2)
 DS_LAYOUT_VERSION = 2
 DSL_KV = 16
@@ -332,11 +325,9 @@ def _dkdv96_impl(
     z8 = _ir(fx.Vector.filled(8, 0, fx.Int32))
 
     def tdm_prep(qt, stage_off, live=None):
-        """Group 0 of the 3 ops of tile (q pair qt) into the stage at stage_off (this wave's rows); NULL_PF: the NULL
-        descriptor unless `live`."""
-        cnt = fx.Int32(1)
-        if const_expr(NULL_PF and live is not None):
-            cnt = live.select(fx.Int32(1), fx.Int32(0))
+        """Group 0 of the 3 ops of tile (q pair qt) into the stage at stage_off (this wave's rows); the NULL descriptor
+        (count 0) unless `live`."""
+        cnt = fx.Int32(1) if live is None else live.select(fx.Int32(1), fx.Int32(0))
         out = []
         for op in range_constexpr(3):
             ga = gb[op] + fx.Int64(qt) * gsq[op]
@@ -466,14 +457,13 @@ def _dkdv96_impl(
                 [
                     cat(
                         rocdl.raw_ptr_buffer_load(
-                            v8b, r_k, _ir((kr + fx.Int32(dt * 4)) * fx.Int32(16)), _ir(fx.Int32(0)), aux=KV_TH
+                            v8b, r_k, _ir((kr + fx.Int32(dt * 4)) * fx.Int32(16)), _ir(fx.Int32(0))
                         ),
                         rocdl.raw_ptr_buffer_load(
                             v8b,
                             r_k,
                             _ir((kr + fx.Int32(dt * 4 + 2)) * fx.Int32(16)),
                             _ir(fx.Int32(0)),
-                            aux=KV_TH,
                         ),
                     )
                     for dt in range_constexpr(NDT_QK)
@@ -483,14 +473,13 @@ def _dkdv96_impl(
                 [
                     cat(
                         rocdl.raw_ptr_buffer_load(
-                            v8b, r_v, _ir((vr + fx.Int32(dt * 4)) * fx.Int32(16)), _ir(fx.Int32(0)), aux=KV_TH
+                            v8b, r_v, _ir((vr + fx.Int32(dt * 4)) * fx.Int32(16)), _ir(fx.Int32(0))
                         ),
                         rocdl.raw_ptr_buffer_load(
                             v8b,
                             r_v,
                             _ir((vr + fx.Int32(dt * 4 + 2)) * fx.Int32(16)),
                             _ir(fx.Int32(0)),
-                            aux=KV_TH,
                         ),
                     )
                     for dt in range_constexpr(NDT_V)
@@ -567,8 +556,6 @@ def _dkdv96_impl(
                         nd = fx.Vector(pre[hh * 4 + 2 + si // 4])[si % 4]
                         dpv[kh, si] = fx.Float32(fx.fma(pv[si], scale, nd))
 
-            if const_expr(SMX_BF == 2):
-                dp_stage()  # the dP chains finish two k-steps before the S chains
             for kh in khs:
                 sv = fx.Vector(sp[kh][0])
                 kvl = kv0 + fx.Int32(kh * 16) + row
@@ -581,8 +568,7 @@ def _dkdv96_impl(
             for kh in khs:
                 for si in range_constexpr(8):
                     pf[kh, si] = _exp2(tt[kh, si])
-            if const_expr(SMX_BF != 2):
-                dp_stage()
+            dp_stage()
             for kh in khs:
                 for si in range_constexpr(8):
                     ph[kh][hh * 8 + si] = pf[kh, si].to(fx.BFloat16)
@@ -632,11 +618,7 @@ def _dkdv96_impl(
             # hh1's WMMAs (kh-major) with hh0's softmax / dS interleaved: {1 WMMA, 2 VALU, 1 TRANS}
             qfr1, dfr1 = frags(op1)
             mm1 = [sdp_mm(kh, qfr1, dfr1) for kh in range_constexpr(NKV)]
-            if const_expr(SMX_BF):
-                smx_bf(do_mask, 0, list(range(NKV)), list(zip(s0, p0)), pre, q0, ph, dh)
-            else:
-                for kh in range_constexpr(NKV):
-                    smx(do_mask, 0, kh, s0[kh], p0[kh], pre, q0, ph, dh)
+            smx_bf(do_mask, 0, list(range(NKV)), list(zip(s0, p0)), pre, q0, ph, dh)
             nvw = 2 if const_expr(not do_mask) else 4
             for i in range_constexpr(NKV * (NDT_QK + NDT_V)):
                 rocdl.sched_group_barrier(0x008, 1, 0)
@@ -645,11 +627,7 @@ def _dkdv96_impl(
             rocdl.sched_barrier(0)
             mid()
             rocdl.sched_barrier(SB_ALU)
-            if const_expr(SMX_BF):
-                smx_bf(do_mask, 1, list(range(NKV)), mm1, pre, q0, ph, dh)
-            else:
-                for kh in range_constexpr(NKV):
-                    smx(do_mask, 1, kh, mm1[kh][0], mm1[kh][1], pre, q0, ph, dh)
+            smx_bf(do_mask, 1, list(range(NKV)), mm1, pre, q0, ph, dh)
             return pack(ph, dh)
 
         def dv_kh(kh, acc, b_do, a_pk):
@@ -888,46 +866,25 @@ def _dkdv96_impl(
         rdk = lds_ptr(lds0 + wv * fx.Int32(EPI_W) + fx.Int32(EPI_DK) + lr * fx.Int32(XK) + lc * fx.Int32(16))
         gv = vbase + (kv0 + lr) * rs_v + lc
         gk = kbase + (kv0 + lr) * rs_k + lc
-        if const_expr(EPI_BATCH):
-            lines = []
-            for rb in range_constexpr(4 * NKV):
-                for li in range_constexpr(D_V * 2 // 128):
-                    o = rb * 4 * XV + li * 128
-                    lines.append(
-                        (r_dv, (gv + fx.Int32(rb * 4) * rs_v + fx.Int32(li * 8)) * fx.Int32(16), rdv, o)
-                    )
-                for li in range_constexpr(D_QK * 2 // 128):
-                    o = rb * 4 * XK + li * 128
-                    lines.append(
-                        (r_dk, (gk + fx.Int32(rb * 4) * rs_k + fx.Int32(li * 8)) * fx.Int32(16), rdk, o)
-                    )
-            vals = [
-                llvm.load(v8b, rb_ if o == 0 else get_element_ptr(rb_, static_byte_offset=o))
-                for _, _, rb_, o in lines
-            ]
-            rocdl.sched_barrier(0)
-            for (rs_, go, _, _), vv in zip(lines, vals):
-                buffer_store(vv, rs_, go, offset_is_bytes=True)
-        else:
-            for rb in range_constexpr(4 * NKV):
-                for li in range_constexpr(D_V * 2 // 128):
-                    o = rb * 4 * XV + li * 128
-                    vv = llvm.load(v8b, rdv if o == 0 else get_element_ptr(rdv, static_byte_offset=o))
-                    buffer_store(
-                        vv,
-                        r_dv,
-                        (gv + fx.Int32(rb * 4) * rs_v + fx.Int32(li * 8)) * fx.Int32(16),
-                        offset_is_bytes=True,
-                    )
-                for li in range_constexpr(D_QK * 2 // 128):
-                    o = rb * 4 * XK + li * 128
-                    kk = llvm.load(v8b, rdk if o == 0 else get_element_ptr(rdk, static_byte_offset=o))
-                    buffer_store(
-                        kk,
-                        r_dk,
-                        (gk + fx.Int32(rb * 4) * rs_k + fx.Int32(li * 8)) * fx.Int32(16),
-                        offset_is_bytes=True,
-                    )
+        for rb in range_constexpr(4 * NKV):
+            for li in range_constexpr(D_V * 2 // 128):
+                o = rb * 4 * XV + li * 128
+                vv = llvm.load(v8b, rdv if o == 0 else get_element_ptr(rdv, static_byte_offset=o))
+                buffer_store(
+                    vv,
+                    r_dv,
+                    (gv + fx.Int32(rb * 4) * rs_v + fx.Int32(li * 8)) * fx.Int32(16),
+                    offset_is_bytes=True,
+                )
+            for li in range_constexpr(D_QK * 2 // 128):
+                o = rb * 4 * XK + li * 128
+                kk = llvm.load(v8b, rdk if o == 0 else get_element_ptr(rdk, static_byte_offset=o))
+                buffer_store(
+                    kk,
+                    r_dk,
+                    (gk + fx.Int32(rb * 4) * rs_k + fx.Int32(li * 8)) * fx.Int32(16),
+                    offset_is_bytes=True,
+                )
 
     @flyc.jit
     def by_height(is96):
