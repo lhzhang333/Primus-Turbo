@@ -20,3 +20,5 @@ primus_turbo/_version.py
 !primus_turbo/hipkittens/gfx1250_mla_mx/hip/*.hip
 !benchmark/hk_mla_mx/**/*.hip
 primus_turbo/hipkittens/gfx1250_mla/bin/
+!csrc/kernels/attention/hipkittens/gfx1250_mla/src/*.hip
+primus_turbo/lib/hk_gfx1250_mla/
