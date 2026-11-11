@@ -37,6 +37,7 @@ from primus_turbo.pytorch.ops.utils import (
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx_wgrad_accum_backend,
 )
 
 __all__ = ["gemm_fp8"]
@@ -701,7 +702,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
             False,
             granularity=ctx.config.granularity.value,
             default_backend=(
-                BackendType.HIPBLASLT.value if ctx.fuse_bgrad_accum else BackendType.FLYDSL.value
+                mx_wgrad_accum_backend(grouped=False).value if ctx.fuse_bgrad_accum else BackendType.FLYDSL.value
             ),
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,

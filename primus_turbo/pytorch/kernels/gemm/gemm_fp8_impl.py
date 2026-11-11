@@ -103,6 +103,9 @@ class GEMMFP8HipBLASLtBackend(KernelBackend):
         supported = True
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             supported &= not is_gfx942()
+            # gfx1250: hipBLASLt's MX GEMM disagrees with its own dequantized operands (~8 dB SNR, 2026-11-11), so the
+            # dispatcher takes the Triton MX path there
+            supported &= not is_gfx1250()
         # check ScalingGranularity
         supported &= granularity in GEMMFP8HipBLASLtBackend.SUPPORTED_GRANULARITIES
         # check dtype
@@ -237,6 +240,37 @@ class GEMMFP8CKBackend(KernelBackend):
         )
 
 
+_MX_ONE_GROUP_OFFS = {}
+
+
+def _mx_dense_triton(a, a_scale_inv, b, b_scale_inv, out_dtype, beta=0.0, out=None):
+    """MX_BLOCKWISE NT GEMM C = A B^T on the Triton variable-K MX kernel with one group spanning the reduction dim
+    (beta=1 accumulates into ``out``). K must be a multiple of 128, as the HIP / FlyDSL MX quantization pads it."""
+    from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
+        grouped_gemm_mxfp8_variable_k_triton_kernel,
+    )
+
+    m, k = a.shape
+    n = b.shape[0]
+    key = (k, a.device)
+    if key not in _MX_ONE_GROUP_OFFS:
+        _MX_ONE_GROUP_OFFS[key] = torch.tensor([0, k], dtype=torch.int64, device=a.device)
+    c = grouped_gemm_mxfp8_variable_k_triton_kernel(
+        a,
+        a_scale_inv,
+        b,
+        b_scale_inv,
+        _MX_ONE_GROUP_OFFS[key],
+        m,
+        n,
+        1,
+        out_dtype=out_dtype,
+        beta=beta,
+        out=None if out is None else out.view(1, m, n),
+    )
+    return c[0]
+
+
 class GEMMFP8TritonBackend(KernelBackend):
     """Triton persistent-kernel backend for FP8 GEMM.
 
@@ -245,12 +279,16 @@ class GEMMFP8TritonBackend(KernelBackend):
       - ROWWISE: per-row/per-col vector scaling (all layouts)
       - BLOCKWISE: block-wise scaling with three layouts:
           NT/RCR (forward), NN/RRR (grad_X), TN/CRR (grad_W)
+      - MX_BLOCKWISE (gfx1250 only): NT, raw E8M0 [rows, K/32] scales, K % 128 == 0, beta=1 into a bf16 / fp16 /
+        fp32 ``out``: the grouped variable-K MX kernel with one group (``_mx_dense_triton``), the fallback until
+        the FlyDSL gfx1250 MX GEMM lands (hipBLASLt's MX GEMM is wrong there)
     """
 
     SUPPORTED_GRANULARITIES = {
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.ROWWISE,
         ScalingGranularity.BLOCKWISE,
+        ScalingGranularity.MX_BLOCKWISE,
     }
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
@@ -267,8 +305,20 @@ class GEMMFP8TritonBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
         inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            m, k = a.shape
+            # gfx1250 only: other archs keep their MX backends (and auto-tune candidates) as they are
+            supported = is_gfx1250() and (not trans_a) and trans_b and not trans_c
+            supported &= a.dim() == 2 and b.dim() == 2 and b.shape[1] == k and k % 128 == 0
+            supported &= a.dtype in (float8_e4m3, float8_e5m2) and b.dtype in (float8_e4m3, float8_e5m2)
+            supported &= out_dtype in (torch.bfloat16, torch.float16)
+            if inplace_add_to_out:
+                supported &= out is not None and out.is_contiguous() and tuple(out.shape) == (m, b.shape[0])
+                supported &= out is not None and out.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            return supported
         supported = True
         supported &= granularity in GEMMFP8TritonBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8TritonBackend.SUPPORTED_DTYPES
@@ -295,6 +345,8 @@ class GEMMFP8TritonBackend(KernelBackend):
     ):
         beta = 1.0 if inplace_add_to_out else 0.0
 
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            return _mx_dense_triton(a, a_scale_inv, b, b_scale_inv, out_dtype, beta=beta, out=out)
         if granularity == ScalingGranularity.TENSORWISE:
             return gemm_fp8_tensorwise_triton_kernel(
                 a,
