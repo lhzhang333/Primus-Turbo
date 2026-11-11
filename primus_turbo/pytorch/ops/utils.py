@@ -10,11 +10,62 @@ from typing import Optional
 
 import torch
 
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
 from primus_turbo.pytorch.core.low_precision import (
     Format,
     float8_e4m3,
     float8_e5m2,
 )
+from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950, is_gfx1250
+
+# MXFP8 wgrad GEMMs with a beta=1 epilogue (fuse_bgrad_accum_pattern) and the main_grad dtypes each one accumulates
+# into: dense = the wgrad of gemm_fp8, grouped = the variable-K wgrad of grouped_gemm_fp8. FlyDSL's are gfx950-only and
+# write 16-bit only.
+_MX_WGRAD_ACCUM_OUT_DTYPES = {
+    False: {
+        BackendType.HIPBLASLT: (torch.bfloat16, torch.float16, torch.float32),
+        BackendType.TRITON: (torch.bfloat16, torch.float16, torch.float32),
+        BackendType.FLYDSL: (torch.bfloat16, torch.float16),
+    },
+    True: {
+        BackendType.TRITON: (torch.bfloat16, torch.float16, torch.float32),
+        BackendType.FLYDSL: (torch.bfloat16, torch.float16),
+    },
+}
+
+
+def mx_wgrad_accum_backend(grouped: bool) -> BackendType:
+    """Default backend of the MXFP8 wgrad that accumulates into ``main_grad`` (beta=1), in one place so a new kernel
+    switches it here: dense hipBLASLt (Triton on gfx1250, where hipBLASLt's MX GEMM is wrong); grouped Triton, which
+    also takes the fp32 main_grad Megatron allocates by default (FlyDSL's gfx950 epilogue writes only 16-bit; pin it
+    with GlobalBackendManager for a bf16 main_grad)."""
+    if grouped or is_gfx1250():
+        return BackendType.TRITON
+    return BackendType.HIPBLASLT
+
+
+def mx_wgrad_accum_supported(grouped: bool, main_grad_dtype: torch.dtype) -> bool:
+    """Whether the MXFP8 wgrad of ``grouped_gemm_fp8`` (``grouped``) or ``gemm_fp8`` can add into a ``main_grad`` of
+    ``main_grad_dtype`` on this GPU with the backend it would run: the FP8 backend pinned through GlobalBackendManager
+    (or its env variable), else ``mx_wgrad_accum_backend``. Auto-tune only picks among backends that accept the
+    accumulating call, so it is answered for the default. Frameworks ask before passing fuse_bgrad_accum_pattern."""
+    if is_gfx942():  # no MXFP8
+        return False
+    pinned = (GlobalBackendManager.get_grouped_gemm_backend if grouped else GlobalBackendManager.get_gemm_backend)(
+        PrecisionType.FP8
+    )
+    backend = getattr(pinned, "backend", None) or mx_wgrad_accum_backend(grouped)
+    if backend == BackendType.FLYDSL and not is_gfx950():
+        return False
+    if backend == BackendType.HIPBLASLT and is_gfx1250():  # GEMMFP8HipBLASLtBackend refuses MX there
+        return False
+    if backend == BackendType.TRITON and not grouped and not is_gfx1250():  # the dense Triton MX path is gfx1250's
+        return False
+    return main_grad_dtype in _MX_WGRAD_ACCUM_OUT_DTYPES[grouped].get(backend, ())
 
 
 def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
