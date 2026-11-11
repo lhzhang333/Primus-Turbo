@@ -29,6 +29,8 @@ workgroup past M or N runs with zero extents and drops its stores.
 
 from __future__ import annotations
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -119,6 +121,7 @@ def _launch_gemm_mxfp8(
     k_tail: Constexpr[bool],
 ):
     cfg = MXGemmConfig(tile_m, tile_n, num_buffers, kpair, cluster_m, cluster_n, scale_4d, b_shuf)
+    LAB = os.environ.get("PT_MXG_LAB", "").split(",")  # lab A/B switches (run with the JIT cache off)
     LDS_ROW, STAGE, BASE, ARENA = geometry(cfg)
     assert tile_m in (128, 256) and tile_n in (128, 256) and kpair in (1, 2) and num_buffers in (2, 3, 4)
     assert ARENA <= LDS_BYTES, f"{cfg} needs {ARENA} B of LDS"
@@ -361,6 +364,8 @@ def _launch_gemm_mxfp8(
 
             def _wait_refill():
                 if const_expr(boundary and has_next):
+                    if const_expr("splitbar" in LAB):
+                        rocdl.sched_barrier(0)  # keep the slack WMMAs between signal and wait
                     rocdl.s_barrier_wait(_WG_BARRIER)
                     if const_expr(refill):
                         tdm_ops.tensor_load_2d(prepared)
@@ -446,16 +451,21 @@ def _launch_gemm_mxfp8(
         m_ext = (m_ext > zero).select(m_ext, zero)
         n_ext = (n_valid < tile_n).select(n_valid, fx.Int32(tile_n))
         c_addr = fx.Int64(fx.ptrtoint(arg_c)) + (fx.Int64(blk_m) * fx.Int64(i32_ldc) + fx.Int64(blk_n)) * 2
-        c_res = create_buffer_resource_from_addr(c_addr, num_records_bytes=m_ext * i32_ldc * 2)
-        ldc_w = i32_ldc // 2
-        dropped = m_ext * ldc_w  # first word past num_records: the store is dropped
+        ldc_b = i32_ldc * 2
+        c_res = create_buffer_resource_from_addr(c_addr, num_records_bytes=m_ext * ldc_b)
+        # lane tid stores 16-byte chunk tid % CH of rows tid // CH + i * RPI: one column per lane, so the column mask
+        # is folded into the lane's base (past num_records, and every later row of it too: dropped)
         CH = tile_n * 2 // 16
-        for i in range_constexpr(tile_m * CH // BLOCK):
-            chunk = tid + i * BLOCK
-            row, c16 = chunk // CH, chunk % CH
-            v = lds_load_b128(lds0, row * (C_ROW * 2) + c16 * 16)
-            word = (c16 * 8 < n_ext).select(row * ldc_w + c16 * 4, dropped)
-            buffer_store(v, c_res, word)
+        RPI = BLOCK // CH
+        c16, r0 = tid % CH, tid // CH
+        lane_b = (c16 * 8 < n_ext).select(r0 * ldc_b + c16 * 16, m_ext * ldc_b)
+        step_b = RPI * ldc_b
+        GRP = 65536 // (RPI * C_ROW * 2)  # iterations per LDS base: displacements stay 16-bit DS offsets
+        for i in range_constexpr(tile_m // RPI):
+            if const_expr(i % GRP == 0):
+                rd = _planar(i * RPI * C_ROW * 2, r0 * (C_ROW * 2) + c16 * 16)
+            v = lds_load_b128(rd, (i % GRP) * RPI * C_ROW * 2)
+            buffer_store(v, c_res, lane_b + step_b * i, offset_is_bytes=True)
 
     # Launch: grid.x runs up to 32 M tiles (a power of two dividing them), grid.y the N tiles, grid.z the M chunks.
     gx = ((i32_m + (tile_m - 1)) // tile_m + (cluster_m - 1)) // cluster_m * cluster_m
