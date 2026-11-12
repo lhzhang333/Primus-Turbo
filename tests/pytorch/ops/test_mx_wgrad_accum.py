@@ -6,7 +6,8 @@
 
 """MXFP8 wgrad accumulated into main_grad (fuse_bgrad_accum_pattern="megatron", beta=1) against the unfused wgrad
 added by the framework, for gemm_fp8 and grouped_gemm_fp8, over two micro-batches on top of an existing gradient;
-and which backends / main_grad dtypes ``mx_wgrad_accum_supported`` reports."""
+which backends / main_grad dtypes ``mx_wgrad_accum_supported`` reports; and which weight-cache layout
+``mx_weight_layout_recipe`` asks for (the op layer's ``mx_gemm_layout`` agreeing)."""
 
 import pytest
 import torch
@@ -23,11 +24,13 @@ from primus_turbo.pytorch.core.low_precision import (
     Format,
     ScaleDtype,
     ScalingGranularity,
+    ScalingRecipe,
     check_mxfp8_support,
 )
 from primus_turbo.pytorch.ops import (
     gemm_fp8,
     grouped_gemm_fp8,
+    mx_weight_layout_recipe,
     mx_wgrad_accum_backend,
     mx_wgrad_accum_supported,
 )
@@ -94,6 +97,39 @@ def test_supported(monkeypatch, grouped, pinned, arch, fly_accum, dtype, want):
     getter = "get_grouped_gemm_backend" if grouped else "get_gemm_backend"
     monkeypatch.setattr(GlobalBackendManager, getter, classmethod(lambda cls, precision: choice))
     assert mx_wgrad_accum_supported(grouped, dtype) is want
+
+
+@pytest.mark.parametrize(
+    "arch, grouped, kernels, pinned, shape, want",
+    [
+        ("gfx1250", False, False, None, (64, 64), True),  # dense: the FlyDSL dense MX GEMM reads it
+        (
+            "gfx1250",
+            True,
+            False,
+            None,
+            (4, 64, 64),
+            False,
+        ),  # grouped: not until the grouped entry points are in
+        ("gfx1250", True, True, None, (4, 64, 64), True),
+        ("gfx1250", False, False, BackendType.TRITON, (64, 64), False),  # another FP8 backend pinned
+        ("gfx1250", True, True, BackendType.TRITON, (4, 64, 64), False),
+        ("gfx1250", False, False, None, (64, 72), False),  # no 16x16 blocks
+        ("gfx950", False, False, None, (64, 64), False),
+    ],
+)
+def test_weight_layout_recipe(monkeypatch, arch, grouped, kernels, pinned, shape, want):
+    import primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl as gimpl
+
+    monkeypatch.setattr(ops_utils, "is_gfx1250", lambda: arch == "gfx1250")
+    monkeypatch.setattr(gimpl, "mx1250_grouped", lambda: (min, max) if kernels else (None, None))
+    choice = BackendChoice(backend=pinned) if pinned is not None else None
+    getter = "get_grouped_gemm_backend" if grouped else "get_gemm_backend"
+    monkeypatch.setattr(GlobalBackendManager, getter, classmethod(lambda cls, precision: choice))
+    assert mx_weight_layout_recipe(grouped, shape) == (
+        ops_utils.MX_W if want else ScalingRecipe(use_2d_block=True)
+    )
+    assert ops_utils.mx_gemm_layout(torch.empty(shape), grouped) is want  # the op layer agrees
 
 
 def test_no_mx_on_gfx942(monkeypatch):

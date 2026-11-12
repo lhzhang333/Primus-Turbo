@@ -41,10 +41,14 @@ from primus_turbo.pytorch.ops.quantization import (
     quantize_fp8_with_trans,
 )
 from primus_turbo.pytorch.ops.utils import (
+    MX_A,
+    MX_B,
+    MX_W,
     _ensure_contiguous_grad_out,
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx_gemm_layout,
     mx_wgrad_accum_backend,
 )
 
@@ -663,7 +667,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
         a_dtype = b_dtype = _get_fp8_dtype(config.format, True)
 
-        a_scaling_recipe = ScalingRecipe()
+        lay = mx_gemm_layout(b, grouped=True)
+        a_scaling_recipe, a_t_recipe = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
         if not isinstance(a, QuantizedTensor):
             # NOTE: If a is not a QuantizedTensor use grouped_quantize_fp8_with_trans to avoid call dequantize.
             (
@@ -683,7 +688,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                 group_offs,
                 block_size=config.block_size,
                 scaling_recipe=a_scaling_recipe,
-                scaling_recipe_for_trans=a_scaling_recipe,
+                scaling_recipe_for_trans=a_t_recipe,
             )
         else:
             quantized_a = a
@@ -697,7 +702,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                     config.granularity,
                     axis=-2,
                     block_size=config.block_size,
-                    scaling_recipe=a_scaling_recipe,
+                    scaling_recipe=a_t_recipe,
                     group_lens=group_lens,
                 )
             else:
@@ -711,7 +716,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
             group_offs_padded_rowwise = quantized_a.group_offs
 
-        b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+        b_scaling_recipe = MX_W if lay else ScalingRecipe(use_2d_block=True)
         if not isinstance(b, QuantizedTensor):
             # NOTE: If b is not a QuantizedTensor use quantize_fp8_with_trans to avoid call dequantize.
 
@@ -720,8 +725,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                 b_dtype,
                 config.granularity,
                 block_size=config.block_size,
-                scaling_recipe=ScalingRecipe(use_2d_block=True),
-                scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
+                scaling_recipe=b_scaling_recipe,
+                scaling_recipe_for_trans=b_scaling_recipe,
             )
         else:
             quantized_b = b
@@ -764,6 +769,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             num_cu=num_cu,
             default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
+            b_preshuffled=lay,
         )
         out = out[:total_m]
 
@@ -776,6 +782,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             group_offs,
         )
         ctx.config = config
+        ctx.lay = lay
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
         ctx.total_m = total_m
@@ -805,8 +812,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             group_lens,
             group_offs,
             block_size=ctx.config.block_size,
-            scaling_recipe=ScalingRecipe(),
-            scaling_recipe_for_trans=ScalingRecipe(),
+            scaling_recipe=MX_A if ctx.lay else ScalingRecipe(),
+            scaling_recipe_for_trans=MX_A if ctx.lay else ScalingRecipe(),
         )
 
         # dgrad: grad_a = grad_out @ b_col^T  (same single NT op as fwd)
@@ -824,6 +831,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             num_cu=ctx.num_cu,
             default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
+            b_preshuffled=ctx.lay,
         )
         grad_a = grad_a[: ctx.total_m]
 
@@ -847,6 +855,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             default_backend=wgrad_backend.value,
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
+            b_preshuffled=ctx.lay,
         )
         # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
         return (

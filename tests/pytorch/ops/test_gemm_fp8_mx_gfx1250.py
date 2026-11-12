@@ -27,6 +27,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 )
 from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.pytorch.ops import gemm_fp8
+from primus_turbo.pytorch.ops.utils import MX_W
 from tests.pytorch.ref.mxfp8_ref import dequant, quant_2d, quant_dual, snr_db
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or not is_gfx1250(), reason="gfx1250 MX GEMM")
@@ -89,18 +90,23 @@ def test_linear(M, N, K):
         )
 
 
-def test_cached_weight():
-    """A weight quantized ahead (``create_quantized_weight``, Primus' first-micro-batch cache) gives the same
-    out and dx, bitwise."""
+@pytest.mark.parametrize("gemm_layout", [True, False])
+def test_cached_weight(gemm_layout):
+    """A weight quantized ahead (``create_quantized_weight``, Primus' first-micro-batch cache), in gfx1250's MX GEMM
+    layout (``MX_W``: what the op quantizes a plain weight into here, so bitwise the same) or the raw one (another
+    kernel config, the same values: >= 50 dB)."""
     x, w, dy = _data(512, 1536, 1024)
-    q, q_t = create_quantized_weight(w, float8_e4m3, MX, need_weight_transpose_cache=True)
+    q, q_t = create_quantized_weight(
+        w, float8_e4m3, MX, need_weight_transpose_cache=True, scaling_recipe=MX_W if gemm_layout else None
+    )
     res = []
     for b in (w, QuantizedTensorPair(q, q_t)):
         xg = x.clone().requires_grad_()
         out = gemm_fp8(xg, b, trans_b=True, out_dtype=torch.bfloat16, config=MX)
         out.backward(dy)
         res.append((out, xg.grad))
-    assert all(torch.equal(a, b) for a, b in zip(*res))
+    for got, ref in zip(*res):
+        assert torch.equal(got, ref) if gemm_layout else snr_db(got, ref) >= 50
 
 
 def test_chain():
