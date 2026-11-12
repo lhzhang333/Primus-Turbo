@@ -19,6 +19,7 @@ from primus_turbo.pytorch.core.low_precision import (
     Format,
     ScaleDtype,
     ScalingGranularity,
+    ScalingRecipe,
     float8_e4m3,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
@@ -27,7 +28,8 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 )
 from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.pytorch.ops import gemm_fp8
-from primus_turbo.pytorch.ops.utils import MX_W
+from primus_turbo.pytorch.ops.normalization import rmsnorm_mxfp8
+from primus_turbo.pytorch.ops.utils import MX_A, MX_W
 from tests.pytorch.ref.mxfp8_ref import dequant, quant_2d, quant_dual, snr_db
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or not is_gfx1250(), reason="gfx1250 MX GEMM")
@@ -132,3 +134,17 @@ def test_fallback_refused(strict):
     strict(0)
     out = gemm_fp8(x, w, trans_b=True, out_dtype=torch.bfloat16, config=MX)
     assert snr_db(out, x.float() @ w.float().t()) >= 25
+
+
+def test_prequantized_recipe_mismatch():
+    """A pre-quantized activation pair (``rmsnorm_mxfp8``) in another layout than the GEMM reads is refused with a
+    clear error: the GEMM-layout pair against a weight cached raw, a raw column copy next to a GEMM-layout row."""
+    x, w, _ = _data(256, 512, 1024)
+    gamma = torch.ones(1024, device="cuda", dtype=torch.bfloat16)
+    _, pair = rmsnorm_mxfp8(x, gamma)  # gfx1250 default: MX_A rows, MX_B columns
+    raw_w = QuantizedTensorPair(*create_quantized_weight(w, float8_e4m3, MX, need_weight_transpose_cache=True))
+    with pytest.raises(ValueError, match="a was quantized with .* raw MX layout"):
+        gemm_fp8(pair, raw_w, trans_b=True, out_dtype=torch.bfloat16, config=MX)
+    _, pair = rmsnorm_mxfp8(x, gamma, row_recipe=MX_A, col_recipe=ScalingRecipe())
+    with pytest.raises(ValueError, match="a_t .* gfx1250 MX GEMM layout"):
+        gemm_fp8(pair, w, trans_b=True, out_dtype=torch.bfloat16, config=MX)

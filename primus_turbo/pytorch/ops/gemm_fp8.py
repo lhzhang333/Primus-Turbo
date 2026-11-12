@@ -40,6 +40,7 @@ from primus_turbo.pytorch.ops.utils import (
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx_check_operand_recipe,
     mx_gemm_layout,
     mx_wgrad_accum_backend,
 )
@@ -592,9 +593,12 @@ class FP8GemmMXFunction(torch.autograd.Function):
         lay = mx_gemm_layout(b, a=a)
         a_scaling_recipe, a_t_recipe = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
         if isinstance(a, QuantizedTensor):
-            check_quantized_tensor(a, config, axis=-1, scaling_recipe=a_scaling_recipe)
+            mx_check_operand_recipe("gemm_fp8 (MXFP8)", "a", a, a_scaling_recipe, lay)
+            check_quantized_tensor(a, config, axis=-1)
             a_row, a_row_scale = a.qdata, a.scale_inv
-            if a_t is None:
+            if a_t is not None:
+                mx_check_operand_recipe("gemm_fp8 (MXFP8)", "a_t (a's column copy)", a_t, a_t_recipe, lay)
+            else:
                 mx_strict("gemm_fp8 (MXFP8): no a_t, re-quantizing a from its dequantized values")
                 a_t = QuantizedTensor.quantize(
                     a.dequantize(),
