@@ -100,6 +100,7 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
     out: Optional[torch.Tensor] = None,
     m_real: Optional[int] = None,
     n_real: Optional[int] = None,
+    b_preshuffled: bool = False,
 ) -> Optional[torch.Tensor]:
     """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked to.
 
@@ -121,6 +122,7 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
         default_backend=default_backend,
         m_real=m_real,
         n_real=n_real,
+        b_preshuffled=b_preshuffled,
     )
 
     if not inplace_add_to_out:
