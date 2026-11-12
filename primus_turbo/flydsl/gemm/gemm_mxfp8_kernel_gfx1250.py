@@ -135,16 +135,6 @@ def _tdm_group1(mask, tile0: int, tile1: int, dim0, dim1, stride, pad: int):
     ]
 
 
-def _i64_table(arg, n: int):
-    """The low words of an int64 table of ``n`` entries as uniform values (scalar buffer loads)."""
-    rsrc = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg)), num_records_bytes=8 * n)
-    vals = []
-    for q in range_constexpr((2 * n + 3) // 4):
-        v = Vec(buffer_load(rsrc, fx.Int32(4 * q), vec_width=4, is_scalar=True))
-        vals += [fx.Int32(v[0]), fx.Int32(v[2])]
-    return vals[:n]
-
-
 @flyc.jit
 def _launch_gemm_mxfp8(
     arg_c: fx.Pointer,
@@ -402,8 +392,8 @@ def _launch_gemm_mxfp8(
         def _make_prepare(d, supers, rot):
             """The load of K offset ``delta`` (this wave's units, clamped to the last K step) into logical slot
             ``slot`` of a tile (descriptor words ``d``); slot j is physical slot j ^ ``rot`` (persistent tiles).
-            c_early: loads past the last K step (re-loads of it) go into the last step's own slot (the same bytes),
-            never into the slot the old C is fetched into."""
+            c_early / persistent: loads past the last K step (re-loads of it) go into the last step's own slot (the
+            same bytes), never into the free slot (the old C, or the next tile's first loads, go there)."""
             t_lo, t_hi, t_lds, t_lds_step, t_step, t_total, t_g10, t_g12_hi, t_g13, t_g14, t_g15, t_g10h, t_g13h = d
             last_delta = (supers - 1) * t_step
             last_slot = (supers - 1) % NB
