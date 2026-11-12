@@ -753,6 +753,12 @@ class QuantizedTensor(torch.Tensor):
 
         if out_shape == wrapper_shape:
             return tensor._data, tensor._scale_inv, out_shape
+        recipe = tensor._scaling_recipe
+        if tensor._dest_dtype != float4_e2m1fn_x2 and recipe is not None and is_gfx1250():
+            if recipe.shuffle_scale or recipe.shuffle_out:
+                raise NotImplementedError(
+                    f"view / reshape of a gfx1250 MXFP8 QuantizedTensor in the GEMM layouts ({recipe})"
+                )
 
         align = _get_padding_align_size(tensor)
         padded_target_shape = _pad_inner_dim(target_shape, align)
@@ -947,8 +953,20 @@ def create_quantized_weight(
     dest_dtype: torch.dtype,
     quant_config: Union[Float4QuantConfig, Float8QuantConfig],
     need_weight_transpose_cache: bool = False,
+    scaling_recipe: Optional[ScalingRecipe] = None,
 ) -> Tuple[QuantizedTensor, Optional[QuantizedTensor]]:
+    """Quantize ``weight`` ([N, K] or [G, N, K]) into (W, Wᵀ or None).
+
+    ``scaling_recipe`` overrides the recipe ``quant_config`` implies, for both copies. gfx1250 MXFP8 weight
+    caches ask for the MX GEMM layouts with ``ScalingRecipe(use_2d_block=True, shuffle_scale=True,
+    shuffle_out=True)``: packed scales ``[.., ceil(R/32), ceil(C/128), 32, 4]`` and 16x16-preshuffled codes
+    ``[R/16][C/16][16][16]`` (same shape), N and K % 16 == 0, bf16 weights; the copies carry the recipe, so
+    their consumers and ``dequantize`` know the layout. With the transpose cache, gfx1250 writes both
+    copies in one pass."""
+
     def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
+        if scaling_recipe is not None:
+            return scaling_recipe
         if isinstance(quant_config, Float4QuantConfig):
             weight_scaling_recipe = ScalingRecipe(
                 use_2d_block=True,
