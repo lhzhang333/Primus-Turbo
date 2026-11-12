@@ -706,6 +706,17 @@ def grouped_quantize_mxfp8_impl(
             assert with_trans and total_m is not None, (
                 "a gathered quantization is the dual one, given total_m"
             )
+            if x.shape[1] % 8:  # the fused gather loads 16-byte row chunks: gather here, same rule
+                pp = None if permuted_probs is None else permuted_probs[:total_m]
+                return Q.grouped_quant_mxfp8_raw(
+                    _gathered_rows(x, dest2src[:total_m], pp),
+                    group_lens,
+                    group_offs,
+                    out_dtype,
+                    rule,
+                    True,
+                    layout=lay,
+                )
             return Q.grouped_gather_quant_mxfp8(
                 x.contiguous(),
                 dest2src,
@@ -789,6 +800,17 @@ def _mxfp4_gather_xcd(hidden: int, bk: int = 128) -> Tuple[int, int]:
     n_pad = (hidden + 127) // 128 * 128
     nbk = (n_pad + bk - 1) // bk
     return 4, 4 * nbk
+
+
+def _gathered_rows(x: torch.Tensor, dest2src: torch.Tensor, permuted_probs: Optional[torch.Tensor]):
+    """Row d = x[dest2src[d]], zero where the index is out of [0, rows) or the row's prob is exactly 0:
+    what the gfx1250 fused gather + quantization reads (no host sync)."""
+    idx = dest2src.long()
+    ok = (idx >= 0) & (idx < x.shape[0])
+    if permuted_probs is not None:
+        ok &= permuted_probs != 0
+    rows = x.index_select(0, idx.clamp(0, max(x.shape[0] - 1, 0)))
+    return torch.where(ok[:, None], rows, torch.zeros((), dtype=x.dtype, device=x.device))
 
 
 def _materialize_gathered_activation(

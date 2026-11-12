@@ -427,16 +427,21 @@ def _launch(
                 sb = base + I32((2 - 2 * hf if PROD == P_DGLU else 0) * TILE)  # a consumed tile: the stage
                 ocol = I32(hf * K)  # the half's first column of the row copy / row of the column copy
                 # ---- rows phase: lane = (row, 32-block kb, half h), 4 rows per wave and pass; codes
-                # straight to q_row (8 lanes = one 128-byte line), scale bytes to LDS. Expert row copies hold
-                # whole 32-row groups: rows past the tokens are zero codes, scale 127.
+                # straight to q_row (8 lanes = one 128-byte line), scale bytes to LDS. 16x16 codes: 16 rows x
+                # one kb per wave and pass, so each 16-lane half stores a whole 256-byte block. Expert row copies
+                # hold whole 32-row groups: rows past the tokens are zero codes, scale 127.
                 nrows = ((nreal + I32(31)) >> I32(5)) << I32(5) if EXP else nreal
                 rowbase = I64(rb32) if EXP else I64(bat) * I64(i32_m) + I64(in0)
                 if const_expr(OUT & O_ROWS):
                     qr = _rsrc(_addr(arg_qr) + rowbase * I64(OW), nrows * I32(OW))
-                    kb, h = (lane % I32(8)) // I32(2), lane % I32(2)
-                    col = k0 + kb * I32(32) + h * I32(16)
+                    h = lane % I32(2)
                     for p in range_constexpr(BM // 32):
-                        r = I32(p * 32) + wave * I32(4) + lane // I32(8)
+                        if const_expr(SR):
+                            u = I32(p * 8) + wave
+                            r, kb = (u >> I32(2)) * I32(16) + lane // I32(2), u & I32(3)
+                        else:
+                            r, kb = I32(p * 32) + wave * I32(4) + lane // I32(8), (lane % I32(8)) // I32(2)
+                        col = k0 + kb * I32(32) + h * I32(16)
                         a0 = tb + r * I32(PITCH) + (kb * I32(2) + h) * I32(32)
                         words = [_lds_v4(a0), _lds_v4(a0 + I32(16))]
                         byte = _e8m0(blk_amax(words, (r // I32(32)) * I32(4) + kb, 0xB1), RULE_C)

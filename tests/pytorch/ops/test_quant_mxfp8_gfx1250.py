@@ -443,6 +443,8 @@ def test_dispatch_layouts():
                 _eq(qt_.dequantize(), raw.dequantize(), f"weight {axis} dequantize")
         _eq(single.qdata, pair[0].qdata, "weight without the transpose cache")
         _eq(single.scale_inv, pair[0].scale_inv, "weight scales without the transpose cache")
+    with pytest.raises(NotImplementedError):  # the GEMM layouts have no view to another shape
+        pair[0].view(48, 640)
     x = _x(200, 320, seed=5, special=False)
     raw = quantize_fp8_with_trans(x, E4, MX, block_size=32)
     got = quantize_fp8_with_trans(x, E4, MX, block_size=32, scaling_recipe=rr, scaling_recipe_for_trans=rc)
