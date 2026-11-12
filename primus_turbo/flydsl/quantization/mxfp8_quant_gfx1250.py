@@ -34,6 +34,8 @@ tile per workgroup (8 waves):
   it, so ``q_t == q.T``;
 * ``grouped`` (MoE): the row copy per expert zero-padded to 32 rows, the column copy to 128 tokens (pad
   rows / blocks: scale 127, Turbo's grouped contract); HIP's 8-tuple with both padded lens / offsets.
+* producers of the tile besides a plain load: fused GLU / dGLU, gather (permute), RMSNorm (``P_NORM``,
+  ``rmsnorm_mxfp8_gfx1250``: the tile normalized by a precomputed ``rstd``).
 
 Scale rules (compile-time): ``nosat`` (default: the smallest 2^e with amax / 2^e <= 448) and
 ``even`` (Turbo's HIP rule). ``tests/pytorch/ref/mxfp8_ref.py`` is the bitwise reference.
@@ -79,7 +81,7 @@ NT = 256  # 8 waves
 # TDM group-1 word 0: 2-byte elements, LDS padding 4 dwords after every 64 (one tile row)
 TDM_W0 = (1 << 16) | (1 << 20) | (5 << 22) | (3 << 25)
 RULES = {"nosat": 0x1F, "even": 0x08}  # added to |amax| bf16 bits before taking the exponent
-P_DENSE, P_GROUPED, P_GLU, P_DGLU, P_GATHER = range(5)  # producers of the bf16 tile
+P_DENSE, P_GROUPED, P_GLU, P_DGLU, P_GATHER, P_NORM = range(6)  # producers of the bf16 tile
 O_ROWS, O_COLS = 1, 2  # outputs
 PAD_SCALE = 127
 
@@ -291,7 +293,7 @@ def _launch(
     LAY: Constexpr[int],
 ):
     NKT = (K + BK - 1) // BK
-    EXP = PROD != P_DENSE  # expert-padded column copy
+    EXP = PROD not in (P_DENSE, P_NORM)  # expert-padded column copy
     HALVES = 2 if PROD == P_DGLU else 1  # dGLU quantizes dgate (columns [0, K)) and dup ([K, 2K))
     OW = 2 * K if PROD == P_DGLU else KO  # row-copy width (KO > K: zero columns to a 128 pad)
     KV = K if PROD in (P_GLU, P_DGLU) else KO  # columns of a half the row copy holds
@@ -357,9 +359,10 @@ def _launch(
             row0 = I64(bat) * I64(i32_m) + I64(in0)  # the tile's first input (= output) row
             cols = I32(K) - k0
             # ---- producer: the bf16 tile(s) into LDS, rows / columns past the data zero
-            if const_expr(PROD in (P_DENSE, P_GROUPED)):
+            if const_expr(PROD in (P_DENSE, P_GROUPED, P_NORM)):
+                xs = i32_t if PROD == P_NORM else I32(K)  # row stride of x (elements)
                 if wave == I32(0):
-                    _tdm_load(base, _addr(arg_x) + (row0 * I64(K) + I64(k0)) * I64(2), cols, nreal, K, CPOL >> 5)
+                    _tdm_load(base, _addr(arg_x) + (row0 * I64(xs) + I64(k0)) * I64(2), cols, nreal, xs, CPOL >> 5)
                     rocdl.s_wait_tensorcnt(0)
             elif const_expr(PROD in (P_GLU, P_DGLU)):  # gate / up halves of l1, then dact
                 l1 = _addr(arg_x2 if PROD == P_DGLU else arg_x) + (row0 * I64(2 * K) + I64(k0)) * I64(2)
@@ -408,6 +411,22 @@ def _launch(
                         if const_expr(AUX):  # the bf16 values (tests)
                             buffer_store(res[w], dbg, (r * I32(OW) + I32(w * K) + k0 + c8) * I32(2), mask=dok,
                                          offset_is_bytes=True)
+                gpu.barrier()
+            if const_expr(PROD == P_NORM):  # RMSNorm: y = bf16((x * rstd[row]) * gamma[col]) in place; AUX: y out
+                rp = _rsrc(_addr(arg_p), i32_m * I32(4))
+                ys = _rsrc(_addr(arg_dbg) + row0 * I64(K * 2), nreal * I32(K * 2))
+                c8 = (t % I32(16)) * I32(8)  # a lane's 8 columns, the same in every pass
+                gam = Vec(buffer_load(_rsrc(_addr(arg_x2), I32(K * 2)), (k0 + c8) >> I32(1), vec_width=4, dtype=T.i32))
+                gam = gam.bitcast(fx.BFloat16).to(fx.Float32)
+                for i in range_constexpr(BM * BK // 8 // NT):
+                    r = t // I32(16) + I32(i * 16)
+                    off = base + r * I32(PITCH) + c8 * I32(2)
+                    rstd = fx.Float32(buffer_load(rp, in0 + r, vec_width=1, dtype=T.f32))
+                    yv = _bf8((Vec(_lds_v4(off)).bitcast(fx.BFloat16).to(fx.Float32) * rstd) * gam)
+                    _lds_st(off, yv, 16)
+                    if const_expr(AUX):
+                        buffer_store(yv, ys, (r * I32(K) + k0 + c8) * I32(2), mask=(r < nreal) & (k0 + c8 < I32(K)),
+                                     offset_is_bytes=True)
                 gpu.barrier()
             if const_expr(B2D):  # 32 x 32 block maxima: 16 lanes per block, 2 rows each
                 bi, sub = t // I32(16), t % I32(16)
