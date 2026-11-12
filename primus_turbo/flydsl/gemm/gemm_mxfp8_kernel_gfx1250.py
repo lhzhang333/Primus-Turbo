@@ -42,7 +42,9 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.dialects import rocdl as _rocdl
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster, tdm_ops
 from flydsl.expr.typing import Constexpr, T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
@@ -69,6 +71,7 @@ C_PAD_B = 16  # bytes after every row of the epilogue's C staging
 DENSE, GROUPED_M, VARIABLE_K = 0, 1, 2
 LDS_BYTES = 320 * 1024
 NUM_CUS = 256  # MI455X: workgroups of a persistent launch
+STAGGER_SLEEP = 48  # persistent variable-K stagger: s_sleep units (64 clocks) per phase step
 CLUSTER_SYNC_REVS = 8  # a cluster barrier every this many pipeline revolutions keeps multicast partners close
 _WG_BARRIER = -1
 _E8M0 = (torch.uint8, getattr(torch, "float8_e8m0fnu", torch.uint8))
@@ -100,10 +103,9 @@ def geometry(c: MXGemmConfig, stage_f32: bool = False, slot_major: bool = False)
 
 def c_early_fits(c: MXGemmConfig) -> bool:
     """beta = 1 into a bf16 C can fetch the old C tile (rows padded like the staging) during the last K step into the
-    A + B slot that step does not read: kpair 2 (one free slot of a whole tile), no cluster (a lagging partner's
-    multicast could still land in the free slot)."""
-    return c.kpair == 2 and c.cluster_m * c.cluster_n == 1 and \
-        c.tile_m * (c.tile_n * 2 + C_PAD_B) <= geometry(c, slot_major=True)[4]
+    A + B slot that step does not read: kpair 2 (one free slot of a whole tile). With a cluster, a cluster barrier
+    first: every partner is past the previous step, so none of its multicasts into that slot is still in flight."""
+    return c.kpair == 2 and c.tile_m * (c.tile_n * 2 + C_PAD_B) <= geometry(c, slot_major=True)[4]
 
 
 def _tdm_group1(mask, tile0: int, tile1: int, dim0, dim1, stride, pad: int):
@@ -168,13 +170,15 @@ def _launch_gemm_mxfp8(
     beta1: Constexpr[bool],
     c_early: Constexpr[bool],
     persist: Constexpr[bool],
+    xcd_remap: Constexpr[bool],
+    stagger: Constexpr[int],
 ):
     """``arg_g0`` / ``arg_g1``: grouped-M: the tight and the 32-padded row offsets of the experts (int64, G + 1);
     variable-K: the 128-padded token offsets (``arg_g0``). Unused in dense mode. ``c_early`` (beta = 1, bf16 out,
     ``c_early_fits``, whole N tiles): the old C tile comes into the free A + B slot during the last K step."""
     cfg = MXGemmConfig(tile_m, tile_n, num_buffers, kpair, cluster_m, cluster_n, scale_4d, b_shuf)
     assert not c_early or (beta1 and not out_f32 and c_early_fits(cfg))
-    assert not persist or (mode == VARIABLE_K and c_early and num_buffers == 2)
+    assert not persist or (mode == VARIABLE_K and c_early and num_buffers == 2 and cluster_m * cluster_n == 1)
     STG = 4 if out_f32 or (beta1 and not c_early) else 2  # bytes per staged output element
     OB = 4 if out_f32 else 2  # bytes per output element
     LDS_ROW, STAGE, BASE, ARENA, PITCH = geometry(cfg, STG == 4, c_early)
@@ -204,7 +208,7 @@ def _launch_gemm_mxfp8(
     kname = f"gemm_mxfp8_gfx1250_{('dense', f'grouped{G}', f'vark{G}')[mode]}_t{tile_m}x{tile_n}_nb{NB}_kp{KPAIR}" \
         f"_c{cluster_m}x{cluster_n}" + ("_s4d" if scale_4d else "") + ("_bsh" if b_shuf else "") + \
         ("_kt" if k_tail else "") + ("_f32" if out_f32 else "") + ("_acc" if beta1 else "") + ("_ce" if c_early else "") + \
-        ("_p" if persist else "")
+        ("_p" if persist else "") + ("_x" if xcd_remap else "") + (f"_s{stagger}" if stagger else "")
 
     @flyc.kernel(name=kname, known_block_size=[BLOCK, 1, 1])
     def kernel_gemm_mxfp8(
@@ -252,16 +256,42 @@ def _launch_gemm_mxfp8(
         elif const_expr(mode == GROUPED_M):
             # m-tile t of the experts' tiles in order (ceil(len_g / tile_m) each); a tile past them is dead
             blk_n = fx.Int32(bid_y) * tile_n
-            t = fx.Int32(bid_z) * fx.Int32(fx.grid_dim.x) + fx.Int32(bid_x)
-            offs, offs_pad = _i64_table(arg_g0, G + 1), _i64_table(arg_g1, G + 1)
+            t_x = fx.Int32(bid_x)
+            if const_expr(xcd_remap):
+                # workgroups go round-robin over the XCDs, so x and x + 8 share one: give an XCD consecutive m tiles
+                # (an expert's B tiles then stay in fewer L2s); grid.x is a multiple of 8 here
+                gdx = fx.Int32(fx.grid_dim.x)
+                t_x = (gdx % 8 == 0).select((t_x % 8) * (gdx // 8) + t_x // 8, t_x)
+            t = fx.Int32(bid_z) * fx.Int32(fx.grid_dim.x) + t_x
+            # lane l of chunk c takes expert 32 c + l: its tile count, a DPP prefix sum of them, a ballot of the
+            # expert whose tiles hold t (no dependent scalar chain, no 2 x G live SGPRs)
+            rs0 = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg_g0)), num_records_bytes=8 * (G + 1))
+            rs1 = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg_g1)), num_records_bytes=8 * (G + 1))
+
+            def _scan(v):  # inclusive prefix over the wave: row_shr within 16-lane rows, then row 0's total
+                for k in (1, 2, 4, 8):
+                    v = v + fx.Int32(_rocdl.update_dpp(T.i32, _raw(zero), _raw(v), 0x110 + k, 0xF, 0xF, True))
+                return v + (lane >= 16).select(fx.Int32(rocdl.readlane(T.i32, v, 15)), zero)
+
             acc, first, len_g, in0, out0, expert = zero, zero, zero, zero, zero, zero
-            for g in range_constexpr(G):
-                n_g = (offs[g + 1] - offs[g] + (tile_m - 1)) // tile_m
-                hit = (t >= acc) & (t < acc + n_g)
-                expert, first = hit.select(fx.Int32(g), expert), hit.select(acc, first)
-                len_g = hit.select(offs[g + 1] - offs[g], len_g)
-                in0, out0 = hit.select(offs_pad[g], in0), hit.select(offs[g], out0)
-                acc = acc + n_g
+            for ch in range_constexpr((G + 31) // 32):
+                g = lane + ch * 32
+                o0 = fx.Int32(buffer_load(rs0, g * 2, vec_width=1, dtype=T.i32))  # low words (int64 tables)
+                ln = (g < G).select(fx.Int32(buffer_load(rs0, g * 2 + 2, vec_width=1, dtype=T.i32)) - o0, zero)
+                p0 = fx.Int32(buffer_load(rs1, g * 2, vec_width=1, dtype=T.i32))
+                n_g = (ln + (tile_m - 1)) // tile_m
+                incl = _scan(n_g)
+                excl = acc + incl - n_g
+                hit = fx.Int32(rocdl.ballot(T.i32, (t >= excl) & (t < excl + n_g)))
+                src = fx.Int32(_llvm.call_intrinsic(T.i32, "llvm.cttz.i32", [_raw(hit), _raw(fx.Boolean(False))],
+                                                    [], []))
+                found = hit != zero
+                expert = found.select(src + ch * 32, expert)
+                first = found.select(fx.Int32(rocdl.readlane(T.i32, excl, src)), first)
+                len_g = found.select(fx.Int32(rocdl.readlane(T.i32, ln, src)), len_g)
+                in0 = found.select(fx.Int32(rocdl.readlane(T.i32, p0, src)), in0)
+                out0 = found.select(fx.Int32(rocdl.readlane(T.i32, o0, src)), out0)
+                acc = acc + fx.Int32(rocdl.readlane(T.i32, incl, 31))
             # a tile past the experts' (the grid is an upper bound) ends its workgroup here: uniform, and a cluster
             # (along N) shares the m tile, so whole clusters end
             _llvm.inline_asm(None, [as_ir_value(t), as_ir_value(acc)],
@@ -616,6 +646,8 @@ def _launch_gemm_mxfp8(
                 if g < n_drain:
                     if const_expr(c_early and g % KPAIR == 0):
                         if fx.Int32(g) == (drain - 1) * KPAIR:  # the last K step begins
+                            if const_expr(use_cluster):
+                                cluster.cluster_barrier()
                             if wave == 3:
                                 _c_load()
                     _stage(g, (g + 1) % UNROLL, g // KPAIR, None, NB - 2 - g // KPAIR, g < UNROLL - 1,
@@ -694,6 +726,11 @@ def _launch_gemm_mxfp8(
                 return _decode_vk(tile % mt, (tile // mt) % nt, tile // (mt * nt))
 
             n_iter = (n_tiles - pid + (n_wg - 1)) // n_wg  # >= 1: the launch has at most n_tiles workgroups
+            if const_expr(stagger):
+                # start the workgroups in ``stagger`` phases a fraction of a tile apart, so their old-C reads and
+                # stores (the memory-bound end of every tile) do not all fall into the same microseconds
+                for _ in range(pid % stagger):
+                    rocdl.s_sleep(STAGGER_SLEEP)
             d0 = _decode_lin(pid)
             prep0, t_step0, _ = _make_prepare(_desc(d0), d0[8], zero)
             for i in range_constexpr(NB):
@@ -774,6 +811,8 @@ def _check_scales(sa, sb, a_rows: int, b_rows: int, K: int, who: str, b_batch: t
 
 C_EARLY_ON = True  # beta = 1 into bf16: fetch the old C during the last K step where it fits (A/B switch)
 PERSIST_ON = False  # variable-K with c_early and 2 slots: persistent workgroups, next tile loaded during the stores
+XCD_REMAP_ON = False  # grouped-M: consecutive m tiles of a grid chunk on one XCD (A/B switch)
+STAGGER_ON = 0  # persistent variable-K: start the workgroups in this many phases (0: together)
 
 
 def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1) -> tuple:
@@ -784,9 +823,10 @@ def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1
     cn = _divisor_cluster((N + cfg.tile_n - 1) // cfg.tile_n, cfg.cluster_n)
     c_early = C_EARLY_ON and beta1 and not out_f32 and N % cfg.tile_n == 0 and \
         c_early_fits(cfg._replace(cluster_m=cm, cluster_n=cn))
-    persist = PERSIST_ON and c_early and mode == VARIABLE_K and cfg.num_buffers == 2
+    persist = PERSIST_ON and c_early and mode == VARIABLE_K and cfg.num_buffers == 2 and cm * cn == 1
     return (cfg.tile_m, cfg.tile_n, cfg.num_buffers, cfg.kpair, cm, cn, bool(packed), bool(b_preshuffled),
-            bool(k_tail), mode, G, bool(out_f32), bool(beta1), bool(c_early), bool(persist))
+            bool(k_tail), mode, G, bool(out_f32), bool(beta1), bool(c_early), bool(persist),
+            bool(XCD_REMAP_ON and mode == GROUPED_M), int(STAGGER_ON) if persist else 0)
 
 
 def _launch(who, mode, cfg, out, a, b, sa, sb, g0, g1, M, N, K, lda, ldb, ldsa, ldsb, G, b_preshuffled, beta1,
