@@ -486,6 +486,20 @@ def _format_kwargs(kwargs: Dict[str, Any]) -> str:
     return ", ".join(f"{k}={_format_value(v)}" for k, v in kwargs.items())
 
 
+def _mx_strict_fallback(
+    dispatcher: str, default: Optional[BackendType], fallback: BackendType, kwargs: dict
+) -> None:
+    """MXFP8 strict mode (``low_precision.mx_strict``): an MX_BLOCKWISE call may not fall back from its default."""
+    if getattr(kwargs.get("granularity"), "name", None) != "MX_BLOCKWISE":
+        return
+    from primus_turbo.pytorch.core.low_precision import mx_strict
+
+    name = default.name if default is not None else None
+    mx_strict(
+        f"{dispatcher}: the default backend {name} cannot take {_format_kwargs(kwargs)}; would fall back to {fallback.name}"
+    )
+
+
 def _warn_fallback(backend_enum: BackendType, kwargs: dict) -> None:
     """Say once that the default backend was not eligible and we fell back.
 
@@ -666,6 +680,9 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         # 4. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
+                _mx_strict_fallback(
+                    cls.__name__, default_backend_choice.backend, fallback_backend_enum, kwargs
+                )
                 _warn_fallback(fallback_backend_enum, kwargs)
                 return fallback_backend_entry.impl.execute(**kwargs)
 
@@ -722,6 +739,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         # 4. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
+                _mx_strict_fallback(cls.__name__, default_backend_enum, fallback_backend_enum, kwargs)
                 _warn_fallback(fallback_backend_enum, kwargs)
                 return fallback_backend_enum
 
