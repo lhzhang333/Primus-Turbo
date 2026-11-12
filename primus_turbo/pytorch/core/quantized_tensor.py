@@ -25,6 +25,7 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
+from primus_turbo.pytorch.core.utils import is_gfx1250
 
 _SUPPORTED_QUANTIZED_DTYPES = [float8_e4m3, float8_e5m2, float4_e2m1fn_x2]
 _SUPPORTED_QUANTIZED_GRANS = [
@@ -966,6 +967,40 @@ def create_quantized_weight(
     scale_rounding_mode = (
         quant_config.scale_rounding_mode if isinstance(quant_config, Float4QuantConfig) else 0
     )
+    if (
+        need_weight_transpose_cache
+        and is_gfx1250()
+        and isinstance(quant_config, Float8QuantConfig)
+        and quant_config.granularity == ScalingGranularity.MX_BLOCKWISE
+    ):
+        # gfx1250: both copies from one read (32x32 blocks: one scale per block, q_t == q.T).
+        from primus_turbo.pytorch.ops.quantization import quantize_fp8_with_trans
+
+        recipe = _weight_scaling_recipe(quant_config)
+        q, s, q_t, s_t = quantize_fp8_with_trans(
+            weight,
+            dest_dtype,
+            quant_config.granularity,
+            block_size=quant_config.block_size,
+            scaling_recipe=recipe,
+            scaling_recipe_for_trans=recipe,
+        )
+        return tuple(
+            QuantizedTensor(
+                data,
+                scale,
+                shape=weight.size(),
+                orig_dtype=weight.dtype,
+                dest_dtype=dest_dtype,
+                granularity=quant_config.granularity,
+                block_size=quant_config.block_size,
+                scaling_recipe=recipe,
+                quantized_axis=axis,
+                requires_grad=weight.requires_grad,
+            )
+            for data, scale, axis in ((q, s, -1), (q_t, s_t, -2))
+        )
+
     quantized_weight = QuantizedTensor.quantize(
         weight,
         dest_dtype=dest_dtype,

@@ -25,7 +25,8 @@ Scale layout of the GEMM (aiter's mx32 layout): ``[ceil(R/32), ceil(K/128), 32, 
 One int32 of it is the WMMA scale operand of one row for one 128-wide K step. Pad bytes are 0x00.
 
 MoE (``quant_grouped``): rows as ``quant_rows``; the column copy per expert, padded to 128 tokens,
-blocks without a token get scale ``PAD_SCALE`` (127).
+blocks without a token get scale ``PAD_SCALE`` (127). Its fused producers: ``glu_ref`` / ``dglu_ref``
+(the grouped MLP's activation and its gradient, bf16 before quantization) and ``gather_rows`` (permute).
 """
 
 import torch
@@ -142,6 +143,59 @@ def quant_grouped(x: torch.Tensor, group_lens: torch.Tensor, rule: str = "nosat"
     lens_col = torch.tensor(pads, dtype=torch.int64, device=x.device)
     offs_col = torch.nn.functional.pad(torch.cumsum(lens_col, 0), (1, 0))
     return q_row, s_row, q_col.view(torch.float8_e4m3fn), s_col, lens_col, offs_col
+
+
+_GELU_A2, _GELU_B, _GELU_C2 = 2 * 0.7978845608028654, 0.044715, 6 * 0.7978845608028654 * 0.044715
+
+
+def _glu_in(l1, clamp_limit):
+    """gate / up halves of l1 [M, 2I] in fp32, clamped (min(gate, L), clamp(up, -L, L)), with kept masks."""
+    g, u = l1.float().chunk(2, dim=1)
+    if not clamp_limit:
+        return g, u, None, None
+    gc, uc = g.clamp(max=clamp_limit), u.clamp(-clamp_limit, clamp_limit)
+    return gc, uc, gc == g, uc == u
+
+
+def glu_ref(l1, probs, activation="silu", clamp_limit=None):
+    """MoE GLU forward before its quantization (bf16 [M, I]): f(gate) * up * probs[row] in fp32 as the
+    gfx950 / gfx1250 phase-2 kernels compute it: silu as g / (1 + exp2(-g log2 e)), gelu (tanh form) as
+    g * sigmoid(2 sqrt(2/pi) g (1 + 0.044715 g^2)). The kernels' exp2 / reciprocal are the hardware's, so
+    their bf16 values may be an ulp off this; their quantization is checked on their own values."""
+    g, u, _, _ = _glu_in(l1, clamp_limit)
+    gate = g / (1 + torch.exp2(g * -1.4426950408889634)) if activation == "silu" else g * torch.sigmoid(
+        g * _GELU_A2 * (1 + g * g * _GELU_B)
+    )
+    return ((gate * u) * probs.float()[:, None]).to(torch.bfloat16)
+
+
+def dglu_ref(grad_act, l1, probs, activation="silu", clamp_limit=None):
+    """MoE GLU backward before quantization: (grad_l1 = [dgate | dup] [M, 2I] bf16, grad_probs [M] fp32)
+    with d = grad_act, a = f(gate): dgate = d p up f'(gate), dup = d p a (zero where the clamp bit),
+    grad_probs = sum_j d a up."""
+    g, u, kg, ku = _glu_in(l1, clamp_limit)
+    if activation == "silu":
+        sg = torch.sigmoid(g)
+        a, da = sg * g, sg * (1 + g - sg * g)
+    else:
+        sg = torch.sigmoid(g * _GELU_A2 * (1 + g * g * _GELU_B))
+        a, da = g * sg, sg + g * sg * (1 - sg) * (_GELU_A2 + g * g * _GELU_C2)
+    d = grad_act.float()
+    dp = d * probs.float()[:, None]
+    dg, du = dp * u * da, dp * a
+    if kg is not None:
+        dg, du = torch.where(kg, dg, 0.0), torch.where(ku, du, 0.0)
+    return torch.cat([dg, du], 1).to(torch.bfloat16), (d * a * u).sum(1)
+
+
+def gather_rows(x, dest2src, permuted_probs=None):
+    """The permuted activation: row d = x[dest2src[d]]; zero where dest2src is out of range or the
+    row's prob is exactly 0 (the routing padding rule)."""
+    idx = dest2src.long()
+    ok = (idx >= 0) & (idx < x.shape[0])
+    if permuted_probs is not None:
+        ok &= permuted_probs != 0
+    return torch.where(ok[:, None], x[idx.clamp(0, x.shape[0] - 1)], torch.zeros((), dtype=x.dtype))
 
 
 def pack_scales(s: torch.Tensor) -> torch.Tensor:

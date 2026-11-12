@@ -203,6 +203,9 @@ def grouped_quantize_fp8_with_trans(
     block_size: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+    dest2src: Optional[torch.Tensor] = None,
+    permuted_probs: Optional[torch.Tensor] = None,
+    total_m: Optional[int] = None,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -215,7 +218,16 @@ def grouped_quantize_fp8_with_trans(
 ]:
     """
     FP8 Grouped Quantize with trans
+
+    ``dest2src`` / ``permuted_probs`` / ``total_m``: the routing/permute -> MXFP8 fusion
+    handoff, with the same contract and side-table lookup as
+    :func:`grouped_quantize_fp4_with_trans` (``x`` is then the pre-permutation source).
     """
+    if dest2src is None and granularity == ScalingGranularity.MX_BLOCKWISE:
+        _seam = lookup_permuted_activation_seam(x)
+        if _seam is not None:
+            total_m = int(x.shape[0])
+            x, dest2src, permuted_probs = _seam
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MXFP8_BLOCK_SIZE, (
             f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
@@ -231,6 +243,9 @@ def grouped_quantize_fp8_with_trans(
             True,
             scaling_recipe,
             scaling_recipe_for_trans,
+            dest2src=dest2src,
+            permuted_probs=permuted_probs,
+            total_m=total_m,
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
