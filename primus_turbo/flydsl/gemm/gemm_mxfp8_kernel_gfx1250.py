@@ -78,7 +78,7 @@ LDS_PAD = 16  # bytes after every A / B LDS row: conflict-free ds_load_b128 frag
 C_PAD_B = 16  # bytes after every row of the epilogue's C staging
 DENSE, GROUPED_M, VARIABLE_K = 0, 1, 2
 LDS_BYTES = 320 * 1024
-NUM_CUS = 256  # MI455X: workgroups of a persistent launch
+NUM_CUS = 256  # MI455X CUs (the persistent grid uses the device's count; this where there is no device)
 STAGGER_SLEEP = 48  # stagger: s_sleep units (64 clocks) per phase step (~1.4 us)
 CLUSTER_SYNC_REVS = 8  # a cluster barrier every this many pipeline revolutions keeps multicast partners close
 _WG_BARRIER = -1
@@ -180,6 +180,7 @@ def _launch_gemm_mxfp8(
     persist: Constexpr[bool],
     xcd_remap: Constexpr[bool],
     stagger: Constexpr[int],
+    n_cus: Constexpr[int],
 ):
     """``arg_g0`` / ``arg_g1``: grouped-M: the tight and the 32-padded row offsets of the experts (int64, G + 1);
     variable-K: the 128-padded token offsets (``arg_g0``). Unused in dense mode. ``c_early`` (beta = 1, bf16 out,
@@ -837,8 +838,8 @@ def _launch_gemm_mxfp8(
     grid = (m_run, gy, gx // m_run)
     if const_expr(mode == VARIABLE_K):
         grid = (gx, gy, G)
-    if const_expr(persist):  # NUM_CUS workgroups in clusters along x; variable-K: at most one cluster per tile
-        n_cl = NUM_CUS // (cluster_m * cluster_n)
+    if const_expr(persist):  # n_cus workgroups in clusters along x; variable-K: at most one cluster per tile
+        n_cl = n_cus // (cluster_m * cluster_n)
         if const_expr(mode == VARIABLE_K):
             n_ct = gx // cluster_m * (gy // cluster_n) * G
             n_cl = (n_ct < n_cl).select(n_ct, fx.Int32(n_cl))
@@ -904,6 +905,18 @@ def _sw(switch, default):
     return default if switch is None else switch
 
 
+_NUM_CUS: list = []
+
+
+def _num_cus() -> int:
+    """The device's CUs (persistent launches start one workgroup per CU); NUM_CUS where there is no device."""
+    if not _NUM_CUS:
+        dev = torch.cuda.is_available() and torch.cuda.device_count() > 0
+        _NUM_CUS.append(torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+                        if dev else NUM_CUS)
+    return _NUM_CUS[0]
+
+
 def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1) -> tuple:
     """The constexpr tail of ``_launch_gemm_mxfp8`` (and the compiled-kernel key) of a call. A cluster must tile the
     grid exactly (a workgroup wholly past M or N would sit in a multicast group): it shrinks to what the tiles
@@ -916,7 +929,8 @@ def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1
         not out_f32 and c_early_fits(cfg) and (c_early or not beta1)
     return (cfg.tile_m, cfg.tile_n, cfg.num_buffers, cfg.kpair, cm, cn, bool(packed), bool(b_preshuffled),
             bool(k_tail), mode, G, bool(out_f32), bool(beta1), bool(c_early), bool(persist),
-            bool(_sw(XCD_REMAP_ON, cfg.xcd_remap) and mode == GROUPED_M and not persist), int(_sw(STAGGER_ON, cfg.stagger)))
+            bool(_sw(XCD_REMAP_ON, cfg.xcd_remap) and mode == GROUPED_M and not persist), int(_sw(STAGGER_ON, cfg.stagger)),
+            _num_cus() if persist else 0)
 
 
 def _launch(who, mode, cfg, out, a, b, sa, sb, g0, g1, M, N, K, lda, ldb, ldsa, ldsb, G, b_preshuffled, beta1,
