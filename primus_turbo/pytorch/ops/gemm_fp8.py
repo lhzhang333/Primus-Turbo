@@ -34,9 +34,14 @@ from primus_turbo.pytorch.ops.quantization import (
     quantize_fp8_with_trans,
 )
 from primus_turbo.pytorch.ops.utils import (
+    MX_A,
+    MX_B,
+    MX_W,
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx_check_operand_recipe,
+    mx_gemm_layout,
     mx_wgrad_accum_backend,
 )
 
@@ -585,21 +590,23 @@ class FP8GemmMXFunction(torch.autograd.Function):
         granularity = config.granularity
         block_size = config.block_size
 
-        a_scaling_recipe = ScalingRecipe()
+        lay = mx_gemm_layout(b, a=a)
+        a_scaling_recipe, a_t_recipe = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
         if isinstance(a, QuantizedTensor):
-            check_quantized_tensor(a, config, axis=-1, scaling_recipe=a_scaling_recipe)
+            mx_check_operand_recipe("gemm_fp8 (MXFP8)", "a", a, a_scaling_recipe, lay)
+            check_quantized_tensor(a, config, axis=-1)
             a_row, a_row_scale = a.qdata, a.scale_inv
-            if a_t is None:
-                mx_strict(
-                    "gemm_fp8 (MXFP8): a has no transposed copy (a_t); re-quantizing it from its dequantized values"
-                )
+            if a_t is not None:
+                mx_check_operand_recipe("gemm_fp8 (MXFP8)", "a_t (a's column copy)", a_t, a_t_recipe, lay)
+            else:
+                mx_strict("gemm_fp8 (MXFP8): no a_t, re-quantizing a from its dequantized values")
                 a_t = QuantizedTensor.quantize(
                     a.dequantize(),
                     a.real_dtype,
                     granularity,
                     axis=-2,
                     block_size=block_size,
-                    scaling_recipe=a_scaling_recipe,
+                    scaling_recipe=a_t_recipe,
                 )
             a_col, a_col_scale = a_t.qdata, a_t.scale_inv
         else:
@@ -610,17 +617,15 @@ class FP8GemmMXFunction(torch.autograd.Function):
                 block_size,
                 with_trans=True,
                 scaling_recipe=a_scaling_recipe,
-                scaling_recipe_for_trans=a_scaling_recipe,
+                scaling_recipe_for_trans=a_t_recipe,
             )
 
-        b_scaling_recipe = ScalingRecipe(use_2d_block=True)
+        b_scaling_recipe = MX_W if lay else ScalingRecipe(use_2d_block=True)
         if isinstance(b, QuantizedTensor):
             check_quantized_tensor(b, config, axis=-1, scaling_recipe=b_scaling_recipe)
             b_row, b_row_scale = b.qdata, b.scale_inv
             if b_t is None:
-                mx_strict(
-                    "gemm_fp8 (MXFP8): b has no transposed copy (b_t); re-quantizing it from its dequantized values"
-                )
+                mx_strict("gemm_fp8 (MXFP8): no b_t, re-quantizing b from its dequantized values")
                 b_t = QuantizedTensor.quantize(
                     b.dequantize(),
                     b.real_dtype,
@@ -653,9 +658,11 @@ class FP8GemmMXFunction(torch.autograd.Function):
             False,
             granularity=granularity.value,
             default_backend=BackendType.FLYDSL.value,
+            b_preshuffled=lay,
         )
 
         ctx.save_for_backward(a_col, a_col_scale, b_col, b_col_scale)
+        ctx.lay = lay
         ctx.out_dtype = out_dtype
         ctx.config = config
         ctx.fuse_bgrad_accum = fuse_bgrad_accum
@@ -680,8 +687,8 @@ class FP8GemmMXFunction(torch.autograd.Function):
             None,
             ctx.config.block_size,
             with_trans=True,
-            scaling_recipe=ScalingRecipe(),
-            scaling_recipe_for_trans=ScalingRecipe(),
+            scaling_recipe=MX_A if ctx.lay else ScalingRecipe(),
+            scaling_recipe_for_trans=MX_A if ctx.lay else ScalingRecipe(),
         )
 
         grad_a = gemm_fp8_impl(
@@ -695,8 +702,10 @@ class FP8GemmMXFunction(torch.autograd.Function):
             False,
             granularity=ctx.config.granularity.value,
             default_backend=BackendType.FLYDSL.value,
+            b_preshuffled=ctx.lay,
         )
 
+        wgrad_backend = mx_wgrad_accum_backend(grouped=False) if ctx.fuse_bgrad_accum else BackendType.FLYDSL
         grad_b = _bgrad_gemm_fp8_impl_wrapper(
             g_col,
             g_col_scale,
@@ -707,13 +716,10 @@ class FP8GemmMXFunction(torch.autograd.Function):
             ctx.out_dtype,
             False,
             granularity=ctx.config.granularity.value,
-            default_backend=(
-                mx_wgrad_accum_backend(grouped=False).value
-                if ctx.fuse_bgrad_accum
-                else BackendType.FLYDSL.value
-            ),
+            default_backend=wgrad_backend.value,
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
+            b_preshuffled=ctx.lay,
         )
 
         return (

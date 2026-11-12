@@ -82,15 +82,10 @@ def check_mxfp8_support() -> Tuple[bool, str]:
 
 
 def mx_strict(what: str, level: int = 1) -> None:
-    """MXFP8 strict mode: raise for ``what``, a silent MXFP8 fallback, when PRIMUS_TURBO_MX_STRICT >= ``level``.
-
-    Level 1: a GEMM backend other than the default / pinned one, a quantized operand re-quantized from its
-    dequantized values (transposed copy missing). Level 2: also the HIP MXFP8 quantization on gfx1250 (called by the
-    gfx1250 quantization dispatch: ``mx_strict("...", level=2)`` where it falls back to HIP).
-    """
-    strict = envs.PRIMUS_TURBO_MX_STRICT
-    if strict >= level:
-        raise RuntimeError(f"PRIMUS_TURBO_MX_STRICT={strict}: {what}")
+    """Raise for ``what``, a silent MXFP8 fallback, when PRIMUS_TURBO_MX_STRICT >= ``level`` (1: GEMM backend fallback,
+    re-quantizing a dequantized operand; 2: also the HIP MXFP8 quantization on gfx1250)."""
+    if envs.PRIMUS_TURBO_MX_STRICT >= level:
+        raise RuntimeError(f"PRIMUS_TURBO_MX_STRICT={envs.PRIMUS_TURBO_MX_STRICT}: {what}")
 
 
 ###################################################
