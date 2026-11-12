@@ -14,7 +14,9 @@ class MXGemmConfig(NamedTuple):
     A (along N) and B (along M) tiles; 1x1 is the no-multicast config. ``scale_4d`` / ``b_preshuffle`` describe the
     inputs (the entry point sets them from the scale tensors' rank and its ``b_preshuffled`` flag). ``persist``:
     persistent workgroups (bf16 out, kpair 2 x 2 slots; the next tile loads during the stores); ``stagger``: the (first wave of) workgroups start in that many phases; ``xcd_remap``: grouped-M m tiles
-    grouped per XCD. The three are dropped where they do not apply."""
+    grouped per XCD; ``c_pre`` (beta = 1 into bf16 with the early old-C fetch): the old C's first rows come at the
+    tile's start into the LDS past the slots, only the rest during the last K step. They are dropped where they do
+    not apply."""
 
     tile_m: int = 256
     tile_n: int = 256
@@ -27,6 +29,7 @@ class MXGemmConfig(NamedTuple):
     persist: bool = False
     stagger: int = 0
     xcd_remap: bool = False
+    c_pre: bool = False
 
 
 DEFAULT = MXGemmConfig()
