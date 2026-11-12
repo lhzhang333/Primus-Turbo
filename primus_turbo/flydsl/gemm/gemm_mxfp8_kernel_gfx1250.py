@@ -302,8 +302,10 @@ def _launch_gemm_mxfp8(
             addr = fx.Int64(fx.ptrtoint(ptr)) + eoff + fx.Int64(row0) * fx.Int64(ld) + fx.Int64(kb)
             g1 = _tdm_group1(mask, inner, rows, total, ext1, ld, pad)
             # a half K step (HALF_TAIL): half the row, the rest of the LDS row skipped as padding, so nothing past
-            # the data is addressed (the inner extent of a TDM load clamps the data, not the addressing)
-            g1h = _tdm_group1(mask, inner // 2, rows, total, ext1, ld, pad + inner // 2 if pad else 0)
+            # the data is addressed (the inner extent of a TDM load clamps the data, not the addressing). The pad
+            # field holds at most 512 B, the interval 1 KiB: not a preshuffled B (2 KiB halves), nor raw scales (4 B)
+            halvable = w == 0 or (w == 1 and not b_shuf) or (w >= 2 and scale_4d)
+            g1h = _tdm_group1(mask, inner // 2, rows, total, ext1, ld, pad + inner // 2) if halvable else g1
             return [fx.Int32(addr), fx.Int32(addr >> 32) | fx.Int32(-(1 << 31)), lds0 + BASE[w], fx.Int32(STAGE[w]),
                     fx.Int32(step), total, g1[0], g1[2] & fx.Int32(-65536), g1[3], g1[4], g1[5], g1h[0], g1h[3]]
 
@@ -725,6 +727,17 @@ def _launch(who, mode, cfg, out, a, b, sa, sb, g0, g1, M, N, K, lda, ldb, ldsa, 
     return out
 
 
+def _b_tail_safe(cfg: MXGemmConfig, b: torch.Tensor, b_preshuffled: bool, half_tail: bool) -> MXGemmConfig:
+    """A half last K step (kpair 2, <= 128 of K left) loads a preshuffled b's whole 2 KiB group row and lets the TDM
+    clamp the data: the bytes past it are still addressed, past the end of b at its last 16 rows. Unless b's storage
+    has that slack (the quantizers allocate it), use kpair 1, which has no partial step at 128-aligned K."""
+    if cfg.kpair == 2 and b_preshuffled and half_tail:
+        slack = b.untyped_storage().nbytes() - (b.storage_offset() + b.numel()) * b.element_size()
+        if slack < WMMA_K * 16:
+            return cfg._replace(kpair=1, num_buffers=min(4, 2 * cfg.num_buffers))
+    return cfg
+
+
 def _out(out, shape, out_dtype, accumulate, device, who):
     if out_dtype not in _F16_OUT:
         raise NotImplementedError(f"{who}: out_dtype {out_dtype} (bf16 or fp32)")
@@ -765,6 +778,7 @@ def gemm_mxfp8_gfx1250(
     if K == 0:
         return out if accumulate else out.zero_()
     cfg = config or pick_config(M, N, K, b_preshuffled)
+    cfg = _b_tail_safe(cfg, b, b_preshuffled, 0 < K % (2 * WMMA_K) <= WMMA_K)
     packed, ldsa, ldsb = _check_scales(a_scale, b_scale, M, N, K, "gemm_mxfp8_gfx1250")
     k_tail = K % (WMMA_K * cfg.kpair) != 0
     return _launch("gemm_mxfp8_gfx1250", DENSE, cfg, out, a, b, a_scale, b_scale, None, None, M, N, K, a.stride(0),
@@ -805,6 +819,7 @@ def grouped_gemm_mxfp8_gfx1250(
     if K == 0:
         return out.zero_()
     cfg = config or pick_grouped_config(GROUPED_M, m_out // max(G, 1), N, K, b_preshuffled)
+    cfg = _b_tail_safe(cfg, b, b_preshuffled, 0 < K % (2 * WMMA_K) <= WMMA_K)
     packed, ldsa, ldsb = _check_scales(a_scale, b_scale, a.shape[0], N, K, who, (G,))
     if packed and N % 32:
         raise ValueError(f"{who}: packed b scales need N % 32 == 0")
@@ -841,6 +856,7 @@ def grouped_gemm_mxfp8_variable_k_gfx1250(
     if M == 0 or N == 0 or G == 0:
         return out
     cfg = config or pick_grouped_config(VARIABLE_K, M, N, T // max(G, 1), b_preshuffled)
+    cfg = _b_tail_safe(cfg, b, b_preshuffled, True)  # an expert with an odd count of 128 tokens
     packed, ldsa, ldsb = _check_scales(a_scale, b_scale, M, N, T, who)
     return _launch(who, VARIABLE_K, cfg, out, a, b, a_scale, b_scale, group_offs, None, M, N, T, a.stride(0),
                    b.stride(0), ldsa, ldsb, G, b_preshuffled, accumulate, True)
