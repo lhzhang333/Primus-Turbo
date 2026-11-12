@@ -496,3 +496,42 @@ def test_strict_hip_fallback(monkeypatch):
     ):
         with pytest.raises(RuntimeError, match="PRIMUS_TURBO_MX_STRICT=2"):
             call()
+
+
+def test_operand_slack():
+    """Every GEMM operand the quantizers allocate (codes and scales, both copies, any layout and producer, the cached
+    weights) has >= 2 KiB of storage past its last byte: the gfx1250 MX GEMM's TDM loads address past a tensor's end."""
+    from primus_turbo.flydsl.quantization import mxfp8_quant_gfx1250 as Q
+    from primus_turbo.pytorch.core.quantized_tensor import create_quantized_weight
+    from primus_turbo.pytorch.ops.quantization import quantize_fp8_with_trans
+
+    (MX, Recipe, cfg), E4 = _dispatch_names(), torch.float8_e4m3fn
+
+    def slack(t):
+        return t.untyped_storage().nbytes() - (t.storage_offset() + t.numel()) * t.element_size()
+
+    x = _x(208, 256, special=False)
+    lens = torch.tensor([0, 37, 1, 170], device="cuda")
+    offs = torch.nn.functional.pad(torch.cumsum(lens, 0), (1, 0))
+    l1 = _x(208, 512, special=False)
+    probs = torch.rand(208, device="cuda")
+    d2s = torch.randint(0, 208, (208,), device="cuda", dtype=torch.int32)
+    outs = {
+        "dual": Q.quant_mxfp8_raw(x),
+        "dual 16x16": Q.quant_mxfp8_raw(x, pad=True, layout=15)[0:4],
+        "rows": Q.quant_mxfp8_rows(x),
+        "cols": Q.quant_mxfp8_cols(x, layout=PACK_COL),
+        "2d": Q.quant_mxfp8_raw_batched(_x(3, 64, 96, special=False), row_2d=True, col_2d=True, layout=15),
+        "grouped": Q.grouped_quant_mxfp8_raw(x, lens, offs)[:4],
+        "glu": Q.grouped_glu_quant_mxfp8(l1, probs, lens, offs, layout=PACK_ROW | PACK_COL | SHUF_COL)[:4],
+        "dglu": Q.grouped_dglu_quant_mxfp8(x, l1, probs, lens, offs)[1:5],
+        "gather": Q.grouped_gather_quant_mxfp8(x, d2s, lens, offs, probs)[:4],
+        "op": quantize_fp8_with_trans(x, E4, MX, block_size=32),
+    }
+    shuf2 = Recipe(use_2d_block=True, shuffle_scale=True, shuffle_out=True)
+    w = create_quantized_weight(_x(64, 96, special=False), E4, cfg, need_weight_transpose_cache=True,
+                                scaling_recipe=shuf2)
+    outs["weight"] = [t for qt_ in w for t in (qt_.qdata, qt_.scale_inv)]
+    for name, ts in outs.items():
+        for i, t in enumerate(ts):
+            assert t is not None and slack(t) >= 2048, f"{name}[{i}]: only {slack(t)} bytes past the end"
