@@ -715,7 +715,8 @@ def _launch_gemm_mxfp8(
                 src = c_addr + fx.Int64(c_pre) * fx.Int64(i32_ldc) * 2 if const_expr(c_pre) else c_addr
                 ext = m_ext - c_pre if const_expr(c_pre) else m_ext
                 ext = (ext > zero).select(ext, zero) if const_expr(c_pre) else ext
-                g0 = Vec.from_elements([fx.Int32(1), lds0 + free_slot * PITCH + c_pre * C_ROW_B, fx.Int32(src),
+                # (rows from c_pre on start at the free slot's base: a kpair-1 slot holds only the rest)
+                g0 = Vec.from_elements([fx.Int32(1), lds0 + free_slot * PITCH, fx.Int32(src),
                                         fx.Int32(src >> 32) | fx.Int32(-(1 << 31))], fx.Int32)
                 g1 = Vec.from_elements(_tdm_group1(0, tile_n * 2, tile_m - c_pre, fx.Int32(tile_n * 2), ext,
                                                    i32_ldc * 2, C_PAD_B), fx.Int32)
@@ -779,10 +780,12 @@ def _launch_gemm_mxfp8(
                     stg_off = last_phys * PITCH
             # c_pre: the first c_pre rows (in wave row 0's first fragments) live in their own LDS, staged in place there
             pre_d = fx.Int32(PRE_BASE) - stg_off
-            pre_sel = (wave_m == 0).select(pre_d, zero) if const_expr(c_pre) else zero
+            late_d = fx.Int32(-c_pre * C_ROW_B)  # rows from c_pre on: re-based to the free slot's start
+            pre_sel = (wave_m == 0).select(pre_d, late_d) if const_expr(c_pre) else zero
             for wm in range_constexpr(m_rep):
                 # rows wave_m * WM + wm * 16 + [0, 16): early rows in both wave rows, wave row 0 only, or none
-                sel = pre_d if const_expr(WM + wm * 16 < c_pre) else (pre_sel if const_expr(wm * 16 < c_pre) else zero)
+                sel = pre_d if const_expr(WM + wm * 16 < c_pre) else \
+                    (pre_sel if const_expr(wm * 16 < c_pre) else (late_d if const_expr(c_pre) else zero))
                 for wn in range_constexpr(n_rep):
                     h = accs[wm * n_rep + wn]
                     row, col = wmb + wm * 16 + lane16, wnb + wn * 16 + kgrp * 8
@@ -806,7 +809,7 @@ def _launch_gemm_mxfp8(
                     if const_expr(i < NPRE):
                         rd = _planar(PRE_BASE + i * RPI * C_ROW_B, r0 * C_ROW_B + c16 * EPC * STG)
                     else:
-                        rd = _planar(i * RPI * C_ROW_B, stg_off + r0 * C_ROW_B + c16 * EPC * STG)
+                        rd = _planar((i * RPI - c_pre) * C_ROW_B, stg_off + r0 * C_ROW_B + c16 * EPC * STG)
                 off = lane_b + step_b * i
                 if const_expr(STG == 2):
                     v = lds_load_b128(rd, (ig % GRP) * RPI * C_ROW_B)
