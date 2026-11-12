@@ -41,6 +41,8 @@ Scale rules (compile-time): ``nosat`` (default: the smallest 2^e with amax / 2^e
 
 from __future__ import annotations
 
+import math
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -597,16 +599,26 @@ def _check(x, out_dtype, rule, ndims):
     return x.contiguous()
 
 
-def _new(*shape, dtype, like):
-    return torch.empty(*shape, dtype=dtype, device=like.device)
+def _new(*shape, dtype, like, slack=0):
+    """torch.empty, with ``slack`` bytes of storage past the tensor's last byte when asked (no copy: a view)."""
+    if not slack:
+        return torch.empty(*shape, dtype=dtype, device=like.device)
+    n = math.prod(shape) * torch.empty(0, dtype=dtype).element_size()
+    return torch.empty(n + slack, dtype=torch.uint8, device=like.device)[:n].view(dtype).view(*shape)
+
+
+# Storage past every GEMM operand the quantizers write: a TDM load's inner extent clamps the data, not the
+# addressing, so the gfx1250 MX GEMM's last K step may address up to ~2 KiB past an operand's end.
+GEMM_SLACK = 4096
 
 
 def _bufs(lead, rows, cols, pack, shuf, dtype, like):
     """A copy's codes [*lead, rows, cols] (16x16 blocks when ``shuf``) and E8M0 scales, raw [*lead, rows,
-    ceil(cols/32)] or (``pack``) [*lead, ceil(rows/32), ceil(cols/128), 32, 4]."""
+    ceil(cols/32)] or (``pack``) [*lead, ceil(rows/32), ceil(cols/128), 32, 4]; both with ``GEMM_SLACK``."""
     assert not shuf or rows % 16 == cols % 16 == 0, f"16x16-preshuffled codes need rows, cols % 16 == 0: {rows}, {cols}"
     sshape = (-(-rows // 32), -(-cols // BK), 32, 4) if pack else (rows, -(-cols // 32))
-    return _new(*lead, rows, cols, dtype=dtype, like=like), _new(*lead, *sshape, dtype=torch.uint8, like=like)
+    return (_new(*lead, rows, cols, dtype=dtype, like=like, slack=GEMM_SLACK),
+            _new(*lead, *sshape, dtype=torch.uint8, like=like, slack=GEMM_SLACK))
 
 
 def quant_mxfp8_rows(x, out_dtype=torch.float8_e4m3fn, rule="nosat", blk_2d=False, pad=False, layout=0):
