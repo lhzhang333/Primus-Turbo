@@ -31,8 +31,8 @@ Operands: E4M3, K contiguous, 16-byte rows. Scales: one E8M0 byte per 32 K, pack
 an operand up to a step past its data (a TDM load's inner extent clamps the data, not the addressing): the quantizers
 allocate >= 2 KiB of storage slack after a preshuffled B (and raw scales); without it the entry points use kpair 1
 (128-aligned K has no partial step) and refuse K % 128 != 0. The module switches ``C_EARLY_ON`` (beta = 1 into bf16:
-fetch the old C during the last K step), ``PERSIST_ON`` (persistent variable-K), ``XCD_REMAP_ON`` (grouped-M m tile
-order) and ``STAGGER_ON`` (staggered first wave) select kernel variants (A/B; read at the call).
+fetch the old C during the last K step) and ``PERSIST_ON`` / ``XCD_REMAP_ON`` / ``STAGGER_ON`` (None: as the config's
+``persist`` / ``xcd_remap`` / ``stagger`` fields say) select kernel variants for A/B runs; read at the call.
 
 The mainloop is aiter's compute-bound gfx1250 tile: 2x2 waves of up to 128x128, ``v_wmma_scale_f32_16x16x128_f8f6f4``
 with one scale VGPR feeding two WMMAs (ROW0 / ROW1 lane halves), ``num_buffers`` LDS slots of ``kpair`` 128-wide K
@@ -873,10 +873,15 @@ def _check_scales(sa, sb, a_rows: int, b_rows: int, K: int, who: str, b_batch: t
     return False, sa.stride(0), sb.stride(-2)
 
 
-C_EARLY_ON = True  # beta = 1 into bf16: fetch the old C during the last K step where it fits (A/B switch)
-PERSIST_ON = False  # grouped-M / variable-K, bf16 out, kpair 2 x 2 slots: persistent, next tile loaded during the stores
-XCD_REMAP_ON = False  # grouped-M: consecutive m tiles of a grid chunk on one XCD (A/B switch)
-STAGGER_ON = 0  # start the (first wave of) workgroups in this many phases (0: together); A/B switch
+# A/B switches over the configs' choices (None: as the config says)
+C_EARLY_ON = True  # beta = 1 into bf16: fetch the old C during the last K step where it fits
+PERSIST_ON = None  # grouped-M / variable-K, bf16 out, kpair 2 x 2 slots: persistent, next tile loaded during the stores
+XCD_REMAP_ON = None  # grouped-M: consecutive m tiles of a grid chunk on one XCD
+STAGGER_ON = None  # start the (first wave of) workgroups in this many phases (0: together)
+
+
+def _sw(switch, default):
+    return default if switch is None else switch
 
 
 def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1) -> tuple:
@@ -887,11 +892,11 @@ def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1
     cn = _divisor_cluster((N + cfg.tile_n - 1) // cfg.tile_n, cfg.cluster_n)
     c_early = C_EARLY_ON and beta1 and not out_f32 and N % cfg.tile_n == 0 and \
         c_early_fits(cfg._replace(cluster_m=cm, cluster_n=cn))
-    persist = PERSIST_ON and mode in (GROUPED_M, VARIABLE_K) and cfg.num_buffers == 2 and not out_f32 and \
-        c_early_fits(cfg) and (c_early or not beta1)
+    persist = _sw(PERSIST_ON, cfg.persist) and mode in (GROUPED_M, VARIABLE_K) and cfg.num_buffers == 2 and \
+        not out_f32 and c_early_fits(cfg) and (c_early or not beta1)
     return (cfg.tile_m, cfg.tile_n, cfg.num_buffers, cfg.kpair, cm, cn, bool(packed), bool(b_preshuffled),
             bool(k_tail), mode, G, bool(out_f32), bool(beta1), bool(c_early), bool(persist),
-            bool(XCD_REMAP_ON and mode == GROUPED_M), int(STAGGER_ON))
+            bool(_sw(XCD_REMAP_ON, cfg.xcd_remap) and mode == GROUPED_M and not persist), int(_sw(STAGGER_ON, cfg.stagger)))
 
 
 def _launch(who, mode, cfg, out, a, b, sa, sb, g0, g1, M, N, K, lda, ldb, ldsa, ldsb, G, b_preshuffled, beta1,

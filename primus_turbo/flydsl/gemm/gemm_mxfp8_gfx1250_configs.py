@@ -12,7 +12,10 @@ class MXGemmConfig(NamedTuple):
     """One kernel instance: a ``tile_m x tile_n`` block per workgroup of 2x2 waves, ``num_buffers`` LDS slots of
     ``kpair`` 128-wide K steps each, and a ``cluster_m x cluster_n`` workgroup cluster that multicasts the shared
     A (along N) and B (along M) tiles; 1x1 is the no-multicast config. ``scale_4d`` / ``b_preshuffle`` describe the
-    inputs (the entry point sets them from the scale tensors' rank and its ``b_preshuffled`` flag)."""
+    inputs (the entry point sets them from the scale tensors' rank and its ``b_preshuffled`` flag). ``persist``:
+    persistent workgroups (grouped-M / variable-K, bf16 out, kpair 2 x 2 slots; the next tile loads during the
+    stores); ``stagger``: the (first wave of) workgroups start in that many phases; ``xcd_remap``: grouped-M m tiles
+    grouped per XCD. The three are dropped where they do not apply."""
 
     tile_m: int = 256
     tile_n: int = 256
@@ -22,6 +25,9 @@ class MXGemmConfig(NamedTuple):
     cluster_n: int = 2
     scale_4d: bool = False
     b_preshuffle: bool = False
+    persist: bool = False
+    stagger: int = 0
+    xcd_remap: bool = False
 
 
 DEFAULT = MXGemmConfig()
