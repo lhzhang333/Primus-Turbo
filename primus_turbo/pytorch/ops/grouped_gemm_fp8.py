@@ -848,7 +848,9 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
             default_backend=(
-                mx_wgrad_accum_backend(grouped=True).value if ctx.fuse_bgrad_accum else BackendType.FLYDSL.value
+                mx_wgrad_accum_backend(grouped=True).value
+                if ctx.fuse_bgrad_accum
+                else BackendType.FLYDSL.value
             ),
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,

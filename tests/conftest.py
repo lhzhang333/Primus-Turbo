@@ -57,6 +57,10 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/core/test_mx_strict.py",
     # MXFP8 wgrad into main_grad (beta=1) vs the unfused add, dense and grouped; mx_wgrad_accum_supported.
     "tests/pytorch/ops/test_mx_wgrad_accum.py",
+    # gemm_fp8 (MXFP8) on the FlyDSL gfx1250 MX GEMM vs BF16 and the emulated recipe, strict mode.
+    "tests/pytorch/ops/test_gemm_fp8_mx_gfx1250.py",
+    # grouped_gemm_fp8 / grouped_mlp_fp8 (MXFP8, two-phase fused GLU) at the DSv3 expert shape vs BF16, strict mode.
+    "tests/pytorch/ops/test_grouped_mlp_mxfp8_gfx1250.py",
     # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250_mla).
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
     # HipKittens kernels of its backward (csrc/kernels/attention/hipkittens/gfx1250_mla).

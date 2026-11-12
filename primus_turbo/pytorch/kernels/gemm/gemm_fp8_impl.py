@@ -4,6 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import functools
+import inspect
 from typing import Tuple
 
 import torch
@@ -271,6 +273,63 @@ def _mx_dense_triton(a, a_scale_inv, b, b_scale_inv, out_dtype, beta=0.0, out=No
     return c[0]
 
 
+@functools.lru_cache(maxsize=None)
+def mx1250_gemm():
+    """(``gemm_mxfp8_gfx1250``, whether it has the beta=1 epilogue: its ``accumulate`` argument, the K line's
+    fp32-out / beta=1 step). gfx1250's MX GEMM, imported on first use."""
+    from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 import gemm_mxfp8_gfx1250
+
+    return gemm_mxfp8_gfx1250, "accumulate" in inspect.signature(gemm_mxfp8_gfx1250).parameters
+
+
+def mx1250_rows_ok(t: torch.Tensor) -> bool:
+    """An operand of gfx1250's MX GEMMs: E4M3, K contiguous, 16-byte aligned rows."""
+    return (
+        t.dtype == torch.float8_e4m3fn
+        and t.stride(-1) == 1
+        and t.stride(-2) % 16 == 0
+        and t.data_ptr() % 16 == 0
+    )
+
+
+def mx1250_scale_ok(s: torch.Tensor, rows: int, k: int, batch: tuple = ()) -> bool:
+    """E8M0 scales of a ``rows`` x ``k`` operand as gfx1250's MX GEMMs take them: raw ``[*batch, rows, ceil(k/32)]``
+    (k/32 contiguous) or packed ``[*batch, ceil(rows/32), ceil(k/128), 32, 4]`` (contiguous)."""
+    if s.element_size() != 1:
+        return False
+    if s.dim() == len(batch) + 4:
+        return s.shape == (*batch, -(-rows // 32), -(-k // 128), 32, 4) and s.is_contiguous()
+    return s.shape == (*batch, rows, -(-k // 32)) and s.stride(-1) == 1 and (not batch or s.is_contiguous())
+
+
+def mx1250_out_ok(out, shape, accumulate: bool, out_dtype) -> bool:
+    """The output of gfx1250's MX GEMMs: bf16 (N % 8 == 0); beta=1 (``accumulate``) into a bf16 / fp32 ``out`` of
+    ``shape`` with 16-byte aligned rows."""
+    if shape[-1] % 8:
+        return False
+    if not accumulate:
+        return out_dtype == torch.bfloat16
+    ok = out is not None and out.dtype in (torch.bfloat16, torch.float32) and out.shape == shape
+    return ok and out.is_contiguous() and out.data_ptr() % 16 == 0
+
+
+def _mx1250_can_handle(a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c, accumulate, out):
+    """``gemm_mxfp8_gfx1250``: NT, K % 16 == 0, both scales raw or both packed; beta=1 once it has that epilogue."""
+    if (
+        trans_a
+        or not trans_b
+        or trans_c
+        or a.dim() != 2
+        or b.dim() != 2
+        or a_scale_inv.dim() != b_scale_inv.dim()
+    ):
+        return False
+    (m, k), n = a.shape, b.shape[0]
+    ok = b.shape[1] == k and k % 16 == 0 and mx1250_rows_ok(a) and mx1250_rows_ok(b)
+    ok = ok and mx1250_scale_ok(a_scale_inv, m, k) and mx1250_scale_ok(b_scale_inv, n, k)
+    return ok and (not accumulate or mx1250_gemm()[1]) and mx1250_out_ok(out, (m, n), accumulate, out_dtype)
+
+
 class GEMMFP8TritonBackend(KernelBackend):
     """Triton persistent-kernel backend for FP8 GEMM.
 
@@ -280,8 +339,8 @@ class GEMMFP8TritonBackend(KernelBackend):
       - BLOCKWISE: block-wise scaling with three layouts:
           NT/RCR (forward), NN/RRR (grad_X), TN/CRR (grad_W)
       - MX_BLOCKWISE (gfx1250 only): NT, raw E8M0 [rows, K/32] scales, K % 128 == 0, beta=1 into a bf16 / fp16 /
-        fp32 ``out``: the grouped variable-K MX kernel with one group (``_mx_dense_triton``), the fallback until
-        the FlyDSL gfx1250 MX GEMM lands (hipBLASLt's MX GEMM is wrong there)
+        fp32 ``out``: the grouped variable-K MX kernel with one group (``_mx_dense_triton``), the fallback of the
+        FlyDSL gfx1250 MX GEMM (hipBLASLt's MX GEMM is wrong there)
     """
 
     SUPPORTED_GRANULARITIES = {
@@ -313,6 +372,7 @@ class GEMMFP8TritonBackend(KernelBackend):
             # gfx1250 only: other archs keep their MX backends (and auto-tune candidates) as they are
             supported = is_gfx1250() and (not trans_a) and trans_b and not trans_c
             supported &= a.dim() == 2 and b.dim() == 2 and b.shape[1] == k and k % 128 == 0
+            supported &= a_scale_inv.dim() == 2 and b_scale_inv.dim() == 2  # raw [rows, K/32] scales only
             supported &= a.dtype in (float8_e4m3, float8_e5m2) and b.dtype in (float8_e4m3, float8_e5m2)
             supported &= out_dtype in (torch.bfloat16, torch.float16)
             if inplace_add_to_out:
@@ -446,7 +506,9 @@ class GEMMFP8TurboBackend(KernelBackend):
 
 
 class GEMMFP8FlyDSLBackend(KernelBackend):
-    """FlyDSL 8-wave fp8 dense GEMM backend (gfx950 only).
+    """FlyDSL 8-wave fp8 dense GEMM backend (gfx950), and gfx1250's MX_BLOCKWISE GEMM.
+
+    gfx1250 MX_BLOCKWISE: ``gemm_mxfp8_gfx1250`` (``_mx1250_can_handle``), the default MX backend there.
 
     TENSORWISE: scalar a_scale/b_scale, bf16/fp16 out, arbitrary M/N/K, layouts
     NT/NN/TN (TT unsupported). trans_c via post-hoc transpose.
@@ -474,6 +536,10 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
+        if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
+            return _mx1250_can_handle(
+                a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c, inplace_add_to_out, out
+            )
         supported = True
         if inplace_add_to_out:
             supported &= out is not None and out.dtype == out_dtype
@@ -514,6 +580,10 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         out: torch.Tensor | None = None,
         **kwargs,
     ):
+        if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
+            if inplace_add_to_out:
+                return mx1250_gemm()[0](a, a_scale_inv, b, b_scale_inv, out.dtype, out=out, accumulate=True)
+            return mx1250_gemm()[0](a, a_scale_inv, b, b_scale_inv)
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             res = gemm_mxfp8_flydsl_kernel(
                 a,

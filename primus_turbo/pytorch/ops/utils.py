@@ -23,12 +23,11 @@ from primus_turbo.pytorch.core.low_precision import (
 from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950, is_gfx1250
 
 # MXFP8 wgrad GEMMs with a beta=1 epilogue (fuse_bgrad_accum_pattern) and the main_grad dtypes each one accumulates
-# into: dense = the wgrad of gemm_fp8, grouped = the variable-K wgrad of grouped_gemm_fp8. FlyDSL's are gfx950-only and
-# write 16-bit only.
+# into, off gfx1250: dense = the wgrad of gemm_fp8, grouped = the variable-K wgrad of grouped_gemm_fp8. FlyDSL's
+# (gfx950) write 16-bit only; gfx1250's FlyDSL epilogue takes bf16 / fp32.
 _MX_WGRAD_ACCUM_OUT_DTYPES = {
     False: {
         BackendType.HIPBLASLT: (torch.bfloat16, torch.float16, torch.float32),
-        BackendType.TRITON: (torch.bfloat16, torch.float16, torch.float32),
         BackendType.FLYDSL: (torch.bfloat16, torch.float16),
     },
     True: {
@@ -38,14 +37,27 @@ _MX_WGRAD_ACCUM_OUT_DTYPES = {
 }
 
 
+def _mx1250_flydsl_accum(grouped: bool) -> bool:
+    """Whether gfx1250's FlyDSL MX wgrad has its beta=1 epilogue yet (dense: ``gemm_mxfp8_gfx1250(accumulate=)``,
+    grouped: the variable-K entry point)."""
+    if grouped:
+        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import mx1250_grouped
+
+        return mx1250_grouped().variable_k is not None
+    from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import mx1250_gemm
+
+    return mx1250_gemm()[1]
+
+
 def mx_wgrad_accum_backend(grouped: bool) -> BackendType:
     """Default backend of the MXFP8 wgrad that accumulates into ``main_grad`` (beta=1), in one place so a new kernel
-    switches it here: dense hipBLASLt (Triton on gfx1250, where hipBLASLt's MX GEMM is wrong); grouped Triton, which
-    also takes the fp32 main_grad Megatron allocates by default (FlyDSL's gfx950 epilogue writes only 16-bit; pin it
-    with GlobalBackendManager for a bf16 main_grad)."""
-    if grouped or is_gfx1250():
-        return BackendType.TRITON
-    return BackendType.HIPBLASLT
+    switches it here: gfx1250 FlyDSL (until its kernels have the beta=1 epilogue ``mx_wgrad_accum_supported`` says
+    no, so frameworks add the wgrad themselves; a call that asks anyway falls back to Triton); elsewhere dense
+    hipBLASLt, grouped Triton, which also takes the fp32 main_grad Megatron allocates by default (FlyDSL's gfx950
+    epilogue writes only 16-bit; pin it with GlobalBackendManager for a bf16 main_grad)."""
+    if is_gfx1250():
+        return BackendType.FLYDSL
+    return BackendType.TRITON if grouped else BackendType.HIPBLASLT
 
 
 def mx_wgrad_accum_supported(grouped: bool, main_grad_dtype: torch.dtype) -> bool:
@@ -55,15 +67,21 @@ def mx_wgrad_accum_supported(grouped: bool, main_grad_dtype: torch.dtype) -> boo
     accumulating call, so it is answered for the default. Frameworks ask before passing fuse_bgrad_accum_pattern."""
     if is_gfx942():  # no MXFP8
         return False
-    pinned = (GlobalBackendManager.get_grouped_gemm_backend if grouped else GlobalBackendManager.get_gemm_backend)(
-        PrecisionType.FP8
-    )
+    pinned = (
+        GlobalBackendManager.get_grouped_gemm_backend if grouped else GlobalBackendManager.get_gemm_backend
+    )(PrecisionType.FP8)
     backend = getattr(pinned, "backend", None) or mx_wgrad_accum_backend(grouped)
+    if (
+        is_gfx1250()
+    ):  # hipBLASLt's MX GEMM is wrong there (GEMMFP8HipBLASLtBackend refuses it); Triton is the fallback
+        if backend == BackendType.FLYDSL:
+            return main_grad_dtype in (torch.bfloat16, torch.float32) and _mx1250_flydsl_accum(grouped)
+        return backend == BackendType.TRITON and main_grad_dtype in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        )
     if backend == BackendType.FLYDSL and not is_gfx950():
-        return False
-    if backend == BackendType.HIPBLASLT and is_gfx1250():  # GEMMFP8HipBLASLtBackend refuses MX there
-        return False
-    if backend == BackendType.TRITON and not grouped and not is_gfx1250():  # the dense Triton MX path is gfx1250's
         return False
     return main_grad_dtype in _MX_WGRAD_ACCUM_OUT_DTYPES[grouped].get(backend, ())
 
