@@ -113,6 +113,25 @@ def _mlp_bf16(x, w1, w2, lens, probs):
     return torch.cat(out)
 
 
+@pytest.mark.parametrize("G, M, H, I", SHAPES)
+def test_grouped_chain(backend, G, M, H, I):
+    """The unfused experts (``turbo_fused_grouped_gemm`` off): fc1 and fc2 by grouped_gemm_fp8 around a torch SwiGLU
+    with probs, plain bf16 leaves (no cached weights): every leaf's gradient vs BF16 (SNR >= 20 dB)."""
+    lens = _group_lens(G, M, True)
+    x, dy = _randn(M, H, seed=1), _randn(M, H, seed=4)
+    w1, w2 = _randn(G, 2 * I, H, scale=H**-0.5, seed=2), _randn(G, H, I, scale=I**-0.5, seed=3)
+    probs = torch.rand(M, device="cuda", generator=torch.Generator(device="cuda").manual_seed(5))
+    leaves = [t.clone().requires_grad_() for t in (x, w1, w2, probs)]
+    gate, up = grouped_gemm_fp8(leaves[0], leaves[1], lens, trans_b=True, config=MX).chunk(2, dim=-1)
+    act = (F.silu(gate.float()) * up.float() * leaves[3][:, None]).bfloat16()
+    grouped_gemm_fp8(act, leaves[2], lens, trans_b=True, config=MX).backward(dy)
+    refs = [t.clone().requires_grad_() for t in (x, w1, w2, probs)]
+    _mlp_bf16(*refs[:3], lens, refs[3]).backward(dy)
+    for name, got, ref in zip(("dx", "dw1", "dw2", "dprobs"), leaves, refs):
+        assert got.grad is not None, name
+        _check(name, got.grad, ref.grad, 20)
+
+
 @pytest.mark.parametrize("skew", [False, True])
 @pytest.mark.parametrize("G, M, H, I", SHAPES)
 def test_grouped_mlp(backend, G, M, H, I, skew):

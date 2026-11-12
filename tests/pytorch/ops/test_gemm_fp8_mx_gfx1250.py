@@ -10,6 +10,7 @@ the same quantization, so only the GEMM's accumulation order and the bf16 output
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import primus_turbo.common.envs as envs
 from primus_turbo.pytorch.core.backend import GlobalBackendManager
@@ -100,6 +101,21 @@ def test_cached_weight():
         out.backward(dy)
         res.append((out, xg.grad))
     assert all(torch.equal(a, b) for a, b in zip(*res))
+
+
+def test_chain():
+    """Two linears around a GELU on plain bf16 leaves: every leaf's gradient vs BF16 (SNR >= 20 dB)."""
+    x, w1, _ = _data(512, 1024, 768)
+    _, w2, dy = _data(512, 768, 1024, seed=1)
+
+    def grads(mm):
+        leaves = [t.clone().requires_grad_() for t in (x, w1, w2)]
+        mm(F.gelu(mm(leaves[0], leaves[1]).float()).bfloat16(), leaves[2]).backward(dy)
+        return [t.grad for t in leaves]
+
+    mx = grads(lambda a, b: gemm_fp8(a, b, trans_b=True, out_dtype=torch.bfloat16, config=MX))
+    for name, got, ref in zip(("dx", "dw1", "dw2"), mx, grads(lambda a, b: a @ b.t())):
+        assert got is not None and snr_db(got, ref) >= 20, name
 
 
 def test_fallback_refused(strict):
