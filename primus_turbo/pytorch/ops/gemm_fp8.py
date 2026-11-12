@@ -589,7 +589,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
         granularity = config.granularity
         block_size = config.block_size
 
-        lay = mx_gemm_layout(b)
+        lay = mx_gemm_layout(b, a=a)
         a_scaling_recipe, a_t_recipe = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
         if isinstance(a, QuantizedTensor):
             check_quantized_tensor(a, config, axis=-1, scaling_recipe=a_scaling_recipe)

@@ -552,8 +552,8 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
 
         M = int(probs.shape[0])
         x_dtype = _get_fp8_dtype(config.format, True)
-        lay = mx_gemm_layout(w1, grouped=True)
-        assert mx_gemm_layout(w2, grouped=True) == lay, "w1 and w2 must be quantized in the same layout"
+        lay = mx_gemm_layout(w1, grouped=True, a=x)
+        assert mx_gemm_layout(w2, grouped=True, a=x) == lay, "w1 and w2 must be quantized in the same layout"
         x_rec, x_t_rec = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
         if not isinstance(x, QuantizedTensor):
             x_row, x_row_scale, x_col, x_col_scale, _, offs_row, _, _ = grouped_quantize_fp8_with_trans(

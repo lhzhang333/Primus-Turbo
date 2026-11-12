@@ -667,7 +667,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
         a_dtype = b_dtype = _get_fp8_dtype(config.format, True)
 
-        lay = mx_gemm_layout(b, grouped=True)
+        lay = mx_gemm_layout(b, grouped=True, a=a)
         a_scaling_recipe, a_t_recipe = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
         if not isinstance(a, QuantizedTensor):
             # NOTE: If a is not a QuantizedTensor use grouped_quantize_fp8_with_trans to avoid call dequantize.

@@ -102,13 +102,15 @@ def mx_weight_layout_recipe(grouped: bool, shape=None) -> ScalingRecipe:
     return MX_W if ok else ScalingRecipe(use_2d_block=True)
 
 
-def mx_gemm_layout(w, grouped: bool = False) -> bool:
-    """Whether the MX GEMMs of a ``gemm_fp8`` / (``grouped``) grouped op with weight ``w`` run on gfx1250's GEMM
-    layouts: a cached ``w``'s recipe says, a plain one takes them when ``mx_weight_layout_recipe`` would cache it so."""
+def mx_gemm_layout(w, grouped: bool = False, a=None) -> bool:
+    """Whether the MX GEMMs of a ``gemm_fp8`` / (``grouped``) grouped op with weight ``w`` and input ``a`` run on
+    gfx1250's GEMM layouts: a cached ``w``'s recipe says, else a quantized ``a``'s, else a plain ``w`` takes them when
+    ``mx_weight_layout_recipe`` would cache it so."""
     from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 
-    if isinstance(w, QuantizedTensor):
-        return bool(w.scaling_recipe is not None and w.scaling_recipe.shuffle_out)
+    for t, flag in ((w, "shuffle_out"), (a, "shuffle_scale")):
+        if isinstance(t, QuantizedTensor):
+            return bool(t.scaling_recipe is not None and getattr(t.scaling_recipe, flag))
     return mx_weight_layout_recipe(grouped, w.shape) == MX_W
 
 
