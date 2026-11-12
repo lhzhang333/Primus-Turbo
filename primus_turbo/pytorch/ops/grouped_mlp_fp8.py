@@ -40,10 +40,14 @@ from primus_turbo.pytorch.ops.quantization import (
     quantize_fp8_with_trans,
 )
 from primus_turbo.pytorch.ops.utils import (
+    MX_A,
+    MX_B,
+    MX_W,
     _ensure_contiguous_grad_out,
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx_gemm_layout,
 )
 
 __all__ = [
@@ -96,6 +100,7 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
     out: Optional[torch.Tensor] = None,
     m_real: Optional[int] = None,
     n_real: Optional[int] = None,
+    b_preshuffled: bool = False,
 ) -> Optional[torch.Tensor]:
     """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked to.
 
@@ -117,6 +122,7 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
         default_backend=default_backend,
         m_real=m_real,
         n_real=n_real,
+        b_preshuffled=b_preshuffled,
     )
 
     if not inplace_add_to_out:
@@ -453,6 +459,7 @@ def _quantize_weight(
     w: Union[torch.Tensor, QuantizedTensor],
     w_t: Optional[QuantizedTensor],
     config: Float8QuantConfig,
+    lay: bool = False,
 ):
     """(row-wise, col-wise) MXFP8 operands for one 3D expert weight.
 
@@ -460,7 +467,7 @@ def _quantize_weight(
     across the tile keeps the forward and dgrad operands consistent. A cached ``w_t``
     is taken as given; only its absence forces the col-wise pass.
     """
-    recipe = ScalingRecipe(use_2d_block=True)
+    recipe = MX_W if lay else ScalingRecipe(use_2d_block=True)  # lay: gfx1250's MX GEMM layout
     w_dtype = _get_fp8_dtype(config.format, True)
     if not isinstance(w, QuantizedTensor):
         return quantize_fp8_with_trans(
@@ -476,7 +483,7 @@ def _quantize_weight(
     check_quantized_tensor(w, config, axis=-1, scaling_recipe=recipe)
     if w_t is None:
         mx_strict(
-            "grouped_mlp_fp8 (MXFP8): an expert weight has no transposed copy; re-quantizing it from its dequantized values"
+            "grouped_mlp_fp8 (MXFP8): no w_t, re-quantizing an expert weight from its dequantized values"
         )
         w_t = QuantizedTensor.quantize(
             w.dequantize(),
@@ -547,6 +554,9 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
 
         M = int(probs.shape[0])
         x_dtype = _get_fp8_dtype(config.format, True)
+        lay = mx_gemm_layout(w1, grouped=True, a=x)
+        assert mx_gemm_layout(w2, grouped=True, a=x) == lay, "w1 and w2 must be quantized in the same layout"
+        x_rec, x_t_rec = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
         if not isinstance(x, QuantizedTensor):
             x_row, x_row_scale, x_col, x_col_scale, _, offs_row, _, _ = grouped_quantize_fp8_with_trans(
                 x,
@@ -555,30 +565,31 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
                 group_lens,
                 group_offs,
                 block_size=MXFP8_BLOCK_SIZE,
+                scaling_recipe=x_rec,
+                scaling_recipe_for_trans=x_t_rec,
             )
         else:
             assert x._is_grouped_tensor, "a QuantizedTensor input must be a grouped tensor"
-            check_quantized_tensor(x, config, axis=-1)
+            check_quantized_tensor(x, config, axis=-1, scaling_recipe=x_rec if lay else None)
             x_row, x_row_scale = x.qdata, x.scale_inv
             offs_row = x.group_offs
             if x_t is None:
-                mx_strict(
-                    "grouped_mlp_fp8 (MXFP8): x has no transposed copy (x_t); re-quantizing it from its dequantized values"
-                )
+                mx_strict("grouped_mlp_fp8 (MXFP8): no x_t, re-quantizing x from its dequantized values")
                 x_t = QuantizedTensor.quantize(
                     x.dequantize(),
                     x.real_dtype,
                     config.granularity,
                     axis=-2,
                     block_size=config.block_size,
+                    scaling_recipe=x_t_rec,
                     group_lens=group_lens,
                 )
             else:
                 assert isinstance(x_t, QuantizedTensor)
             x_col, x_col_scale = x_t.qdata, x_t.scale_inv
 
-        w1_row, w1_row_scale, w1_col, w1_col_scale = _quantize_weight(w1, w1_t, config)
-        w2_row, w2_row_scale, w2_col, w2_col_scale = _quantize_weight(w2, w2_t, config)
+        w1_row, w1_row_scale, w1_col, w1_col_scale = _quantize_weight(w1, w1_t, config, lay)
+        w2_row, w2_row_scale, w2_col, w2_col_scale = _quantize_weight(w2, w2_t, config, lay)
 
         # The activation is quantised inside the epilogue: it feeds nothing but the
         # quantiser, so staging it in out_dtype would be an [M, I] round trip through HBM.
@@ -595,8 +606,8 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             num_cu=num_cu,
             probs=probs,
             config=config,
-            out_row_scaling_recipe=ScalingRecipe(),
-            out_col_scaling_recipe=ScalingRecipe(),
+            out_row_scaling_recipe=x_rec,  # act: fc2's A rows, its wgrad's B columns
+            out_col_scaling_recipe=x_t_rec,
             activation=activation,
             clamp_limit=clamp_limit,
         )
@@ -617,6 +628,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             num_cu=num_cu,
             default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
+            b_preshuffled=lay,
         )[:M]
 
         ctx.save_for_backward(
@@ -633,6 +645,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             group_lens,
             group_offs,
         )
+        ctx.lay = lay
         ctx.activation = activation
         ctx.clamp_limit = clamp_limit
         ctx.config = config
@@ -665,6 +678,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
         ) = ctx.saved_tensors
 
         M = int(probs.shape[0])
+        g_rec = MX_A if ctx.lay else ScalingRecipe()  # grad_out's two copies are A operands
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
         (
             go_row,
@@ -682,6 +696,8 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             group_lens,
             group_offs,
             block_size=ctx.config.block_size,
+            scaling_recipe=g_rec,
+            scaling_recipe_for_trans=g_rec,
         )
         default_backend = BackendType.FLYDSL.value
 
@@ -702,6 +718,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             default_backend=default_backend,
             inplace_add_to_out=ctx.fuse_w2_accum,
             out=ctx.w2_main_grad,
+            b_preshuffled=ctx.lay,
         )
 
         # dgrad against w2_col, contracting K_out; the epilogue turns it into the
@@ -720,8 +737,8 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             probs=probs,
             intermediate=l1,
             config=ctx.config,
-            out_row_scaling_recipe=ScalingRecipe(),
-            out_col_scaling_recipe=ScalingRecipe(),
+            out_row_scaling_recipe=g_rec,  # grad_l1: the A of fc1's dgrad and wgrad
+            out_col_scaling_recipe=g_rec,
             activation=ctx.activation,
             clamp_limit=ctx.clamp_limit,
         )
@@ -741,6 +758,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             num_cu=ctx.num_cu,
             default_backend=default_backend,
             group_offs_out=group_offs,
+            b_preshuffled=ctx.lay,
         )[:M]
 
         # grad_w1 = grad_l1_col @ x_col^T, contracting M.
@@ -760,6 +778,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             default_backend=default_backend,
             inplace_add_to_out=ctx.fuse_w1_accum,
             out=ctx.w1_main_grad,
+            b_preshuffled=ctx.lay,
         )
 
         return (

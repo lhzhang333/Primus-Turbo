@@ -5,7 +5,6 @@
 ###############################################################################
 
 import functools
-from typing import Callable, NamedTuple, Optional
 
 import torch
 
@@ -429,7 +428,7 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
             supported &= b.dtype in (float8_e4m3, float8_e5m2)
             supported &= out_dtype in (torch.float16, torch.bfloat16)
             supported &= trans_b
-            # raw [rows, K/32] scales and a row-major b only (not gfx1250's packed / 16x16 GEMM layouts)
+            # raw scales, row-major b (not gfx1250's GEMM layouts)
             supported &= a_scales.dim() == 2 and b_scales.dim() == 3 and not kwargs.get("b_preshuffled")
         return supported
 
@@ -499,29 +498,18 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         )
 
 
-class MX1250Grouped(NamedTuple):
-    """gfx1250's grouped MX GEMMs (the grouped-M and variable-K modes of ``gemm_mxfp8_kernel_gfx1250``), None while
-    that module does not have them."""
-
-    grouped: Optional[Callable]
-    variable_k: Optional[Callable]
-
-
 @functools.lru_cache(maxsize=None)
-def mx1250_grouped() -> MX1250Grouped:
+def mx1250_grouped():
+    """gfx1250's (grouped-M, variable-K) MX GEMMs of ``gemm_mxfp8_kernel_gfx1250``, None while it lacks them."""
     from primus_turbo.flydsl.gemm import gemm_mxfp8_kernel_gfx1250 as k
 
-    return MX1250Grouped(
-        getattr(k, "grouped_gemm_mxfp8_gfx1250", None),
-        getattr(k, "grouped_gemm_mxfp8_variable_k_gfx1250", None),
-    )
+    return tuple(getattr(k, f"grouped_gemm_mxfp8{m}_gfx1250", None) for m in ("", "_variable_k"))
 
 
-def _mx1250_grouped_can_handle(a, b, sa, sb, group_offs, trans_a, trans_b, out_dtype, kw) -> bool:
-    """gfx1250 fwd / dgrad: ``a [M, K]`` read from ``group_offs`` (the quantizer's row table; 32-aligned when the
-    scales are packed), ``b [G, N, K]`` row-major or 16x16 blocks (``b_preshuffled``), out tight under
-    ``group_offs_out``."""
-    if mx1250_grouped().grouped is None or trans_a or not trans_b or a.dim() != 2 or b.dim() != 3:
+def _mx1250_grouped_ok(a, sa, b, sb, group_offs, out_dtype, kw) -> bool:
+    """gfx1250 fwd / dgrad: ``a [M, K]`` read under ``group_offs`` (32-aligned for packed scales),
+    ``b [G, N, K]`` row-major or (``b_preshuffled``) 16x16 blocks, out tight under ``group_offs_out``."""
+    if mx1250_grouped()[0] is None or a.dim() != 2 or b.dim() != 3:
         return False
     (m, k), (g, n) = a.shape, b.shape[:2]
     ok = mx1250_operands_ok(a, sa, b, sb, k, (g,)) and b.is_contiguous() and group_offs.dtype == torch.int64
@@ -529,22 +517,25 @@ def _mx1250_grouped_can_handle(a, b, sa, sb, group_offs, trans_a, trans_b, out_d
     return ok and kw.get("n_real") is None and mx1250_out_ok(None, (m, n), False, out_dtype)
 
 
-def _mx1250_variable_k_can_handle(
-    lhs, ls, rhs, rs, group_offs, out_shape, out_dtype, accumulate, out, kw
-) -> bool:
-    """gfx1250 wgrad: ``out[g] (+)= lhs[:, T_g] @ rhs[:, T_g]^T`` over the [rows, T] column copies, T_g from
-    ``group_offs`` (multiples of 128); ``rhs`` row-major or 16x16 blocks (``b_preshuffled``)."""
-    if mx1250_grouped().variable_k is None or lhs.dim() != 2 or rhs.dim() != 2:
+def _mx1250_vk_ok(a, sa, b, sb, trans_c, group_offs, out_dtype, accumulate, out, kw) -> bool:
+    """gfx1250 wgrad ``out[g] (+)= lhs[:, T_g] @ rhs[:, T_g]^T`` of the [rows, T] column copies (``trans_c``
+    swaps them; rhs row-major or 16x16 blocks), T_g from ``group_offs`` (multiples of 128)."""
+    (lhs, ls), (rhs, rs) = ((b, sb), (a, sa)) if trans_c else ((a, sa), (b, sb))
+    if mx1250_grouped()[1] is None or lhs.dim() != 2 or rhs.dim() != 2:
         return False
-    t, n = lhs.shape[1], rhs.shape[0]
+    (m, t), n = lhs.shape, rhs.shape[0]
     ok = t % 128 == 0 and mx1250_operands_ok(lhs, ls, rhs, rs, t) and group_offs.dtype == torch.int64
-    ok = ok and (not kw.get("b_preshuffled") or n % 16 == 0)
-    ok = ok and kw.get("m_real") is None and kw.get("n_real") is None
-    return ok and mx1250_out_ok(out, out_shape, accumulate, out_dtype)
+    ok = (
+        ok
+        and (not kw.get("b_preshuffled") or n % 16 == 0)
+        and kw.get("m_real") is None
+        and kw.get("n_real") is None
+    )
+    return ok and mx1250_out_ok(out, (group_offs.numel() - 1, m, n), accumulate, out_dtype)
 
 
 class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
-    """FlyDSL fp8 grouped GEMM backend (gfx950), and gfx1250's MX_BLOCKWISE grouped GEMM (``mx1250_grouped``).
+    """FlyDSL fp8 grouped GEMM backend (gfx950); gfx1250 MX_BLOCKWISE through ``mx1250_grouped``.
 
     M-grouped operator. Granularities:
       - TENSORWISE: forward (trans_b=True, NT) + dgrad (trans_b=False, NN).
@@ -571,9 +562,8 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
-            return _mx1250_grouped_can_handle(
-                a, b, a_scales, b_scales, group_offs, trans_a, trans_b, out_dtype, kwargs
-            )
+            nt = not trans_a and trans_b
+            return nt and _mx1250_grouped_ok(a, a_scales, b, b_scales, group_offs, out_dtype, kwargs)
         supported = True
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
@@ -613,13 +603,10 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
         )
 
         if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
-            # read a from group_offs, write tight under group_offs_out; out over-allocated to a's rows
-            offs_out = kwargs.get("group_offs_out")
-            offs_out = group_offs if offs_out is None else offs_out
-            bsh = bool(kwargs.get("b_preshuffled"))
-            return mx1250_grouped().grouped(
-                a, a_scales, b, b_scales, offs_out, group_offs, a.shape[0], out_dtype, b_preshuffled=bsh
-            )
+            # a read under group_offs, out written tight under group_offs_out (over-allocated to a's rows)
+            offs = group_offs if kwargs.get("group_offs_out") is None else kwargs["group_offs_out"]
+            fn, bsh = mx1250_grouped()[0], bool(kwargs.get("b_preshuffled"))
+            return fn(a, a_scales, b, b_scales, offs, group_offs, a.shape[0], out_dtype, b_preshuffled=bsh)
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_kernel import (
                 grouped_gemm_mxfp8_flydsl_kernel,
@@ -833,7 +820,7 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
 
 
 class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
-    """FlyDSL fp8 variable-K grouped GEMM backend (gfx950), and gfx1250's MX_BLOCKWISE wgrad (``mx1250_grouped``).
+    """FlyDSL fp8 variable-K grouped GEMM backend (gfx950); gfx1250 MX_BLOCKWISE through ``mx1250_grouped``.
 
     wgrad: C[g] = lhs[offs[g]:offs[g+1]]^T @ rhs[offs[g]:offs[g+1]], contraction
     = m_g (variable per group) via a runtime scf.for K-loop. Supports TENSORWISE
@@ -863,14 +850,8 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
-            if trans_a or trans_b:
-                return False
-            (lhs, ls), (rhs, rs) = (
-                ((b, b_scales), (a, a_scales)) if trans_c else ((a, a_scales), (b, b_scales))
-            )
-            shape = (group_lens.shape[0], lhs.shape[0], rhs.shape[0])
-            return _mx1250_variable_k_can_handle(
-                lhs, ls, rhs, rs, group_offs, shape, out_dtype, inplace_add_to_out, out, kwargs
+            return not (trans_a or trans_b) and _mx1250_vk_ok(
+                a, a_scales, b, b_scales, trans_c, group_offs, out_dtype, inplace_add_to_out, out, kwargs
             )
         supported = True
         if inplace_add_to_out:
@@ -928,12 +909,10 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
             lhs_scales, rhs_scales = a_scales, b_scales
 
         if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
-            fn, bsh = mx1250_grouped().variable_k, bool(kwargs.get("b_preshuffled"))
-            if inplace_add_to_out:
-                return fn(
-                    lhs, lhs_scales, rhs, rhs_scales, group_offs, out.dtype, out, True, b_preshuffled=bsh
-                )
-            return fn(lhs, lhs_scales, rhs, rhs_scales, group_offs, out_dtype, b_preshuffled=bsh)
+            bsh = bool(kwargs.get("b_preshuffled"))
+            acc = dict(out_dtype=out.dtype, out=out, accumulate=True) if inplace_add_to_out else {}
+            kw = {"out_dtype": out_dtype, "b_preshuffled": bsh, **acc}
+            return mx1250_grouped()[1](lhs, lhs_scales, rhs, rhs_scales, group_offs, **kw)
 
         beta = 1.0 if inplace_add_to_out else 0.0
         accum_out = out if inplace_add_to_out else None
@@ -1361,8 +1340,8 @@ def _check_mx_out_recipes(row: ScalingRecipe, col: ScalingRecipe) -> None:
     for name, recipe in (("row", row), ("col", col)):
         assert not recipe.use_sr, f"the fused MXFP8 epilogue has no stochastic rounding, got {name}={recipe}"
         assert not recipe.use_rht, f"the fused MXFP8 epilogue has no RHT, got {name}={recipe}"
-        assert not recipe.shuffle_scale and not recipe.shuffle_out, (
-            f"the fused MXFP8 epilogue writes unshuffled operands, got {name}={recipe}"
+        assert is_gfx1250() or not (recipe.shuffle_scale or recipe.shuffle_out), (
+            f"the fused MXFP8 epilogue writes unshuffled operands (but gfx1250's), got {name}={recipe}"
         )
         assert not recipe.use_2d_block, (
             f"2-D block scaling is the only recipe field this epilogue could express, but it is "
@@ -1374,7 +1353,9 @@ _MX_COL_ALIGN = 128  # the col-wise operand's per-group M alignment, as the quan
 _MX_ROW_ALIGN = 128  # and the row-wise operand's N alignment
 
 
-def _alloc_mx_act_buffers(I: int, M_pad_row: int, M_pad_col: int, quant_dtype: torch.dtype, device):
+def _alloc_mx_act_buffers(
+    I: int, M_pad_row: int, M_pad_col: int, quant_dtype: torch.dtype, device, row=None, col=None
+):
     """The four MXFP8 operands ``grouped_quant_mxfp8_raw`` would have made.
 
     Byte-identical geometry to the standalone quantiser, because the wgrad and fc2 consume
@@ -1387,16 +1368,23 @@ def _alloc_mx_act_buffers(I: int, M_pad_row: int, M_pad_col: int, quant_dtype: t
     zero-amax safe path. The epilogue writes every real column and every padded col-wise
     row (a group's ragged tail included, as zeros), but the columns past ``I`` belong to no
     tile and fc2 contracts over them.
+
+    ``row`` / ``col``: the out recipes; ``shuffle_scale`` packs that copy's scales as gfx1250's quantizers do,
+    ``[ceil(R/32), ceil(C/128), 32, 4]`` (the fake functions' shapes).
     """
     I_pad = -(-I // _MX_ROW_ALIGN) * _MX_ROW_ALIGN
     e8 = getattr(torch, "float8_e8m0fnu", torch.uint8)
+
+    def pk(r, c, rec):
+        return (-(-r // 32), -(-c // 128), 32, 4) if rec and rec.shuffle_scale else (r, c // MXFP8_BLOCK_SIZE)
+
     row_out = torch.empty((M_pad_row, I_pad), dtype=quant_dtype, device=device)
-    row_sc = torch.empty((M_pad_row, I_pad // MXFP8_BLOCK_SIZE), dtype=torch.uint8, device=device)
-    if I_pad != I:
+    row_sc = torch.empty(pk(M_pad_row, I_pad, row), dtype=torch.uint8, device=device)
+    if I_pad != I and row_sc.dim() == 2:
         row_out.view(torch.uint8)[:, I:].zero_()
         row_sc[:, I // MXFP8_BLOCK_SIZE :].fill_(127)
     col_out = torch.empty((I, M_pad_col), dtype=quant_dtype, device=device)
-    col_sc = torch.empty((I, M_pad_col // MXFP8_BLOCK_SIZE), dtype=torch.uint8, device=device)
+    col_sc = torch.empty(pk(I, M_pad_col, col), dtype=torch.uint8, device=device)
     return row_out, row_sc.view(e8), col_out, col_sc.view(e8)
 
 
@@ -1684,19 +1672,27 @@ def grouped_gemm_fp8_dglu_impl_meta(
     return grad_probs, grad_intermediate, grad_scale_inv
 
 
-def _mx1250_glu_phase1(a, b, a_scales, b_scales, group_lens, group_offs, out_dtype, num_cu, M):
-    """gfx1250's fused GLU / dGLU run in two phases; this is the first: the grouped MX GEMM's bf16 output, tight
-    ``[M, N]``, and the tight offsets the second (the fused GLU / dGLU + dual-quant kernel) indexes it by."""
-    import primus_turbo.common.envs as envs
-    from primus_turbo.flydsl.quantization import mxfp8_quant_gfx1250
+def _mx1250_glu_phase1(
+    a, b, a_scales, b_scales, group_lens, group_offs, out_dtype, num_cu, M, row, col, qdtype
+):
+    """gfx1250's fused GLU / dGLU run in two phases; this is the first: the grouped MX GEMM's bf16 output
+    (tight ``[M, N]``) and the tight offsets, then (the quantizer module, its scale rule, the layout bits of the
+    ``row`` / ``col`` out recipes) for the second, the fused GLU / dGLU + dual-quant kernel. A shuffled out
+    recipe means the MX GEMM layouts throughout, ``b`` (a weight copy) included: 16x16 blocks."""
+    from primus_turbo.pytorch.kernels.quantization.quantization_impl import _gfx1250_mxfp8
 
     offs = torch.zeros(group_lens.shape[0] + 1, device=a.device, dtype=torch.int64)
     torch.cumsum(group_lens, 0, out=offs[1:])
     out = grouped_gemm_fp8_impl(
-        a, b, a_scales, b_scales, group_lens, group_offs, False, True, out_dtype, ScalingGranularity.MX_BLOCKWISE.value,
-        num_cu, BackendType.FLYDSL.value, group_offs_out=offs,
+        a, b, a_scales, b_scales, group_lens, group_offs, False, True, out_dtype,
+        ScalingGranularity.MX_BLOCKWISE.value, num_cu, BackendType.FLYDSL.value, group_offs_out=offs,
+        b_preshuffled=row.shuffle_scale,
     )[:M]  # fmt: skip
-    return out, offs, mxfp8_quant_gfx1250, envs.PRIMUS_TURBO_MXFP8_SCALE_RULE
+    quant = _gfx1250_mxfp8(out, qdtype, row, col)
+    assert quant is not None, (
+        f"gfx1250 fused MXFP8 GLU / dGLU: no FlyDSL quantizer for {out.dtype} -> {qdtype}"
+    )
+    return (out, offs, *quant)
 
 
 @_torch_custom_op_wrapper("primus_turbo::grouped_gemm_mxfp8_glu_impl", mutates_args=(), device_types="cuda")
@@ -1749,22 +1745,15 @@ def grouped_gemm_mxfp8_glu_impl(
     I, G = N // 2, int(group_lens.shape[0])
     assert N % 2 == 0, f"fc1 width must be even (gate||up), got {N}"
     if is_gfx1250():
-        # the activation is fc2's K, which its weight copies pad to 128: unpadded only when I is a multiple of it
-        assert I % _MX_ROW_ALIGN == 0, (
-            f"gfx1250 fused MXFP8 GLU: I ({I}) must be a multiple of {_MX_ROW_ALIGN}"
-        )
-        l1, offs, Q, rule = _mx1250_glu_phase1(
-            a, b, a_scales, b_scales, group_lens, group_offs, out_dtype, num_cu, int(probs.shape[0])
-        )
+        # the activation is fc2's K, which its weight copies pad to 128: unpadded only for I % 128 == 0
+        assert I % _MX_ROW_ALIGN == 0, f"gfx1250 fused MXFP8 GLU: I ({I}) must be a multiple of 128"
+        qdtype = _get_fp8_dtype(config.format, True)
+        l1, offs, Q, rule, lay = _mx1250_glu_phase1(
+            a, b, a_scales, b_scales, group_lens, group_offs, out_dtype, num_cu, int(probs.shape[0]),
+            out_row_scaling_recipe, out_col_scaling_recipe, qdtype,
+        )  # fmt: skip
         q = Q.grouped_glu_quant_mxfp8(
-            l1,
-            probs.float(),
-            group_lens,
-            offs,
-            activation,
-            clamp_limit,
-            _get_fp8_dtype(config.format, True),
-            rule,
+            l1, probs.float(), group_lens, offs, activation, clamp_limit, qdtype, rule, layout=lay
         )
         return l1, q[0], q[1], q[2], q[3]
 
@@ -1846,8 +1835,9 @@ def grouped_gemm_mxfp8_glu_impl_meta(
     M_pad_col = -(-(M + G * _MX_COL_ALIGN) // _MX_COL_ALIGN) * _MX_COL_ALIGN
     intermediate = torch.empty((M, N), device=a.device, dtype=out_dtype)
     row_out, row_sc, col_out, col_sc = _alloc_mx_act_buffers(
-        I, M_pad_row, M_pad_col, _get_fp8_dtype(config.format, True), a.device
-    )
+        I, M_pad_row, M_pad_col, _get_fp8_dtype(config.format, True), a.device, out_row_scaling_recipe,
+        out_col_scaling_recipe,
+    )  # fmt: skip
     return intermediate, row_out, row_sc, col_out, col_sc
 
 
@@ -1889,12 +1879,14 @@ def grouped_gemm_mxfp8_dglu_impl(
     I, K = int(b.shape[1]), int(b.shape[2])
     G = int(group_lens.shape[0])
     if is_gfx1250():
-        grad_act, offs, Q, rule = _mx1250_glu_phase1(
-            a, b, a_scales, b_scales, group_lens, group_offs, out_dtype, num_cu, int(probs.shape[0])
-        )
+        qdtype = _get_fp8_dtype(config.format, False)
+        grad_act, offs, Q, rule, lay = _mx1250_glu_phase1(
+            a, b, a_scales, b_scales, group_lens, group_offs, out_dtype, num_cu, int(probs.shape[0]),
+            out_row_scaling_recipe, out_col_scaling_recipe, qdtype,
+        )  # fmt: skip
         grad_probs, *q = Q.grouped_dglu_quant_mxfp8(
-            grad_act, intermediate, probs.float(), group_lens, offs, activation, clamp_limit,
-            _get_fp8_dtype(config.format, False), rule,
+            grad_act, intermediate, probs.float(), group_lens, offs, activation, clamp_limit, qdtype, rule,
+            layout=lay,
         )  # fmt: skip
         return grad_probs, q[0], q[1], q[2], q[3]
 
@@ -1983,6 +1975,7 @@ def grouped_gemm_mxfp8_dglu_impl_meta(
     M_pad_col = -(-(M + G * _MX_COL_ALIGN) // _MX_COL_ALIGN) * _MX_COL_ALIGN
     grad_probs = torch.empty((M,), device=a.device, dtype=torch.float32)
     row_out, row_sc, col_out, col_sc = _alloc_mx_act_buffers(
-        2 * I, M_pad_row, M_pad_col, _get_fp8_dtype(config.format, False), a.device
-    )
+        2 * I, M_pad_row, M_pad_col, _get_fp8_dtype(config.format, False), a.device, out_row_scaling_recipe,
+        out_col_scaling_recipe,
+    )  # fmt: skip
     return grad_probs, row_out, row_sc, col_out, col_sc
