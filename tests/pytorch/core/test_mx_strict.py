@@ -30,7 +30,10 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 
 MX = Float8QuantConfig(
-    format=Format.E4M3, granularity=ScalingGranularity.MX_BLOCKWISE, scale_dtype=ScaleDtype.E8M0, block_size=32
+    format=Format.E4M3,
+    granularity=ScalingGranularity.MX_BLOCKWISE,
+    scale_dtype=ScaleDtype.E8M0,
+    block_size=32,
 )
 
 
@@ -117,7 +120,12 @@ def test_requantize_raises(strict):
     a = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
     qa = QuantizedTensor.quantize(
-        a, float8_e4m3, ScalingGranularity.MX_BLOCKWISE, axis=-1, block_size=32, scaling_recipe=ScalingRecipe()
+        a,
+        float8_e4m3,
+        ScalingGranularity.MX_BLOCKWISE,
+        axis=-1,
+        block_size=32,
+        scaling_recipe=ScalingRecipe(),
     )
     strict(1)
     with pytest.raises(RuntimeError, match="a has no transposed copy"):

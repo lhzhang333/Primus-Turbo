@@ -65,6 +65,7 @@ def _bgrad_gemm_fp8_impl_wrapper(
     default_backend: int,
     inplace_add_to_out: bool = False,
     out: Optional[torch.Tensor] = None,
+    b_preshuffled: bool = False,
 ) -> torch.Tensor:
     """Run the wgrad GEMM, accumulating into ``out`` when asked to.
 
@@ -80,6 +81,7 @@ def _bgrad_gemm_fp8_impl_wrapper(
         out_dtype=out_dtype,
         trans_c=trans_c,
         granularity=granularity,
+        b_preshuffled=b_preshuffled,
     )
 
     if not inplace_add_to_out:
@@ -588,7 +590,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
             check_quantized_tensor(a, config, axis=-1, scaling_recipe=a_scaling_recipe)
             a_row, a_row_scale = a.qdata, a.scale_inv
             if a_t is None:
-                mx_strict("gemm_fp8 (MXFP8): a has no transposed copy (a_t); re-quantizing it from its dequantized values")
+                mx_strict(
+                    "gemm_fp8 (MXFP8): a has no transposed copy (a_t); re-quantizing it from its dequantized values"
+                )
                 a_t = QuantizedTensor.quantize(
                     a.dequantize(),
                     a.real_dtype,
@@ -614,7 +618,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
             check_quantized_tensor(b, config, axis=-1, scaling_recipe=b_scaling_recipe)
             b_row, b_row_scale = b.qdata, b.scale_inv
             if b_t is None:
-                mx_strict("gemm_fp8 (MXFP8): b has no transposed copy (b_t); re-quantizing it from its dequantized values")
+                mx_strict(
+                    "gemm_fp8 (MXFP8): b has no transposed copy (b_t); re-quantizing it from its dequantized values"
+                )
                 b_t = QuantizedTensor.quantize(
                     b.dequantize(),
                     b.real_dtype,
@@ -702,7 +708,9 @@ class FP8GemmMXFunction(torch.autograd.Function):
             False,
             granularity=ctx.config.granularity.value,
             default_backend=(
-                mx_wgrad_accum_backend(grouped=False).value if ctx.fuse_bgrad_accum else BackendType.FLYDSL.value
+                mx_wgrad_accum_backend(grouped=False).value
+                if ctx.fuse_bgrad_accum
+                else BackendType.FLYDSL.value
             ),
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,

@@ -475,7 +475,9 @@ def _quantize_weight(
     assert not w._is_grouped_tensor, "an expert weight must not be a grouped tensor"
     check_quantized_tensor(w, config, axis=-1, scaling_recipe=recipe)
     if w_t is None:
-        mx_strict("grouped_mlp_fp8 (MXFP8): an expert weight has no transposed copy; re-quantizing it from its dequantized values")
+        mx_strict(
+            "grouped_mlp_fp8 (MXFP8): an expert weight has no transposed copy; re-quantizing it from its dequantized values"
+        )
         w_t = QuantizedTensor.quantize(
             w.dequantize(),
             w.real_dtype,
@@ -560,7 +562,9 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             x_row, x_row_scale = x.qdata, x.scale_inv
             offs_row = x.group_offs
             if x_t is None:
-                mx_strict("grouped_mlp_fp8 (MXFP8): x has no transposed copy (x_t); re-quantizing it from its dequantized values")
+                mx_strict(
+                    "grouped_mlp_fp8 (MXFP8): x has no transposed copy (x_t); re-quantizing it from its dequantized values"
+                )
                 x_t = QuantizedTensor.quantize(
                     x.dequantize(),
                     x.real_dtype,
