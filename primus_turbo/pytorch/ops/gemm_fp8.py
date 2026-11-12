@@ -65,6 +65,7 @@ def _bgrad_gemm_fp8_impl_wrapper(
     default_backend: int,
     inplace_add_to_out: bool = False,
     out: Optional[torch.Tensor] = None,
+    b_preshuffled: bool = False,
 ) -> torch.Tensor:
     """Run the wgrad GEMM, accumulating into ``out`` when asked to.
 
@@ -80,6 +81,7 @@ def _bgrad_gemm_fp8_impl_wrapper(
         out_dtype=out_dtype,
         trans_c=trans_c,
         granularity=granularity,
+        b_preshuffled=b_preshuffled,
     )
 
     if not inplace_add_to_out:

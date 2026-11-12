@@ -33,9 +33,8 @@ from primus_turbo.pytorch.core.utils import (
     is_gfx1250,
 )
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
+    mx1250_operands_ok,
     mx1250_out_ok,
-    mx1250_rows_ok,
-    mx1250_scale_ok,
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
@@ -430,6 +429,8 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
             supported &= b.dtype in (float8_e4m3, float8_e5m2)
             supported &= out_dtype in (torch.float16, torch.bfloat16)
             supported &= trans_b
+            # raw [rows, K/32] scales and a row-major b only (not gfx1250's packed / 16x16 GEMM layouts)
+            supported &= a_scales.dim() == 2 and b_scales.dim() == 3 and not kwargs.get("b_preshuffled")
         return supported
 
     @staticmethod
@@ -516,54 +517,30 @@ def mx1250_grouped() -> MX1250Grouped:
     )
 
 
-def _mx1250_grouped_can_handle(a, b, sa, sb, group_offs, trans_a, trans_b, out_dtype, **kwargs) -> bool:
+def _mx1250_grouped_can_handle(a, b, sa, sb, group_offs, trans_a, trans_b, out_dtype, kw) -> bool:
     """gfx1250 fwd / dgrad: ``a [M, K]`` read from ``group_offs`` (the quantizer's row table; 32-aligned when the
-    scales are packed), ``b [G, N, K]`` row-major, out tight under ``group_offs_out``."""
+    scales are packed), ``b [G, N, K]`` row-major or 16x16 blocks (``b_preshuffled``), out tight under
+    ``group_offs_out``."""
     if mx1250_grouped().grouped is None or trans_a or not trans_b or a.dim() != 2 or b.dim() != 3:
         return False
     (m, k), (g, n) = a.shape, b.shape[:2]
-    ok = b.shape[2] == k and k % 16 == 0 and b.is_contiguous() and mx1250_rows_ok(a) and mx1250_rows_ok(b)
-    ok = ok and sa.dim() + 1 == sb.dim() and mx1250_scale_ok(sa, m, k) and mx1250_scale_ok(sb, n, k, (g,))
-    ok = (
-        ok
-        and (sa.dim() == 2 or n % 32 == 0)
-        and group_offs.dtype == torch.int64
-        and kwargs.get("n_real") is None
-    )
-    return ok and mx1250_out_ok(None, (m, n), False, out_dtype)
+    ok = mx1250_operands_ok(a, sa, b, sb, k, (g,)) and b.is_contiguous() and group_offs.dtype == torch.int64
+    ok = ok and (sa.dim() == 2 or n % 32 == 0) and (not kw.get("b_preshuffled") or n % 16 == 0)
+    return ok and kw.get("n_real") is None and mx1250_out_ok(None, (m, n), False, out_dtype)
 
 
 def _mx1250_variable_k_can_handle(
-    a,
-    b,
-    sa,
-    sb,
-    group_lens,
-    group_offs,
-    trans_a,
-    trans_b,
-    trans_c,
-    out_dtype,
-    inplace_add_to_out=False,
-    out=None,
-    **kwargs,
+    lhs, ls, rhs, rs, group_offs, out_shape, out_dtype, accumulate, out, kw
 ) -> bool:
-    """gfx1250 wgrad: ``out[g] (+)= lhs[:, T_g] @ rhs[:, T_g]^T``, lhs / rhs the [rows, T] column copies (``trans_c``
-    swaps them), T_g from ``group_offs`` (multiples of 128)."""
-    if mx1250_grouped().variable_k is None or trans_a or trans_b or a.dim() != 2 or b.dim() != 2:
+    """gfx1250 wgrad: ``out[g] (+)= lhs[:, T_g] @ rhs[:, T_g]^T`` over the [rows, T] column copies, T_g from
+    ``group_offs`` (multiples of 128); ``rhs`` row-major or 16x16 blocks (``b_preshuffled``)."""
+    if mx1250_grouped().variable_k is None or lhs.dim() != 2 or rhs.dim() != 2:
         return False
-    (lhs, ls), (rhs, rs) = ((b, sb), (a, sa)) if trans_c else ((a, sa), (b, sb))
-    (m, t), n = lhs.shape, rhs.shape[0]
-    ok = (
-        rhs.shape[1] == t
-        and t % 128 == 0
-        and mx1250_rows_ok(lhs)
-        and mx1250_rows_ok(rhs)
-        and ls.dim() == rs.dim()
-    )
-    ok = ok and mx1250_scale_ok(ls, m, t) and mx1250_scale_ok(rs, n, t) and group_offs.dtype == torch.int64
-    ok = ok and kwargs.get("m_real") is None and kwargs.get("n_real") is None
-    return ok and mx1250_out_ok(out, (group_lens.shape[0], m, n), inplace_add_to_out, out_dtype)
+    t, n = lhs.shape[1], rhs.shape[0]
+    ok = t % 128 == 0 and mx1250_operands_ok(lhs, ls, rhs, rs, t) and group_offs.dtype == torch.int64
+    ok = ok and (not kw.get("b_preshuffled") or n % 16 == 0)
+    ok = ok and kw.get("m_real") is None and kw.get("n_real") is None
+    return ok and mx1250_out_ok(out, out_shape, accumulate, out_dtype)
 
 
 class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
@@ -595,7 +572,7 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
     ) -> bool:
         if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
             return _mx1250_grouped_can_handle(
-                a, b, a_scales, b_scales, group_offs, trans_a, trans_b, out_dtype, **kwargs
+                a, b, a_scales, b_scales, group_offs, trans_a, trans_b, out_dtype, kwargs
             )
         supported = True
         supported &= a.dim() == 2 and b.dim() == 3
@@ -639,8 +616,9 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
             # read a from group_offs, write tight under group_offs_out; out over-allocated to a's rows
             offs_out = kwargs.get("group_offs_out")
             offs_out = group_offs if offs_out is None else offs_out
+            bsh = bool(kwargs.get("b_preshuffled"))
             return mx1250_grouped().grouped(
-                a, a_scales, b, b_scales, offs_out, group_offs, a.shape[0], out_dtype, b_preshuffled=False
+                a, a_scales, b, b_scales, offs_out, group_offs, a.shape[0], out_dtype, b_preshuffled=bsh
             )
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_kernel import (
@@ -767,6 +745,7 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
             supported &= b.dtype in (float8_e4m3, float8_e5m2)
             supported &= out_dtype in (torch.float16, torch.bfloat16)
             supported &= not trans_a and not trans_b
+            supported &= a_scales.dim() == 2 and b_scales.dim() == 2 and not kwargs.get("b_preshuffled")
         return supported
 
     @staticmethod
@@ -884,10 +863,15 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
+            if trans_a or trans_b:
+                return False
+            (lhs, ls), (rhs, rs) = (
+                ((b, b_scales), (a, a_scales)) if trans_c else ((a, a_scales), (b, b_scales))
+            )
+            shape = (group_lens.shape[0], lhs.shape[0], rhs.shape[0])
             return _mx1250_variable_k_can_handle(
-                a, b, a_scales, b_scales, group_lens, group_offs, trans_a, trans_b, trans_c, out_dtype,
-                inplace_add_to_out, out, **kwargs,
-            )  # fmt: skip
+                lhs, ls, rhs, rs, group_offs, shape, out_dtype, inplace_add_to_out, out, kwargs
+            )
         supported = True
         if inplace_add_to_out:
             _out_allowed = (
@@ -944,11 +928,12 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
             lhs_scales, rhs_scales = a_scales, b_scales
 
         if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
-            fn = mx1250_grouped().variable_k
+            fn, bsh = mx1250_grouped().variable_k, bool(kwargs.get("b_preshuffled"))
             if inplace_add_to_out:
-                return fn(lhs, lhs_scales, rhs, rhs_scales, group_offs, out.dtype, out=out, accumulate=True,
-                          b_preshuffled=False)  # fmt: skip
-            return fn(lhs, lhs_scales, rhs, rhs_scales, group_offs, out_dtype, b_preshuffled=False)
+                return fn(
+                    lhs, lhs_scales, rhs, rhs_scales, group_offs, out.dtype, out, True, b_preshuffled=bsh
+                )
+            return fn(lhs, lhs_scales, rhs, rhs_scales, group_offs, out_dtype, b_preshuffled=bsh)
 
         beta = 1.0 if inplace_add_to_out else 0.0
         accum_out = out if inplace_add_to_out else None
@@ -1053,6 +1038,7 @@ def grouped_gemm_fp8_impl(
     maybe_pre_sync: bool = False,
     group_offs_out: torch.Tensor | None = None,
     n_real: int | None = None,
+    b_preshuffled: bool = False,
 ) -> torch.Tensor:
     default_backend_choice = BackendChoice(backend=BackendType(default_backend))
     user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
@@ -1074,6 +1060,8 @@ def grouped_gemm_fp8_impl(
         group_offs_out=group_offs_out,
         n_real=n_real,
     )
+    if b_preshuffled:  # b in 16x16 blocks, gfx1250's MX GEMM layout (only its FlyDSL backend takes it)
+        kwargs["b_preshuffled"] = True
 
     out = GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
     # Over-allocated output: zero the unwritten tail past the tight write bound
@@ -1103,6 +1091,7 @@ def grouped_gemm_fp8_variable_k_impl(
     maybe_pre_sync: bool = False,
     m_real: int | None = None,
     n_real: int | None = None,
+    b_preshuffled: bool = False,
 ) -> torch.Tensor:
     default_backend_choice = BackendChoice(backend=BackendType(default_backend))
     user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
@@ -1125,6 +1114,8 @@ def grouped_gemm_fp8_variable_k_impl(
         m_real=m_real,
         n_real=n_real,
     )
+    if b_preshuffled:
+        kwargs["b_preshuffled"] = True
 
     return GroupedGEMMFP8VariableKKernelDispatcher.dispatch(
         default_backend_choice, user_backend_choice, **kwargs
@@ -1152,6 +1143,7 @@ def grouped_gemm_fp8_variable_k_accum_impl(
     maybe_pre_sync: bool = False,
     m_real: int | None = None,
     n_real: int | None = None,
+    b_preshuffled: bool = False,
 ) -> None:
     """Variable-K grouped FP8 GEMM that accumulates into ``out`` instead of returning.
 
@@ -1181,6 +1173,8 @@ def grouped_gemm_fp8_variable_k_accum_impl(
         m_real=m_real,
         n_real=n_real,
     )
+    if b_preshuffled:
+        kwargs["b_preshuffled"] = True
 
     if (
         GlobalBackendManager.auto_tune_enabled()
@@ -1210,6 +1204,7 @@ def grouped_gemm_fp8_variable_k_accum_impl_meta(
     maybe_pre_sync: bool = False,
     m_real: int | None = None,
     n_real: int | None = None,
+    b_preshuffled: bool = False,
 ) -> None:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 2, f"b must be 2D, got {b.shape}"
@@ -1234,6 +1229,7 @@ def grouped_gemm_fp8_impl_meta(
     maybe_pre_sync: bool = False,
     group_offs_out: torch.Tensor | None = None,
     n_real: int | None = None,
+    b_preshuffled: bool = False,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 3, f"b must be 3D, got {b.shape}"
@@ -1268,6 +1264,7 @@ def grouped_gemm_fp8_variable_k_impl_meta(
     maybe_pre_sync: bool = False,
     m_real: int | None = None,
     n_real: int | None = None,
+    b_preshuffled: bool = False,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 2, f"b must be 2D, got {b.shape}"

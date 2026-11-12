@@ -282,17 +282,13 @@ def mx1250_gemm():
     return gemm_mxfp8_gfx1250, "accumulate" in inspect.signature(gemm_mxfp8_gfx1250).parameters
 
 
-def mx1250_rows_ok(t: torch.Tensor) -> bool:
+def _mx1250_rows_ok(t: torch.Tensor) -> bool:
     """An operand of gfx1250's MX GEMMs: E4M3, K contiguous, 16-byte aligned rows."""
-    return (
-        t.dtype == torch.float8_e4m3fn
-        and t.stride(-1) == 1
-        and t.stride(-2) % 16 == 0
-        and t.data_ptr() % 16 == 0
-    )
+    ok = t.dtype == torch.float8_e4m3fn and t.stride(-1) == 1
+    return ok and t.stride(-2) % 16 == 0 and t.data_ptr() % 16 == 0
 
 
-def mx1250_scale_ok(s: torch.Tensor, rows: int, k: int, batch: tuple = ()) -> bool:
+def _mx1250_scale_ok(s: torch.Tensor, rows: int, k: int, batch: tuple = ()) -> bool:
     """E8M0 scales of a ``rows`` x ``k`` operand as gfx1250's MX GEMMs take them: raw ``[*batch, rows, ceil(k/32)]``
     (k/32 contiguous) or packed ``[*batch, ceil(rows/32), ceil(k/128), 32, 4]`` (contiguous)."""
     if s.element_size() != 1:
@@ -300,6 +296,13 @@ def mx1250_scale_ok(s: torch.Tensor, rows: int, k: int, batch: tuple = ()) -> bo
     if s.dim() == len(batch) + 4:
         return s.shape == (*batch, -(-rows // 32), -(-k // 128), 32, 4) and s.is_contiguous()
     return s.shape == (*batch, rows, -(-k // 32)) and s.stride(-1) == 1 and (not batch or s.is_contiguous())
+
+
+def mx1250_operands_ok(a, sa, b, sb, k: int, batch: tuple = ()) -> bool:
+    """``a [M, k]`` and ``b [*batch, N, k]`` with their scales, both raw or both packed, for gfx1250's MX GEMMs."""
+    ok = a.shape[-1] == b.shape[-1] == k and k % 16 == 0 and _mx1250_rows_ok(a) and _mx1250_rows_ok(b)
+    ok = ok and sa.dim() + len(batch) == sb.dim() and _mx1250_scale_ok(sa, a.shape[-2], k)
+    return ok and _mx1250_scale_ok(sb, b.shape[-2], k, batch)
 
 
 def mx1250_out_ok(out, shape, accumulate: bool, out_dtype) -> bool:
@@ -313,20 +316,17 @@ def mx1250_out_ok(out, shape, accumulate: bool, out_dtype) -> bool:
     return ok and out.is_contiguous() and out.data_ptr() % 16 == 0
 
 
-def _mx1250_can_handle(a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c, accumulate, out):
-    """``gemm_mxfp8_gfx1250``: NT, K % 16 == 0, both scales raw or both packed; beta=1 once it has that epilogue."""
-    if (
-        trans_a
-        or not trans_b
-        or trans_c
-        or a.dim() != 2
-        or b.dim() != 2
-        or a_scale_inv.dim() != b_scale_inv.dim()
-    ):
+def _mx1250_can_handle(
+    a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c, accumulate, out, bsh
+):
+    """``gemm_mxfp8_gfx1250``: NT, ``b`` row-major or (``bsh``) in dense 16x16 blocks (N % 16 == 0); beta=1 once
+    the kernel has that epilogue."""
+    if trans_a or not trans_b or trans_c or a.dim() != 2 or b.dim() != 2:
         return False
     (m, k), n = a.shape, b.shape[0]
-    ok = b.shape[1] == k and k % 16 == 0 and mx1250_rows_ok(a) and mx1250_rows_ok(b)
-    ok = ok and mx1250_scale_ok(a_scale_inv, m, k) and mx1250_scale_ok(b_scale_inv, n, k)
+    ok = mx1250_operands_ok(a, a_scale_inv, b, b_scale_inv, k) and (
+        not bsh or (n % 16 == 0 and b.stride(0) == k)
+    )
     return ok and (not accumulate or mx1250_gemm()[1]) and mx1250_out_ok(out, (m, n), accumulate, out_dtype)
 
 
@@ -372,7 +372,8 @@ class GEMMFP8TritonBackend(KernelBackend):
             # gfx1250 only: other archs keep their MX backends (and auto-tune candidates) as they are
             supported = is_gfx1250() and (not trans_a) and trans_b and not trans_c
             supported &= a.dim() == 2 and b.dim() == 2 and b.shape[1] == k and k % 128 == 0
-            supported &= a_scale_inv.dim() == 2 and b_scale_inv.dim() == 2  # raw [rows, K/32] scales only
+            # raw [rows, K/32] scales and a row-major b only
+            supported &= a_scale_inv.dim() == 2 and b_scale_inv.dim() == 2 and not kwargs.get("b_preshuffled")
             supported &= a.dtype in (float8_e4m3, float8_e5m2) and b.dtype in (float8_e4m3, float8_e5m2)
             supported &= out_dtype in (torch.bfloat16, torch.float16)
             if inplace_add_to_out:
@@ -538,8 +539,9 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
     ) -> bool:
         if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
             return _mx1250_can_handle(
-                a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c, inplace_add_to_out, out
-            )
+                a, a_scale_inv, trans_a, b, b_scale_inv, trans_b, out_dtype, trans_c, inplace_add_to_out, out,
+                kwargs.get("b_preshuffled", False),
+            )  # fmt: skip
         supported = True
         if inplace_add_to_out:
             supported &= out is not None and out.dtype == out_dtype
@@ -581,9 +583,12 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         **kwargs,
     ):
         if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
+            bsh = kwargs.get("b_preshuffled", False)
             if inplace_add_to_out:
-                return mx1250_gemm()[0](a, a_scale_inv, b, b_scale_inv, out.dtype, out=out, accumulate=True)
-            return mx1250_gemm()[0](a, a_scale_inv, b, b_scale_inv)
+                return mx1250_gemm()[0](
+                    a, a_scale_inv, b, b_scale_inv, out.dtype, out=out, accumulate=True, b_preshuffled=bsh
+                )
+            return mx1250_gemm()[0](a, a_scale_inv, b, b_scale_inv, b_preshuffled=bsh)
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             res = gemm_mxfp8_flydsl_kernel(
                 a,
@@ -649,7 +654,9 @@ def gemm_fp8_impl(
     trans_c: bool,
     granularity: int,
     default_backend: int,
+    b_preshuffled: bool = False,
 ) -> torch.Tensor:
+    """``b_preshuffled``: ``b`` in 16x16 blocks, gfx1250's MX GEMM layout (only its FlyDSL backend takes it)."""
     default_backend_choice = BackendChoice(backend=BackendType(default_backend))
     user_backend_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
@@ -665,6 +672,8 @@ def gemm_fp8_impl(
         trans_c=trans_c,
         granularity=granularity_enum,
     )
+    if b_preshuffled:
+        kwargs["b_preshuffled"] = True
 
     return GEMMFP8KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
 
@@ -682,6 +691,7 @@ def gemm_fp8_accum_impl(
     granularity: int,
     out: torch.Tensor,
     default_backend: int,
+    b_preshuffled: bool = False,
 ) -> None:
     """Dense FP8 GEMM that accumulates into ``out`` instead of returning.
 
@@ -705,6 +715,8 @@ def gemm_fp8_accum_impl(
         inplace_add_to_out=True,
         out=out,
     )
+    if b_preshuffled:
+        kwargs["b_preshuffled"] = True
 
     # The tuner benchmarks a backend by launching it repeatedly, so letting it tune on
     # the caller's buffer would accumulate the wgrad once per warmup and timing
@@ -727,6 +739,7 @@ def gemm_fp8_impl_meta(
     trans_c: bool,
     granularity: int,
     default_backend: int,
+    b_preshuffled: bool = False,
 ) -> torch.Tensor:
     m, n, _ = get_gemm_logical_shape(a, b, trans_a, trans_b)
     if trans_c:
@@ -747,6 +760,7 @@ def gemm_fp8_accum_impl_meta(
     granularity: int,
     out: torch.Tensor,
     default_backend: int,
+    b_preshuffled: bool = False,
 ) -> None:
     m, n, _ = get_gemm_logical_shape(a, b, trans_a, trans_b)
     if trans_c:

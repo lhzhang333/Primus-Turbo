@@ -71,6 +71,7 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
     out: Optional[torch.Tensor] = None,
     m_real: Optional[int] = None,
     n_real: Optional[int] = None,
+    b_preshuffled: bool = False,
 ) -> Optional[torch.Tensor]:
     """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked. Returns the
     weight grad, or a dummy buffer (weight dtype, never read) when it accumulated in
@@ -85,6 +86,7 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
         granularity=granularity,
         num_cu=num_cu,
         default_backend=default_backend,
+        b_preshuffled=b_preshuffled,
     )
 
     if not inplace_add_to_out:
