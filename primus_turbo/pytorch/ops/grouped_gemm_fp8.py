@@ -16,6 +16,7 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp8_support,
+    mx_strict,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
@@ -44,6 +45,7 @@ from primus_turbo.pytorch.ops.utils import (
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx_wgrad_accum_backend,
 )
 
 __all__ = [
@@ -69,6 +71,7 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
     out: Optional[torch.Tensor] = None,
     m_real: Optional[int] = None,
     n_real: Optional[int] = None,
+    b_preshuffled: bool = False,
 ) -> Optional[torch.Tensor]:
     """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked. Returns the
     weight grad, or a dummy buffer (weight dtype, never read) when it accumulated in
@@ -83,6 +86,7 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
         granularity=granularity,
         num_cu=num_cu,
         default_backend=default_backend,
+        b_preshuffled=b_preshuffled,
     )
 
     if not inplace_add_to_out:
@@ -686,6 +690,9 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             check_quantized_tensor(quantized_a, config, axis=-1, scaling_recipe=a_scaling_recipe)
 
             if a_t is None:
+                mx_strict(
+                    "grouped_gemm_fp8 (MXFP8): a has no transposed copy (a_t); re-quantizing it from its dequantized values"
+                )
                 quantized_a_t = QuantizedTensor.quantize(
                     quantized_a.dequantize(),
                     quantized_a.real_dtype,
@@ -723,6 +730,9 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             check_quantized_tensor(quantized_b, config, axis=-1, scaling_recipe=b_scaling_recipe)
 
             if b_t is None:
+                mx_strict(
+                    "grouped_gemm_fp8 (MXFP8): b has no transposed copy (b_t); re-quantizing it from its dequantized values"
+                )
                 quantized_b_t = QuantizedTensor.quantize(
                     quantized_b.dequantize(),
                     quantized_b.real_dtype,
@@ -822,10 +832,10 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         grad_a = grad_a[: ctx.total_m]
 
         # wgrad: grad_b[g] = grad_out_col[g] @ a_col[g]^T  (variable-K over colwise-128 M_g)
-        # FlyDSL is the default for the ordinary path, where it is faster. Its beta=1
-        # epilogue only writes 16-bit, so the fused path defaults to Triton, which also
-        # covers the fp32 main_grad Megatron allocates by default; pin FlyDSL through
-        # GlobalBackendManager when main_grad matches the weight's own bf16/fp16 dtype.
+        # FlyDSL is the default for the ordinary path, where it is faster; the fused (beta=1)
+        # path takes mx_wgrad_accum_backend (Triton: FlyDSL's gfx950 epilogue writes only
+        # 16-bit, Triton also covers the fp32 main_grad Megatron allocates by default; pin
+        # FlyDSL through GlobalBackendManager when main_grad is the weight's own bf16/fp16).
         grad_b = _grouped_gemm_fp8_variable_k_impl_wrapper(
             grad_out_t_fp8,
             a_fp8_col,
@@ -839,7 +849,11 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=(BackendType.TRITON.value if ctx.fuse_bgrad_accum else BackendType.FLYDSL.value),
+            default_backend=(
+                mx_wgrad_accum_backend(grouped=True).value
+                if ctx.fuse_bgrad_accum
+                else BackendType.FLYDSL.value
+            ),
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
         )
