@@ -6,7 +6,8 @@
 
 """MXFP8 routed experts on gfx1250, strict mode (a fallback raises): grouped_gemm_fp8, and grouped_mlp_fp8 with its
 GLU / dGLU in two phases (the grouped MX GEMM, then the FlyDSL GLU / dGLU + dual-quant kernel), against BF16, at a
-toy shape and the DSv3 expert shape (32 experts x 2048 tokens, H 7168, I 2048), balanced and skewed (empty experts).
+toy shape and the DSv3 expert shape (32 experts x 2048 tokens, H 7168, I 2048), balanced and skewed (empty experts),
+and as Primus runs them (cached weights, wgrads fused into main_grad).
 The grouped GEMMs run on gfx1250's FlyDSL MX kernels ("default"; skipped while they are missing) or on Triton, pinned
 (the fallback)."""
 
@@ -25,9 +26,18 @@ from primus_turbo.pytorch.core.low_precision import (
     Format,
     ScaleDtype,
     ScalingGranularity,
+    float8_e4m3,
+)
+from primus_turbo.pytorch.core.quantized_tensor import (
+    QuantizedTensorPair,
+    create_quantized_weight,
 )
 from primus_turbo.pytorch.core.utils import is_gfx1250
-from primus_turbo.pytorch.ops import grouped_gemm_fp8
+from primus_turbo.pytorch.ops import (
+    grouped_gemm_fp8,
+    mx_weight_layout_recipe,
+    mx_wgrad_accum_supported,
+)
 from primus_turbo.pytorch.ops.grouped_mlp_fp8 import grouped_mlp_fp8
 from tests.pytorch.ref.mxfp8_ref import snr_db
 
@@ -150,3 +160,48 @@ def test_grouped_mlp(backend, G, M, H, I, skew):
     _check("y", y, ref_y, 20)
     for name, got, ref in zip(("dx", "dw1", "dw2", "dprobs"), leaves, refs):
         _check(name, got.grad, ref.grad, 20)
+
+
+@pytest.mark.parametrize("main_grad_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("G, M, H, I", SHAPES)
+def test_grouped_mlp_primus(backend, G, M, H, I, main_grad_dtype):
+    """Primus' routed experts (fused grouped MLP, several micro-batches): w1 / w2 cached by create_quantized_weight
+    in the recipe ``mx_weight_layout_recipe`` asks for (gfx1250's GEMM layout once its FlyDSL grouped kernels run),
+    wgrads accumulated into main_grad (beta=1): y / dx / dprobs bitwise those of plain bf16 weights (the same
+    operands), each main_grad increment vs the plain run's dw (>= 40 dB: one rounding against two) and BF16."""
+    if not mx_wgrad_accum_supported(True, main_grad_dtype):
+        pytest.skip(f"no grouped MXFP8 beta=1 wgrad into {main_grad_dtype} here")
+    lens = _group_lens(G, M, True)
+    x, dy = _randn(M, H, seed=1), _randn(M, H, seed=4)
+    w1, w2 = _randn(G, 2 * I, H, scale=H**-0.5, seed=2), _randn(G, H, I, scale=I**-0.5, seed=3)
+    probs = torch.rand(M, device="cuda", generator=torch.Generator(device="cuda").manual_seed(5))
+
+    def run(wa, wb, fuse):
+        xl, pl = x.clone().requires_grad_(), probs.clone().requires_grad_()
+        y = grouped_mlp_fp8(xl, wa, wb, lens, pl, trans_w1=True, trans_w2=True, config=MX, activation="silu",
+                            fuse_wgrad_accum_pattern="megatron" if fuse else None)  # fmt: skip
+        y.backward(dy)
+        return y, xl.grad, pl.grad
+
+    plain = [w.clone().requires_grad_() for w in (w1, w2)]
+    ref = run(*plain, False)
+    cached = []
+    for w in (w1, w2):
+        q, q_t = create_quantized_weight(w, float8_e4m3, MX, need_weight_transpose_cache=True,
+                                         scaling_recipe=mx_weight_layout_recipe(True, w.shape))  # fmt: skip
+        q.main_grad = (_randn(*w.shape, scale=1e-3, seed=6)).to(main_grad_dtype)
+        q.grad_added_to_main_grad = False
+        cached.append(QuantizedTensorPair(q, q_t))
+    main_grad0 = [p.data.main_grad.clone() for p in cached]
+    got = run(*cached, True)
+    for name, a, b in zip(("y", "dx", "dprobs"), got, ref):
+        assert torch.equal(a, b), name
+    bf = [t.clone().requires_grad_() for t in (x, w1, w2, probs)]
+    _mlp_bf16(bf[0], bf[1], bf[2], lens, bf[3]).backward(dy)
+    for name, p, g0, dw, dw_bf in zip(("dw1", "dw2"), cached, main_grad0, (plain[0].grad, plain[1].grad),
+                                      (bf[1].grad, bf[2].grad)):  # fmt: skip
+        assert p.data.grad_added_to_main_grad, name
+        inc = p.data.main_grad.double() - g0.double()
+        s = snr_db(inc, dw)
+        assert s >= 40, f"{name}: main_grad increment vs the unfused wgrad {s:.2f} dB"
+        _check(name, inc, dw_bf, 20)
