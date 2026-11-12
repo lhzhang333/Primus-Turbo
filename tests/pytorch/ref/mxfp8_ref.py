@@ -24,9 +24,11 @@ Scale layout of the GEMM (aiter's mx32 layout): ``[ceil(R/32), ceil(K/128), 32, 
 ``s4[g, t, r, j]`` scales row ``32 g + r`` over K block ``4 t + j`` (elements ``128 t + 32 j ..``).
 One int32 of it is the WMMA scale operand of one row for one 128-wide K step. Pad bytes are 0x00.
 
-MoE (``quant_grouped``): rows as ``quant_rows``; the column copy per expert, padded to 128 tokens,
-blocks without a token get scale ``PAD_SCALE`` (127). Its fused producers: ``glu_ref`` / ``dglu_ref``
-(the grouped MLP's activation and its gradient, bf16 before quantization) and ``gather_rows`` (permute).
+MoE (``quant_grouped``): rows as ``quant_rows`` per expert padded to 32 rows, the column copy per expert
+padded to 128 tokens; pad rows and blocks without a token get scale ``PAD_SCALE`` (127). Its fused
+producers: ``glu_ref`` / ``dglu_ref`` (the grouped MLP's activation and its gradient, bf16 before
+quantization) and ``gather_rows`` (permute). B operands of the GEMM may be 16x16-preshuffled
+(``preshuffle_b16``).
 """
 
 import torch
@@ -114,19 +116,28 @@ def quant_2d(w: torch.Tensor, rule: str = "nosat"):
 PAD_SCALE = 127  # E8M0 byte of a column block that holds no token (padding only): 1.0
 
 
-def quant_grouped(x: torch.Tensor, group_lens: torch.Tensor, rule: str = "nosat", align: int = 128):
+def quant_grouped(x: torch.Tensor, group_lens: torch.Tensor, rule: str = "nosat", align: int = 128, row_align: int = 32):
     """MoE activation / gradient ``x [M, C]`` in expert order, ``group_lens [G]`` tokens per expert.
 
-    Rows: ``quant_rows(x)``, no padding (``offs_row = group_offs``). Columns: per expert, its tokens
-    transposed and zero-padded to a multiple of ``align``, so no 32-block straddles two experts:
-    ``q_col [C, sum(pad_g)]``, ``s_col [C, sum(pad_g) / 32]``. A column block holding no token gets
-    ``PAD_SCALE`` (127 = 1.0: Turbo's grouped contract, ``grouped_gemm_fp8_impl._alloc_mx_act_buffers``,
-    whose quantizer gives every zero block 1.0); a block with tokens is quantized normally (all-zero
-    tokens: byte 0, like any zero block). Codes of padding are 0.
+    Rows: ``quant_rows(x)`` with each expert's rows zero-padded to a multiple of ``row_align`` (32: Turbo's
+    ``group_offs_padded_rowwise``, so an expert starts on a 32-row scale block of the packed layout; 1:
+    unpadded). Columns: per expert, its tokens transposed and zero-padded to a multiple of ``align``, so no
+    32-block straddles two experts: ``q_col [C, sum(pad_g)]``, ``s_col [C, sum(pad_g) / 32]``. A pad row's
+    blocks and a column block holding no token get ``PAD_SCALE`` (127 = 1.0: Turbo's grouped contract,
+    ``grouped_gemm_fp8_impl._alloc_mx_act_buffers``, whose quantizer gives every zero block 1.0); a block
+    with tokens is quantized normally (all-zero tokens: byte 0, like any zero block). Codes of padding are 0.
 
-    Returns (q_row, s_row, q_col, s_col, lens_col [G] int64, offs_col [G + 1] int64)."""
-    q_row, s_row = quant_rows(x, rule)
+    Returns (q_row, s_row, q_col, s_col, lens_col [G] int64, offs_col [G + 1] int64, lens_row, offs_row)."""
     lens = [int(n) for n in group_lens.tolist()]
+    rpads = [-(-n // row_align) * row_align for n in lens]
+    q_row = torch.zeros(sum(rpads), x.shape[1], dtype=torch.uint8, device=x.device)
+    s_row = torch.full((sum(rpads), -(-x.shape[1] // MX)), PAD_SCALE, dtype=torch.uint8, device=x.device)
+    qr, sr = quant_rows(x, rule)
+    o = orow = 0
+    for n, pn in zip(lens, rpads):
+        q_row[orow : orow + n], s_row[orow : orow + n] = qr[o : o + n].view(torch.uint8), sr[o : o + n]
+        o, orow = o + n, orow + pn
+    q_row = q_row.view(torch.float8_e4m3fn)
     pads = [-(-n // align) * align for n in lens]
     q_col = torch.zeros(x.shape[1], sum(pads), dtype=torch.uint8, device=x.device)
     s_col = torch.zeros(x.shape[1], sum(pads) // MX, dtype=torch.uint8, device=x.device)
@@ -140,9 +151,9 @@ def quant_grouped(x: torch.Tensor, group_lens: torch.Tensor, rule: str = "nosat"
             q_col[:, oc : oc + pn] = q.view(torch.uint8)
             s_col[:, oc // MX : (oc + pn) // MX] = s
         o, oc = o + n, oc + pn
-    lens_col = torch.tensor(pads, dtype=torch.int64, device=x.device)
-    offs_col = torch.nn.functional.pad(torch.cumsum(lens_col, 0), (1, 0))
-    return q_row, s_row, q_col.view(torch.float8_e4m3fn), s_col, lens_col, offs_col
+    lens_col, lens_row = (torch.tensor(v, dtype=torch.int64, device=x.device) for v in (pads, rpads))
+    offs_col, offs_row = (torch.nn.functional.pad(torch.cumsum(v, 0), (1, 0)) for v in (lens_col, lens_row))
+    return q_row, s_row, q_col.view(torch.float8_e4m3fn), s_col, lens_col, offs_col, lens_row, offs_row
 
 
 _GELU_A2, _GELU_B, _GELU_C2 = 2 * 0.7978845608028654, 0.044715, 6 * 0.7978845608028654 * 0.044715
@@ -205,6 +216,21 @@ def pack_scales(s: torch.Tensor) -> torch.Tensor:
     sp = torch.zeros(Rp, KBp, dtype=torch.uint8, device=s.device)
     sp[:R, :KB] = s
     return sp.view(Rp // 32, 32, KBp // 4, 4).permute(0, 2, 1, 3).contiguous()
+
+
+def preshuffle_b16(q: torch.Tensor) -> torch.Tensor:
+    """A GEMM B operand [.., N, K] in the 16x16-preshuffled byte order of the gfx1250 MX GEMM
+    (``[N/16][K/16][16][16]``: each 16x16 block's 256 bytes contiguous), same shape and dtype."""
+    *b, N, K = q.shape
+    u = q.contiguous().view(torch.uint8).view(*b, N // 16, 16, K // 16, 16)
+    return u.transpose(-3, -2).contiguous().view(*b, N, K).view(q.dtype)
+
+
+def unpreshuffle_b16(q: torch.Tensor) -> torch.Tensor:
+    """Inverse of ``preshuffle_b16``."""
+    *b, N, K = q.shape
+    u = q.contiguous().view(torch.uint8).view(*b, N // 16, K // 16, 16, 16)
+    return u.transpose(-3, -2).contiguous().view(*b, N, K).view(q.dtype)
 
 
 def unpack_scales(s4: torch.Tensor, R: int, K: int) -> torch.Tensor:
