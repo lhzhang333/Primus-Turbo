@@ -262,6 +262,11 @@ def _launch_gemm_mxfp8(
                 len_g = hit.select(offs[g + 1] - offs[g], len_g)
                 in0, out0 = hit.select(offs_pad[g], in0), hit.select(offs[g], out0)
                 acc = acc + n_g
+            # a tile past the experts' (the grid is an upper bound) ends its workgroup here: uniform, and a cluster
+            # (along N) shares the m tile, so whole clusters end
+            _llvm.inline_asm(None, [as_ir_value(t), as_ir_value(acc)],
+                             "s_cmp_lt_u32 $0, $1\n\ts_cbranch_scc1 1f\n\ts_endpgm\n\t1:", "s,s,~{scc},~{memory}",
+                             has_side_effects=True)
             local = (t - first) * tile_m
             rows = len_g - local
             m_valid = (rows < tile_m).select(rows, fx.Int32(tile_m))
