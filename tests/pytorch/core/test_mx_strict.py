@@ -128,5 +128,5 @@ def test_requantize_raises(strict):
         scaling_recipe=ScalingRecipe(),
     )
     strict(1)
-    with pytest.raises(RuntimeError, match="a has no transposed copy"):
+    with pytest.raises(RuntimeError, match="no a_t, re-quantizing a"):
         gemm_fp8(qa, b, trans_b=True, out_dtype=torch.bfloat16, config=MX)

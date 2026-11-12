@@ -487,17 +487,14 @@ def _format_kwargs(kwargs: Dict[str, Any]) -> str:
 
 
 def _mx_strict_fallback(
-    dispatcher: str, default: Optional[BackendType], fallback: BackendType, kwargs: dict
+    dispatcher: str, default: Optional[BackendType], fallback: BackendType, kw: dict
 ) -> None:
     """MXFP8 strict mode (``low_precision.mx_strict``): an MX_BLOCKWISE call may not fall back from its default."""
-    if getattr(kwargs.get("granularity"), "name", None) != "MX_BLOCKWISE":
-        return
-    from primus_turbo.pytorch.core.low_precision import mx_strict
+    if getattr(kw.get("granularity"), "name", None) == "MX_BLOCKWISE":
+        from primus_turbo.pytorch.core.low_precision import mx_strict
 
-    name = default.name if default is not None else None
-    mx_strict(
-        f"{dispatcher}: the default backend {name} cannot take {_format_kwargs(kwargs)}; would fall back to {fallback.name}"
-    )
+        what = f"{dispatcher}: the default backend {getattr(default, 'name', None)} cannot take {_format_kwargs(kw)}"
+        mx_strict(f"{what}; would fall back to {fallback.name}")
 
 
 def _warn_fallback(backend_enum: BackendType, kwargs: dict) -> None:
