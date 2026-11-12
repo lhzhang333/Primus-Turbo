@@ -34,8 +34,9 @@ tile per workgroup (8 waves):
   it, so ``q_t == q.T``;
 * ``grouped`` (MoE): the row copy per expert zero-padded to 32 rows, the column copy to 128 tokens (pad
   rows / blocks: scale 127, Turbo's grouped contract); HIP's 8-tuple with both padded lens / offsets.
-* producers of the tile besides a plain load: fused GLU / dGLU, gather (permute), RMSNorm (``P_NORM``,
-  ``rmsnorm_mxfp8_gfx1250``: the tile normalized by a precomputed ``rstd``).
+* producers of the tile besides a plain load: fused GLU / dGLU (MoE, or dense: ``glu_quant_mxfp8``),
+  gather (permute), RMSNorm (``P_NORM``, ``rmsnorm_mxfp8_gfx1250``: the tile normalized by a precomputed
+  ``rstd``).
 
 Scale rules (compile-time): ``nosat`` (default: the smallest 2^e with amax / 2^e <= 448) and
 ``even`` (Turbo's HIP rule). ``tests/pytorch/ref/mxfp8_ref.py`` is the bitwise reference.
@@ -291,9 +292,11 @@ def _launch(
     CLAMP: Constexpr[float],
     AUX: Constexpr[int],
     LAY: Constexpr[int],
+    NOP: Constexpr[int],
 ):
     NKT = (K + BK - 1) // BK
-    EXP = PROD not in (P_DENSE, P_NORM)  # expert-padded column copy
+    # expert-padded copies: the MoE producers; GLU / dGLU without group offsets (G = 0) are dense
+    EXP = PROD in (P_GROUPED, P_GATHER) or (PROD in (P_GLU, P_DGLU) and G > 0)
     HALVES = 2 if PROD == P_DGLU else 1  # dGLU quantizes dgate (columns [0, K)) and dup ([K, 2K))
     OW = 2 * K if PROD == P_DGLU else KO  # row-copy width (KO > K: zero columns to a 128 pad)
     KV = K if PROD in (P_GLU, P_DGLU) else KO  # columns of a half the row copy holds
@@ -395,7 +398,7 @@ def _launch(
                     q = t + I32(i * NT)
                     r, c8 = q // I32(16), (q % I32(16)) * I32(8)
                     off = base + r * I32(PITCH) + c8 * I32(2)
-                    prob = fx.Float32(buffer_load(rp, in0 + r, vec_width=1, dtype=T.f32))
+                    prob = fx.Float32(1.0) if NOP else fx.Float32(buffer_load(rp, in0 + r, vec_width=1, dtype=T.f32))
                     gv, uv = [Vec(_lds_v4(off + I32(w * TILE))).bitcast(fx.BFloat16).to(fx.Float32) for w in range(2)]
                     dok = (r < nreal) & (k0 + c8 < I32(K))
                     if const_expr(PROD == P_GLU):
@@ -405,7 +408,8 @@ def _launch(
                         dg, du, gsum = _dact8(dv, gv, uv, prob, ACT, CLAMP)
                         res = [_bf8(dg), _bf8(du)]
                         gsum = _row16_sum_f32(gsum)  # lane 15 of each 16-lane row: the row's sum over the tile
-                        buffer_store(gsum, gpr, in0 + r, mask=(r < nreal) & (q % I32(16) == I32(15)))
+                        if const_expr(not NOP):
+                            buffer_store(gsum, gpr, in0 + r, mask=(r < nreal) & (q % I32(16) == I32(15)))
                     for w in range_constexpr(len(res)):
                         _lds_st(off + I32(w * TILE), res[w], 16)
                         if const_expr(AUX):  # the bf16 values (tests)
@@ -602,7 +606,8 @@ def _run(prod, out, rule, x, outs, m, mc, m_tiles, k, ko=0, b2d=0, padm=0, go=No
     args = [_ptr(a if a is not None else x) for a in (x, x2, *outs[:4], go, *outs[4:], p, gp, dbg, _ZERO[x.device])]
     args += [torch.cuda.current_stream(), m, mc, grid, batch, t]
     args += [k, prod, out, b2d, RULES[rule], 0 if go is None else go.shape[0] - 1, _width(mc), CACHE_POLICY]
-    args += [ko or k, padm, act, float(clamp or 0.0), int(dbg is not None or (prod == P_GATHER and p is not None)), lay]
+    args += [ko or k, padm, act, float(clamp or 0.0), int(dbg is not None or (prod == P_GATHER and p is not None)), lay,
+             int(p is None and prod in (P_GLU, P_DGLU))]
     key = tuple(args[19:])
     fn = _COMPILED.get(key)
     if fn is None:
@@ -747,6 +752,48 @@ def grouped_dglu_quant_mxfp8(grad_act, l1, probs, group_lens, group_offs, activa
                    gp=part, dbg=grad_out, act=_check_activation(activation), clamp=_check_clamp_limit(clamp_limit),
                    layout=layout)
     return (part.sum(0), *out)
+
+
+def _dense_glu(prod, x, l1, probs, I, out_dtype, rule, pad, layout, **kw):
+    """Dense GLU / dGLU + dual cast: x the tile source ([M, 2I] l1 for GLU, [M, I] grad_act for dGLU)."""
+    M, W = l1.shape[0], (2 * I if prod == P_DGLU else I)  # W: columns of the quantized output
+    assert probs is None or (probs.shape == (M,) and probs.dtype == torch.float32), "probs: fp32 [M] or None"
+    assert not pad or I % BK == 0, f"the HIP padding needs I % 128 == 0 here: {I}"
+    assert not (prod == P_DGLU and layout & PACK_ROW and I % BK), f"packed dGLU row scales need I % 128 == 0: {I}"
+    Mc = _ceil128(M) if pad else M
+    qr, sr = _bufs((), M, W, layout & PACK_ROW, layout & SHUF_ROW, out_dtype, x)
+    qc, sc = _bufs((), W, Mc, layout & PACK_COL, layout & SHUF_COL, out_dtype, x)
+    _run(prod, O_ROWS | O_COLS, rule, x, (qr, sr, qc, sc, None, None), M, Mc, -(-M // BM), I, W if prod != P_DGLU
+         else I, 0, int(pad), p=None if probs is None else probs.contiguous(), lay=layout, **kw)
+    return qr, sr.view(_E8), qc, sc.view(_E8)
+
+
+def glu_quant_mxfp8(l1, probs=None, activation="silu", clamp_limit=None, out_dtype=torch.float8_e4m3fn,
+                    rule="nosat", pad=False, act_out=None, layout=0):
+    """Dense GLU forward + dual cast (a dense SwiGLU MLP's fc2 operands, e.g. the shared expert): act =
+    bf16(f(min(gate, L)) * clamp(up, -L, L) [* probs[row]]) from l1 [M, 2I] bf16, the grouped kernel's math, quantized
+    as ``quant_mxfp8_raw(act, pad=pad, layout=layout)`` would: (q_row [M, I], s_row, q_col [I, M'], s_col).
+    ``probs`` None: no row weights (bit-identical to all ones). ``act_out`` [M, I] bf16 (tests): also receives act."""
+    l1 = _check(l1, out_dtype, rule, (2,))
+    I = l1.shape[1] // 2
+    assert l1.shape[1] == 2 * I
+    return _dense_glu(P_GLU, l1, l1, probs, I, out_dtype, rule, pad, layout, dbg=act_out,
+                      act=_check_activation(activation), clamp=_check_clamp_limit(clamp_limit))
+
+
+def dglu_quant_mxfp8(grad_act, l1, probs=None, activation="silu", clamp_limit=None, out_dtype=torch.float8_e4m3fn,
+                     rule="nosat", pad=False, grad_out=None, layout=0):
+    """Dense GLU backward + dual cast (the fc1 dgrad / wgrad operands): grad_l1 = [dgate | dup] [M, 2I] from
+    grad_act [M, I] (the fc2 dgrad) and l1 [M, 2I], quantized as ``quant_mxfp8_raw(grad_l1, pad=pad, layout=layout)``
+    would. Returns (grad_probs [M] fp32 or None when ``probs`` is None, q_row [M, 2I], s_row, q_col [2I, M'],
+    s_col). ``grad_out`` [M, 2I] bf16 (tests): also receives grad_l1."""
+    grad_act, l1 = _check(grad_act, out_dtype, rule, (2,)), _check(l1, out_dtype, rule, (2,))
+    M, I = grad_act.shape
+    assert l1.shape == (M, 2 * I) and I % 32 == 0
+    part = None if probs is None else torch.empty(-(-I // BK), M, dtype=torch.float32, device=l1.device)
+    out = _dense_glu(P_DGLU, grad_act, l1, probs, I, out_dtype, rule, pad, layout, x2=l1, gp=part, dbg=grad_out,
+                     act=_check_activation(activation), clamp=_check_clamp_limit(clamp_limit))
+    return (None if part is None else part.sum(0), *out)
 
 
 def grouped_gather_quant_mxfp8(x, dest2src, group_lens, group_offs, permuted_probs=None,
