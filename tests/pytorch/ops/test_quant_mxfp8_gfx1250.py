@@ -468,3 +468,29 @@ def test_dispatch_layouts():
         quantize_fp8_with_trans(x, E4, MX, block_size=32, scaling_recipe=shuf2, scaling_recipe_for_trans=rc)
     with pytest.raises(AssertionError):  # 16x16 codes need rows % 16 == 0
         quantize_fp8(_x(100, 320, special=False), E4, MX, block_size=32, axis=1, scaling_recipe=Recipe(shuffle_out=True))
+
+
+def test_strict_hip_fallback(monkeypatch):
+    """PRIMUS_TURBO_MX_STRICT=2: an MXFP8 quantization the gfx1250 kernels do not take (and HIP would) raises."""
+    import primus_turbo.common.envs as envs
+    from primus_turbo.pytorch.ops.quantization import (
+        grouped_quantize_fp8_with_trans,
+        quantize_fp8_with_trans,
+    )
+
+    (MX, Recipe, _), E4 = _dispatch_names(), torch.float8_e4m3fn
+    monkeypatch.setenv("PRIMUS_TURBO_MX_STRICT", "2")
+    envs.reset_cache()
+    x = _x(64, 128, special=False)
+    lens = torch.tensor([10, 54], device="cuda")
+    offs = torch.nn.functional.pad(torch.cumsum(lens, 0), (1, 0))
+    quantize_fp8_with_trans(x, E4, MX, block_size=32)  # the FlyDSL kernels: no fallback
+    grouped_quantize_fp8_with_trans(x, E4, MX, lens, offs, block_size=32)
+    r2, r1 = Recipe(use_2d_block=True), Recipe()
+    for call in (
+        lambda: quantize_fp8_with_trans(x.half(), E4, MX, block_size=32),
+        lambda: quantize_fp8_with_trans(x, E4, MX, block_size=32, scaling_recipe=r2, scaling_recipe_for_trans=r1),
+        lambda: grouped_quantize_fp8_with_trans(x, E4, MX, lens, offs, block_size=32, scaling_recipe=r2),
+    ):
+        with pytest.raises(RuntimeError, match="PRIMUS_TURBO_MX_STRICT=2"):
+            call()

@@ -22,6 +22,7 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
+    mx_strict,
 )
 from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.triton.quantization.quant_blockwise import (
@@ -49,8 +50,8 @@ def _gfx1250_mxfp8(
     ``col``: the column copy) select the gfx1250 MX GEMM's operand layouts, not HIP's CDNA4 ones:
     ``shuffle_scale``: packed scales ``[.., ceil(R/32), ceil(C/128), 32, 4]``; ``shuffle_out``: codes in
     16x16 blocks ``[R/16][C/16][16][16]`` (same shape; R, C % 16 == 0). Only these kernels write them, so
-    a shuffled recipe they cannot take raises. The E8M0 rule is PRIMUS_TURBO_MXFP8_SCALE_RULE (nosat by
-    default)."""
+    a shuffled recipe they cannot take raises, and so does any HIP fallback under PRIMUS_TURBO_MX_STRICT=2.
+    The E8M0 rule is PRIMUS_TURBO_MXFP8_SCALE_RULE (nosat by default)."""
     if not is_gfx1250():
         return None
     if (
@@ -70,6 +71,10 @@ def _gfx1250_mxfp8(
             f"gfx1250 MXFP8: shuffled (GEMM) layouts need bf16 -> E4M3 without SR / RHT and block shapes the "
             f"FlyDSL quantizers support, got {x.dtype} -> {out_dtype}, {row}, {col}"
         )
+    mx_strict(
+        f"MXFP8 quantization of {x.dtype} -> {out_dtype} ({row}, {col}) runs the HIP kernels on gfx1250",
+        level=2,
+    )
     return None
 
 
