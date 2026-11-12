@@ -727,15 +727,32 @@ def _launch(who, mode, cfg, out, a, b, sa, sb, g0, g1, M, N, K, lda, ldb, ldsa, 
     return out
 
 
-def _b_tail_safe(cfg: MXGemmConfig, b: torch.Tensor, b_preshuffled: bool, half_tail: bool) -> MXGemmConfig:
-    """A half last K step (kpair 2, <= 128 of K left) loads a preshuffled b's whole 2 KiB group row and lets the TDM
-    clamp the data: the bytes past it are still addressed, past the end of b at its last 16 rows. Unless b's storage
-    has that slack (the quantizers allocate it), use kpair 1, which has no partial step at 128-aligned K."""
-    if cfg.kpair == 2 and b_preshuffled and half_tail:
-        slack = b.untyped_storage().nbytes() - (b.storage_offset() + b.numel()) * b.element_size()
-        if slack < WMMA_K * 16:
-            return cfg._replace(kpair=1, num_buffers=min(4, 2 * cfg.num_buffers))
-    return cfg
+def _slack(t: torch.Tensor) -> int:
+    """Bytes of ``t``'s storage after its last element."""
+    end = t.storage_offset() + sum((n - 1) * st for n, st in zip(t.shape, t.stride())) + 1
+    return t.untyped_storage().nbytes() - end * t.element_size()
+
+
+def _tail_safe(cfg: MXGemmConfig, v: int, tensors, b_preshuffled: bool, packed: bool, who: str) -> MXGemmConfig:
+    """A partial last K step of ``v`` (mod 128 * kpair) loads whole tile rows and lets the TDM clamp the data (its
+    inner extent bounds the data, not the addressing): the last row of a, b and the scales is read up to a step past
+    its data. A half step (kpair 2, v <= 128) loads only its first half of a, a row-major b and packed scales, which
+    then read nothing past the data at 128-aligned K; a preshuffled b (2 KiB group rows) and raw scales still do. So:
+    ``cfg`` if the storages have that slack (the quantizers allocate it), else kpair 1 when K is 128-aligned (no
+    partial step); K % 128 != 0 without the slack is refused (pad K to 128, as the MX quantizers do)."""
+    v %= WMMA_K * cfg.kpair
+    if v == 0:
+        return cfg
+    width = WMMA_K if cfg.kpair == 1 or v <= WMMA_K else 2 * WMMA_K
+    need = (width - v, (WMMA_K * cfg.kpair - v) * 16 if b_preshuffled else width - v,
+            0 if packed else 4 * cfg.kpair - (v + 31) // 32)
+    need = need + need[2:]
+    if all(_slack(t) >= n for t, n in zip(tensors, need)):
+        return cfg
+    if v % WMMA_K == 0:  # kpair 2 with a half step: kpair 1 has none
+        return cfg._replace(kpair=1, num_buffers=min(4, 2 * cfg.num_buffers))
+    raise ValueError(f"{who}: K % 128 = {v % WMMA_K} would read up to {max(need)} B past the last row of a / b / the "
+                     f"scales, more than their storages hold: pad K to a multiple of 128 or give them that slack")
 
 
 def _out(out, shape, out_dtype, accumulate, device, who):
@@ -778,8 +795,8 @@ def gemm_mxfp8_gfx1250(
     if K == 0:
         return out if accumulate else out.zero_()
     cfg = config or pick_config(M, N, K, b_preshuffled)
-    cfg = _b_tail_safe(cfg, b, b_preshuffled, 0 < K % (2 * WMMA_K) <= WMMA_K)
     packed, ldsa, ldsb = _check_scales(a_scale, b_scale, M, N, K, "gemm_mxfp8_gfx1250")
+    cfg = _tail_safe(cfg, K, (a, b, a_scale, b_scale), b_preshuffled, packed, "gemm_mxfp8_gfx1250")
     k_tail = K % (WMMA_K * cfg.kpair) != 0
     return _launch("gemm_mxfp8_gfx1250", DENSE, cfg, out, a, b, a_scale, b_scale, None, None, M, N, K, a.stride(0),
                    b.stride(0), ldsa, ldsb, 1, b_preshuffled, accumulate, k_tail)
@@ -819,8 +836,8 @@ def grouped_gemm_mxfp8_gfx1250(
     if K == 0:
         return out.zero_()
     cfg = config or pick_grouped_config(GROUPED_M, m_out // max(G, 1), N, K, b_preshuffled)
-    cfg = _b_tail_safe(cfg, b, b_preshuffled, 0 < K % (2 * WMMA_K) <= WMMA_K)
     packed, ldsa, ldsb = _check_scales(a_scale, b_scale, a.shape[0], N, K, who, (G,))
+    cfg = _tail_safe(cfg, K, (a, b, a_scale, b_scale), b_preshuffled, packed, who)
     if packed and N % 32:
         raise ValueError(f"{who}: packed b scales need N % 32 == 0")
     return _launch(who, GROUPED_M, cfg, out, a, b, a_scale, b_scale, group_offs, group_offs_padded, m_out, N, K,
@@ -856,7 +873,7 @@ def grouped_gemm_mxfp8_variable_k_gfx1250(
     if M == 0 or N == 0 or G == 0:
         return out
     cfg = config or pick_grouped_config(VARIABLE_K, M, N, T // max(G, 1), b_preshuffled)
-    cfg = _b_tail_safe(cfg, b, b_preshuffled, True)  # an expert with an odd count of 128 tokens
     packed, ldsa, ldsb = _check_scales(a_scale, b_scale, M, N, T, who)
+    cfg = _tail_safe(cfg, WMMA_K, (a, b, a_scale, b_scale), b_preshuffled, packed, who)  # any expert: 128 * odd
     return _launch(who, VARIABLE_K, cfg, out, a, b, a_scale, b_scale, group_offs, None, M, N, T, a.stride(0),
                    b.stride(0), ldsa, ldsb, G, b_preshuffled, accumulate, True)
