@@ -110,11 +110,13 @@ def geometry(c: MXGemmConfig, stage_f32: bool = False, slot_major: bool = False)
     return row, step, (base_a, base_b, base_sa, base_sb), arena, pitch
 
 
-def c_early_fits(c: MXGemmConfig) -> bool:
+def c_early_fits(c: MXGemmConfig, pre: int = 0) -> bool:
     """beta = 1 into a bf16 C can fetch the old C tile (rows padded like the staging) during the last K step into the
-    A + B slot that step does not read: kpair 2 (one free slot of a whole tile). With a cluster, a cluster barrier
-    first: every partner is past the previous step, so none of its multicasts into that slot is still in flight."""
-    return c.kpair == 2 and c.tile_m * (c.tile_n * 2 + C_PAD_B) <= geometry(c, slot_major=True)[4]
+    A + B slot that step does not read: kpair 2 (one free slot of a whole tile), or, with ``pre`` rows fetched early
+    (c_pre), any kpair whose slot holds the rest. With a cluster, a cluster barrier first: every partner is past the
+    previous step, so none of its multicasts into that slot is still in flight."""
+    return (c.kpair == 2 or pre > 0) and \
+        (c.tile_m - pre) * (c.tile_n * 2 + C_PAD_B) <= geometry(c, slot_major=True)[4]
 
 
 def _tdm_group1(mask, tile0: int, tile1: int, dim0, dim1, stride, pad: int):
@@ -178,15 +180,18 @@ def _launch_gemm_mxfp8(
     variable-K: the 128-padded token offsets (``arg_g0``). Unused in dense mode. ``c_early`` (beta = 1, bf16 out,
     ``c_early_fits``, whole N tiles): the old C tile comes into the free A + B slot during the last K step."""
     cfg = MXGemmConfig(tile_m, tile_n, num_buffers, kpair, cluster_m, cluster_n, scale_4d, b_shuf)
-    assert not c_early or (beta1 and not out_f32 and c_early_fits(cfg))
+    assert not c_early or (beta1 and not out_f32 and c_early_fits(cfg, c_pre))
     # persistent: the next tile's slots load during this one's epilogue, which stages bf16 in one slot
     assert not persist or (num_buffers == 2 and c_early_fits(cfg) and not out_f32 and (c_early or not beta1))
     STG = 4 if out_f32 or (beta1 and not c_early) else 2  # bytes per staged output element
     OB = 4 if out_f32 else 2  # bytes per output element
     LDS_ROW, STAGE, BASE, ARENA, PITCH = geometry(cfg, STG == 4, c_early or persist)
-    # c_pre (c_early): the first c_pre rows of the old C come early, at the tile's start, into LDS past the slots;
-    # the last K step then fetches only the rest into the free slot
-    assert not c_pre or (c_early and c_pre % 16 == 0 and c_pre <= tile_m // 2)
+    # c_pre (c_early): the first c_pre rows of the old C come early into the LDS past the slots: 16 rows per K-step
+    # boundary of the mainloop (wave 3, after its refill; the rest of them at the last K step if the loop is short),
+    # or, persistent, all at once during the previous tile's epilogue once its stores have read them (the trickle's
+    # loop state spills there); the last K step fetches only the rows past them into the free slot
+    TRICKLE = bool(c_pre) and not persist
+    assert not c_pre or (c_early and c_pre % 16 == 0 and c_pre <= tile_m)
     PRE_BASE = (ARENA + 15) // 16 * 16
     if c_pre:
         ARENA = PRE_BASE + c_pre * (tile_n * 2 + C_PAD_B)
@@ -520,13 +525,32 @@ def _launch_gemm_mxfp8(
                 c_addr = c_addr + fx.Int64(expert) * fx.Int64(i32_m) * fx.Int64(i32_ldc) * OB
             return m_ext, n_ext, c_addr
 
+        def _c_pre_args(m_ext, c_addr):
+            """c_pre: the tile's old-C address (TDM words 2, 3), valid rows and 16-row stride, uniform (SGPRs)."""
+            rf = lambda v: fx.Int32(rocdl.readfirstlane(T.i32, v))  # noqa: E731
+            return (rf(fx.Int32(c_addr)), rf(fx.Int32(c_addr >> 32) | fx.Int32(-(1 << 31))), rf(m_ext),
+                    rf(i32_ldc * 32))
+
         def _c_pre_load(dec):
-            """c_pre (wave 3): the first ``c_pre`` rows of tile ``dec``'s old C into their own LDS (past the slots)."""
+            """c_pre, persistent (wave 3): the first ``c_pre`` rows of tile ``dec``'s old C, one load."""
             m_ext, _, c_addr = _c_geo(dec)
             g0 = Vec.from_elements([fx.Int32(1), lds0 + PRE_BASE, fx.Int32(c_addr),
                                     fx.Int32(c_addr >> 32) | fx.Int32(-(1 << 31))], fx.Int32)
             g1 = Vec.from_elements(_tdm_group1(0, tile_n * 2, c_pre, fx.Int32(tile_n * 2), m_ext, i32_ldc * 2,
                                                C_PAD_B), fx.Int32)
+            tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(as_ir_value(g0), as_ir_value(g1)))
+
+        def _c_chunk(c, pre):
+            """c_pre (wave 3): old-C rows [16 c, 16 c + 16) of the tile (``_c_pre_args``) into their own LDS (past the
+            slots); rows past the tile's valid rows zero-filled, not read."""
+            lo0, hi0, rows, rstep = pre
+            lo, hi = tdm_ops.add_addr_with_carry(lo0, hi0, c * rstep)
+            ext = rows - c * 16
+            ext = (ext > zero).select(ext, zero)
+            g0 = Vec.from_elements([fx.Int32(1), lds0 + PRE_BASE + c * (16 * C_ROW_B), fx.Int32(lo), fx.Int32(hi)],
+                                   fx.Int32)
+            g1 = Vec.from_elements(_tdm_group1(0, tile_n * 2, 16, fx.Int32(tile_n * 2), ext, i32_ldc * 2, C_PAD_B),
+                                   fx.Int32)
             tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(as_ir_value(g0), as_ir_value(g1)))
 
         def _tile(dec, rot, nxt=None):
@@ -556,7 +580,7 @@ def _launch_gemm_mxfp8(
                 return (head + a_th, b_th) if parity == 0 else (head + b_th, a_th)
 
             def _stage(stage, next_stage, future_slot, future_delta, fence_out, has_next, boundary, parity=0,
-                       more=None):
+                       more=None, chunk=None):
                 """One 128-wide K step: four quadrants of the wave tile, at most three fragment groups live; the
                 second-half fragments of this step and the first half of the next are read in between the WMMAs.
                 ``more`` (drain): whether a later step runs, else its slot fence and barrier are skipped."""
@@ -613,6 +637,10 @@ def _launch_gemm_mxfp8(
                         rocdl.s_barrier_wait(_WG_BARRIER)
                         if const_expr(refill):
                             tdm_ops.tensor_load_2d(prepared)
+                            if const_expr(TRICKLE and chunk is not None):  # the next 16 early old-C rows
+                                if wave == 3:
+                                    if chunk < c_pre // 16:
+                                        _c_chunk(chunk, pre_args)
                     elif const_expr(boundary and has_next):
                         if more:
                             rocdl.s_barrier_wait(_WG_BARRIER)
@@ -640,6 +668,7 @@ def _launch_gemm_mxfp8(
 
             # the output tile: rows / columns past M / N dropped by the stores (and not read by the old-C load)
             m_ext, n_ext, c_addr = _c_geo(dec)
+            pre_args = _c_pre_args(m_ext, c_addr) if const_expr(TRICKLE) else None
             free_slot = (last_slot + (NB - 1)) % NB  # c_early: the previous K step's slot (logical)
             if const_expr(persist):
                 free_slot = free_slot ^ rot
@@ -650,10 +679,7 @@ def _launch_gemm_mxfp8(
                     cluster.cluster_barrier()
                 for i in range_constexpr(NB):
                     tdm_ops.tensor_load_2d(_prepare(i, fx.Int32(i) * t_step))
-                if const_expr(c_pre):
-                    if wave == 3:
-                        _c_pre_load(dec)
-            if const_expr(c_pre):  # wave 3 has the early old-C rows in flight after the slots
+            if const_expr(c_pre and persist):  # wave 3 has this tile's early old-C rows in flight after its slots
                 if wave == 3:
                     tdm_ops.tensor_wait(NB)
                 else:
@@ -677,7 +703,8 @@ def _launch_gemm_mxfp8(
                     rev_delta = rev * NB * t_step
                     for g in range_constexpr(UNROLL):
                         delta = rev_delta + slot_delta[g // KPAIR]
-                        _stage(g, (g + 1) % UNROLL, g // KPAIR, delta, NB - 2, True, g % KPAIR == KPAIR - 1, parity)
+                        _stage(g, (g + 1) % UNROLL, g // KPAIR, delta, NB - 2, True, g % KPAIR == KPAIR - 1, parity,
+                               chunk=rev * NB + g // KPAIR)
                     if const_expr(use_cluster):
                         if (rev % CLUSTER_SYNC_REVS) == (CLUSTER_SYNC_REVS - 1):
                             cluster.cluster_barrier()
@@ -719,7 +746,11 @@ def _launch_gemm_mxfp8(
                                 cluster.cluster_barrier()  # (in every partner: loads multicast into it)
                             if const_expr(c_early):
                                 if wave == 3:
-                                    _c_load()
+                                    if const_expr(TRICKLE):  # the early rows a short mainloop did not reach
+                                        for c in range(n_full * NB, c_pre // 16):
+                                            _c_chunk(c, pre_args)
+                                    if const_expr(c_pre < tile_m):  # (c_pre = the whole tile: nothing left)
+                                        _c_load()
                             else:
                                 if more_tiles:
                                     tdm_ops.tensor_load_2d(prep_n(0, zero))
@@ -747,9 +778,11 @@ def _launch_gemm_mxfp8(
                 else:
                     stg_off = last_phys * PITCH
             # c_pre: the first c_pre rows (in wave row 0's first fragments) live in their own LDS, staged in place there
-            pre_sel = (wave_m == 0).select(fx.Int32(PRE_BASE) - stg_off, zero) if const_expr(c_pre) else zero
+            pre_d = fx.Int32(PRE_BASE) - stg_off
+            pre_sel = (wave_m == 0).select(pre_d, zero) if const_expr(c_pre) else zero
             for wm in range_constexpr(m_rep):
-                sel = pre_sel if const_expr(wm * 16 < c_pre) else zero
+                # rows wave_m * WM + wm * 16 + [0, 16): early rows in both wave rows, wave row 0 only, or none
+                sel = pre_d if const_expr(WM + wm * 16 < c_pre) else (pre_sel if const_expr(wm * 16 < c_pre) else zero)
                 for wn in range_constexpr(n_rep):
                     h = accs[wm * n_rep + wn]
                     row, col = wmb + wm * 16 + lane16, wnb + wn * 16 + kgrp * 8
@@ -797,7 +830,7 @@ def _launch_gemm_mxfp8(
                     gpu.barrier()
                 if more_tiles:
                     tdm_ops.tensor_load_2d(prep_n(1, t_step_n))
-                    if const_expr(c_pre):  # (the stores have read this tile's c_pre rows)
+                    if const_expr(c_pre):  # (the stores have read this tile's early rows)
                         if wave == 3:
                             _c_pre_load(nd)
             return rot_n
@@ -979,14 +1012,20 @@ def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1
     divide; grouped-M m tiles belong to different experts, so it multicasts A along N only."""
     cm = 1 if mode == GROUPED_M else _divisor_cluster((M + cfg.tile_m - 1) // cfg.tile_m, cfg.cluster_m)
     cn = _divisor_cluster((N + cfg.tile_n - 1) // cfg.tile_n, cfg.cluster_n)
-    c_early = C_EARLY_ON and beta1 and not out_f32 and N % cfg.tile_n == 0 and \
-        c_early_fits(cfg._replace(cluster_m=cm, cluster_n=cn))
+    cg = cfg._replace(cluster_m=cm, cluster_n=cn, scale_4d=bool(packed), b_preshuffle=bool(b_preshuffled))
+    ce_ok = C_EARLY_ON and beta1 and not out_f32 and N % cfg.tile_n == 0
+    c_pre = 0
+    if ce_ok and _sw(C_PRE_ON, cfg.c_pre):
+        # the old C's first rows: as many as the LDS past the slots holds (within half of it for a 128x128 tile whose
+        # slots leave room for a second workgroup on the CU)
+        arena = (geometry(cg, False, True)[3] + 15) // 16 * 16
+        two = cfg.tile_m * cfg.tile_n <= 128 * 128 and arena <= LDS_BYTES // 2
+        budget = LDS_BYTES // 2 if two else LDS_BYTES
+        c_pre = min((budget - arena) // (cfg.tile_n * 2 + C_PAD_B) // 16 * 16, cfg.tile_m)
+    c_early = ce_ok and c_early_fits(cg, c_pre)
+    c_pre = c_pre if c_early else 0
     persist = _sw(PERSIST_ON, cfg.persist) and cfg.num_buffers == 2 and not out_f32 and c_early_fits(cfg) and \
         (c_early or not beta1)
-    c_pre = 0
-    if c_early and _sw(C_PRE_ON, cfg.c_pre):
-        arena = geometry(cfg._replace(scale_4d=bool(packed), b_preshuffle=bool(b_preshuffled)), False, True)[3]
-        c_pre = min((LDS_BYTES - (arena + 15) // 16 * 16) // (cfg.tile_n * 2 + C_PAD_B) // 16 * 16, cfg.tile_m // 2)
     return (cfg.tile_m, cfg.tile_n, cfg.num_buffers, cfg.kpair, cm, cn, bool(packed), bool(b_preshuffled),
             bool(k_tail), mode, G, bool(out_f32), bool(beta1), bool(c_early), bool(persist),
             bool(_sw(XCD_REMAP_ON, cfg.xcd_remap) and mode == GROUPED_M and not persist), int(_sw(STAGGER_ON, cfg.stagger)),
