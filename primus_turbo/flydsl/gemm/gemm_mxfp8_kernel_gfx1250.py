@@ -188,8 +188,7 @@ def _launch_gemm_mxfp8(
     cfg = MXGemmConfig(tile_m, tile_n, num_buffers, kpair, cluster_m, cluster_n, scale_4d, b_shuf)
     assert not c_early or (beta1 and not out_f32 and c_early_fits(cfg))
     # persistent: the next tile's slots load during this one's epilogue, which stages bf16 in one slot
-    assert not persist or (mode in (GROUPED_M, VARIABLE_K) and num_buffers == 2 and c_early_fits(cfg) and
-                           not out_f32 and (c_early or not beta1))
+    assert not persist or (num_buffers == 2 and c_early_fits(cfg) and not out_f32 and (c_early or not beta1))
     STG = 4 if out_f32 or (beta1 and not c_early) else 2  # bytes per staged output element
     OB = 4 if out_f32 else 2  # bytes per output element
     LDS_ROW, STAGE, BASE, ARENA, PITCH = geometry(cfg, STG == 4, c_early or persist)
@@ -315,7 +314,7 @@ def _launch_gemm_mxfp8(
             supers = (t < acc).select((i32_k + (SUPER_K - 1)) // SUPER_K, fx.Int32(1))
             return in0 + local, out0 + local, m_valid, blk_n, n_valid, expert, zero, i32_k, supers
 
-        if const_expr(mode == DENSE):
+        if const_expr(mode == DENSE and not persist):
             blk_n = fx.Int32(bid_y) * tile_n
             blk_m = (fx.Int32(bid_z) * fx.Int32(fx.grid_dim.x) + fx.Int32(bid_x)) * tile_m
             supers = (i32_k + (SUPER_K - 1)) // SUPER_K
@@ -778,6 +777,21 @@ def _launch_gemm_mxfp8(
                 def _decode_lin(tau):
                     xg, yg = tau % mtg, (tau // mtg) % ntg
                     return _decode_vk(xg * cluster_m + lxp, yg * cluster_n + lyp, tau // (mtg * ntg))
+            elif const_expr(mode == DENSE):  # chunks of 32 m tiles x all n groups (the grid's order), the last short
+                n_tiles = mtg * ntg
+                RX = max(1, 32 // cluster_m)
+                full = mtg // RX * RX
+                rem = mtg - full
+                rem = (rem > zero).select(rem, fx.Int32(1))
+                supers_d = (i32_k + (SUPER_K - 1)) // SUPER_K
+
+                def _decode_lin(tau):
+                    head = tau < full * ntg
+                    tail = tau - full * ntg
+                    xg = head.select(tau // (RX * ntg) * RX + tau % RX, full + tail % rem)
+                    yg = head.select((tau // RX) % ntg, tail // rem)
+                    blk_m, blk_n = (xg * cluster_m + lxp) * tile_m, (yg * cluster_n + lyp) * tile_n
+                    return blk_m, blk_m, i32_m - blk_m, blk_n, i32_n - blk_n, zero, zero, i32_k, supers_d
             else:  # GROUPED_M (cluster_m == 1): chunks of 32 m tiles x all n groups (the grid's order), the last short
                 gm_tab = _gm_table()
                 n_m = gm_tab[1]
@@ -840,8 +854,8 @@ def _launch_gemm_mxfp8(
         grid = (gx, gy, G)
     if const_expr(persist):  # n_cus workgroups in clusters along x; variable-K: at most one cluster per tile
         n_cl = n_cus // (cluster_m * cluster_n)
-        if const_expr(mode == VARIABLE_K):
-            n_ct = gx // cluster_m * (gy // cluster_n) * G
+        if const_expr(mode != GROUPED_M):
+            n_ct = gx // cluster_m * (gy // cluster_n) * (G if mode == VARIABLE_K else 1)
             n_cl = (n_ct < n_cl).select(n_ct, fx.Int32(n_cl))
         grid = (n_cl * cluster_m, cluster_n, 1)
     attrs = {"rocdl.cluster_dims": f"{cluster_m},{cluster_n},1"} if use_cluster else {}
@@ -896,7 +910,7 @@ def _check_scales(sa, sb, a_rows: int, b_rows: int, K: int, who: str, b_batch: t
 
 # A/B switches over the configs' choices (None: as the config says)
 C_EARLY_ON = True  # beta = 1 into bf16: fetch the old C during the last K step where it fits
-PERSIST_ON = None  # grouped-M / variable-K, bf16 out, kpair 2 x 2 slots: persistent, next tile loaded during the stores
+PERSIST_ON = None  # bf16 out, kpair 2 x 2 slots: persistent workgroups, the next tile loaded during the stores
 XCD_REMAP_ON = None  # grouped-M: consecutive m tiles of a grid chunk on one XCD
 STAGGER_ON = None  # start the (first wave of) workgroups in this many phases (0: together)
 
@@ -925,8 +939,8 @@ def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1
     cn = _divisor_cluster((N + cfg.tile_n - 1) // cfg.tile_n, cfg.cluster_n)
     c_early = C_EARLY_ON and beta1 and not out_f32 and N % cfg.tile_n == 0 and \
         c_early_fits(cfg._replace(cluster_m=cm, cluster_n=cn))
-    persist = _sw(PERSIST_ON, cfg.persist) and mode in (GROUPED_M, VARIABLE_K) and cfg.num_buffers == 2 and \
-        not out_f32 and c_early_fits(cfg) and (c_early or not beta1)
+    persist = _sw(PERSIST_ON, cfg.persist) and cfg.num_buffers == 2 and not out_f32 and c_early_fits(cfg) and \
+        (c_early or not beta1)
     return (cfg.tile_m, cfg.tile_n, cfg.num_buffers, cfg.kpair, cm, cn, bool(packed), bool(b_preshuffled),
             bool(k_tail), mode, G, bool(out_f32), bool(beta1), bool(c_early), bool(persist),
             bool(_sw(XCD_REMAP_ON, cfg.xcd_remap) and mode == GROUPED_M and not persist), int(_sw(STAGGER_ON, cfg.stagger)),

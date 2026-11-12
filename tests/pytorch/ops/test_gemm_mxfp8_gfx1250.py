@@ -124,6 +124,23 @@ def test_gemm_mxfp8_fp32_out_and_accumulate(cfg, M, N, K, c_early, monkeypatch):
         torch.testing.assert_close(out, (ref + c0.float()).to(dt), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("cfg", [C(256, 256, 2, 2, 1, 1), C(256, 256, 2, 2, 2, 2)] if is_gfx1250() else [None], ids=str)
+def test_gemm_mxfp8_persistent(cfg, monkeypatch):
+    """Persistent dense (272 tiles on <= 256 workgroups, a half last K step): bf16 out and beta = 1 into bf16."""
+    M, N, Kd = 4352, 4096, 640
+    a, sa, b, sb = int_valued_operands(M, N, Kd, seed=3)
+    ref = gemm_ref(a, sa, b, sb).float()
+    sa, sb, a, b = pack_scales(sa), pack_scales(sb), _slack(a), _slack(_shuf(b))
+    monkeypatch.setattr(K, "PERSIST_ON", True)
+    out = torch.full((M, N), float("nan"), device=DEV, dtype=torch.bfloat16)
+    gemm_mxfp8_gfx1250(a, sa, b, sb, out=out, config=cfg, b_preshuffled=True)
+    torch.testing.assert_close(out, ref.to(torch.bfloat16), rtol=0, atol=0)
+    c0 = (torch.randn(M, N, device=DEV) * 64).to(torch.bfloat16)
+    out = c0.clone()
+    gemm_mxfp8_gfx1250(a, sa, b, sb, out=out, config=cfg, b_preshuffled=True, accumulate=True)
+    torch.testing.assert_close(out, (ref + c0.float()).to(torch.bfloat16), rtol=0, atol=0)
+
+
 def test_gemm_mxfp8_random_snr():
     M, N, K = 1024, 2048, 4096
     g = torch.Generator(device=DEV).manual_seed(5)
