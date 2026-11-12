@@ -440,8 +440,8 @@ def _launch(
                         a0 = tb + r * I32(PITCH) + (kb * I32(2) + h) * I32(32)
                         words = [_lds_v4(a0), _lds_v4(a0 + I32(16))]
                         byte = _e8m0(blk_amax(words, (r // I32(32)) * I32(4) + kb, 0xB1), RULE_C)
-                        if const_expr(EXP):
-                            byte = ((r >= nreal) & (k0 + kb * I32(32) < I32(KV))).select(I32(PAD_SCALE), byte)
+                        if const_expr(EXP):  # pad rows: 127 over the real columns, 0 in the K padding
+                            byte = ((r >= nreal) & (k0 + kb * I32(32) < I32(K))).select(I32(PAD_SCALE), byte)
                         codes = _cvt16(words, byte, RULE_C)
                         ok = (r < nrows) & (col < I32(KV))
                         if const_expr(SR):
