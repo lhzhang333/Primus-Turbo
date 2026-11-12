@@ -180,13 +180,14 @@ def _grouped_operands(lens, N, Kd, seed):
         ([256] * 8, 768, 576, C(128, 256, 3, 2, 1, 2)),
         ([77, 300, 0, 129], 512, 640, C(256, 256, 2, 2, 1, 2)),
         ([(37 * i) % 300 for i in range(40)], 256, 1024, C(256, 256, 2, 2, 1, 1)),  # > 32 experts
+        ([(53 * i) % 900 for i in range(48)], 1024, 512, C(256, 256, 2, 2, 1, 4)),  # persistent: ~2 tiles each
     ]
     if is_gfx1250()
     else [],
 )
 def test_grouped_gemm_mxfp8(lens, N, Kd, cfg, monkeypatch):
     """Routed experts fwd / dgrad: skewed, empty and one-row experts, K tails; packed scales + preshuffled B and the
-    raw / row-major fallback; fp32 out; the XCD-grouped m tile order."""
+    raw / row-major fallback; fp32 out; the XCD-grouped m tile order; persistent (+ staggered) workgroups."""
     a, sa, b, sb, offs, offs_p, ref = _grouped_operands(lens, N, Kd, seed=len(lens) + Kd)
     m = sum(lens)
     sb4 = torch.stack([pack_scales(sb[g]) for g in range(len(lens))])
@@ -203,6 +204,15 @@ def test_grouped_gemm_mxfp8(lens, N, Kd, cfg, monkeypatch):
     out = torch.full((m, N), float("nan"), device=DEV, dtype=torch.bfloat16)
     grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(_shuf(b)), sb4, offs, offs_p, m, out=out, config=cfg)
     torch.testing.assert_close(out, ref.to(torch.bfloat16), rtol=0, atol=0)
+    monkeypatch.setattr(K, "XCD_REMAP_ON", False)
+    if cfg.num_buffers == 2 and cfg.kpair == 2:
+        monkeypatch.setattr(K, "PERSIST_ON", True)
+        for c, sg in ((cfg, 0), (cfg._replace(cluster_n=1), 8)):
+            monkeypatch.setattr(K, "STAGGER_ON", sg)
+            out = torch.full((m, N), float("nan"), device=DEV, dtype=torch.bfloat16)
+            grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(_shuf(b)), sb4, offs, offs_p, m, out=out,
+                                       config=c)
+            torch.testing.assert_close(out, ref.to(torch.bfloat16), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

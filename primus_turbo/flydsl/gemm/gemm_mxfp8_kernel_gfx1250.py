@@ -186,10 +186,12 @@ def _launch_gemm_mxfp8(
     ``c_early_fits``, whole N tiles): the old C tile comes into the free A + B slot during the last K step."""
     cfg = MXGemmConfig(tile_m, tile_n, num_buffers, kpair, cluster_m, cluster_n, scale_4d, b_shuf)
     assert not c_early or (beta1 and not out_f32 and c_early_fits(cfg))
-    assert not persist or (mode == VARIABLE_K and c_early and num_buffers == 2 and cluster_m * cluster_n == 1)
+    # persistent: the next tile's slots load during this one's epilogue, which stages bf16 in one slot
+    assert not persist or (mode in (GROUPED_M, VARIABLE_K) and num_buffers == 2 and c_early_fits(cfg) and
+                           not out_f32 and (c_early or not beta1))
     STG = 4 if out_f32 or (beta1 and not c_early) else 2  # bytes per staged output element
     OB = 4 if out_f32 else 2  # bytes per output element
-    LDS_ROW, STAGE, BASE, ARENA, PITCH = geometry(cfg, STG == 4, c_early)
+    LDS_ROW, STAGE, BASE, ARENA, PITCH = geometry(cfg, STG == 4, c_early or persist)
     G = n_groups
     assert tile_m in (128, 256) and tile_n in (128, 256) and kpair in (1, 2) and num_buffers in (2, 3, 4)
     assert ARENA <= LDS_BYTES, f"{cfg} needs {ARENA} B of LDS"
@@ -255,24 +257,11 @@ def _launch_gemm_mxfp8(
             # (a_row0, out_row0, m_valid, blk_n, n_valid, expert, k0, klen, supers)
             return blk_m, blk_m, i32_m - blk_m, blk_n, i32_n - blk_n, e, k0, klen, supers
 
-        if const_expr(mode == DENSE):
-            blk_n = fx.Int32(bid_y) * tile_n
-            blk_m = (fx.Int32(bid_z) * fx.Int32(fx.grid_dim.x) + fx.Int32(bid_x)) * tile_m
-            supers = (i32_k + (SUPER_K - 1)) // SUPER_K
-            # m_valid <= 0 for a workgroup past the edge
-            dec = (blk_m, blk_m, i32_m - blk_m, blk_n, i32_n - blk_n, zero, zero, i32_k, supers)
-        elif const_expr(mode == GROUPED_M):
-            # m-tile t of the experts' tiles in order (ceil(len_g / tile_m) each); a tile past them is dead
-            blk_n = fx.Int32(bid_y) * tile_n
-            t_x = fx.Int32(bid_x)
-            if const_expr(xcd_remap):
-                # workgroups go round-robin over the XCDs, so x and x + 8 share one: give an XCD consecutive m tiles
-                # (an expert's B tiles then stay in fewer L2s); grid.x is a multiple of 8 here
-                gdx = fx.Int32(fx.grid_dim.x)
-                t_x = (gdx % 8 == 0).select((t_x % 8) * (gdx // 8) + t_x // 8, t_x)
-            t = fx.Int32(bid_z) * fx.Int32(fx.grid_dim.x) + t_x
-            # lane l of chunk c takes expert 32 c + l: its tile count, a DPP prefix sum of them, a ballot of the
-            # expert whose tiles hold t (no dependent scalar chain, no 2 x G live SGPRs)
+        def _decode_gm(t, blk_n):
+            """grouped-M: m tile t of the experts' tiles in order (ceil(len_g / tile_m) each): (the tile, the number
+            of m tiles); a tile past them is dead (no rows, no B). Lane l of chunk c takes expert 32 c + l: its tile
+            count, a DPP prefix sum of them, a ballot of the expert whose tiles hold t (no dependent scalar chain,
+            no 2 x G live SGPRs)."""
             rs0 = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg_g0)), num_records_bytes=8 * (G + 1))
             rs1 = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg_g1)), num_records_bytes=8 * (G + 1))
 
@@ -300,19 +289,35 @@ def _launch_gemm_mxfp8(
                 in0 = found.select(fx.Int32(rocdl.readlane(T.i32, p0, src)), in0)
                 out0 = found.select(fx.Int32(rocdl.readlane(T.i32, o0, src)), out0)
                 acc = acc + fx.Int32(rocdl.readlane(T.i32, incl, 31))
+            local = (t - first) * tile_m
+            rows = len_g - local
+            m_valid = (rows < tile_m).select(rows, fx.Int32(tile_m))
+            m_valid = (t < acc).select(m_valid, zero)
+            n_valid = (t < acc).select(i32_n - blk_n, zero)
+            supers = (t < acc).select((i32_k + (SUPER_K - 1)) // SUPER_K, fx.Int32(1))
+            return (in0 + local, out0 + local, m_valid, blk_n, n_valid, expert, zero, i32_k, supers), acc
+
+        if const_expr(mode == DENSE):
+            blk_n = fx.Int32(bid_y) * tile_n
+            blk_m = (fx.Int32(bid_z) * fx.Int32(fx.grid_dim.x) + fx.Int32(bid_x)) * tile_m
+            supers = (i32_k + (SUPER_K - 1)) // SUPER_K
+            # m_valid <= 0 for a workgroup past the edge
+            dec = (blk_m, blk_m, i32_m - blk_m, blk_n, i32_n - blk_n, zero, zero, i32_k, supers)
+        elif const_expr(mode == GROUPED_M and not persist):
+            t_x = fx.Int32(bid_x)
+            if const_expr(xcd_remap):
+                # workgroups go round-robin over the XCDs, so x and x + 8 share one: give an XCD consecutive m tiles
+                # (an expert's B tiles then stay in fewer L2s); grid.x is a multiple of 8 here
+                gdx = fx.Int32(fx.grid_dim.x)
+                t_x = (gdx % 8 == 0).select((t_x % 8) * (gdx // 8) + t_x // 8, t_x)
+            t = fx.Int32(bid_z) * fx.Int32(fx.grid_dim.x) + t_x
+            dec, acc = _decode_gm(t, fx.Int32(bid_y) * tile_n)
             # a tile past the experts' (the grid is an upper bound) ends its workgroup here: uniform, and a cluster
             # (along N) shares the m tile, so whole clusters end
             _llvm.inline_asm(None, [as_ir_value(t), as_ir_value(acc)],
                              "s_cmp_lt_u32 $0, $1\n\ts_cbranch_scc1 1f\n\ts_endpgm\n\t1:", "s,s,~{scc},~{memory}",
                              has_side_effects=True)
-            local = (t - first) * tile_m
-            rows = len_g - local
-            m_valid = (rows < tile_m).select(rows, fx.Int32(tile_m))
-            m_valid = (t < acc).select(m_valid, zero)  # dead: no row, no B either
-            n_valid = (t < acc).select(i32_n - blk_n, zero)
-            supers = (t < acc).select((i32_k + (SUPER_K - 1)) // SUPER_K, fx.Int32(1))
-            dec = (in0 + local, out0 + local, m_valid, blk_n, n_valid, expert, zero, i32_k, supers)
-        elif const_expr(not persist):
+        elif const_expr(mode == VARIABLE_K and not persist):
             dec = _decode_vk(fx.Int32(bid_x), fx.Int32(bid_y), fx.Int32(bid_z))
         a_mask = b_mask = 0
         if const_expr(use_cluster):
@@ -387,7 +392,7 @@ def _launch_gemm_mxfp8(
             def _prepare(slot, delta):
                 past = delta > last_delta
                 delta = past.select(last_delta, delta)
-                if const_expr(c_early):
+                if const_expr(c_early or persist):
                     slot = past.select(last_slot, fx.Int32(slot))
                 if const_expr(persist):
                     slot = fx.Int32(slot) ^ rot
@@ -643,6 +648,16 @@ def _launch_gemm_mxfp8(
                                                    C_PAD_B), fx.Int32)
                 tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(as_ir_value(g0), as_ir_value(g1)))
 
+            rot_n = rot
+            if const_expr(persist):
+                # the next tile: its first slot goes into the slot the epilogue does not stage in (c_early: the last
+                # K step's, after the mainloop; else the free one, at the last K step's start), its second one into
+                # the staging slot once the stores have read it
+                nd, more_tiles = nxt
+                last_phys = last_slot ^ rot
+                rot_n = last_phys if const_expr(c_early) else last_phys ^ 1
+                prep_n, t_step_n, _ = _make_prepare(_desc(nd), nd[8], rot_n)
+
             # odd waves run the quadrants B-first: the two wave pairs read different fragment halves at a time
             if wave_parity == 0:
                 _run_steady(0)
@@ -652,14 +667,19 @@ def _launch_gemm_mxfp8(
             rocdl.sched_barrier(0)
             for g in range_constexpr(UNROLL):
                 if g < n_drain:
-                    if const_expr(c_early and g % KPAIR == 0):
-                        if fx.Int32(g) == (drain - 1) * KPAIR:  # the last K step begins
+                    if const_expr((c_early or persist) and g % KPAIR == 0):
+                        if fx.Int32(g) == (drain - 1) * KPAIR:  # the last K step begins: the free slot is free
                             if const_expr(use_cluster):
-                                cluster.cluster_barrier()
-                            if wave == 3:
-                                _c_load()
+                                cluster.cluster_barrier()  # (in every partner: loads multicast into it)
+                            if const_expr(c_early):
+                                if wave == 3:
+                                    _c_load()
+                            else:
+                                if more_tiles:
+                                    tdm_ops.tensor_load_2d(prep_n(0, zero))
                     _stage(g, (g + 1) % UNROLL, g // KPAIR, None, NB - 2 - g // KPAIR, g < UNROLL - 1,
-                           g % KPAIR == KPAIR - 1, more=(fx.Int32(g) < n_drain - 1) if const_expr(c_early) else None)
+                           g % KPAIR == KPAIR - 1,
+                           more=(fx.Int32(g) < n_drain - 1) if const_expr(c_early or persist) else None)
 
             # ---- epilogue: accumulators -> rows in LDS (bf16, or fp32 for fp32 out / beta = 1 without c_early)
             # -> 16-byte buffer stores; beta = 1: + the old C (c_early: from the free slot, added in registers and
@@ -671,18 +691,15 @@ def _launch_gemm_mxfp8(
                 cluster.cluster_barrier()  # no multicast into this LDS is still in flight
             else:
                 gpu.barrier()
-            rot_n = rot
-            if const_expr(persist):
-                # the next tile's first slot goes where this tile's last K step was (free now), its second one
-                # into the old-C / staging slot once the stores have read it
-                nd, more_tiles = nxt
-                rot_n = (last_slot ^ rot) if const_expr(NB == 2) else rot
-                prep_n, t_step_n, _ = _make_prepare(_desc(nd), nd[8], rot_n)
-                if more_tiles:
-                    tdm_ops.tensor_load_2d(prep_n(0, zero))
             stg_off = zero
             if const_expr(c_early):  # staged in place over the old C
                 stg_off = free_slot * PITCH
+            if const_expr(persist):
+                if const_expr(c_early):
+                    if more_tiles:
+                        tdm_ops.tensor_load_2d(prep_n(0, zero))
+                else:
+                    stg_off = last_phys * PITCH
             for wm in range_constexpr(m_rep):
                 for wn in range_constexpr(n_rep):
                     h = accs[wm * n_rep + wn]
@@ -719,36 +736,64 @@ def _launch_gemm_mxfp8(
                 buffer_store(v, c_res, off, offset_is_bytes=True)
             if const_expr(persist):
                 rocdl.s_wait_dscnt(0)
-                gpu.barrier()  # the staging slot is read: the next tile's second slot may land there
+                # the staging slot is read (in every workgroup of the cluster: the loads multicast into it)
+                if const_expr(use_cluster):
+                    cluster.cluster_barrier()
+                else:
+                    gpu.barrier()
                 if more_tiles:
                     tdm_ops.tensor_load_2d(prep_n(1, t_step_n))
             return rot_n
 
         if const_expr(persist):
-            # variable-K, persistent: workgroup p runs tiles p, p + P, ... (m tile fastest, then n tile, then expert)
-            pid, n_wg = fx.Int32(bid_x), fx.Int32(fx.grid_dim.x)
-            mt, nt = (i32_m + (tile_m - 1)) // tile_m, (i32_n + (tile_n - 1)) // tile_n
-            n_tiles = mt * nt * G
+            # persistent: cluster c (a workgroup without one) runs cluster tiles c, c + NC, ...; its workgroup
+            # (lx, ly) takes tile (xg * cluster_m + lx, yg * cluster_n + ly) of cluster tile (xg, yg)
+            c_id, n_cl = fx.Int32(bid_x) // cluster_m, fx.Int32(fx.grid_dim.x) // cluster_m
+            lxp, lyp = fx.Int32(bid_x) % cluster_m, fx.Int32(bid_y)
+            mtg = (i32_m + (tile_m - 1)) // tile_m // cluster_m  # (the entry's cluster divides the tile counts)
+            ntg = (i32_n + (tile_n - 1)) // tile_n // cluster_n
+            if const_expr(mode == VARIABLE_K):  # m tile fastest, then n tile, then expert
+                n_tiles = mtg * ntg * G
 
-            def _decode_lin(tile):
-                return _decode_vk(tile % mt, (tile // mt) % nt, tile // (mt * nt))
+                def _decode_lin(tau):
+                    xg, yg = tau % mtg, (tau // mtg) % ntg
+                    return _decode_vk(xg * cluster_m + lxp, yg * cluster_n + lyp, tau // (mtg * ntg))
+            else:  # GROUPED_M (cluster_m == 1): chunks of 32 m tiles x all n groups (the grid's order), the last short
+                _, n_m = _decode_gm(zero, zero)
+                n_tiles = n_m * ntg
+                full = n_m // 32 * 32
+                rem = n_m - full
+                rem = (rem > zero).select(rem, fx.Int32(1))
 
-            n_iter = (n_tiles - pid + (n_wg - 1)) // n_wg  # >= 1: the launch has at most n_tiles workgroups
+                def _decode_lin(tau):
+                    head = tau < full * ntg
+                    tail = tau - full * ntg
+                    t = head.select(tau // (32 * ntg) * 32 + tau % 32, full + tail % rem)
+                    yg = head.select((tau // 32) % ntg, tail // rem)
+                    return _decode_gm(t, (yg * cluster_n + lyp) * tile_n)[0]
+
+            n_iter = (n_tiles - c_id + (n_cl - 1)) // n_cl
+            # a cluster with no tile ends here (uniform over it)
+            _llvm.inline_asm(None, [as_ir_value(c_id), as_ir_value(n_tiles)],
+                             "s_cmp_lt_u32 $0, $1\n\ts_cbranch_scc1 1f\n\ts_endpgm\n\t1:", "s,s,~{scc},~{memory}",
+                             has_side_effects=True)
             if const_expr(stagger):
-                # start the workgroups in ``stagger`` phases a fraction of a tile apart, so their old-C reads and
-                # stores (the memory-bound end of every tile) do not all fall into the same microseconds
-                for _ in range(pid % stagger):
+                # start the clusters in ``stagger`` phases a fraction of a tile apart, so their epilogues (old-C reads,
+                # stores: the memory-bound end of every tile) do not all fall into the same microseconds
+                for _ in range(c_id % stagger):
                     rocdl.s_sleep(STAGGER_SLEEP)
-            d0 = _decode_lin(pid)
+            if const_expr(use_cluster):
+                cluster.cluster_barrier()  # every partner resident before the first multicast
+            d0 = _decode_lin(c_id)
             prep0, t_step0, _ = _make_prepare(_desc(d0), d0[8], zero)
             for i in range_constexpr(NB):
                 tdm_ops.tensor_load_2d(prep0(i, fx.Int32(i) * t_step0))
             rot = zero
             for it in range(n_iter):
-                tile = pid + it * n_wg
+                tau = c_id + it * n_cl
                 more_tiles = it + 1 < n_iter
-                nxt_tile = more_tiles.select(tile + n_wg, tile)
-                rot = _tile(_decode_lin(tile), rot, (_decode_lin(nxt_tile), more_tiles))
+                nxt_tau = more_tiles.select(tau + n_cl, tau)
+                rot = _tile(_decode_lin(tau), rot, (_decode_lin(nxt_tau), more_tiles))
         else:
             if const_expr(stagger):
                 # the first wave of workgroups starts in ``stagger`` phases (by cluster), and the waves after it
@@ -762,7 +807,7 @@ def _launch_gemm_mxfp8(
 
     # Launch: grid.x runs up to 32 M tiles (a power of two dividing them), grid.y the N tiles, grid.z the M chunks
     # (grouped-M: the m tiles of all experts, at most ceil(M / tile_m) + G; variable-K: grid.z = the expert;
-    # persistent variable-K: min(tiles, NUM_CUS) workgroups along x).
+    # persistent: NUM_CUS workgroups).
     gx = (i32_m + (tile_m - 1)) // tile_m + (G if mode == GROUPED_M else 0)
     gx = (gx + (cluster_m - 1)) // cluster_m * cluster_m
     gy = ((i32_n + (tile_n - 1)) // tile_n + (cluster_n - 1)) // cluster_n * cluster_n
@@ -772,9 +817,12 @@ def _launch_gemm_mxfp8(
     grid = (m_run, gy, gx // m_run)
     if const_expr(mode == VARIABLE_K):
         grid = (gx, gy, G)
-    if const_expr(persist):
-        n_tiles = gx * gy * G
-        grid = ((n_tiles < NUM_CUS).select(n_tiles, fx.Int32(NUM_CUS)), 1, 1)
+    if const_expr(persist):  # NUM_CUS workgroups in clusters along x; variable-K: at most one cluster per tile
+        n_cl = NUM_CUS // (cluster_m * cluster_n)
+        if const_expr(mode == VARIABLE_K):
+            n_ct = gx // cluster_m * (gy // cluster_n) * G
+            n_cl = (n_ct < n_cl).select(n_ct, fx.Int32(n_cl))
+        grid = (n_cl * cluster_m, cluster_n, 1)
     attrs = {"rocdl.cluster_dims": f"{cluster_m},{cluster_n},1"} if use_cluster else {}
     kernel_gemm_mxfp8(
         arg_c, arg_a, arg_b, arg_sa, arg_sb, arg_g0, arg_g1, i32_m, i32_n, i32_k, i32_lda, i32_ldb, i32_ldc,
@@ -826,7 +874,7 @@ def _check_scales(sa, sb, a_rows: int, b_rows: int, K: int, who: str, b_batch: t
 
 
 C_EARLY_ON = True  # beta = 1 into bf16: fetch the old C during the last K step where it fits (A/B switch)
-PERSIST_ON = False  # variable-K with c_early and 2 slots: persistent workgroups, next tile loaded during the stores
+PERSIST_ON = False  # grouped-M / variable-K, bf16 out, kpair 2 x 2 slots: persistent, next tile loaded during the stores
 XCD_REMAP_ON = False  # grouped-M: consecutive m tiles of a grid chunk on one XCD (A/B switch)
 STAGGER_ON = 0  # start the (first wave of) workgroups in this many phases (0: together); A/B switch
 
@@ -839,7 +887,8 @@ def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1
     cn = _divisor_cluster((N + cfg.tile_n - 1) // cfg.tile_n, cfg.cluster_n)
     c_early = C_EARLY_ON and beta1 and not out_f32 and N % cfg.tile_n == 0 and \
         c_early_fits(cfg._replace(cluster_m=cm, cluster_n=cn))
-    persist = PERSIST_ON and c_early and mode == VARIABLE_K and cfg.num_buffers == 2 and cm * cn == 1
+    persist = PERSIST_ON and mode in (GROUPED_M, VARIABLE_K) and cfg.num_buffers == 2 and not out_f32 and \
+        c_early_fits(cfg) and (c_early or not beta1)
     return (cfg.tile_m, cfg.tile_n, cfg.num_buffers, cfg.kpair, cm, cn, bool(packed), bool(b_preshuffled),
             bool(k_tail), mode, G, bool(out_f32), bool(beta1), bool(c_early), bool(persist),
             bool(XCD_REMAP_ON and mode == GROUPED_M), int(STAGGER_ON))
