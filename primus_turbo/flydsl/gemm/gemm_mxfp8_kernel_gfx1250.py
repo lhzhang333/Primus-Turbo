@@ -71,7 +71,7 @@ C_PAD_B = 16  # bytes after every row of the epilogue's C staging
 DENSE, GROUPED_M, VARIABLE_K = 0, 1, 2
 LDS_BYTES = 320 * 1024
 NUM_CUS = 256  # MI455X: workgroups of a persistent launch
-STAGGER_SLEEP = 48  # persistent variable-K stagger: s_sleep units (64 clocks) per phase step
+STAGGER_SLEEP = 48  # stagger: s_sleep units (64 clocks) per phase step (~1.4 us)
 CLUSTER_SYNC_REVS = 8  # a cluster barrier every this many pipeline revolutions keeps multicast partners close
 _WG_BARRIER = -1
 _E8M0 = (torch.uint8, getattr(torch, "float8_e8m0fnu", torch.uint8))
@@ -742,6 +742,14 @@ def _launch_gemm_mxfp8(
                 nxt_tile = more_tiles.select(tile + n_wg, tile)
                 rot = _tile(_decode_lin(tile), rot, (_decode_lin(nxt_tile), more_tiles))
         else:
+            if const_expr(stagger):
+                # the first wave of workgroups starts in ``stagger`` phases (by cluster), and the waves after it
+                # inherit the offsets: the memory-bound epilogues of the CUs stop falling into the same microseconds
+                gdx, gdy = fx.Int32(fx.grid_dim.x), fx.Int32(fx.grid_dim.y)
+                lin = fx.Int32(bid_x) + gdx * (fx.Int32(bid_y) + gdy * fx.Int32(bid_z))
+                phase = (lin < NUM_CUS).select((fx.Int32(bid_x) // cluster_m) % stagger, zero)
+                for _ in range(phase):
+                    rocdl.s_sleep(STAGGER_SLEEP)
             _tile(dec, 0)
 
     # Launch: grid.x runs up to 32 M tiles (a power of two dividing them), grid.y the N tiles, grid.z the M chunks
@@ -812,7 +820,7 @@ def _check_scales(sa, sb, a_rows: int, b_rows: int, K: int, who: str, b_batch: t
 C_EARLY_ON = True  # beta = 1 into bf16: fetch the old C during the last K step where it fits (A/B switch)
 PERSIST_ON = False  # variable-K with c_early and 2 slots: persistent workgroups, next tile loaded during the stores
 XCD_REMAP_ON = False  # grouped-M: consecutive m tiles of a grid chunk on one XCD (A/B switch)
-STAGGER_ON = 0  # persistent variable-K: start the workgroups in this many phases (0: together)
+STAGGER_ON = 0  # start the (first wave of) workgroups in this many phases (0: together); A/B switch
 
 
 def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1) -> tuple:
@@ -826,7 +834,7 @@ def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1
     persist = PERSIST_ON and c_early and mode == VARIABLE_K and cfg.num_buffers == 2 and cm * cn == 1
     return (cfg.tile_m, cfg.tile_n, cfg.num_buffers, cfg.kpair, cm, cn, bool(packed), bool(b_preshuffled),
             bool(k_tail), mode, G, bool(out_f32), bool(beta1), bool(c_early), bool(persist),
-            bool(XCD_REMAP_ON and mode == GROUPED_M), int(STAGGER_ON) if persist else 0)
+            bool(XCD_REMAP_ON and mode == GROUPED_M), int(STAGGER_ON))
 
 
 def _launch(who, mode, cfg, out, a, b, sa, sb, g0, g1, M, N, K, lda, ldb, ldsa, ldsb, G, b_preshuffled, beta1,
