@@ -246,22 +246,31 @@ def _launch_gemm_mxfp8(
         wave_m, wave_n = wave // 2, wave % 2
         zero = fx.Int32(0)
 
+        vk_tab = None
+        if const_expr(mode == VARIABLE_K and G <= 32):
+            # the experts' token offsets, lane e holding offs[e] / offs[e + 1] (read once; a tile then needs no load)
+            rs_vk = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg_g0)), num_records_bytes=8 * (G + 1))
+            vk_tab = (fx.Int32(buffer_load(rs_vk, lane * 2, vec_width=1, dtype=T.i32)),
+                      fx.Int32(buffer_load(rs_vk, lane * 2 + 2, vec_width=1, dtype=T.i32)))
+
         def _decode_vk(bx, by, e):
             """variable-K: output tile (bx, by) of expert e over its tokens [offs[e], offs[e + 1])."""
             blk_m, blk_n = bx * tile_m, by * tile_n
-            rsrc = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg_g0)), num_records_bytes=8 * (G + 1))
-            o2 = Vec(buffer_load(rsrc, e * 2, vec_width=4, is_scalar=True))
-            k0, klen = fx.Int32(o2[0]), fx.Int32(o2[2]) - fx.Int32(o2[0])
+            if const_expr(vk_tab is not None):
+                k0 = fx.Int32(rocdl.readlane(T.i32, vk_tab[0], e))
+                klen = fx.Int32(rocdl.readlane(T.i32, vk_tab[1], e)) - k0
+            else:
+                rsrc = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg_g0)), num_records_bytes=8 * (G + 1))
+                o2 = Vec(buffer_load(rsrc, e * 2, vec_width=4, is_scalar=True))
+                k0, klen = fx.Int32(o2[0]), fx.Int32(o2[2]) - fx.Int32(o2[0])
             supers = (klen + (SUPER_K - 1)) // SUPER_K
             supers = (supers > zero).select(supers, fx.Int32(1))  # an empty expert: one zero K step
             # (a_row0, out_row0, m_valid, blk_n, n_valid, expert, k0, klen, supers)
             return blk_m, blk_m, i32_m - blk_m, blk_n, i32_n - blk_n, e, k0, klen, supers
 
-        def _decode_gm(t, blk_n):
-            """grouped-M: m tile t of the experts' tiles in order (ceil(len_g / tile_m) each): (the tile, the number
-            of m tiles); a tile past them is dead (no rows, no B). Lane l of chunk c takes expert 32 c + l: its tile
-            count, a DPP prefix sum of them, a ballot of the expert whose tiles hold t (no dependent scalar chain,
-            no 2 x G live SGPRs)."""
+        def _gm_table():
+            """grouped-M, once per workgroup: lane l of chunk c holds expert 32 c + l's first m tile (a DPP prefix sum
+            of the tile counts ceil(len_g / tile_m)), tile count, rows and row offsets; and the number of m tiles."""
             rs0 = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg_g0)), num_records_bytes=8 * (G + 1))
             rs1 = create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(arg_g1)), num_records_bytes=8 * (G + 1))
 
@@ -270,7 +279,7 @@ def _launch_gemm_mxfp8(
                     v = v + fx.Int32(_rocdl.update_dpp(T.i32, _raw(zero), _raw(v), 0x110 + k, 0xF, 0xF, True))
                 return v + (lane >= 16).select(fx.Int32(rocdl.readlane(T.i32, v, 15)), zero)
 
-            acc, first, len_g, in0, out0, expert = zero, zero, zero, zero, zero, zero
+            acc, chunks = zero, []
             for ch in range_constexpr((G + 31) // 32):
                 g = lane + ch * 32
                 o0 = fx.Int32(buffer_load(rs0, g * 2, vec_width=1, dtype=T.i32))  # low words (int64 tables)
@@ -278,7 +287,16 @@ def _launch_gemm_mxfp8(
                 p0 = fx.Int32(buffer_load(rs1, g * 2, vec_width=1, dtype=T.i32))
                 n_g = (ln + (tile_m - 1)) // tile_m
                 incl = _scan(n_g)
-                excl = acc + incl - n_g
+                chunks.append((acc + incl - n_g, n_g, ln, p0, o0))
+                acc = acc + fx.Int32(rocdl.readlane(T.i32, incl, 31))
+            return chunks, acc
+
+        def _decode_gm(tab, t, blk_n):
+            """grouped-M: m tile t of the experts' tiles in order; a tile past them is dead (no rows, no B). A ballot
+            of the expert whose tiles hold t, its entries by readlane (no load)."""
+            chunks, acc = tab
+            first, len_g, in0, out0, expert = zero, zero, zero, zero, zero
+            for ch, (excl, n_g, ln, p0, o0) in enumerate(chunks):
                 hit = fx.Int32(rocdl.ballot(T.i32, (t >= excl) & (t < excl + n_g)))
                 src = fx.Int32(_llvm.call_intrinsic(T.i32, "llvm.cttz.i32", [_raw(hit), _raw(fx.Boolean(False))],
                                                     [], []))
@@ -288,14 +306,13 @@ def _launch_gemm_mxfp8(
                 len_g = found.select(fx.Int32(rocdl.readlane(T.i32, ln, src)), len_g)
                 in0 = found.select(fx.Int32(rocdl.readlane(T.i32, p0, src)), in0)
                 out0 = found.select(fx.Int32(rocdl.readlane(T.i32, o0, src)), out0)
-                acc = acc + fx.Int32(rocdl.readlane(T.i32, incl, 31))
             local = (t - first) * tile_m
             rows = len_g - local
             m_valid = (rows < tile_m).select(rows, fx.Int32(tile_m))
             m_valid = (t < acc).select(m_valid, zero)
             n_valid = (t < acc).select(i32_n - blk_n, zero)
             supers = (t < acc).select((i32_k + (SUPER_K - 1)) // SUPER_K, fx.Int32(1))
-            return (in0 + local, out0 + local, m_valid, blk_n, n_valid, expert, zero, i32_k, supers), acc
+            return in0 + local, out0 + local, m_valid, blk_n, n_valid, expert, zero, i32_k, supers
 
         if const_expr(mode == DENSE):
             blk_n = fx.Int32(bid_y) * tile_n
@@ -311,7 +328,9 @@ def _launch_gemm_mxfp8(
                 gdx = fx.Int32(fx.grid_dim.x)
                 t_x = (gdx % 8 == 0).select((t_x % 8) * (gdx // 8) + t_x // 8, t_x)
             t = fx.Int32(bid_z) * fx.Int32(fx.grid_dim.x) + t_x
-            dec, acc = _decode_gm(t, fx.Int32(bid_y) * tile_n)
+            gm_tab = _gm_table()
+            acc = gm_tab[1]
+            dec = _decode_gm(gm_tab, t, fx.Int32(bid_y) * tile_n)
             # a tile past the experts' (the grid is an upper bound) ends its workgroup here: uniform, and a cluster
             # (along N) shares the m tile, so whole clusters end
             _llvm.inline_asm(None, [as_ir_value(t), as_ir_value(acc)],
@@ -759,7 +778,8 @@ def _launch_gemm_mxfp8(
                     xg, yg = tau % mtg, (tau // mtg) % ntg
                     return _decode_vk(xg * cluster_m + lxp, yg * cluster_n + lyp, tau // (mtg * ntg))
             else:  # GROUPED_M (cluster_m == 1): chunks of 32 m tiles x all n groups (the grid's order), the last short
-                _, n_m = _decode_gm(zero, zero)
+                gm_tab = _gm_table()
+                n_m = gm_tab[1]
                 n_tiles = n_m * ntg
                 full = n_m // 32 * 32
                 rem = n_m - full
@@ -770,7 +790,7 @@ def _launch_gemm_mxfp8(
                     tail = tau - full * ntg
                     t = head.select(tau // (32 * ntg) * 32 + tau % 32, full + tail % rem)
                     yg = head.select((tau // 32) % ntg, tail // rem)
-                    return _decode_gm(t, (yg * cluster_n + lyp) * tile_n)[0]
+                    return _decode_gm(gm_tab, t, (yg * cluster_n + lyp) * tile_n)
 
             n_iter = (n_tiles - c_id + (n_cl - 1)) // n_cl
             # a cluster with no tile ends here (uniform over it)
