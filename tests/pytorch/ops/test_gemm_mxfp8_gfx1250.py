@@ -231,13 +231,44 @@ def test_grouped_gemm_mxfp8_variable_k(lens, M, N, cfg, monkeypatch):
                   sb[:, o[g] // 32: o[g + 1] // 32]) for g in range(len(lens))]
     ).float()
     sa, sb, b = pack_scales(sa), pack_scales(sb), _slack(_shuf(b))
-    for dt, acc, ce in ((torch.bfloat16, False, True), (torch.float32, False, True), (torch.float32, True, True),
-                        (torch.bfloat16, True, True), (torch.bfloat16, True, False)):
+    for dt, acc, ce, pe in ((torch.bfloat16, False, True, False), (torch.float32, False, True, False),
+                            (torch.float32, True, True, False), (torch.bfloat16, True, True, False),
+                            (torch.bfloat16, True, False, False), (torch.bfloat16, True, True, True)):
         monkeypatch.setattr(K, "C_EARLY_ON", ce)
+        monkeypatch.setattr(K, "PERSIST_ON", pe)
         c0 = (torch.randn(len(lens), M, N, device=DEV) * 64).to(dt)
         out = c0.clone() if acc else torch.full(c0.shape, float("nan"), device=DEV, dtype=dt)
         grouped_gemm_mxfp8_variable_k_gfx1250(a, sa, b, sb, offs, out_dtype=dt, out=out, accumulate=acc, config=cfg)
         torch.testing.assert_close(out, ((ref + c0.float()) if acc else ref).to(dt), rtol=0, atol=0)
+
+
+def test_grouped_gemm_mxfp8_variable_k_persistent(monkeypatch):
+    """Persistent variable-K (beta = 1 into bf16, early old-C fetch): 768 output tiles on <= 256 workgroups, so each
+    runs several tiles whose last K steps end in either slot; == the one-tile-per-workgroup launch bitwise and the
+    reference."""
+    lens = [128 * (i % 5) + (0 if i % 7 == 3 else 37 * (i % 3)) for i in range(24)]
+    M, N = 1024, 2048
+    pads = [-(-n // 128) * 128 for n in lens]
+    T = sum(pads)
+    a, sa, b, sb = int_valued_operands(M, N, T, seed=11)
+    offs = torch.tensor([0] + torch.tensor(pads).cumsum(0).tolist(), dtype=torch.int64, device=DEV)
+    o = [int(x) for x in offs]
+    for g, n in enumerate(lens):
+        a[:, o[g] + n: o[g + 1]], b[:, o[g] + n: o[g + 1]] = 0, 0
+        sa[:, -(-(o[g] + n) // 32): o[g + 1] // 32], sb[:, -(-(o[g] + n) // 32): o[g + 1] // 32] = PAD_SCALE, PAD_SCALE
+    ref = torch.stack([gemm_ref(a[:, o[g]: o[g + 1]], sa[:, o[g] // 32: o[g + 1] // 32], b[:, o[g]: o[g + 1]],
+                                sb[:, o[g] // 32: o[g + 1] // 32]) for g in range(len(lens))]).float()
+    sa, sb, b = pack_scales(sa), pack_scales(sb), _slack(_shuf(b))
+    c0 = (torch.randn(len(lens), M, N, device=DEV) * 64).to(torch.bfloat16)
+    outs = []
+    for pe in (True, False):
+        monkeypatch.setattr(K, "PERSIST_ON", pe)
+        out = c0.clone()
+        grouped_gemm_mxfp8_variable_k_gfx1250(a, sa, b, sb, offs, out=out, accumulate=True,
+                                              config=C(256, 256, 2, 2, 1, 1))
+        outs.append(out)
+    torch.testing.assert_close(outs[0], (ref + c0.float()).to(torch.bfloat16), rtol=0, atol=0)
+    assert torch.equal(outs[0], outs[1])
 
 
 def test_gemm_mxfp8_tail_at_allocation_end():
