@@ -26,7 +26,7 @@ from tests.pytorch.ref.mxfp8_ref import (
 pytestmark = pytest.mark.skipif(not is_gfx1250(), reason="gfx1250 kernel")
 
 if is_gfx1250():
-    import primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 as K
+    import primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 as KM
     from primus_turbo.flydsl.gemm.gemm_mxfp8_gfx1250_configs import MXGemmConfig as C
     from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 import (
         gemm_mxfp8_gfx1250,
@@ -110,7 +110,7 @@ def test_gemm_mxfp8_int_exact(cfg, M, N, K):
 @pytest.mark.parametrize("c_early", [True, False])
 def test_gemm_mxfp8_fp32_out_and_accumulate(cfg, M, N, K, c_early, monkeypatch):
     """fp32 out == the exact result; beta = 1 into bf16 / fp32 == round(fp32 result + C), rounded once."""
-    monkeypatch.setattr(K, "C_EARLY_ON", c_early)
+    monkeypatch.setattr(KM, "C_EARLY_ON", c_early)
     a, sa, b, sb = int_valued_operands(M, N, K, seed=M + K)
     ref = gemm_ref(a, sa, b, sb).float()
     sa, sb, a, b = pack_scales(sa), pack_scales(sb), _slack(a), _slack(_shuf(b))
@@ -131,7 +131,7 @@ def test_gemm_mxfp8_persistent(cfg, monkeypatch):
     a, sa, b, sb = int_valued_operands(M, N, Kd, seed=3)
     ref = gemm_ref(a, sa, b, sb).float()
     sa, sb, a, b = pack_scales(sa), pack_scales(sb), _slack(a), _slack(_shuf(b))
-    monkeypatch.setattr(K, "PERSIST_ON", True)
+    monkeypatch.setattr(KM, "PERSIST_ON", True)
     out = torch.full((M, N), float("nan"), device=DEV, dtype=torch.bfloat16)
     gemm_mxfp8_gfx1250(a, sa, b, sb, out=out, config=cfg, b_preshuffled=True)
     torch.testing.assert_close(out, ref.to(torch.bfloat16), rtol=0, atol=0)
@@ -217,15 +217,15 @@ def test_grouped_gemm_mxfp8(lens, N, Kd, cfg, monkeypatch):
     grouped_gemm_mxfp8_gfx1250(_slack(a), _slack(sa), _slack(b), _slack(sb), offs, offs_p, m, out=out, config=cfg,
                                b_preshuffled=False)
     torch.testing.assert_close(out, ref.to(torch.bfloat16), rtol=0, atol=0)
-    monkeypatch.setattr(K, "XCD_REMAP_ON", True)
+    monkeypatch.setattr(KM, "XCD_REMAP_ON", True)
     out = torch.full((m, N), float("nan"), device=DEV, dtype=torch.bfloat16)
     grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(_shuf(b)), sb4, offs, offs_p, m, out=out, config=cfg)
     torch.testing.assert_close(out, ref.to(torch.bfloat16), rtol=0, atol=0)
-    monkeypatch.setattr(K, "XCD_REMAP_ON", False)
+    monkeypatch.setattr(KM, "XCD_REMAP_ON", False)
     if cfg.num_buffers == 2 and cfg.kpair == 2:
-        monkeypatch.setattr(K, "PERSIST_ON", True)
+        monkeypatch.setattr(KM, "PERSIST_ON", True)
         for c, sg in ((cfg, 0), (cfg._replace(cluster_n=1), 8)):
-            monkeypatch.setattr(K, "STAGGER_ON", sg)
+            monkeypatch.setattr(KM, "STAGGER_ON", sg)
             out = torch.full((m, N), float("nan"), device=DEV, dtype=torch.bfloat16)
             grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(_shuf(b)), sb4, offs, offs_p, m, out=out,
                                        config=c)
@@ -266,8 +266,8 @@ def test_grouped_gemm_mxfp8_variable_k(lens, M, N, cfg, monkeypatch):
     for dt, acc, ce, pe in ((torch.bfloat16, False, True, False), (torch.float32, False, True, False),
                             (torch.float32, True, True, False), (torch.bfloat16, True, True, False),
                             (torch.bfloat16, True, False, False), (torch.bfloat16, True, True, True)):
-        monkeypatch.setattr(K, "C_EARLY_ON", ce)
-        monkeypatch.setattr(K, "PERSIST_ON", pe)
+        monkeypatch.setattr(KM, "C_EARLY_ON", ce)
+        monkeypatch.setattr(KM, "PERSIST_ON", pe)
         c0 = (torch.randn(len(lens), M, N, device=DEV) * 64).to(dt)
         out = c0.clone() if acc else torch.full(c0.shape, float("nan"), device=DEV, dtype=dt)
         grouped_gemm_mxfp8_variable_k_gfx1250(a, sa, b, sb, offs, out_dtype=dt, out=out, accumulate=acc, config=cfg)
@@ -294,8 +294,8 @@ def test_grouped_gemm_mxfp8_variable_k_persistent(monkeypatch):
     c0 = (torch.randn(len(lens), M, N, device=DEV) * 64).to(torch.bfloat16)
     outs = []
     for pe, sg in ((True, 0), (False, 0), (True, 8)):
-        monkeypatch.setattr(K, "PERSIST_ON", pe)
-        monkeypatch.setattr(K, "STAGGER_ON", sg)
+        monkeypatch.setattr(KM, "PERSIST_ON", pe)
+        monkeypatch.setattr(KM, "STAGGER_ON", sg)
         out = c0.clone()
         grouped_gemm_mxfp8_variable_k_gfx1250(a, sa, b, sb, offs, out=out, accumulate=True,
                                               config=C(256, 256, 2, 2, 1, 1))
@@ -312,7 +312,7 @@ def test_gemm_mxfp8_tail_at_allocation_end():
     a, sa, b, sb = int_valued_operands(M, N, Kd, seed=1)
     ref = gemm_ref(a, sa, b, sb).to(torch.bfloat16)
     a = _exact(a)
-    assert a.numel() == 10 << 20 and K._slack(a) == 0
+    assert a.numel() == 10 << 20 and KM._slack(a) == 0
     for cfg in (C(256, 256, 2, 2, 1, 1), C(256, 256, 2, 2, 2, 2)):
         out = gemm_mxfp8_gfx1250(a, pack_scales(sa), _slack(_shuf(b)), pack_scales(sb), config=cfg, b_preshuffled=True)
         torch.testing.assert_close(out, ref, rtol=0, atol=0)
@@ -337,7 +337,7 @@ def test_gemm_mxfp8_tail_at_allocation_end():
 
 def test_gemm_mxfp8_rejects():
     a, sa, b, sb = int_valued_operands(256, 260, 256)
-    with pytest.raises(ValueError, match="multiple of 8"):
+    with pytest.raises(ValueError, match="multiples of 8"):
         gemm_mxfp8_gfx1250(a, sa, b, sb)
     a, sa, b, sb = int_valued_operands(256, 256, 256)
     with pytest.raises(ValueError, match="E8M0"):

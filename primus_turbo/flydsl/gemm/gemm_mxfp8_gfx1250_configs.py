@@ -32,20 +32,21 @@ class MXGemmConfig(NamedTuple):
 DEFAULT = MXGemmConfig()
 
 C = MXGemmConfig
-# (M, N, K) -> fastest measured config with packed scales, DSv3 at T = 8192 (MI455X, scratch_mxd/results/k1_perf.md);
-# fwd (T, N, K), dgrad (T, K, N), wgrad (N, K, T); experts: one expert of 2048 rows. Configs within ~2% are noise.
+# (M, N, K) -> fastest measured config with packed scales, DSv3 at T = 8192 (MI455X, scratch_mxd/results/k1_perf.md;
+# persistent entries: the in-job A/B scratch_mxd/results/kg3c_pd.json, 11-12); fwd (T, N, K), dgrad (T, K, N),
+# wgrad (N, K, T); experts: one expert of 2048 rows. Configs within ~2% are noise.
 _TABLE: dict = {
     # MLA projections
     (8192, 1536, 7168): C(256, 256, 2, 2, 2, 2),  # q_down fwd
     (8192, 7168, 1536): C(256, 256, 2, 2, 2, 2),  # q_down dgrad
     (1536, 7168, 8192): C(256, 256, 4, 1, 1, 1),  # q_down wgrad
-    (8192, 24576, 1536): C(256, 256, 2, 2, 2, 2),  # q_up fwd
+    (8192, 24576, 1536): C(256, 256, 2, 2, 4, 1, persist=True),  # q_up fwd: 106.0 us (c2x2 115.0, c4x1 111.4)
     (8192, 1536, 24576): C(256, 256, 2, 2, 2, 2),  # q_up dgrad
     (24576, 1536, 8192): C(256, 256, 2, 2, 2, 2),  # q_up wgrad
     (8192, 576, 7168): C(256, 128, 3, 2, 1, 1),  # kv_down fwd
     (8192, 7168, 576): C(256, 256, 2, 2, 4, 1),  # kv_down dgrad
     (576, 7168, 8192): C(128, 256, 3, 2, 1, 4),  # kv_down wgrad
-    (8192, 32768, 512): C(256, 256, 2, 2, 4, 1),  # kv_up fwd
+    (8192, 32768, 512): C(256, 256, 2, 2, 4, 1, persist=True),  # kv_up fwd: 74.5 us (not persistent 84.8)
     (8192, 512, 32768): C(128, 128, 4, 2, 2, 2),  # kv_up dgrad
     (32768, 512, 8192): C(256, 256, 2, 2, 2, 2),  # kv_up wgrad
     (8192, 7168, 16384): C(256, 256, 2, 2, 2, 2),  # o_proj fwd
@@ -69,7 +70,9 @@ _TABLE: dict = {
 
 
 # With a 16x16-preshuffled B the deep kpair-1 pipelines become usable (row-major B at kpair 1 is a 128-byte TDM row per
-# tile row): (M, N, K) -> config where that beats the row-major table (scratch_mxd/results/k1_perf.md).
+# tile row): (M, N, K) -> config where that beats the row-major table (scratch_mxd/results/k1_perf.md). q_down /
+# kv_down re-checked 11-12 in one job against the row-major table's kpair-2 configs on the same preshuffled B
+# (results/kg3c_qkv_psh*.json): q_down fwd 29.0 vs 31.4 us, wgrad 31.8 vs 36.9, kv_down dgrad 22.5 vs 23.3.
 _TABLE_BSH: dict = {
     (8192, 1536, 7168): C(256, 256, 4, 1, 2, 2),  # q_down fwd    28.2 us (row-major B 31.0)
     (1536, 7168, 8192): C(256, 256, 4, 1, 2, 2),  # q_down wgrad  31.8 (36.2)
@@ -98,7 +101,12 @@ def pick_config(M: int, N: int, K: int, b_preshuffled: bool = False, num_cus: in
 
 def pick_grouped_config(mode: int, M: int, N: int, K: int, b_preshuffled: bool = True) -> MXGemmConfig:
     """Routed experts. ``mode`` 1 (grouped-M fwd / dgrad: M = rows per expert, multicast along N only) or 2
-    (variable-K wgrad: K = tokens per expert)."""
+    (variable-K wgrad: K = tokens per expert). In-job A/B on the DSv3 experts, 32 x 2048 rows balanced and skewed
+    (scratch_mxd/results/kg3c_*.json, 11-12): grouped-M with K = 7168 (fc1 fwd, fc2 dgrad) runs best as the deep
+    kpair-1 pipeline (preshuffled B), the shorter K (fc1 dgrad 4096, fc2 fwd 2048) persistent (2-4%, skewed up to 9%);
+    variable-K into a bf16 main_grad persistent (6-10%: the next tile loads while a tile stores)."""
     if mode == 1:
-        return MXGemmConfig(256, 256, 4, 1, 1, 4) if b_preshuffled and K >= 4096 else MXGemmConfig(256, 256, 2, 2, 1, 4)
-    return MXGemmConfig(256, 256, 2, 2, 2, 2)
+        if b_preshuffled and K > 4096:
+            return MXGemmConfig(256, 256, 4, 1, 1, 4)
+        return MXGemmConfig(256, 256, 2, 2, 1, 4, persist=True)
+    return MXGemmConfig(256, 256, 2, 2, 2, 2, persist=True)
