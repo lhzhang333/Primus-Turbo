@@ -13,27 +13,35 @@
 ###############################################################################
 
 """MXFP8 NT GEMMs for gfx1250, one mainloop for three modes, fp32 accumulation, ``out`` bf16 or fp32, optionally
-``out += result`` (beta = 1, rounded once):
+``out += result`` (beta = 1, rounded once). Entry points (signatures stable, positional order as listed):
 
-* dense: ``out[M, N] = (a * sa)[M, K] @ (b * sb)[N, K]^T``;
-* grouped-M (routed experts fwd / dgrad): ``out[rows_g] = a[rows_g] @ b[g]^T``, a's rows of expert g padded to 32
-  (``offs_pad``), out tight (``offs``);
-* variable-K (routed experts wgrad): ``out[g] (+)= a[:, k_g] @ b[:, k_g]^T`` over each expert's token range ``k_g``
-  (``offs``, multiples of 128).
+* ``gemm_mxfp8_gfx1250(a, a_scale, b, b_scale, out_dtype=bf16, out=None, config=None, b_preshuffled=False,
+  accumulate=False)``: dense ``out[M, N] (+)= (a * sa)[M, K] @ (b * sb)[N, K]^T``;
+* ``grouped_gemm_mxfp8_gfx1250(a, a_scale, b, b_scale, group_offs, group_offs_padded, m_out, out_dtype=bf16,
+  out=None, config=None, b_preshuffled=True)``: routed experts fwd / dgrad, ``out[offs[g] + i] = a[offs_pad[g] + i]
+  @ b[g]^T`` (``a``'s rows of expert g padded to 32 from ``offs_pad``, out tight under ``offs``, int64 [G + 1]
+  device tables, no host sync);
+* ``grouped_gemm_mxfp8_variable_k_gfx1250(a, a_scale, b, b_scale, group_offs, out_dtype=bf16, out=None,
+  accumulate=False, config=None, b_preshuffled=True)``: routed experts wgrad, ``out[g] (+)= a[:, T_g] @ b[:, T_g]^T``
+  over expert g's tokens ``T_g`` (``offs``, multiples of 128: the column copies), ``out [G, M, N]`` (e.g. main_grad).
 
-Operands: E4M3, K contiguous. Scales: one E8M0 byte per 32 K, packed ``[ceil(R/32)][ceil(K/128)][32][4]`` (fast) or
-raw ``[rows, ceil(K/32)]`` (one 4 * kpair-byte TDM row per tile row: 20-45% slower). B: 16x16-preshuffled
-``[N/16][K/16][16][16]`` (what the quantizers emit: the deep kpair-1 pipelines need it) or row-major (fallback; the
-same speed at kpair 2).
+Operands: E4M3, K contiguous, 16-byte rows. Scales: one E8M0 byte per 32 K, packed ``[ceil(R/32)][ceil(K/128)][32][4]``
+(fast) or raw ``[rows, ceil(K/32)]`` (20-45% slower); both scales of a call in the same layout. B: 16x16-preshuffled
+``[N/16][K/16][16][16]`` (what the quantizers emit) or row-major. K tails: a partial last K step reads the last row of
+an operand up to a step past its data (a TDM load's inner extent clamps the data, not the addressing): the quantizers
+allocate >= 2 KiB of storage slack after a preshuffled B (and raw scales); without it the entry points use kpair 1
+(128-aligned K has no partial step) and refuse K % 128 != 0. The module switches ``C_EARLY_ON`` (beta = 1 into bf16:
+fetch the old C during the last K step), ``PERSIST_ON`` (persistent variable-K), ``XCD_REMAP_ON`` (grouped-M m tile
+order) and ``STAGGER_ON`` (staggered first wave) select kernel variants (A/B; read at the call).
 
 The mainloop is aiter's compute-bound gfx1250 tile: 2x2 waves of up to 128x128, ``v_wmma_scale_f32_16x16x128_f8f6f4``
 with one scale VGPR feeding two WMMAs (ROW0 / ROW1 lane halves), ``num_buffers`` LDS slots of ``kpair`` 128-wide K
-steps filled by persistent per-wave TDM descriptors (wave 0: A, 1: B, 2: A scales, 3: B scales), a split
-signal / wait barrier per slot, cluster multicast of the shared tiles. Changes: row-major A (and B when not
-preshuffled) in padded LDS rows, mx32 scales, M / N / K tails by TDM out-of-bounds zero fill (no padding of the data;
-K tails clamp the inner extent of every load), an LDS-staged epilogue with 16-byte buffer stores (no TDM store: the
-suspect of the grouped kernel's rare silent error). No branch skips the TDM pipeline: a dead tile (past the
-experts' tiles) runs one zero-extent K step and drops its stores; a cluster never mixes experts.
+steps filled by per-wave TDM descriptors (wave 0: A, 1: B, 2: A scales, 3: B scales), a split signal / wait barrier
+per slot, cluster multicast of the shared tiles. Changes: row-major A (and B when not preshuffled) in padded LDS rows,
+mx32 scales, M / N / K tails by TDM out-of-bounds zero fill (no padding of the data; a half last K step loads half
+rows), an LDS-staged epilogue with 16-byte buffer stores (no TDM store: the suspect of the grouped kernel's rare silent
+error). No branch skips the TDM pipeline inside a tile; a grouped-M tile past the experts' ends its workgroup at once
+(whole clusters: a cluster never mixes experts).
 """
 
 from __future__ import annotations
