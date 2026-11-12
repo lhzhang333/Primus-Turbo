@@ -10,6 +10,7 @@ Public API:
     - ``rmsnorm(x, gamma, eps=1e-6, zero_centered=False) -> y``
     - ``rmsnorm_residual(x, residual, gamma, eps=1e-6) -> (y, x_plus_r)``
     - ``rmsnorm_residual_fp4(...) -> (y, x_plus_r, QuantizedTensorPair)``
+    - ``rmsnorm_mxfp8(x, gamma, eps=1e-6) -> (y, QuantizedTensorPair)``
 """
 
 from __future__ import annotations
@@ -19,11 +20,13 @@ from typing import Tuple, Union
 import torch
 
 from primus_turbo.pytorch.core.low_precision import (
+    MXFP8_BLOCK_SIZE,
     Float4QuantConfig,
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp4_support,
     float4_e2m1fn_x2,
+    float8_e4m3,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
@@ -36,7 +39,7 @@ from primus_turbo.pytorch.kernels.normalization.rmsnorm_impl import (
     rmsnorm_fwd_residual_impl,
 )
 
-__all__ = ["rmsnorm", "rmsnorm_residual", "rmsnorm_residual_fp4"]
+__all__ = ["rmsnorm", "rmsnorm_residual", "rmsnorm_residual_fp4", "rmsnorm_mxfp8"]
 
 
 class _RMSNormFunction(torch.autograd.Function):
@@ -315,3 +318,114 @@ def rmsnorm_residual_fp4(
         y, xpr2, rstd, gamma, config, row_recipe, col_recipe, flydsl_rmsnorm_dual_quant
     )
     return y, x_plus_r, QuantizedTensorPair(row_qt, col_qt)
+
+
+def _rmsnorm_mxfp8_fwd(x2, gamma, eps, write_y, row_recipe, col_recipe):
+    """(y or None, rstd, q_row, s_row, q_col, s_col): gfx1250's fused FlyDSL kernels when they take the call
+    (bf16, H % 8 == 0 and H > 512, 16-byte aligned rows), else Turbo's RMSNorm then the MXFP8 dual
+    quantization of its output."""
+    from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+        _gfx1250_mxfp8,
+        quantize_mxfp8_impl,
+    )
+
+    H = x2.shape[1]
+    blocks_1d = not (row_recipe.use_2d_block or col_recipe.use_2d_block)
+    q = _gfx1250_mxfp8(x2, float8_e4m3, row_recipe, col_recipe, blocks_1d)
+    if (
+        q is not None
+        and gamma.dtype == torch.bfloat16
+        and H % 8 == 0
+        and H > 512  # narrower (kv_layernorm): two launches cost more than the bf16 round trip saves
+        and x2.stride(1) == 1
+        and x2.stride(0) % 8 == 0
+        and x2.data_ptr() % 16 == 0
+    ):
+        from primus_turbo.flydsl.quantization.rmsnorm_mxfp8_gfx1250 import (
+            rmsnorm_quant_mxfp8,
+        )
+
+        _, rule, lay = q
+        return rmsnorm_quant_mxfp8(x2, gamma, eps, rule=rule, pad=True, layout=lay, write_y=write_y)
+    y, _, rstd, *_ = rmsnorm_fwd_impl(x2, gamma, eps)
+    out = quantize_mxfp8_impl(y, float8_e4m3, None, MXFP8_BLOCK_SIZE, True, row_recipe, col_recipe)
+    return (y, rstd, *out)
+
+
+class _RMSNormMXFP8Function(torch.autograd.Function):
+    """RMSNorm forward that also returns its output MXFP8-quantized; one backward for both.
+
+    The row copy is the consumer GEMM's A operand, so the dgrad that GEMM returns for it is a gradient of ``y``:
+    the backward adds it to ``y``'s own (other consumers) and runs Turbo's RMSNorm backward with the saved
+    ``rstd``. The column copy (wgrad's operand) gets none. Missing gradients stay ``None`` (no zero fill).
+    """
+
+    @staticmethod
+    def forward(ctx, x, gamma, eps, write_y, row_recipe, col_recipe):
+        ctx.set_materialize_grads(False)
+        H = gamma.shape[0]
+        assert x.shape[-1] == H, (
+            f"rmsnorm_mxfp8: last dim of x ({x.shape[-1]}) must equal gamma.shape[0] ({H})"
+        )
+        x2 = x.reshape(-1, H)
+        y, rstd, qr, sr, qc, sc = _rmsnorm_mxfp8_fwd(x2, gamma, eps, write_y, row_recipe, col_recipe)
+        ctx.save_for_backward(x2, gamma, rstd)
+        ctx.orig_shape = x.shape
+        common = dict(
+            shape=x2.shape,
+            orig_dtype=x.dtype,
+            dest_dtype=float8_e4m3,
+            granularity=ScalingGranularity.MX_BLOCKWISE,
+            block_size=MXFP8_BLOCK_SIZE,
+            requires_grad=x.requires_grad,
+        )
+        row = QuantizedTensor(qr, sr, scaling_recipe=row_recipe, quantized_axis=-1, **common)
+        col = QuantizedTensor(qc, sc, scaling_recipe=col_recipe, quantized_axis=-2, **common)
+        return (y.view(x.shape) if write_y else None), row, col
+
+    @staticmethod
+    def backward(ctx, grad_y, grad_row, grad_col):
+        del grad_col
+        x2, gamma, rstd = ctx.saved_tensors
+        grads = [g.reshape(x2.shape) for g in (grad_y, grad_row) if g is not None]
+        if not grads:
+            return None, None, None, None, None, None
+        dy = grads[0] if len(grads) == 1 else grads[0] + grads[1]
+        dx, dg = rmsnorm_bwd_impl(dy, x2, gamma, rstd, 0, 0, 0, 0)
+        return dx.reshape(ctx.orig_shape), dg, None, None, None, None
+
+
+def rmsnorm_mxfp8(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float = 1e-6,
+    *,
+    write_y: bool = True,
+    row_recipe: Union[ScalingRecipe, None] = None,
+    col_recipe: Union[ScalingRecipe, None] = None,
+) -> Tuple[Union[torch.Tensor, None], QuantizedTensorPair]:
+    """RMSNorm (``(x * rstd) * gamma``, fp32 math, bf16 out) whose output also comes back MXFP8-quantized.
+
+    Returns ``(y, QuantizedTensorPair(data=row, data_t=col))``: E4M3, one E8M0 scale per 32 elements, K (= H)
+    and M padded to 128 as the HIP quantizer pads them. ``row`` (``quantized_axis=-1``) is a consumer GEMM's A
+    operand (fwd / dgrad), ``col`` (``-2``, the transposed copy) its wgrad operand; pass the pair as ``a`` to
+    ``gemm_fp8``: nothing is quantized again. Gradients flow back through both ``y`` and ``row``.
+
+    ``row_recipe`` / ``col_recipe`` must be what the consumer expects for its A / A^T copies: on gfx1250 the MX
+    GEMM layouts by default (``ScalingRecipe(shuffle_scale=True)``: packed scales; ``ScalingRecipe(shuffle_scale
+    =True, shuffle_out=True)``: + 16x16 codes, a B operand), raw ``ScalingRecipe()`` elsewhere.
+
+    gfx1250 (bf16 x and gamma, H % 8 == 0 and H > 512, 16-byte aligned rows; x may be a strided row
+    view): one read of x for the statistics, one tile pass that normalizes, stores ``y`` and quantizes it,
+    so the codes are exactly the MXFP8 cast of the returned ``y``. ``write_y=False`` skips the bf16 store
+    and returns ``None`` for ``y`` (every consumer must read the pair). Elsewhere: Turbo's RMSNorm, then
+    ``quantize_fp8_with_trans`` (same outputs).
+    """
+    from primus_turbo.pytorch.core.utils import is_gfx1250
+
+    if row_recipe is None or col_recipe is None:
+        mx = is_gfx1250()
+        row_recipe = row_recipe or ScalingRecipe(shuffle_scale=mx)
+        col_recipe = col_recipe or ScalingRecipe(shuffle_scale=mx, shuffle_out=mx)
+    y, row, col = _RMSNormMXFP8Function.apply(x, gamma, eps, write_y, row_recipe, col_recipe)
+    return y, QuantizedTensorPair(row, col)

@@ -69,6 +69,9 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
     # MXFP8 quantization (primus_turbo/flydsl/quantization/mxfp8_quant_gfx1250.py), bitwise vs the reference.
     "tests/pytorch/ops/test_quant_mxfp8_gfx1250.py",
+    # RMSNorm forward + MXFP8 dual quantization (primus_turbo/flydsl/quantization/rmsnorm_mxfp8_gfx1250.py) and
+    # its op ops.normalization.rmsnorm_mxfp8 feeding gemm_fp8.
+    "tests/pytorch/ops/test_rmsnorm_mxfp8_gfx1250.py",
     # The MXFP8 quantization ops, which dispatch bf16 / E4M3 to those kernels on gfx1250 (HIP layouts). Not
     # test_quantize_mxfp8_shuffle: on gfx1250 the shuffle flags mean the gfx1250 GEMM layouts, not HIP's.
     "tests/pytorch/ops/test_quantization.py::test_quantize_mxfp8[",
