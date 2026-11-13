@@ -74,6 +74,7 @@ def _addr(p):
 def _launch_dispatch_gemm_nt(
     arg_out: fx.Pointer,
     arg_x: fx.Pointer,
+    arg_x_scale: fx.Pointer,
     arg_w: fx.Pointer,
     arg_token_buffer: fx.Pointer,
     arg_row_idx: fx.Pointer,
@@ -112,8 +113,11 @@ def _launch_dispatch_gemm_nt(
     issue_first: Constexpr[int],
     wmma_b2b: Constexpr[int],
     lds_cosched: Constexpr[int],
+    MX: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
+    if MX and not DISPATCH_ONLY:
+        raise ValueError("MXFP8 tokens only go through the dispatch-only launch (the GEMM tile is bf16)")
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
@@ -137,6 +141,7 @@ def _launch_dispatch_gemm_nt(
     def dispatch_gemm_nt(
         arg_out: fx.Pointer,
         arg_x: fx.Pointer,
+        arg_x_scale: fx.Pointer,
         arg_w: fx.Pointer,
         arg_token_buffer: fx.Pointer,
         arg_row_idx: fx.Pointer,
@@ -196,6 +201,7 @@ def _launch_dispatch_gemm_nt(
                 rank=RANK,
                 block_threads=block,
                 experts_per_publish=EXPERTS_PER_PUBLISH,
+                scale_res=create_buffer_resource_from_addr(_addr(arg_x_scale)) if const_expr(MX) else None,
             )
 
         # ---- GEMM role: straight-line for every workgroup, masked by `live` ----
@@ -283,6 +289,7 @@ def _launch_dispatch_gemm_nt(
     dispatch_gemm_nt(
         arg_out,
         arg_x,
+        arg_x_scale,
         arg_w,
         arg_token_buffer,
         arg_row_idx,
@@ -302,7 +309,7 @@ def _launch_dispatch_gemm_nt(
 _launch_dispatch_gemm_nt.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
 
 _COMPILED: dict = {}
-_CONSTEXPR0 = 17
+_CONSTEXPR0 = 18
 
 
 def dispatch_gemm_nt_gfx1250(
@@ -351,11 +358,18 @@ def dispatch_gemm_nt_gfx1250(
 
 
 def dispatch_only_gfx1250(
-    x: torch.Tensor, handle: DispatchHandle, *, num_dispatch_cu: int | None = None
+    x: torch.Tensor,
+    handle: DispatchHandle,
+    *,
+    num_dispatch_cu: int | None = None,
+    x_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch ``x`` by ``handle`` and return the dispatch token buffer it lands in, in receive
     order (``handle.pool_row_to_recv_token`` maps pool rows to it). ``num_dispatch_cu`` defaults
-    to every CU but the one the launch's waiting workgroup holds: no GEMM shares the launch."""
+    to every CU but the one the launch's waiting workgroup holds: no GEMM shares the launch.
+
+    With ``x_scale`` the tokens are MXFP8: ``x`` E4M3 ``[T, hidden]`` and ``x_scale`` its raw E8M0
+    ``[T, hidden / 32]``, landing in ``SymmBuffer.dispatch_fp8_views()`` (returned instead)."""
     if num_dispatch_cu is None:
         num_dispatch_cu = torch.cuda.get_device_properties(x.device).multi_processor_count - 1
     symm = get_symm_buffer_for_mega_moe()
@@ -366,6 +380,7 @@ def dispatch_only_gfx1250(
         x,
         shape_only,
         handle,
+        x_scale=x_scale,
         dispatch_only=True,
         b_nn=False,
         num_dispatch_cu=num_dispatch_cu,
@@ -380,7 +395,7 @@ def dispatch_only_gfx1250(
         wmma_b2b=0,
         lds_cosched=0,
     )
-    return symm.dispatch_token_buffer
+    return symm.dispatch_token_buffer if x_scale is None else symm.dispatch_fp8_views()
 
 
 def _run(
@@ -388,6 +403,7 @@ def _run(
     w1,
     handle,
     *,
+    x_scale=None,
     dispatch_only,
     b_nn,
     num_dispatch_cu,
@@ -408,8 +424,13 @@ def _run(
         K, N = N, K
         assert N >= tile_n, "an NN block backs its B read off into the row, so N >= tile_n"
     tile_k = tile_k or (128 if K % 128 == 0 else 64)
-    assert x.dtype == w1.dtype == torch.bfloat16 and x.is_contiguous()
-    assert dispatch_only or w1.is_contiguous()
+    mx = x_scale is not None
+    if mx:
+        assert dispatch_only and x.dtype == torch.float8_e4m3fn and x_scale.is_contiguous()
+        assert tuple(x_scale.shape) == (x.shape[0], x.shape[1] // 32), "raw E8M0 scales [T, hidden / 32]"
+    else:
+        assert x.dtype == w1.dtype == torch.bfloat16
+    assert x.is_contiguous() and (dispatch_only or w1.is_contiguous())
     assert K == x.shape[1] == int(symm.hidden), "w1 K, x hidden and the symmetric buffer's hidden must agree"
     assert tile_m == BLOCK_M, "a GEMM tile is one Mega pool block"
     assert K % tile_k == 0 and K // tile_k >= NUM_BUFFERS, "K must be a whole number of >= 2 k-tiles"
@@ -426,6 +447,7 @@ def _run(
     args = (
         _as_ptr(out),
         _as_ptr(x),
+        _as_ptr(x_scale if mx else x),
         _as_ptr(w1),
         _as_ptr(symm.dispatch_token_buffer),
         _as_ptr(handle.pool_row_to_recv_token),
@@ -468,6 +490,7 @@ def _run(
         issue_first,
         wmma_b2b,
         lds_cosched,
+        int(mx),
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

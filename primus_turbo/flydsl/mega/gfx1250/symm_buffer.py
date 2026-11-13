@@ -395,6 +395,15 @@ class SymmBuffer:
         self._reduce_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
         self._sym_buffer = None  # cached so its peer-delta table stays alive with this heap
 
+    def dispatch_fp8_views(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The dispatch token buffer as MXFP8 tokens (``ep_intranode.dispatch_bf16_tile`` with scales):
+        E4M3 rows ``[R, hidden]``, then their raw E8M0 scale rows ``[R, hidden / 32]`` (uint8), R the
+        receive rows; both fit the bf16-sized region, so the heap layout is the bf16 one."""
+        rows, hidden = self.dispatch_token_buffer.shape
+        raw = self.dispatch_token_buffer.view(torch.uint8).view(-1)
+        q = raw[: rows * hidden].view(torch.float8_e4m3fn).view(rows, hidden)
+        return q, raw[rows * hidden : rows * hidden + rows * (hidden // 32)].view(rows, hidden // 32)
+
     def get_sym_buffer(self) -> SymBuffer:
         """Build (once) the SymBuffer handle; cached so its peer-delta table outlives async launches."""
         if self._sym_buffer is None:
