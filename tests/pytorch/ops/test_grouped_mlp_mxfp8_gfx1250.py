@@ -205,3 +205,100 @@ def test_grouped_mlp_primus(backend, G, M, H, I, main_grad_dtype):
         s = snr_db(inc, dw)
         assert s >= 40, f"{name}: main_grad increment vs the unfused wgrad {s:.2f} dB"
         _check(name, inc, dw_bf, 20)
+
+
+class _Permute(torch.autograd.Function):
+    """Stand-in for Primus' permute (moe_permute_with_probs): ``lazy`` returns the placeholder of
+    ``_LazyPermuteFn`` (no values; the caller registers the gather metadata), else the materialized rows; backward =
+    the permute's backward (each token's rows summed in a fixed order)."""
+
+    @staticmethod
+    def forward(ctx, x, d2s, order, k, lazy):
+        ctx.order, ctx.k = order, k
+        if lazy:
+            return torch.empty(1, x.shape[1], dtype=x.dtype, device=x.device).expand(d2s.numel(), x.shape[1])
+        return x.index_select(0, d2s.long())
+
+    @staticmethod
+    def backward(ctx, grad):
+        return _combine(grad, ctx.order, ctx.k), None, None, None, None
+
+
+class _Unpermute(torch.autograd.Function):
+    """Stand-in for Primus' moe_unpermute (no merging probs): claims the fused MLP's output, and its backward
+    defers the gather of dOut to the quantizer (ops/moe_gather.py) instead of writing the permuted bf16 copy."""
+
+    @staticmethod
+    def forward(ctx, y, d2s, row_id_map, order, k, T, E):
+        from primus_turbo.pytorch.ops import moe_gather
+
+        ctx.plan = moe_gather.claim_backward_gather_output(y, row_id_map, None, None, T, E, y.shape[1])
+        ctx.d2s = d2s
+        return _combine(y, order, k)
+
+    @staticmethod
+    def backward(ctx, dout):
+        from primus_turbo.pytorch.ops import moe_gather
+
+        lazy = moe_gather.make_backward_gather(dout.contiguous(), ctx.plan) if ctx.plan is not None else None
+        grad = lazy if lazy is not None else dout.index_select(0, ctx.d2s.long())
+        return grad, None, None, None, None, None, None
+
+
+def _combine(rows, order, k):
+    """Each token's k permuted rows summed in a fixed order (fp32): a deterministic unpermute / permute backward."""
+    return rows.float().index_select(0, order).view(-1, k, rows.shape[1]).sum(1).to(rows.dtype)
+
+
+@pytest.mark.parametrize("skew", [False, True])
+@pytest.mark.parametrize("T, H, I", [(257, 512, 256), (8192, 7168, 2048)])
+def test_grouped_mlp_permute_fusion(backend, T, H, I, skew, monkeypatch):
+    """Primus' MoE permute -> fused grouped MLP -> unpermute with moe_permute_quant_fusion and its backward twin
+    (32 experts, top-8): x and dOut are quantized straight from the token rows through dest2src (no bf16 permuted
+    copy), and y / dx / dw1 / dw2 / dprobs are bitwise those of the materialized permute."""
+    from primus_turbo.pytorch.ops import grouped_mlp_fp8 as op
+    from primus_turbo.pytorch.ops import moe_gather
+
+    E, k = 32, 8
+    g = torch.Generator(device="cuda").manual_seed(T + H)
+    if skew:  # hot experts, empty ones
+        w = torch.rand(E, generator=g, device="cuda") ** 4
+        w[3:9] = 0
+        experts = torch.multinomial(w.expand(T, E), k, generator=g)
+    else:
+        experts = (torch.arange(T, device="cuda")[:, None] + 4 * torch.arange(k, device="cuda")) % E
+    rmap = torch.zeros(T, E, dtype=torch.bool, device="cuda").scatter_(1, experts, True)
+    probs = (0.1 + torch.rand(T, E, generator=g, device="cuda")) * rmap
+    e_idx, t_idx = rmap.T.nonzero(as_tuple=True)  # the permuted rows: expert-major, tokens in order
+    d2s, pprobs = t_idx.to(torch.int32), probs[t_idx, e_idx]
+    order = torch.argsort(t_idx, stable=True)  # each token's permuted rows, in expert order
+    lens = rmap.sum(0)
+    row_id_map = torch.zeros(T, 2 * E + 1, dtype=torch.int32, device="cuda")
+    x, dout = _randn(T, H, seed=1), _randn(T, H, seed=4)
+    w1, w2 = _randn(E, 2 * I, H, scale=H**-0.5, seed=2), _randn(E, H, I, scale=I**-0.5, seed=3)
+
+    calls = []
+    quant = op.grouped_quantize_fp8_with_trans
+    monkeypatch.setattr(op, "grouped_quantize_fp8_with_trans",
+                        lambda *a, **kw: calls.append(kw.get("dest2src") is not None) or quant(*a, **kw))  # fmt: skip
+
+    def run(fused):
+        leaves = [t.clone().requires_grad_() for t in (x, w1, w2, pprobs)]
+        xp = _Permute.apply(leaves[0], d2s, order, k, fused)
+        if fused:  # as moe_permute_with_probs registers the output of _LazyPermuteFn
+            moe_gather.register_permuted_activation_seam(xp, leaves[0].detach(), d2s, pprobs, row_id_map,
+                                                         fuse_backward_permute_quant=True)  # fmt: skip
+        y = grouped_mlp_fp8(xp, leaves[1], leaves[2], lens, leaves[3], trans_w1=True, trans_w2=True, config=MX,
+                            activation="silu")  # fmt: skip
+        out = _Unpermute.apply(y, d2s, row_id_map, order, k, T, E) if fused else _combine(y, order, k)
+        out.backward(dout)
+        return [out] + [t.grad for t in leaves]
+
+    ref = run(False)
+    assert calls == [False, False]
+    calls.clear()
+    got = run(True)
+    assert calls == [True, True], f"the permute fusion did not run (dest2src per quantization: {calls})"
+    assert not moe_gather._PERMUTED_ACTIVATION_SEAM_TABLE and not moe_gather._BACKWARD_GATHER_OUTPUTS
+    for name, a, b in zip(("y", "dx", "dw1", "dw2", "dprobs"), got, ref):
+        assert torch.equal(a, b), name
