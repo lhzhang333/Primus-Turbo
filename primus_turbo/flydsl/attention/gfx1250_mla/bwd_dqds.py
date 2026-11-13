@@ -25,10 +25,11 @@ dS is the scratch the dK / dV kernel writes (bf16, softmax scale included, packe
 k_dqds: grid (HG, ntile + nhead, B * HC / HG) over the q heads [H0, H0 + HC) (the host launches the heads in
 chunks to bound the scratch), block 128 = 4 waves (one per SIMD, one workgroup per CU).
 grid.y < ntile is a 384-query tile of [q_off, Sq) (4 waves x 96 queries, NQW 6 sub-tiles of 16 per wave), longest
-first; grid.y = ntile + j (j < nhead = q_off / 256, q_off in {0, 256, 512}) the 256-query head tile
-[q_off - 256 (j + 1), q_off - 256 j) as 4 waves x 64 queries (NQW 4): one head tile when Sq % 384 == 256, two when
-Sq % 384 == 128 (Sq >= 512). q pairs are dealt to the waves in snake order (wave w: pairs w, 7 - w, 8 + w of the
-workgroup), so the fully masked pairs of the diagonal spread over all waves.
+first; grid.y = ntile + j (j < nhead) the 256-query head tile [q_off - 256 (j + 1), q_off - 256 j) as 4 waves x 64
+queries (NQW 4), the head tiles covering [0, q_off) (dq_split). The lowest head tile may start below query 0: its
+leading q pairs do not exist, their dS is never loaded, their WMMAs are skipped where they could read stored blocks
+of other pairs and their rows are never stored. q pairs are dealt to the waves in snake order (wave w: pairs w,
+7 - w, 8 + w of the workgroup), so the fully masked pairs of the diagonal spread over all waves.
 
 Per 64-kv unit u (kv32 rows 2u, 2u + 1) every wave runs NQW x 12 WMMAs per kv32 row, dQ^T[16 d][16 q] +=
 K^T[16 d][32 kv] dS^T[32 kv][16 q], on operands burst-loaded (ds_load_tr16_b128) one row ahead into the other
@@ -159,6 +160,17 @@ def _wmma(a, b, c):
 def _keep(vals):
     """An empty asm statement that reads `vals`: they stay allocated (live) up to this point."""
     llvm.inline_asm(None, [_ir(v) for v in vals], "", ",".join(["v"] * len(vals)), has_side_effects=True)
+
+
+def _call_if(cond, fn):
+    """fn() (which emits IR) under a wave-uniform condition."""
+
+    @flyc.jit
+    def _go(cond):
+        if cond:
+            fn()
+
+    _go(cond)
 
 
 def _sgb(mask, n):
@@ -579,12 +591,23 @@ def _dqds_body(
         for dt in range(NDT):
             llvm.store(_ir(acc[s * NDT + dt].to(fx.BFloat16)), lds_ptr(w_lane + fx.Int32(dt * 32)))
         qs = q0g + wave_pair(s // 2) * fx.Int32(32) + fx.Int32(16 * (s % 2))
-        for rb in range(4):
-            row = (bat * Sq + qs + fx.Int32(rb * 4) + lane // fx.Int32(8)) * Hq + qh
-            for li in range(D_QK // DQ_LINE_EL):
-                vv = fx.Vector(llvm.load(v8b, lds_ptr(r_lane + fx.Int32(rb * 4 * DQ_IMG_ROW_B + li * 128))))
-                vec8 = row * fx.Int32(DV8_QK) + lane % fx.Int32(8) + fx.Int32(li * (DQ_LINE_EL // 8))
-                buffer_store(_ir(vv), rsrc, vec8 * fx.Int32(16), offset_is_bytes=True)
+
+        def store_rows(qs=qs):
+            for rb in range(4):
+                row = (bat * Sq + qs + fx.Int32(rb * 4) + lane // fx.Int32(8)) * Hq + qh
+                for li in range(D_QK // DQ_LINE_EL):
+                    vv = fx.Vector(
+                        llvm.load(v8b, lds_ptr(r_lane + fx.Int32(rb * 4 * DQ_IMG_ROW_B + li * 128)))
+                    )
+                    vec8 = row * fx.Int32(DV8_QK) + lane % fx.Int32(8) + fx.Int32(li * (DQ_LINE_EL // 8))
+                    buffer_store(_ir(vv), rsrc, vec8 * fx.Int32(16), offset_is_bytes=True)
+
+        if nqw == HEAD_NQW:
+            _call_if(
+                qs >= fx.Int32(0), store_rows
+            )  # a pair of the lowest head tile below query 0 is not stored
+        else:
+            store_rows()
 
 
 @flyc.kernel(name="k_mla_bwd_dqds", known_block_size=[BLOCK, 1, 1])
@@ -668,16 +691,16 @@ launch_dqds.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": Tr
 
 # ------------------------------------------------------------------------------------------------ host entry
 HEAD_GROUP = 32  # head-group target of the grid (bwd._head_group)
-_MAX_BH_S = 512 * 4096  # largest batch * heads * seqlen the 32-bit offsets are checked for
 
 
 def dq_split(sq):
-    """(q_off, nhead, ntile): 384-query tiles over [q_off, sq), nhead 256-query head tiles over [0, q_off).
-    Sq % 384 == 256: one head tile; Sq % 384 == 128 (Sq >= 512): q_off = 512, two head tiles."""
+    """(q_off, nhead, ntile): 384-query tiles over [q_off, sq) and nhead 256-query head tiles covering [0, q_off),
+    the lowest of them starting at q_off - 256 nhead, below query 0 unless q_off is a multiple of 256. q_off =
+    sq % 384, except 512 (two whole head tiles) for sq % 384 == 128 from sq = 512 on."""
     q_off = sq % MAIN_ROWS
     if q_off == MAIN_ROWS - HEAD_ROWS and sq >= 2 * HEAD_ROWS:
         q_off += MAIN_ROWS
-    return q_off, q_off // HEAD_ROWS, (sq - q_off) // MAIN_ROWS
+    return q_off, -(-q_off // HEAD_ROWS), (sq - q_off) // MAIN_ROWS
 
 
 def dqds_unsupported_reason(b, sq, skv, hq, hkv, causal=True):
@@ -690,8 +713,6 @@ def dqds_unsupported_reason(b, sq, skv, hq, hkv, causal=True):
         return f"needs 0 < seqlen_q <= seqlen_kv, got {sq} / {skv}"
     if sq % 32 or skv % 32:
         return f"seqlen_q / seqlen_kv must be multiples of 32, got {sq} / {skv}"
-    if dq_split(sq)[0] % HEAD_ROWS:  # the head [0, q_off) is not a whole number of 256-query tiles
-        return f"seqlen_q must be a multiple of {MAIN_ROWS - HEAD_ROWS} and at least {HEAD_ROWS}, got {sq}"
-    if b * hq * skv > _MAX_BH_S or b * sq * hq * D_QK * 2 >= 1 << 31:
-        return "too large for the 32-bit offsets"
+    if b * sq * hq * D_QK * 2 >= 1 << 31:  # dQ's byte offsets (the dS and K addresses are 64-bit)
+        return "dq too large for the 32-bit offsets"
     return None

@@ -82,15 +82,16 @@ def _meta(b, sq, skv, h):
         pytest.param((1, 512, 512, 2), True, id="s512_two_head_tiles"),
         pytest.param((1, 2048, 2048, 4), True, id="s2048"),
         pytest.param((1, 8192, 8192, 128), True, id="s8192_h128"),
-        pytest.param((1, 128, 256, 2), False, id="s128_recompute"),
-        pytest.param((1, 320, 320, 2), False, id="s320_recompute"),
-        pytest.param((1, 64, 128, 2), False, id="s64_recompute"),
+        pytest.param((1, 128, 256, 2), True, id="s128_partial_head_tile"),
+        pytest.param((1, 320, 320, 2), True, id="s320"),
+        pytest.param((1, 64, 128, 2), True, id="s64"),
+        pytest.param((1, 1984, 1984, 8), True, id="s1984"),
+        pytest.param((1, 16448, 16448, 128), True, id="past_2_21_bhs"),
     ],
 )
 def test_plan_selection(dims, ds_plan):
-    """Every seqlen_q that is a multiple of 128 from 256 on takes the dS plan (seqlen_q % 384 of 0 or 256: one or no
-    256-query dQ head tile; 128: two), other shapes the recompute plan (both behind the entry's gate: seqlen_kv % 64
-    == 0)."""
+    """Every shape the entry's gate takes (seqlen_q and seqlen_kv multiples of 64) takes the dS plan: the dQ head
+    tiles cover any multiple of 32, the lowest one starting below query 0 where needed."""
     bwd = _bwd()
     b, sq, skv, h = dims
     assert bwd.shape_unsupported_reason(b, sq, skv, h) is None
@@ -112,6 +113,8 @@ def test_plan_selection(dims, ds_plan):
         pytest.param((1, 1024, 1024, 40), id="s1024_h40"),
         pytest.param((1, 512, 512, 2), id="s512_two_head_tiles"),
         pytest.param((2, 896, 1024, 3), id="b2_s896_skv1024_h3"),
+        pytest.param((1, 64, 64, 2), id="s64_partial_head_tile"),
+        pytest.param((1, 320, 576, 2), id="s320_head_tiles_partial_and_whole"),
     ],
 )
 def test_ds_plan_grids_cover_every_row_and_head(dims):
@@ -131,7 +134,9 @@ def test_ds_plan_grids_cover_every_row_and_head(dims):
         assert (a["nblk"] - 1) * 96 < skv <= a["nblk"] * 96
         d = inspect.signature(dq_fn.func).bind(*dq_args).arguments
         assert (d["H0"], d["HC"]) == (a["H0"], a["HC"]) and d["HG"] * d["ngz"] == b * d["HC"]
-        assert d["q_off"] + 384 * d["ntile"] == sq and d["ny"] == d["ntile"] + d["q_off"] // 256
+        # 384-query tiles over [q_off, sq), 256-query head tiles from q_off down past query 0
+        nhead = d["ny"] - d["ntile"]
+        assert d["q_off"] + 384 * d["ntile"] == sq and 0 <= d["q_off"] <= 256 * nhead < d["q_off"] + 256
         h_next += a["HC"]
     assert h_next == h
 
@@ -260,6 +265,12 @@ def _grads(monkeypatch, problem, ds_plan):
         pytest.param((1, 1664, 1664, 3), id="s1664_h3"),
         pytest.param((2, 2048, 2048, 4), id="b2_s2048"),
         pytest.param((1, 8192, 8192, 16), id="s8192_h16"),
+        pytest.param((1, 64, 64, 2), id="s64_partial_head_tile"),
+        pytest.param((1, 192, 448, 2), id="s192_skv448"),
+        pytest.param((1, 64, 1024, 2), id="s64_skv1024_dead_pairs_unmasked"),
+        pytest.param((2, 576, 576, 4), id="b2_s576"),
+        pytest.param((1, 4160, 4160, 16), id="s4160_h16"),
+        pytest.param((1, 16448, 16448, 128), id="s16448_h128_past_2_21_bhs"),
     ],
 )
 def test_ds_plan_equals_recompute_plan(monkeypatch, dims):

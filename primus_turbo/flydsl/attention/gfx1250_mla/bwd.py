@@ -16,10 +16,9 @@
 Two launch plans; their gradients are bitwise the same:
   dS plan, where it applies: k_delta_bshd (the row constants NL / ND), k_dkdv96ds (bwd_dkdv96: dK and dV over 96-row kv
     blocks, and every bf16 dS^T tile it feeds its dK WMMA also into a scratch laid out as dslayout v2), then k_dqds
-    (bwd_dqds: dQ = dS K from that scratch, so S and dP are computed once). It takes seqlen_q % 384 in {0, 256}, or
-    128 with seqlen_q >= 512 (every multiple of 128 from 256 on), and batch * heads * seqlen_kv <= 2^21.
-  recompute plan, for every other shape and when no scratch can be allocated: k_delta_bshd, k_dkdv64 / k_dkdv and
-    k_dqg96 / k_dqg, whose dQ kernels recompute S and dP.
+    (bwd_dqds: dQ = dS K from that scratch, so S and dP are computed once). It takes every shape the gate takes.
+  recompute plan, when no scratch can be allocated: k_delta_bshd, k_dkdv64 / k_dkdv and k_dqg96 / k_dqg, whose dQ
+    kernels recompute S and dP.
 
 The whole dS^T scratch is about batch * heads * seqlen_q * seqlen_kv bytes under the causal mask (4.33 GB at b2 s4096
 h128). The dS plan runs the heads in chunks instead, k_dkdv96ds and k_dqds per chunk, the chunks alternating between
