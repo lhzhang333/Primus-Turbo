@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Single-consumer MoE gather handoffs for grouped MXFP4 quantization.
+"""Single-consumer MoE gather handoffs for grouped MXFP4 / MXFP8 quantization.
 
 The forward placeholder must be consumed by the gather-aware quantizer. Backward
 wrappers materialize the original gather when an ordinary tensor consumer needs
@@ -100,6 +100,7 @@ class _BackwardGatherPlan:
         self.shape = (d2s.numel(), src.shape[1])
         self.dtype, self.device = src.dtype, src.device
         self.d2s, self.rowmap = d2s, rowmap
+        self.experts = (rowmap.shape[1] - 1) // 2  # row_id_map is [tokens, 2 * experts + 1]
         self.d2s_signature = _gather_signature(d2s)
         self.rowmap_signature = _gather_signature(rowmap)
 
@@ -122,15 +123,19 @@ def _new_backward_gather_plan(src, d2s, rowmap, *, enabled=False):
         and src.is_cuda
         and src.is_contiguous()
         and src.ndim == 2
-        and src.shape[1] == 2880
+        and src.shape[1] > 0
         and 0 < src.shape[0] <= 32768
         and d2s.dtype == torch.int32
         and d2s.is_contiguous()
         and d2s.ndim == 1
-        and d2s.numel() == src.shape[0] * 4
         and rowmap.dtype == torch.int32
         and rowmap.is_contiguous()
-        and tuple(rowmap.shape) == (src.shape[0], 65)
+        and rowmap.ndim == 2
+        and rowmap.shape[0] == src.shape[0]
+        and rowmap.shape[1] % 2 == 1
+        # top-k routing: every token goes to k <= experts distinct experts
+        and d2s.numel() % src.shape[0] == 0
+        and 0 < d2s.numel() // src.shape[0] <= (rowmap.shape[1] - 1) // 2
         and d2s.device == src.device == rowmap.device
     ):
         return None
@@ -165,8 +170,8 @@ def claim_backward_gather_output(inp, rowmap, probs, padding, tokens, experts, h
         or signature != _gather_signature(inp)
         or probs is not None
         or padding is not None
-        or experts != 32
-        or hidden != 2880
+        or experts != plan.experts
+        or hidden != plan.shape[1]
         or tokens != plan.src_shape[0]
         or _gather_signature(rowmap) != plan.rowmap_signature
     ):
@@ -193,7 +198,7 @@ class _BackwardGatherState:
             self.plan.validate()
             p = self.plan
             self.materialized = torch.ops.te_moe.unpermute_mask_map_bwd_no_probs(
-                self.source, p.rowmap, None, p.src_shape[0], 32, p.shape[0], p.shape[1]
+                self.source, p.rowmap, None, p.src_shape[0], p.experts, p.shape[0], p.shape[1]
             )
         return self.materialized
 
