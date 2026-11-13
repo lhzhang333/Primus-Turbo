@@ -8,12 +8,18 @@
 fwd / dgrad / wgrad against BF16 and against the fp32 emulation of the recipe (``tests/pytorch/ref/mxfp8_ref.py``:
 the same quantization, so only the GEMM's accumulation order and the bf16 output rounding differ)."""
 
+import importlib
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 import primus_turbo.common.envs as envs
-from primus_turbo.pytorch.core.backend import GlobalBackendManager
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
@@ -33,6 +39,8 @@ from primus_turbo.pytorch.ops.utils import MX_A, MX_W
 from tests.pytorch.ref.mxfp8_ref import dequant, quant_2d, quant_dual, snr_db
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or not is_gfx1250(), reason="gfx1250 MX GEMM")
+# the module (``primus_turbo.pytorch.ops`` re-exports the function under the same name)
+gemm_fp8_mod = importlib.import_module("primus_turbo.pytorch.ops.gemm_fp8")
 
 MX = Float8QuantConfig(
     format=Format.E4M3,
@@ -148,6 +156,31 @@ def test_prequantized_recipe_mismatch():
     _, pair = rmsnorm_mxfp8(x, gamma, row_recipe=MX_A, col_recipe=ScalingRecipe())
     with pytest.raises(ValueError, match="a_t .* gfx1250 MX GEMM layout"):
         gemm_fp8(pair, w, trans_b=True, out_dtype=torch.bfloat16, config=MX)
+
+
+def test_direct_path(monkeypatch):
+    """Eager gfx1250 MX linears call the FlyDSL GEMM directly (``mx1250_gemm_direct``: no torch.library custom op,
+    no dispatcher), bitwise the custom-op path's results; a pinned FP8 GEMM backend goes through the dispatcher."""
+    x, w, dy = _data(512, 1536, 1024)
+
+    def run():
+        xg, wg = x.clone().requires_grad_(), w.clone().requires_grad_()
+        out = gemm_fp8(xg, wg, trans_b=True, out_dtype=torch.bfloat16, config=MX)
+        out.backward(dy)
+        return out, xg.grad, wg.grad
+
+    calls, real = [], gemm_fp8_mod.gemm_fp8_impl
+    monkeypatch.setattr(gemm_fp8_mod, "gemm_fp8_impl", lambda *a, **k: calls.append(1) or real(*a, **k))
+    fast = run()
+    assert not calls, "the eager MX linear went through the custom op"
+    GlobalBackendManager.set_gemm_backend(BackendType.FLYDSL, PrecisionType.FP8)
+    pinned = run()
+    assert len(calls) == 3, "a pinned backend must go through the dispatcher (fwd, dgrad, wgrad)"
+    GlobalBackendManager.reset()
+    monkeypatch.setattr(gemm_fp8_mod, "mx1250_gemm_direct", lambda *a, **k: None)
+    slow = run()
+    for f, p, s in zip(fast, pinned, slow):
+        assert torch.equal(f, s) and torch.equal(f, p)
 
 
 class _KernelSwiGLU(torch.autograd.Function):

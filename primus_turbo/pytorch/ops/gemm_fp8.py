@@ -27,6 +27,7 @@ from primus_turbo.pytorch.core.utils import is_gfx942
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     gemm_fp8_accum_impl,
     gemm_fp8_impl,
+    mx1250_gemm_direct,
 )
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import quantize_mxfp8_impl
 from primus_turbo.pytorch.ops.quantization import (
@@ -627,19 +628,21 @@ def _mx_linear_fwd(a, b, a_t, b_t, out_dtype, config):
         )
 
     # NT layout
-    out = gemm_fp8_impl(
-        a_row,
-        a_row_scale,
-        False,
-        b_row,
-        b_row_scale,
-        True,
-        out_dtype,
-        False,
-        granularity=granularity.value,
-        default_backend=BackendType.FLYDSL.value,
-        b_preshuffled=lay,
-    )
+    out = mx1250_gemm_direct(a_row, a_row_scale, b_row, b_row_scale, out_dtype, lay)
+    if out is None:
+        out = gemm_fp8_impl(
+            a_row,
+            a_row_scale,
+            False,
+            b_row,
+            b_row_scale,
+            True,
+            out_dtype,
+            False,
+            granularity=granularity.value,
+            default_backend=BackendType.FLYDSL.value,
+            b_preshuffled=lay,
+        )
     return out, (a_col, a_col_scale, b_col, b_col_scale), lay
 
 
@@ -668,21 +671,28 @@ def _mx_linear_bwd(grad_out, saved, lay, config, out_dtype, fuse_bgrad_accum, ma
             scaling_recipe_for_trans=MX_A if lay else ScalingRecipe(),
         )
 
-    grad_a = gemm_fp8_impl(
-        g_row,
-        g_row_scale,
-        False,
-        b_col,
-        b_col_scale,
-        True,
-        out_dtype,
-        False,
-        granularity=config.granularity.value,
-        default_backend=BackendType.FLYDSL.value,
-        b_preshuffled=lay,
-    )
+    grad_a = mx1250_gemm_direct(g_row, g_row_scale, b_col, b_col_scale, out_dtype, lay)
+    if grad_a is None:
+        grad_a = gemm_fp8_impl(
+            g_row,
+            g_row_scale,
+            False,
+            b_col,
+            b_col_scale,
+            True,
+            out_dtype,
+            False,
+            granularity=config.granularity.value,
+            default_backend=BackendType.FLYDSL.value,
+            b_preshuffled=lay,
+        )
 
     wgrad_backend = mx_wgrad_accum_backend(grouped=False) if fuse_bgrad_accum else BackendType.FLYDSL
+    if wgrad_backend == BackendType.FLYDSL:
+        acc = main_grad if fuse_bgrad_accum else None
+        grad_b = mx1250_gemm_direct(g_col, g_col_scale, a_col, a_col_scale, out_dtype, lay, out=acc)
+        if grad_b is not None:
+            return grad_a, (_get_dummy_wgrad(main_grad.shape, out_dtype) if fuse_bgrad_accum else grad_b)
     grad_b = _bgrad_gemm_fp8_impl_wrapper(
         g_col,
         g_col_scale,
