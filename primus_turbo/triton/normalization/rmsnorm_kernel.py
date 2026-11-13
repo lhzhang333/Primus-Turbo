@@ -31,15 +31,6 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-# Autotune candidates for the grid-stride bwd kernels.
-_GRID_STRIDE_BWD_CONFIGS = [
-    triton.Config({}, num_warps=4, num_stages=1),
-    triton.Config({}, num_warps=4, num_stages=2),
-    triton.Config({}, num_warps=8, num_stages=1),
-    triton.Config({}, num_warps=8, num_stages=2),
-]
-
-
 # ---------------------------------------------------------------------------
 # Forward — one row per program.
 # ---------------------------------------------------------------------------
@@ -297,7 +288,6 @@ def rmsnorm_bwd_kernel_multi_row(
 # Backward — persistent grid-stride. dgamma accumulator stays in registers
 # across the row loop; n_parts == num_programs (not B).
 # ---------------------------------------------------------------------------
-@triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs"])
 @triton.jit
 def rmsnorm_bwd_kernel_grid_stride(
     DY_ptr,
@@ -354,7 +344,6 @@ def rmsnorm_bwd_kernel_grid_stride(
 # ---------------------------------------------------------------------------
 # Backward — persistent grid-stride, fused residual variant.
 # ---------------------------------------------------------------------------
-@triton.autotune(configs=_GRID_STRIDE_BWD_CONFIGS, key=["BLOCK_H", "B", "num_programs"])
 @triton.jit
 def rmsnorm_bwd_residual_kernel_grid_stride(
     DY_ptr,
