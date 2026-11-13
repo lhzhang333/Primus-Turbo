@@ -98,6 +98,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe_ep.py",
     # The MXFP8 dense GEMM (primus_turbo/flydsl/gemm/gemm_mxfp8_kernel_gfx1250.py).
     "tests/pytorch/ops/test_gemm_mxfp8_gfx1250.py",
+    # MegaMoE in MXFP8 (fused_mega_moe_gfx1250_fp8_impl), single GPU (EP1).
+    "tests/pytorch/ops/test_mega_mxfp8_gfx1250.py",
 )
 
 
