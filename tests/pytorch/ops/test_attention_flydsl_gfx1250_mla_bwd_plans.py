@@ -50,13 +50,18 @@ def _meta(b, sq, skv, h):
         pytest.param((1, 384, 384, 2), True, id="s384"),
         pytest.param((1, 256, 448, 2), True, id="s256_skv448"),
         pytest.param((1, 640, 704, 3), True, id="s640_skv704"),
+        pytest.param((1, 512, 512, 2), True, id="s512_two_head_tiles"),
+        pytest.param((1, 2048, 2048, 4), True, id="s2048"),
+        pytest.param((1, 8192, 8192, 128), True, id="s8192_h128"),
+        pytest.param((1, 128, 256, 2), False, id="s128_recompute"),
         pytest.param((1, 320, 320, 2), False, id="s320_recompute"),
         pytest.param((1, 64, 128, 2), False, id="s64_recompute"),
     ],
 )
 def test_plan_selection(dims, ds_plan):
-    """seqlen_q % 384 in {0, 256} takes the dS plan, other shapes the recompute plan (both behind the entry's gate:
-    seqlen_kv % 64 == 0)."""
+    """Every seqlen_q that is a multiple of 128 from 256 on takes the dS plan (seqlen_q % 384 of 0 or 256: one or no
+    256-query dQ head tile; 128: two), other shapes the recompute plan (both behind the entry's gate: seqlen_kv % 64
+    == 0)."""
     bwd = _bwd()
     b, sq, skv, h = dims
     assert bwd.shape_unsupported_reason(b, sq, skv, h) is None
@@ -75,6 +80,8 @@ def test_plan_selection(dims, ds_plan):
         pytest.param((1, 384, 576, 2), id="s384_skv576"),
         pytest.param((2, 256, 320, 5), id="b2_s256_skv320_h5"),
         pytest.param((1, 1024, 1024, 40), id="s1024_h40"),
+        pytest.param((1, 512, 512, 2), id="s512_two_head_tiles"),
+        pytest.param((2, 896, 1024, 3), id="b2_s896_skv1024_h3"),
     ],
 )
 def test_ds_plan_grids_cover_every_row_and_head(dims):
@@ -90,7 +97,7 @@ def test_ds_plan_grids_cover_every_row_and_head(dims):
     assert (a["nblk"] - 1) * 96 < skv <= a["nblk"] * 96
     a = inspect.signature(dq_fn.func).bind(*dq_args).arguments
     assert a["HG"] * a["ngz"] == b * h
-    assert a["q_off"] + 384 * a["ntile"] == sq and a["ny"] == a["ntile"] + int(a["q_off"] > 0)
+    assert a["q_off"] + 384 * a["ntile"] == sq and a["ny"] == a["ntile"] + a["q_off"] // 256
 
 
 def test_ds_plan_allocates_its_scratch_last(monkeypatch):
@@ -174,6 +181,11 @@ def _grads(monkeypatch, problem, ds_plan):
         pytest.param((1, 1024, 1024, 40), id="s1024_h40_head_groups"),
         pytest.param((1, 4096, 4096, 16), id="s4096_h16"),
         pytest.param((1, 4096, 4096, 256), id="dsv3_b2_folded"),
+        pytest.param((1, 512, 512, 2), id="s512_two_head_tiles_only"),
+        pytest.param((1, 896, 960, 2), id="s896_skv960_two_head_tiles"),
+        pytest.param((1, 1664, 1664, 3), id="s1664_h3"),
+        pytest.param((2, 2048, 2048, 4), id="b2_s2048"),
+        pytest.param((1, 8192, 8192, 16), id="s8192_h16"),
     ],
 )
 def test_ds_plan_equals_recompute_plan(monkeypatch, dims):

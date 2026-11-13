@@ -24,9 +24,10 @@ dS is the scratch the dK / dV kernel writes (bf16, softmax scale included, packe
 
 k_dqds: grid (HG, ntile + nhead, B * Hq / HG), block 128 = 4 waves (one per SIMD, one workgroup per CU).
 grid.y < ntile is a 384-query tile of [q_off, Sq) (4 waves x 96 queries, NQW 6 sub-tiles of 16 per wave), longest
-first; grid.y == ntile (q_off == 256 only) the head [0, 256) as 4 waves x 64 queries (NQW 4). q pairs are dealt to
-the waves in snake order (wave w: pairs w, 7 - w, 8 + w of the workgroup), so the fully masked pairs of the
-diagonal spread over all waves.
+first; grid.y = ntile + j (j < nhead = q_off / 256, q_off in {0, 256, 512}) the 256-query head tile
+[q_off - 256 (j + 1), q_off - 256 j) as 4 waves x 64 queries (NQW 4): one head tile when Sq % 384 == 256, two when
+Sq % 384 == 128 (Sq >= 512). q pairs are dealt to the waves in snake order (wave w: pairs w, 7 - w, 8 + w of the
+workgroup), so the fully masked pairs of the diagonal spread over all waves.
 
 Per 64-kv unit u (kv32 rows 2u, 2u + 1) every wave runs NQW x 12 WMMAs per kv32 row, dQ^T[16 d][16 q] +=
 K^T[16 d][32 kv] dS^T[32 kv][16 q], on operands burst-loaded (ds_load_tr16_b128) one row ahead into the other
@@ -617,8 +618,9 @@ def k_dqds(
             lds0,
         )
     else:
-        # the head [0, q_off) = [0, 256)
-        _dqds_body(HEAD_NQW, *args, q_off - fx.Int32(HEAD_ROWS), HG, nblk, dq_bytes, lds0)
+        # the head [0, q_off): 256-query tiles, grid.y = ntile + j over [q_off - 256 (j + 1), q_off - 256 j)
+        q0h = q_off - (gy - ntile + fx.Int32(1)) * fx.Int32(HEAD_ROWS)
+        _dqds_body(HEAD_NQW, *args, q0h, HG, nblk, dq_bytes, lds0)
 
 
 @flyc.jit
@@ -661,9 +663,12 @@ _MAX_BH_S = 512 * 4096  # largest batch * heads * seqlen the 32-bit offsets are 
 
 
 def dq_split(sq):
-    """(q_off, nhead, ntile): 384-query tiles over [q_off, sq), one merged 256-query head tile over [0, q_off)."""
+    """(q_off, nhead, ntile): 384-query tiles over [q_off, sq), nhead 256-query head tiles over [0, q_off).
+    Sq % 384 == 256: one head tile; Sq % 384 == 128 (Sq >= 512): q_off = 512, two head tiles."""
     q_off = sq % MAIN_ROWS
-    return q_off, int(q_off > 0), (sq - q_off) // MAIN_ROWS
+    if q_off == MAIN_ROWS - HEAD_ROWS and sq >= 2 * HEAD_ROWS:
+        q_off += MAIN_ROWS
+    return q_off, q_off // HEAD_ROWS, (sq - q_off) // MAIN_ROWS
 
 
 def dqds_unsupported_reason(b, sq, skv, hq, hkv, causal=True):
@@ -676,8 +681,8 @@ def dqds_unsupported_reason(b, sq, skv, hq, hkv, causal=True):
         return f"needs 0 < seqlen_q <= seqlen_kv, got {sq} / {skv}"
     if sq % 32 or skv % 32:
         return f"seqlen_q / seqlen_kv must be multiples of 32, got {sq} / {skv}"
-    if sq % MAIN_ROWS not in (0, HEAD_ROWS):
-        return f"seqlen_q % {MAIN_ROWS} must be 0 or {HEAD_ROWS}, got {sq}"
+    if dq_split(sq)[0] % HEAD_ROWS:  # the head [0, q_off) is not a whole number of 256-query tiles
+        return f"seqlen_q must be a multiple of {MAIN_ROWS - HEAD_ROWS} and at least {HEAD_ROWS}, got {sq}"
     if b * hq * skv > _MAX_BH_S or b * sq * hq * D_QK * 2 >= 1 << 31:
         return "too large for the 32-bit offsets"
     return None
