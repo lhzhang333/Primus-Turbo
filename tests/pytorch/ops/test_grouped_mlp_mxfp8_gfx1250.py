@@ -302,3 +302,28 @@ def test_grouped_mlp_permute_fusion(backend, T, H, I, skew, monkeypatch):
     assert not moe_gather._PERMUTED_ACTIVATION_SEAM_TABLE and not moe_gather._BACKWARD_GATHER_OUTPUTS
     for name, a, b in zip(("y", "dx", "dw1", "dw2", "dprobs"), got, ref):
         assert torch.equal(a, b), name
+
+
+@pytest.mark.parametrize("G, M, H, I", SHAPES[:1])
+def test_grouped_mlp_custom_op_path(backend, G, M, H, I, monkeypatch):
+    """The fused GLU / dGLU through their torch.library custom ops (torch.compile's path; eager calls run the bodies,
+    whose outputs may share an allocation): unaliased outputs, bitwise the eager results."""
+    import importlib
+
+    op = importlib.import_module("primus_turbo.pytorch.ops.grouped_mlp_fp8")
+    lens = _group_lens(G, M, True)
+    x, dy = _randn(M, H, seed=1), _randn(M, H, seed=4)
+    w1, w2 = _randn(G, 2 * I, H, scale=H**-0.5, seed=2), _randn(G, H, I, scale=I**-0.5, seed=3)
+    probs = torch.rand(M, device="cuda", generator=torch.Generator(device="cuda").manual_seed(5))
+
+    def run():
+        leaves = [t.clone().requires_grad_() for t in (x, w1, w2, probs)]
+        y = grouped_mlp_fp8(leaves[0], leaves[1], leaves[2], lens, leaves[3], trans_w1=True, trans_w2=True,
+                            config=MX, activation="silu")  # fmt: skip
+        y.backward(dy)
+        return [y] + [t.grad for t in leaves]
+
+    eager = run()
+    monkeypatch.setattr(op, "_mx_glu_op", lambda f: f)  # the custom ops themselves
+    for name, a, b in zip(("y", "dx", "dw1", "dw2", "dprobs"), run(), eager):
+        assert torch.equal(a, b), name

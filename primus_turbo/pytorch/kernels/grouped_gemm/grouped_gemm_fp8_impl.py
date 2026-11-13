@@ -1672,6 +1672,29 @@ def grouped_gemm_fp8_dglu_impl_meta(
     return grad_probs, grad_intermediate, grad_scale_inv
 
 
+def _own_storage(outs: tuple, share_storage: bool) -> tuple:
+    """A custom op may not return two views of one allocation, which gfx1250's quantizers hand back (a copy's
+    codes and scales carved from one buffer): clone each output whose storage an earlier one already holds, unless
+    the caller ran the op's Python body directly (``share_storage``, see ``eager_body``)."""
+    if share_storage:
+        return outs
+    seen, out = set(), []
+    for t in outs:
+        key = t.untyped_storage().data_ptr()
+        out.append(t.clone() if key in seen else t)
+        seen.add(key)
+    return tuple(out)
+
+
+def eager_body(op):
+    """The Python body of custom op ``op`` when nothing traces (eager, no dispatch mode): calling it skips
+    torch.library's per-call dispatch (and its aliasing check); else None, and the caller runs the custom op."""
+    fn = getattr(op, "_init_fn", None)
+    if fn is None or torch.compiler.is_compiling() or torch._C._len_torch_dispatch_stack():
+        return None
+    return fn
+
+
 def _mx1250_glu_phase1(
     a, b, a_scales, b_scales, group_lens, group_offs, out_dtype, num_cu, M, row, col, qdtype
 ):
@@ -1713,6 +1736,7 @@ def grouped_gemm_mxfp8_glu_impl(
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
     clamp_limit: float | None = None,
+    share_storage: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc1 grouped MXFP8 GEMM with the GLU activation and its quantisation fused in.
 
@@ -1755,7 +1779,7 @@ def grouped_gemm_mxfp8_glu_impl(
         q = Q.grouped_glu_quant_mxfp8(
             l1, probs.float(), group_lens, offs, activation, clamp_limit, qdtype, rule, layout=lay
         )
-        return l1, q[0], q[1], q[2], q[3]
+        return _own_storage((l1, q[0], q[1], q[2], q[3]), share_storage)
 
     from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_glu_kernel import (
         glu_epi_quant_supported,
@@ -1817,6 +1841,7 @@ def grouped_gemm_mxfp8_glu_impl_meta(
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
     clamp_limit: float | None = None,
+    share_storage: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
 
@@ -1860,6 +1885,7 @@ def grouped_gemm_mxfp8_dglu_impl(
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
     clamp_limit: float | None = None,
+    share_storage: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc2 dgrad with the GLU activation gradient and its quantisation fused in.
 
@@ -1888,7 +1914,7 @@ def grouped_gemm_mxfp8_dglu_impl(
             grad_act, intermediate, probs.float(), group_lens, offs, activation, clamp_limit, qdtype, rule,
             layout=lay,
         )  # fmt: skip
-        return grad_probs, q[0], q[1], q[2], q[3]
+        return _own_storage((grad_probs, q[0], q[1], q[2], q[3]), share_storage)
 
     from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_glu_kernel import (
         dglu_epi_quant_supported,
@@ -1958,6 +1984,7 @@ def grouped_gemm_mxfp8_dglu_impl_meta(
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
     clamp_limit: float | None = None,
+    share_storage: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
 
