@@ -276,6 +276,62 @@ def test_layout_dense(Q, M, K, pad, rule):
         _eq(got, exp, what)
 
 
+def _check_dense(out, vals, rule, pad, lay):
+    """A dense dual cast (q_row, s_row, q_col, s_col) against mxfp8_ref.quant_dual of the bf16 values it quantized
+    (``pad``: the token dim padded to 128, zero codes / byte-0 scales), in layout ``lay``."""
+    M, W = vals.shape
+    Mc = _c128(M) if pad else M
+    shapes = ((M, W), (M, -(-W // 32)), (W, Mc), (W, -(-Mc // 32)))
+    ref = _lay([_padded(t, sh) for t, sh in zip(R.quant_dual(vals.cpu(), rule), shapes)], lay)
+    for got, exp, what in zip(out, ref, ("q_row", "s_row", "q_col", "s_col")):
+        _eq(got, exp, what)
+
+
+# dense GLU / dGLU (a dense SwiGLU MLP, the shared expert): probs None = no row weights, bit-identical to all ones
+DENSE_GLU = [(1, 128, True), (300, 96, False), (257, 2048, True), (130, 256, True)]
+GLU_MATH = [("silu", None, "nosat"), ("gelu", 7.0, "even")]  # activation, clamp, scale rule
+
+
+@pytest.mark.parametrize("act,clamp,rule", GLU_MATH)
+@pytest.mark.parametrize("M,I,pad", DENSE_GLU)
+@pytest.mark.parametrize("with_probs", [False, True])
+def test_glu_dense(Q, M, I, pad, act, clamp, with_probs, rule):
+    g = torch.Generator(device="cuda").manual_seed(M + I)
+    l1 = (torch.randn(M, 2 * I, generator=g, device="cuda") * 3).to(torch.bfloat16)
+    probs = torch.rand(M, generator=g, device="cuda") if with_probs else None
+    lay = _max_lay(M, I, I, _c128(M) if pad else M)
+    act_v = torch.full((M, I), float("nan"), dtype=torch.bfloat16, device="cuda")
+    out = Q.glu_quant_mxfp8(l1, probs, act, clamp, rule=rule, pad=pad, act_out=act_v, layout=lay)
+    ones = torch.ones(M, device="cuda")
+    _ulp_close(act_v, R.glu_ref(l1.cpu(), (ones if probs is None else probs).cpu(), act, clamp), "act")
+    _check_dense(out, act_v, rule, pad, lay)
+    if probs is None:  # = the probs path with ones, bit for bit
+        for got, exp, what in zip(out, Q.glu_quant_mxfp8(l1, ones, act, clamp, rule=rule, pad=pad, layout=lay),
+                                  ("q_row", "s_row", "q_col", "s_col")):
+            _eq(got, exp, f"no probs vs ones: {what}")
+
+
+@pytest.mark.parametrize("act,clamp,rule", GLU_MATH)
+@pytest.mark.parametrize("M,I,pad", DENSE_GLU)
+@pytest.mark.parametrize("with_probs", [False, True])
+def test_dglu_dense(Q, M, I, pad, act, clamp, with_probs, rule):
+    g = torch.Generator(device="cuda").manual_seed(M + 3 * I)
+    l1 = (torch.randn(M, 2 * I, generator=g, device="cuda") * 3).to(torch.bfloat16)
+    dact = torch.randn(M, I, generator=g, device="cuda").to(torch.bfloat16)
+    probs = torch.rand(M, generator=g, device="cuda") if with_probs else None
+    lay = _max_lay(M, 2 * I, 2 * I, _c128(M) if pad else M) & ~(0 if I % 128 == 0 else PACK_ROW)
+    grad_v = torch.full((M, 2 * I), float("nan"), dtype=torch.bfloat16, device="cuda")
+    gp, *out = Q.dglu_quant_mxfp8(dact, l1, probs, act, clamp, rule=rule, pad=pad, grad_out=grad_v, layout=lay)
+    ones = torch.ones(M, device="cuda")
+    ref_grad, ref_gp = R.dglu_ref(dact.cpu(), l1.cpu(), (ones if probs is None else probs).cpu(), act, clamp)
+    _ulp_close(grad_v, ref_grad, "grad_l1")
+    if probs is None:
+        assert gp is None
+    else:
+        torch.testing.assert_close(gp.cpu(), ref_gp, rtol=1e-4, atol=1e-4 * float(ref_gp.abs().max() + 1))
+    _check_dense(out, grad_v, rule, pad, lay)
+
+
 @pytest.mark.parametrize("rule", RULES)
 @pytest.mark.parametrize(
     "B,N,K,pad", [(1, 64, 96, False), (3, 64, 96, True), (2, 256, 2048, False), (2, 129, 257, False),
