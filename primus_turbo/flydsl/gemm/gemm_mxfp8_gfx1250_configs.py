@@ -89,7 +89,8 @@ _TABLE_BSH: dict = {
     (8192, 16384, 7168): C(256, 256, 4, 1, 4, 4),  # o_proj dgrad 240.0 (c2x2 260.1, nb2 kp2 c2x2 283.8; kcl1)
     # kfin7 (results/kfin7_bsh4.json, the old pick first, 2 rounds)
     (8192, 7168, 4096): C(256, 256, 4, 1, 2, 2),  # shared fc1 dgrad 76.3 (nb2 kp2 c2x2 83.8)
-    (8192, 2048, 7168): C(256, 256, 4, 1, 2, 2),  # shared fc2 dgrad 36.5 (nb2 kp2 c1x4 38.9)
+    (8192, 2048, 7168): C(256, 256, 4, 1, 4, 4),  # shared fc2 dgrad 33.2 (c2x2 35.5, kcl3; nb2 kp2 c1x4 38.9)
+    (8192, 4096, 7168): C(256, 256, 4, 1, 4, 4),  # shared fc1 fwd 66.6 (nb2 kp2 c2x2 70.1; kcl1 0.966, kcl3 0.940)
 }
 
 
