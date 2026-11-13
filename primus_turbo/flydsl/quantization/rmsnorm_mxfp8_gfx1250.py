@@ -82,13 +82,17 @@ def rmsnorm_rstd(x: torch.Tensor, eps: float, rstd: torch.Tensor | None = None) 
     rstd = torch.empty(M, dtype=torch.float32, device=x.device) if rstd is None else rstd
     if M == 0:
         return rstd
-    args = [Q._ptr(x), Q._ptr(rstd), torch.cuda.current_stream(), M, x.stride(0), -(-M // ROWS), H, float(eps)]
     key = (H, float(eps))
     fn = _COMPILED.get(key)
-    if fn is None:
-        fn = _COMPILED[key] = flyc.compile(_launch_rstd, *args)
+    if fn is not None:  # the compiled launcher with data_ptr ints and the raw stream (as mxfp8_quant_gfx1250._run)
+        dev = x.get_device()
+        stream = Q._RAW_STREAM(dev) if Q._RAW_STREAM is not None else torch.cuda.current_stream()
+        fn(x.data_ptr(), rstd.data_ptr(), stream, M, x.stride(0), -(-M // ROWS), *key)
+        return rstd
+    fn = flyc.compile(_launch_rstd, Q._ptr(x), Q._ptr(rstd), torch.cuda.current_stream(), M, x.stride(0),
+                      -(-M // ROWS), *key)  # compiles, then runs this call
     if fn is not None:
-        fn(*args)
+        _COMPILED[key] = fn
     return rstd
 
 

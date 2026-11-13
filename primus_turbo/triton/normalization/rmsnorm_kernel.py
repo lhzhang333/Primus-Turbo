@@ -342,6 +342,78 @@ def rmsnorm_bwd_kernel_grid_stride(
 
 
 # ---------------------------------------------------------------------------
+# Backward — tiled grid-stride (256 < BLOCK_H <= 8192): each program walks tiles
+# of ROWS rows (stride NUM_PROGRAMS tiles) with the loads pipelined across tiles,
+# and keeps its dgamma accumulator in fp32 registers. Many rows per load keep the
+# memory system busy where the one-row-at-a-time grid-stride loop is latency-bound.
+# HAS_RESIDUAL: the fused-residual variant, dx = dx_norm + d(x + r).
+# ---------------------------------------------------------------------------
+@triton.jit
+def rmsnorm_bwd_kernel_tiled(
+    DY_ptr,
+    X_ptr,
+    G_ptr,
+    RSTD_ptr,
+    DX_ptr,
+    DG_PART_ptr,
+    DXPR_ptr,
+    stride_xb,
+    stride_xh,
+    stride_dyb,
+    stride_dyh,
+    stride_dxb,
+    stride_dxh,
+    stride_dgp,
+    stride_dxprb,
+    stride_dxprh,
+    B,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    ROWS: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    ZERO_CENTERED: tl.constexpr = False,
+    HAS_RESIDUAL: tl.constexpr = False,
+):
+    pid = tl.program_id(0)
+    h_offs = tl.arange(0, BLOCK_H)
+    h_mask = h_offs < H
+    g = tl.load(G_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
+    if ZERO_CENTERED:
+        g = g + 1.0  # dgamma is unchanged: d(1 + g)/dg = 1
+    dg_acc = tl.zeros((ROWS, BLOCK_H), dtype=tl.float32)
+
+    for tile in tl.range(pid, tl.cdiv(B, ROWS), NUM_PROGRAMS, num_stages=NUM_STAGES):
+        row_offs = tile * ROWS + tl.arange(0, ROWS)
+        row_mask = row_offs < B
+        mask = row_mask[:, None] & h_mask[None, :]
+        x = tl.load(
+            X_ptr + row_offs[:, None] * stride_xb + h_offs[None, :] * stride_xh, mask=mask, other=0.0
+        ).to(tl.float32)
+        dy = tl.load(
+            DY_ptr + row_offs[:, None] * stride_dyb + h_offs[None, :] * stride_dyh, mask=mask, other=0.0
+        ).to(tl.float32)
+        rstd = tl.load(RSTD_ptr + row_offs, mask=row_mask, other=0.0).to(tl.float32)
+
+        x_hat = x * rstd[:, None]
+        dxhat = dy * g[None, :]
+        m = tl.sum(dxhat * x_hat, axis=1) / H
+        dx = (dxhat - x_hat * m[:, None]) * rstd[:, None]
+        if HAS_RESIDUAL:
+            dx += tl.load(
+                DXPR_ptr + row_offs[:, None] * stride_dxprb + h_offs[None, :] * stride_dxprh, mask=mask, other=0.0
+            ).to(tl.float32)
+        tl.store(
+            DX_ptr + row_offs[:, None] * stride_dxb + h_offs[None, :] * stride_dxh,
+            dx.to(DX_ptr.dtype.element_ty),
+            mask=mask,
+        )
+        dg_acc += dy * x_hat  # rows past B loaded as zero
+
+    tl.store(DG_PART_ptr + pid * stride_dgp + h_offs, tl.sum(dg_acc, axis=0), mask=h_mask)
+
+
+# ---------------------------------------------------------------------------
 # Backward — persistent grid-stride, fused residual variant.
 # ---------------------------------------------------------------------------
 @triton.jit
