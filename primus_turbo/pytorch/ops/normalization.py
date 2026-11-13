@@ -417,7 +417,8 @@ def rmsnorm_mxfp8(
 
     gfx1250 (bf16 x and gamma, H % 8 == 0 and H > 512, 16-byte aligned rows; x may be a strided row
     view): one read of x for the statistics, one tile pass that normalizes, stores ``y`` and quantizes it,
-    so the codes are exactly the MXFP8 cast of the returned ``y``. ``write_y=False`` skips the bf16 store
+    so the codes are exactly the MXFP8 cast of the returned ``y`` -- and y, rstd and the gradients are bit for bit
+    those of Turbo's ``rmsnorm`` followed by the quantization. ``write_y=False`` skips the bf16 store
     and returns ``None`` for ``y`` (every consumer must read the pair). Elsewhere: Turbo's RMSNorm, then
     ``quantize_fp8_with_trans`` (same outputs).
     """

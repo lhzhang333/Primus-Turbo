@@ -24,6 +24,7 @@ from primus_turbo.triton.normalization.rmsnorm_kernel import (
     rmsnorm_fwd_kernel_multi_row,
     rmsnorm_fwd_residual_kernel,
     rmsnorm_fwd_residual_kernel_multi_row,
+    rmsnorm_rstd_kernel,
 )
 
 
@@ -277,6 +278,30 @@ def rmsnorm_bwd_impl(
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
+
+
+def rmsnorm_rstd_impl(x: torch.Tensor, H: int, eps: float) -> torch.Tensor:
+    """``rmsnorm_fwd_impl``'s rstd [B] fp32 for x [.., H] (rows may be strided), bit for bit, without writing y:
+    its kernel's reduction and rsqrt under the same launch config."""
+    x2 = _reshape_batch_hidden(x, H)
+    B = x2.shape[0]
+    BLOCK_H, ROWS, num_warps, num_stages = _pick_config(H, B)
+    if ROWS != 1:  # (narrow rows, multi-row forward) its own rstd
+        return rmsnorm_fwd_impl(x2, torch.ones(H, dtype=x2.dtype, device=x2.device), eps)[2]
+    rstd = torch.empty(B, device=x2.device, dtype=torch.float32)
+    if B:
+        rmsnorm_rstd_kernel[(B,)](
+            x2,
+            rstd,
+            x2.stride(0),
+            x2.stride(1),
+            H=H,
+            eps=eps,
+            BLOCK_H=BLOCK_H,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    return rstd
 
 
 def rmsnorm_fwd_residual_impl(

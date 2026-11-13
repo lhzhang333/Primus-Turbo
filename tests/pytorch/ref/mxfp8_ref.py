@@ -27,8 +27,7 @@ One int32 of it is the WMMA scale operand of one row for one 128-wide K step. Pa
 MoE (``quant_grouped``): rows as ``quant_rows`` per expert padded to 32 rows, the column copy per expert
 padded to 128 tokens; pad rows and blocks without a token get scale ``PAD_SCALE`` (127). Fused producers:
 ``glu_ref`` / ``dglu_ref`` (the grouped MLP's activation and its gradient, bf16 before quantization),
-``gather_rows`` (permute) and the dense ``rmsnorm_ref`` (with ``rmsnorm_rstd_ref``). B operands of the GEMM
-may be 16x16-preshuffled (``preshuffle_b16``).
+``gather_rows`` (permute). B operands of the GEMM may be 16x16-preshuffled (``preshuffle_b16``).
 """
 
 import torch
@@ -207,29 +206,6 @@ def gather_rows(x, dest2src, permuted_probs=None):
     if permuted_probs is not None:
         ok &= permuted_probs != 0
     return torch.where(ok[:, None], x[idx.clamp(0, x.shape[0] - 1)], torch.zeros((), dtype=x.dtype))
-
-
-def rmsnorm_rstd_ref(x: torch.Tensor, eps: float) -> torch.Tensor:
-    """fp32 ``rsqrt(mean(x^2) + eps)`` per row of x [M, H] bf16, bit for bit as the gfx1250 kernel sums: lane l
-    of a 32-lane wave adds the squares of chunk ``8 (l + 32 j) .. + 8`` in order (bf16 squares are exact in fp32),
-    adjacent lanes pair up in a binary tree within each 16-lane half, then the halves; ``1 / sqrt(sum / H + eps)``
-    with IEEE division and square root."""
-    M, H = x.shape
-    J = -(-H // 256)
-    sq = torch.nn.functional.pad(x.float(), (0, 256 * J - H)).view(M, J, 32, 8).square()
-    p = torch.zeros(M, 32, dtype=torch.float32, device=x.device)
-    for j in range(J):
-        for e in range(8):
-            p = p + sq[:, j, :, e]
-    for _ in range(4):
-        p = p[:, 0::2] + p[:, 1::2]
-    tot = p[:, 0] + p[:, 1]
-    return 1.0 / torch.sqrt(tot / H + torch.tensor(eps, dtype=torch.float32))
-
-
-def rmsnorm_ref(x: torch.Tensor, gamma: torch.Tensor, rstd: torch.Tensor) -> torch.Tensor:
-    """RMSNorm output bf16 ``(x * rstd[row]) * gamma[col]`` in fp32 (Turbo's formula) for a given per-row rstd."""
-    return ((x.float() * rstd[:, None]) * gamma.float()[None, :]).to(torch.bfloat16)
 
 
 def pack_scales(s: torch.Tensor) -> torch.Tensor:

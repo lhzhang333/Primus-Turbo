@@ -68,6 +68,30 @@ def rmsnorm_fwd_kernel(
     tl.store(RSTD_ptr + row, rstd)
 
 
+@triton.jit
+def rmsnorm_rstd_kernel(
+    X_ptr,
+    RSTD_ptr,
+    stride_xb,
+    stride_xh,
+    H: tl.constexpr,
+    eps,
+    BLOCK_H: tl.constexpr,
+):
+    """rmsnorm_fwd_kernel's rstd alone -- the same load layout, reduction and rsqrt, launched with the same
+    config, so the same bits -- for producers that write their own normalized outputs (the fused RMSNorm +
+    MXFP8 quantization)."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    x_ptrs = X_ptr + row * stride_xb + offs * stride_xh
+    mask = offs < H
+
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=0) / H
+    rstd = tl.rsqrt(var + eps)
+    tl.store(RSTD_ptr + row, rstd)
+
+
 # ---------------------------------------------------------------------------
 # Forward — N rows per program.
 # ---------------------------------------------------------------------------

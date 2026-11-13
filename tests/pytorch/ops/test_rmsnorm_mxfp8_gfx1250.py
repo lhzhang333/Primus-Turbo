@@ -4,8 +4,9 @@
 # See LICENSE for license information.
 ###############################################################################
 """gfx1250 RMSNorm forward + MXFP8 dual quantization (primus_turbo/flydsl/quantization/rmsnorm_mxfp8_gfx1250.py)
-and its op (``primus_turbo.pytorch.ops.normalization.rmsnorm_mxfp8``), against tests/pytorch/ref/mxfp8_ref.py:
-rstd, the bf16 y and both MXFP8 copies bit for bit (reference on the CPU)."""
+and its op (``primus_turbo.pytorch.ops.normalization.rmsnorm_mxfp8``): rstd and the bf16 y bit for bit Turbo's
+RMSNorm forward (``rmsnorm_fwd_impl``), both MXFP8 copies bit for bit tests/pytorch/ref/mxfp8_ref.py's cast of that
+y, and the op bit for bit Turbo's RMSNorm followed by gemm_fp8 (outputs and gradients)."""
 
 import os
 import sys
@@ -62,11 +63,13 @@ def _pack(s):
 
 
 def _check(N, x, gamma, rule, pad, lay, write_y):
+    from primus_turbo.pytorch.kernels.normalization.rmsnorm_impl import rmsnorm_fwd_impl
+
     M, H = x.shape
     y, rstd, *q = N.rmsnorm_quant_mxfp8(x, gamma, EPS, rule=rule, pad=pad, layout=lay, write_y=write_y)
-    rstd_ref = R.rmsnorm_rstd_ref(x.cpu(), EPS)
+    y_ref, _, rstd_ref = rmsnorm_fwd_impl(x, gamma, EPS)[:3]  # Turbo's RMSNorm: the fused path's y and rstd
     _eq(rstd, rstd_ref, "rstd")
-    y_ref = R.rmsnorm_ref(x.cpu(), gamma.cpu(), rstd_ref)
+    y_ref = y_ref.cpu()
     if write_y:
         _eq(y, y_ref, "y")
     else:
@@ -110,9 +113,9 @@ def test_skip_y(N):
 
 @pytest.mark.parametrize("M,H,N_out,stride_pad", [(256, 512, 1024, 64), (300, 1536, 512, 0), (512, 7168, 576, 0)])
 def test_op(M, H, N_out, stride_pad, monkeypatch):
-    """``rmsnorm_mxfp8`` feeding ``gemm_fp8`` with its pair: no re-quantization (strict mode), the GEMM output equal
-    to ``gemm_fp8`` of the op's own bf16 y, and the gradients (through y and through the pair) equal to the
-    unfused path's within its rstd rounding."""
+    """``rmsnorm_mxfp8`` feeding ``gemm_fp8`` with its pair: no re-quantization (strict mode), and y, the GEMM
+    output and the gradients (through y and through the pair) bitwise those of Turbo's RMSNorm followed by
+    ``gemm_fp8`` (the same rstd and y, the same codes, the same two gradients summed)."""
     import primus_turbo.common.envs as envs
     from primus_turbo.pytorch.core.low_precision import (
         Float8QuantConfig,
@@ -154,5 +157,4 @@ def test_op(M, H, N_out, stride_pad, monkeypatch):
     assert torch.equal(out, gemm_fp8(y, w, trans_b=True, config=cfg)), "the pair is the MXFP8 cast of y"
     y2, out2, dx2, dg2 = run(False)
     for a, b, what in ((y, y2, "y"), (out, out2, "out"), (dx, dx2, "dx"), (dg, dg2, "dgamma")):
-        err = float((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30))
-        assert err < 2e-2, f"{what}: relative error {err:.3g} vs the unfused path"
+        assert torch.equal(a, b), f"{what}: not bitwise the unfused path's"
