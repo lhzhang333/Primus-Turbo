@@ -77,6 +77,11 @@ def global_ptr(addr):
     return fx.to_llvm_ptr(fx.inttoptr(pt, addr))
 
 
+def _i32_word(x):
+    """A 32-bit word as a signed Python int (an i32 constant)."""
+    return x - (1 << 32) if x >= 1 << 31 else x
+
+
 def _tdm_cfg(w, row_elems):
     """TDM group 1 word 0 for 2-byte elements: pad (row_elems - w) elements after every w."""
     interval_dw, amount_dw = w // 2, (row_elems - w) // 2
@@ -157,18 +162,14 @@ def read_q_fragments(region, lane_idx):
 ROWS_PER_COPY = N_BLOCK // (NUM_WAVES // 2)  # K / V tile rows each low wave (0-3) copies
 
 
-def _i32_word(x):
-    return x - (1 << 32) if x >= 1 << 31 else x
-
-
 class KVTileLoader:
     """A low wave's share of the TDM copies of an N_BLOCK-row K / V tile.
 
     Each low wave (0-3) copies its ROWS_PER_COPY rows of K columns [0, 128), K columns [128, 192)
-    and V, one op each (a TDM pad interval is a power of two). The descriptors are built here, once:
-    per tile only the global address and the valid-row count change, a few SALU ops instead of the
-    copy atom's whole descriptor (with a v_med3 + readfirstlane for the row clamp) on every issue.
-    Rows past the workgroup's last key are zero-filled by the hardware, as with the atom.
+    and V, one op each (a TDM pad interval is a power of two). Everything but the global address and
+    the valid-row count is fixed here, so an issue costs a few SALU ops (the descriptor words of
+    ``_tdm_rows``, emitted in the order the forward kernel was tuned with). Rows past the workgroup's
+    last key are zero-filled by the hardware.
     """
 
     def __init__(
@@ -199,16 +200,13 @@ class KVTileLoader:
             row_bytes = fx.Int64(sseq) * fx.Int64(2)
             lds = r0 * fx.Int32(row_elems * 2) + fx.Int32(lds_off)
             for c0, w in pow2_segments(width):
-                # group 1 word 0: 2-byte elements, pad (row_elems - w) elements after every w
-                interval_dw, amount_dw = w // 2, (row_elems - w) // 2
-                cfg = (1 << 16) | (1 << 20) | ((interval_dw.bit_length() - 2) << 22) | ((amount_dw - 1) << 25)
                 self.copies.append(
                     dict(
                         base=base + fx.Int64(c0 * 2),
                         row_bytes=row_bytes,
                         stride=sseq,
                         lds=lds + fx.Int32(c0 * 2),
-                        cfg=_i32_word(cfg),
+                        cfg=_tdm_cfg(w, row_elems),
                         w=w,
                     )
                 )
