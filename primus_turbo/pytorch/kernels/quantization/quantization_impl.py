@@ -9,6 +9,7 @@ from typing import Optional, Tuple, Union
 import torch
 import triton
 
+import primus_turbo.common.envs as envs
 from primus_turbo.flydsl.quantization.mxfp8_quant_flydsl import (
     grouped_quant_mxfp8_raw,
     quant_mxfp8_raw,
@@ -39,6 +40,10 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
+_RAW_RECIPE = ScalingRecipe()
+_MX1250: dict = {}  # (dtypes, recipes, block shapes, E8M0 rule) -> (Q, rule, layout): the calls the kernels take
+
+
 def _gfx1250_mxfp8(
     x: torch.Tensor, out_dtype: torch.dtype, row: ScalingRecipe, col: ScalingRecipe, same_blocks=True
 ):
@@ -51,7 +56,12 @@ def _gfx1250_mxfp8(
     ``shuffle_scale``: packed scales ``[.., ceil(R/32), ceil(C/128), 32, 4]``; ``shuffle_out``: codes in
     16x16 blocks ``[R/16][C/16][16][16]`` (same shape; R, C % 16 == 0). Only these kernels write them, so
     a shuffled recipe they cannot take raises, and so does any HIP fallback under PRIMUS_TURBO_MX_STRICT=2.
-    The E8M0 rule is PRIMUS_TURBO_MXFP8_SCALE_RULE (nosat by default)."""
+    The E8M0 rule is PRIMUS_TURBO_MXFP8_SCALE_RULE (nosat by default). Calls the kernels take are memoized
+    (the rule is part of the key); the others go through the checks every time."""
+    key = (x.dtype, out_dtype, row, col, same_blocks, envs.PRIMUS_TURBO_MXFP8_SCALE_RULE)
+    hit = _MX1250.get(key)
+    if hit is not None:
+        return hit
     if not is_gfx1250():
         return None
     if (
@@ -60,12 +70,12 @@ def _gfx1250_mxfp8(
         and same_blocks
         and not any(r.use_sr or r.use_rht for r in (row, col))
     ):
-        import primus_turbo.common.envs as envs
         from primus_turbo.flydsl.quantization import mxfp8_quant_gfx1250 as Q
 
         lay = (Q.PACK_ROW if row.shuffle_scale else 0) | (Q.SHUF_ROW if row.shuffle_out else 0)
         lay |= (Q.PACK_COL if col.shuffle_scale else 0) | (Q.SHUF_COL if col.shuffle_out else 0)
-        return Q, envs.PRIMUS_TURBO_MXFP8_SCALE_RULE, lay
+        hit = _MX1250[key] = (Q, key[-1], lay)
+        return hit
     if any(r.shuffle_scale or r.shuffle_out for r in (row, col)):
         raise NotImplementedError(
             f"gfx1250 MXFP8: shuffled (GEMM) layouts need bf16 -> E4M3 without SR / RHT and block shapes the "
@@ -570,16 +580,12 @@ def quantize_mxfp8_impl(
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-    # NOTE: quantize fp8 kernel use the ISA which only available on cdna4.
-    mxfp8_support, reason = check_mxfp8_support()
-    assert mxfp8_support, reason
-
     assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
 
-    scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
+    scaling_recipe = _RAW_RECIPE if scaling_recipe is None else scaling_recipe
     if with_trans:
         scaling_recipe_for_trans = (
-            ScalingRecipe() if scaling_recipe_for_trans is None else scaling_recipe_for_trans
+            _RAW_RECIPE if scaling_recipe_for_trans is None else scaling_recipe_for_trans
         )
     else:
         scaling_recipe_for_trans = scaling_recipe
@@ -600,12 +606,15 @@ def quantize_mxfp8_impl(
         # gfx1250: one pass, K and M padded to 128 as HIP does (zero codes / byte-0 scales); raw, or the
         # GEMM layouts the recipes' shuffle flags ask for (see _gfx1250_mxfp8).
         Q, rule, lay = q1250
-        x, b2d = x.contiguous(), scaling_recipe.use_2d_block
+        b2d = scaling_recipe.use_2d_block
         if with_trans:
             fn = Q.quant_mxfp8_raw_batched if x.ndim == 3 else Q.quant_mxfp8_raw
             return fn(x, out_dtype, b2d, b2d, rule=rule, pad=True, layout=lay)
         fn = Q.quant_mxfp8_rows if axis == x.ndim - 1 else Q.quant_mxfp8_cols
         return fn(x, out_dtype, rule=rule, blk_2d=b2d, pad=True, layout=lay)
+    # NOTE: quantize fp8 kernel use the ISA which only available on cdna4.
+    mxfp8_support, reason = check_mxfp8_support()
+    assert mxfp8_support, reason
 
     if with_trans:
         # FlyDSL dual-cast quant (raw E8M0 bit-matching the HIP dual, and faster): a 3D
@@ -690,12 +699,9 @@ def grouped_quantize_mxfp8_impl(
     exactly 0); needs ``with_trans`` and ``total_m``. gfx1250 gathers inside the
     quantizer; elsewhere the gather is materialized first.
     """
-    mxfp8_support, reason = check_mxfp8_support()
-    assert mxfp8_support, reason
-
     assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
 
-    scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
+    scaling_recipe = _RAW_RECIPE if scaling_recipe is None else scaling_recipe
     recipe_t = scaling_recipe if scaling_recipe_for_trans is None else scaling_recipe_for_trans
     q1250 = _gfx1250_mxfp8(
         x, out_dtype, scaling_recipe, recipe_t, not (scaling_recipe.use_2d_block or recipe_t.use_2d_block)
@@ -718,7 +724,7 @@ def grouped_quantize_mxfp8_impl(
                     layout=lay,
                 )
             return Q.grouped_gather_quant_mxfp8(
-                x.contiguous(),
+                x,
                 dest2src,
                 group_lens,
                 group_offs,
@@ -730,12 +736,12 @@ def grouped_quantize_mxfp8_impl(
                 layout=lay,
             )
         rows, cols = with_trans or axis == 1, with_trans or axis == 0
-        out = Q.grouped_quant_mxfp8_raw(
-            x.contiguous(), group_lens, group_offs, out_dtype, rule, True, rows, cols, layout=lay
-        )
+        out = Q.grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype, rule, True, rows, cols, layout=lay)
         if with_trans:
             return out
         return (out[0], out[1], out[4], out[5]) if rows else (out[2], out[3], out[6], out[7])
+    mxfp8_support, reason = check_mxfp8_support()
+    assert mxfp8_support, reason
     if dest2src is not None:
         assert total_m is not None, "a gathered quantization needs total_m"
         probs = None if permuted_probs is None else permuted_probs[:total_m]

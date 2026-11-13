@@ -593,56 +593,86 @@ def _ceil128(n):
     return -(-n // BK) * BK
 
 
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
 def _run(prod, out, rule, x, outs, m, mc, m_tiles, k, ko=0, b2d=0, padm=0, go=None, x2=None, p=None, gp=None,
          dbg=None, t=0, act="silu", clamp=0.0, lay=0):
     """Launch one kernel of the family. ``outs`` = (q_row, s_row, q_col, s_col, lens / offs of the column copy,
-    of the row copy (int64 [2, G + 1]: lens, offsets)), any None."""
+    of the row copy (int64 [2, G + 1]: lens, offsets)), any None. The compiled launcher of a constexpr tail is
+    called with the tensors' data_ptr() ints (no per-call pointer objects); compiling runs the call itself."""
     batch = 1 if x.ndim == 2 else x.shape[0]
     grid = m_tiles * -(-k // BK)
     if grid == 0 or batch == 0:
         return
-    if x.device not in _ZERO:
-        _ZERO[x.device] = torch.zeros(64, dtype=torch.uint8, device=x.device)
-    args = [_ptr(a if a is not None else x) for a in (x, x2, *outs[:4], go, *outs[4:], p, gp, dbg, _ZERO[x.device])]
-    args += [torch.cuda.current_stream(), m, mc, grid, batch, t]
-    args += [k, prod, out, b2d, RULES[rule], 0 if go is None else go.shape[0] - 1, _width(mc), CACHE_POLICY]
-    args += [ko or k, padm, act, float(clamp or 0.0), int(dbg is not None or (prod == P_GATHER and p is not None)), lay,
-             int(p is None and prod in (P_GLU, P_DGLU))]
-    key = tuple(args[19:])
-    fn = _COMPILED.get(key)
-    if fn is None:
-        fn = _COMPILED[key] = flyc.compile(_launch, *args)
+    tail = (k, prod, out, b2d, RULES[rule], 0 if go is None else go.shape[0] - 1, _width(mc), CACHE_POLICY, ko or k,
+            padm, act, float(clamp or 0.0), int(dbg is not None or (prod == P_GATHER and p is not None)), lay,
+            int(p is None and prod in (P_GLU, P_DGLU)))
+    dev = x.get_device()
+    zero = _ZERO.get(dev)
+    if zero is None:
+        zero = _ZERO[dev] = torch.zeros(64, dtype=torch.uint8, device=x.device)
+    tensors = (x, x2, *outs[:4], go, *outs[4:], p, gp, dbg, zero)
+    fn = _COMPILED.get(tail)
     if fn is not None:
-        fn(*args)
+        xp = x.data_ptr()
+        fn(*[xp if a is None else a.data_ptr() for a in tensors],
+           _RAW_STREAM(dev) if _RAW_STREAM is not None else torch.cuda.current_stream(), m, mc, grid, batch, t, *tail)
+        return
+    fn = flyc.compile(_launch, *[_ptr(x if a is None else a) for a in tensors], torch.cuda.current_stream(), m, mc,
+                      grid, batch, t, *tail)  # compiles, then runs this call
+    if fn is not None:  # (None under COMPILE_ONLY)
+        _COMPILED[tail] = fn
 
 
 def _check(x, out_dtype, rule, ndims):
     assert x.ndim in ndims and x.is_cuda and x.dtype == torch.bfloat16, f"bf16 {ndims}-D CUDA input, got {x.dtype}"
     assert out_dtype == torch.float8_e4m3fn, f"E4M3 codes only, got {out_dtype}"
     assert rule in RULES, f"rule must be one of {tuple(RULES)}, got {rule!r}"
-    return x.contiguous()
-
-
-def _new(*shape, dtype, like, slack=0):
-    """torch.empty, with ``slack`` bytes of storage past the tensor's last byte when asked (no copy: a view)."""
-    if not slack:
-        return torch.empty(*shape, dtype=dtype, device=like.device)
-    n = math.prod(shape) * torch.empty(0, dtype=dtype).element_size()
-    return torch.empty(n + slack, dtype=torch.uint8, device=like.device)[:n].view(dtype).view(*shape)
+    return x if x.is_contiguous() else x.contiguous()
 
 
 # Storage past every GEMM operand the quantizers write: a TDM load's inner extent clamps the data, not the
 # addressing, so the gfx1250 MX GEMM's last K step may address up to ~2 KiB past an operand's end.
 GEMM_SLACK = 4096
+_ALIGN = 256  # every carved tensor starts 256-byte aligned
+_ESIZE = {torch.float8_e4m3fn: 1, _E8: 1, torch.uint8: 1, torch.int64: 8}
+_PLANS: dict = {}
+
+
+def _carve(specs, device):
+    """The tensors of ``specs`` (``(shape, dtype)`` each) carved from one ``torch.empty``: contiguous, 256-byte
+    aligned, each followed by ``GEMM_SLACK`` bytes of the allocation. The offsets are planned once per ``specs``.
+    (One allocation per copy, not per dual cast: a copy's codes and scales live and die together, while the row
+    and column copies of an activation do not -- the column copy is kept for the wgrad.)"""
+    plan = _PLANS.get(specs)
+    if plan is None:
+        off, parts = 0, []
+        for shape, dtype in specs:
+            size = _ESIZE[dtype]
+            parts.append((dtype, shape, tuple(math.prod(shape[i + 1:]) for i in range(len(shape))), off // size))
+            off = -(-(off + math.prod(shape) * size + GEMM_SLACK) // _ALIGN) * _ALIGN
+        if len(_PLANS) > 4096:  # many distinct shapes: start over rather than grow without bound
+            _PLANS.clear()
+        plan = _PLANS[specs] = (off, tuple(parts))
+    total, parts = plan
+    buf = torch.empty(total, dtype=torch.uint8, device=device)
+    views = {torch.uint8: buf}
+    out = []
+    for dtype, shape, strides, eoff in parts:
+        v = views.get(dtype)
+        if v is None:
+            v = views[dtype] = buf.view(dtype)
+        out.append(v.as_strided(shape, strides, eoff))
+    return out
 
 
 def _bufs(lead, rows, cols, pack, shuf, dtype, like):
     """A copy's codes [*lead, rows, cols] (16x16 blocks when ``shuf``) and E8M0 scales, raw [*lead, rows,
-    ceil(cols/32)] or (``pack``) [*lead, ceil(rows/32), ceil(cols/128), 32, 4]; both with ``GEMM_SLACK``."""
+    ceil(cols/32)] or (``pack``) [*lead, ceil(rows/32), ceil(cols/128), 32, 4], in one allocation (``_carve``)."""
     assert not shuf or rows % 16 == cols % 16 == 0, f"16x16-preshuffled codes need rows, cols % 16 == 0: {rows}, {cols}"
     sshape = (-(-rows // 32), -(-cols // BK), 32, 4) if pack else (rows, -(-cols // 32))
-    return (_new(*lead, rows, cols, dtype=dtype, like=like, slack=GEMM_SLACK),
-            _new(*lead, *sshape, dtype=torch.uint8, like=like, slack=GEMM_SLACK))
+    return _carve(((tuple(lead) + (rows, cols), dtype), (tuple(lead) + sshape, _E8)), like.device)
 
 
 def quant_mxfp8_rows(x, out_dtype=torch.float8_e4m3fn, rule="nosat", blk_2d=False, pad=False, layout=0):
@@ -654,7 +684,7 @@ def quant_mxfp8_rows(x, out_dtype=torch.float8_e4m3fn, rule="nosat", blk_2d=Fals
     q, s = _bufs(b, M, KO, layout & PACK_ROW, layout & SHUF_ROW, out_dtype, x)
     _run(P_DENSE, O_ROWS, rule, x, (q, s, None, None, None, None), M, M, -(-M // BM), K, KO, int(blk_2d),
          lay=layout & ROW_BITS)
-    return q, s.view(_E8)
+    return q, s
 
 
 def quant_mxfp8_cols(x, out_dtype=torch.float8_e4m3fn, rule="nosat", blk_2d=False, pad=False, layout=0):
@@ -666,7 +696,7 @@ def quant_mxfp8_cols(x, out_dtype=torch.float8_e4m3fn, rule="nosat", blk_2d=Fals
     q, s = _bufs(b, K, Mc, layout & PACK_COL, layout & SHUF_COL, out_dtype, x)
     _run(P_DENSE, O_COLS, rule, x, (None, None, q, s, None, None), M, Mc, -(-M // BM), K, K, int(blk_2d), int(pad),
          lay=layout & COL_BITS)
-    return q, s.view(_E8)
+    return q, s
 
 
 def quant_mxfp8_raw_batched(x, out_dtype=torch.float8_e4m3fn, row_2d=False, col_2d=False, rule="nosat", pad=False,
@@ -683,13 +713,20 @@ def quant_mxfp8_raw_batched(x, out_dtype=torch.float8_e4m3fn, row_2d=False, col_
     qc, sc = _bufs((B,), K, Mc, layout & PACK_COL, layout & SHUF_COL, out_dtype, x)
     _run(P_DENSE, O_ROWS | O_COLS, rule, x, (qr, sr, qc, sc, None, None), M, Mc, -(-M // BM), K, KO, int(row_2d),
          int(pad), lay=layout)
-    return qr, sr.view(_E8), qc, sc.view(_E8)
+    return qr, sr, qc, sc
 
 
 def quant_mxfp8_raw(x, out_dtype=torch.float8_e4m3fn, row_2d=False, col_2d=False, rule="nosat", pad=False, layout=0):
     """Dual cast of x [M, K]: ``quant_mxfp8_raw_batched`` with B = 1 (2-D outputs, 4-D packed scales)."""
-    assert x.ndim == 2, f"expects 2-D, got {x.ndim}-D"
-    return tuple(t[0] for t in quant_mxfp8_raw_batched(x.unsqueeze(0), out_dtype, row_2d, col_2d, rule, pad, layout))
+    assert row_2d == col_2d, "the 32x32 block scale is shared by both copies"
+    x = _check(x, out_dtype, rule, (2,))
+    M, K = x.shape
+    KO, Mc = (_ceil128(K), _ceil128(M)) if pad else (K, M)
+    qr, sr = _bufs((), M, KO, layout & PACK_ROW, layout & SHUF_ROW, out_dtype, x)
+    qc, sc = _bufs((), K, Mc, layout & PACK_COL, layout & SHUF_COL, out_dtype, x)
+    _run(P_DENSE, O_ROWS | O_COLS, rule, x, (qr, sr, qc, sc, None, None), M, Mc, -(-M // BM), K, KO, int(row_2d),
+         int(pad), lay=layout)
+    return qr, sr, qc, sc
 
 
 def _grouped(prod, x, group_lens, group_offs, out_dtype, rule, k, M, rows=True, cols=True, pad=False, layout=0, **kw):
@@ -701,13 +738,12 @@ def _grouped(prod, x, group_lens, group_offs, out_dtype, rule, k, M, rows=True, 
     qr, sr = _bufs((), Mr, OW, layout & PACK_ROW, layout & SHUF_ROW, out_dtype, x) if rows else (None, None)
     C = OW if prod == P_DGLU else k
     qc, sc = _bufs((), C, Mp, layout & PACK_COL, layout & SHUF_COL, out_dtype, x) if cols else (None, None)
-    lc, lr = _new(2, G + 1, dtype=torch.int64, like=x), _new(2, G + 1, dtype=torch.int64, like=x)
+    lc, lr = _carve((((2, G + 1), torch.int64), ((2, G + 1), torch.int64)), x.device)
     out = (O_ROWS if rows else 0) | (O_COLS if cols else 0)
     lay = layout & ((ROW_BITS if rows else 0) | (COL_BITS if cols else 0))
     _run(prod, out, rule, x, (qr, sr, qc, sc, lc, lr), M, Mp, Mp // BM, k, OW if prod != P_DGLU else k,
          go=group_offs.contiguous(), lay=lay, **kw)
-    e8 = (lambda s: None if s is None else s.view(_E8))
-    return qr, e8(sr), qc, e8(sc), lr[0, :G], lr[1], lc[0, :G], lc[1]
+    return qr, sr, qc, sc, lr[0, :G], lr[1], lc[0, :G], lc[1]
 
 
 def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype=torch.float8_e4m3fn, rule="nosat", pad=False,
@@ -765,7 +801,7 @@ def _dense_glu(prod, x, l1, probs, I, out_dtype, rule, pad, layout, **kw):
     qc, sc = _bufs((), W, Mc, layout & PACK_COL, layout & SHUF_COL, out_dtype, x)
     _run(prod, O_ROWS | O_COLS, rule, x, (qr, sr, qc, sc, None, None), M, Mc, -(-M // BM), I, W if prod != P_DGLU
          else I, 0, int(pad), p=None if probs is None else probs.contiguous(), lay=layout, **kw)
-    return qr, sr.view(_E8), qc, sc.view(_E8)
+    return qr, sr, qc, sc
 
 
 def glu_quant_mxfp8(l1, probs=None, activation="silu", clamp_limit=None, out_dtype=torch.float8_e4m3fn,

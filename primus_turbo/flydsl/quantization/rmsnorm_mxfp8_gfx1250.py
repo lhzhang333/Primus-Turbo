@@ -109,4 +109,4 @@ def rmsnorm_quant_mxfp8(x, gamma, eps=1e-6, out_dtype=torch.float8_e4m3fn, rule=
     qc, sc = Q._bufs((), H, Mc, layout & Q.PACK_COL, layout & Q.SHUF_COL, out_dtype, x)
     Q._run(Q.P_NORM, Q.O_ROWS | Q.O_COLS, rule, x, (qr, sr, qc, sc, None, None), M, Mc, -(-M // Q.BM), H, KO, 0,
            int(pad), x2=gamma.contiguous(), p=rstd, dbg=y, t=x.stride(0), lay=layout)
-    return y, rstd, qr, sr.view(Q._E8), qc, sc.view(Q._E8)
+    return y, rstd, qr, sr, qc, sc
