@@ -67,6 +67,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_attention_hipkittens_gfx1250_mla.py",
     # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 128.
     "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
+    # Triton RMSNorm (primus_turbo/triton/normalization): the DSv3 training path on gfx1250 uses it.
+    "tests/pytorch/ops/test_normalization.py",
     # MXFP8 quantization (primus_turbo/flydsl/quantization/mxfp8_quant_gfx1250.py), bitwise vs the reference.
     "tests/pytorch/ops/test_quant_mxfp8_gfx1250.py",
     # RMSNorm forward + MXFP8 dual quantization (primus_turbo/flydsl/quantization/rmsnorm_mxfp8_gfx1250.py) and
