@@ -657,7 +657,8 @@ def _mx_linear_bwd(grad_out, saved, lay, config, out_dtype, fuse_bgrad_accum, ma
         grad_out_dtype = _get_fp8_dtype(config.format, False)
         # reshape (not view): the dual-cast quant kernel asserts a contiguous input;
         # a strided grad_out (e.g. a transpose/slice upstream) would trip it.
-        grad_out = grad_out.reshape(grad_out.shape[0], -1).contiguous()
+        if grad_out.dim() != 2 or not grad_out.is_contiguous():
+            grad_out = grad_out.reshape(grad_out.shape[0], -1).contiguous()
 
         # Dual-cast grad_out: one kernel emits both the row-wise (grad_a, NN->NT) and
         # col-wise (grad_b, TN->NT) directions -- no second single-direction pass.
