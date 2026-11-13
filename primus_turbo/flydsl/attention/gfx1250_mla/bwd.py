@@ -56,7 +56,7 @@ _COMPILED = {}
 
 
 def shape_unsupported_reason(batch: int, seqlen_q: int, seqlen_kv: int, num_heads: int) -> Optional[str]:
-    """Why the backward cannot run these MHA sizes, or None."""
+    """Why the backward cannot run these MHA sizes, or None. The forward takes every size this accepts."""
     if batch <= 0 or num_heads <= 0:
         return f"batch and num_heads must be positive, got {batch} / {num_heads}"
     if seqlen_q <= 0 or seqlen_q % 64:  # k_dkdv96ds walks query pairs of 32 rows two at a time
@@ -66,11 +66,10 @@ def shape_unsupported_reason(batch: int, seqlen_q: int, seqlen_kv: int, num_head
     if seqlen_q > seqlen_kv:
         # bottom-right causal leaves the first seqlen_q - seqlen_kv queries without keys
         return f"causal needs seqlen_q <= seqlen_kv, got {seqlen_q} > {seqlen_kv}"
-    # The sizes the attention is verified for: q / dq up to 1 GiB, lse up to 256 MiB, k under 2 GiB (the kernels'
-    # own 32-bit byte offsets would allow q / dq and k up to 2 GiB).
-    rows_q, rows_kv = batch * seqlen_q * num_heads, batch * seqlen_kv * num_heads
-    if rows_q * _d.D_QK * 2 > (1 << 30) or rows_q * 4 > (1 << 28) or rows_kv * _d.D_QK * 2 >= (1 << 31):
-        return "q/k/lse too large for the backward's verified sizes"
+    # The size limit is the 32-bit byte offsets of k / dk (k_dkdv96ds) and q / dq (k_dqds): under 2 GiB each, so
+    # k's, as seqlen_q <= seqlen_kv. The other tensors with 32-bit offsets are smaller than q: o / dO (k_delta_bshd),
+    # lse (the forward), NL / ND (k_dkdv96ds). The rest (q / k / v / o in the forward, Q / dO in k_dkdv96ds, K in
+    # k_dqds, the dS scratch) take 64-bit addresses.
     reason = _d.unsupported_reason(batch, seqlen_q, seqlen_kv, num_heads, num_heads)
     return reason or _q.dqds_unsupported_reason(batch, seqlen_q, seqlen_kv, num_heads, num_heads)
 

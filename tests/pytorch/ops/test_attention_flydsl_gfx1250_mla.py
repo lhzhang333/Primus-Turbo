@@ -140,6 +140,8 @@ def _inputs(b, sq, skv, h, layout="sbhd", seed=0):
     [
         pytest.param((2, 4096, 4096, 128), {"softmax_scale": MLA_SCALE}, id="dsv3_b2"),
         pytest.param((1, 4096, 4096, 128), {"softmax_scale": MLA_SCALE}, id="dsv3_b1"),
+        pytest.param((1, 32768, 32768, 128), {"softmax_scale": MLA_SCALE}, id="dsv3_s32768"),
+        pytest.param((1, 32768, 32768, 170), {}, id="k_just_under_2gib"),
         pytest.param((1, 256, 512, 2), {}, id="sq_lt_skv"),
         pytest.param((1, 64, 64, 1), {"window_size": (-1, 0)}, id="smallest_causal_as_window"),
     ],
@@ -160,7 +162,8 @@ def test_gate_accepts(monkeypatch, dims, kwargs, layout):
         pytest.param({"sq": 96, "skv": 96}, {}, id="sq_not_multiple_of_64"),
         pytest.param({"skv": 288}, {}, id="skv_not_multiple_of_64"),
         pytest.param({"sq": 512}, {}, id="sq_gt_skv"),
-        pytest.param({"sq": 32768, "skv": 32768, "h": 128}, {}, id="too_large"),
+        pytest.param({"sq": 32768, "skv": 32768, "h": 171}, {}, id="k_over_2gib"),
+        pytest.param({"b": 2, "sq": 32768, "skv": 32768, "h": 128}, {}, id="dsv3_b2_s32768"),
         pytest.param({"b": 0}, {}, id="empty_batch"),
         pytest.param({"h": 0}, {}, id="no_heads"),
         pytest.param({}, {"causal": False}, id="non_causal"),
@@ -192,10 +195,17 @@ def test_gate_refuses_mismatched_tensors(monkeypatch):
     assert _gate(monkeypatch, q, None, v) is False and _gate(monkeypatch, q, k, None) is False
 
 
+@pytest.mark.parametrize(
+    "dims",
+    [
+        pytest.param((2, 4096, 4096, 128), id="dsv3_b2"),
+        pytest.param((1, 32768, 32768, 128), id="dsv3_s32768"),
+    ],
+)
 @pytest.mark.parametrize("layout", ["bshd", "sbhd"])
-def test_unpinned_mla_call_resolves_to_flydsl(monkeypatch, layout):
+def test_unpinned_mla_call_resolves_to_flydsl(monkeypatch, layout, dims):
     _on_gfx1250(monkeypatch)
-    q, k, v = _meta(2, 4096, 4096, 128, layout=layout)
+    q, k, v = _meta(*dims, layout=layout)
     assert resolve_flash_attn_backend(False, None, **_resolve_kwargs(q, k, v, layout)) == BackendType.FLYDSL
 
 
@@ -570,6 +580,43 @@ def test_persistent_forward_equals_one_block_per_workgroup(monkeypatch, dims):
     for name, x, r in zip(("out", "lse"), got, ref):
         assert torch.isfinite(x).all(), name
         assert torch.equal(x, r), name
+
+
+@needs_gfx1250
+@pytest.mark.parametrize(
+    ("dims", "heads"),
+    [
+        pytest.param((1, 32768, 32768, 128), 16, id="dsv3_s32768"),
+        pytest.param((1, 4096, 4096, 1360), 170, id="q_and_k_just_under_2gib"),
+        pytest.param((1, 512, 32768, 170), 34, id="k_just_under_2gib_sq_lt_skv"),
+    ],
+)
+def test_largest_sizes_equal_head_slices(dims, heads):
+    """Up to the 2 GiB of q and k the kernels' 32-bit byte offsets allow, the forward and the backward give the bits
+    of the same problem run ``heads`` heads at a time, each slice far below that. NaN-filled outputs expose an element
+    no launch wrote."""
+    from primus_turbo.flydsl.attention.gfx1250_mla import bwd, fwd
+
+    b, sq, skv, h = dims
+    assert bwd.shape_unsupported_reason(b, sq, skv, h) is None
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v, dout = (
+        torch.randn(b, s, h, d, device="cuda", generator=g).to(torch.bfloat16)
+        for s, d in ((sq, D_QK), (skv, D_QK), (skv, D_V), (sq, D_V))
+    )
+
+    def run(q, k, v, dout):
+        with _nan_filled_outputs():
+            out, lse = fwd.flash_attn_mla_fwd(q, k, v, MLA_SCALE)
+            return (out, lse, *bwd.flash_attn_mla_bwd(dout, q, k, v, out, lse, MLA_SCALE, True))
+
+    whole = run(q, k, v, dout)
+    for h0 in range(0, h, heads):
+        part = run(*(t[:, :, h0 : h0 + heads].contiguous() for t in (q, k, v, dout)))
+        torch.cuda.synchronize()
+        for name, x, r in zip(("out", "lse", "dq", "dk", "dv"), whole, part):
+            x = x[:, h0 : h0 + heads] if name == "lse" else x[:, :, h0 : h0 + heads]
+            assert torch.isfinite(r).all() and torch.equal(x, r), (name, h0)
 
 
 @needs_gfx1250
