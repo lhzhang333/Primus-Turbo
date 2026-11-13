@@ -16,9 +16,10 @@
 Two launch plans; their gradients are bitwise the same:
   dS plan, where it applies: k_delta_bshd (the row constants NL / ND), k_dkdv96ds (bwd_dkdv96: dK and dV over 96-row kv
     blocks, and every bf16 dS^T tile it feeds its dK WMMA also into a scratch laid out as dslayout v2), then k_dqds
-    (bwd_dqds: dQ = dS K from that scratch, so S and dP are computed once). It takes seqlen_q % 384 in {0, 256},
-    seqlen_kv % 32 == 0 and the scratch, about batch * heads * seqlen_q * seqlen_kv / 2 bytes under the causal mask
-    (4.33 GB at b2 s4096 h128), from the caching allocator on the current stream.
+    (bwd_dqds: dQ = dS K from that scratch, so S and dP are computed once). It takes seqlen_q % 384 in {0, 256} and
+    batch * heads * seqlen_kv <= 2^21, and a scratch of about batch * heads * seqlen_q * seqlen_kv bytes under the
+    causal mask (4.33 GB at b2 s4096 h128), the last buffer it allocates from the caching allocator on the current
+    stream.
   recompute plan, for every other shape and when the scratch cannot be allocated: k_delta_bshd, k_dkdv64 / k_dkdv and
     k_dqg96 / k_dqg, whose dQ kernels recompute S and dP.
 """
@@ -95,24 +96,32 @@ def _dq_split(sq):
     raise ValueError(f"no dQ split for seqlen_q {sq}")
 
 
+def _buffers(q, k, v):
+    """(delta, NL, ND, (dq, dk, dv)): the buffers of both plans."""
+    b, sq, h, _ = q.shape
+    delta = torch.empty((b, h, sq), device=q.device, dtype=torch.float32)
+    nl = torch.empty_like(delta)  # -LOG2E * lse
+    nd = torch.empty_like(delta)  # -scale * delta
+    return delta, nl, nd, (q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape))
+
+
+def _delta_launch(dout, out, lse, delta, nl, nd, scale, stream):
+    """k_delta_bshd: delta = rowsum(dO * O) and the row constants NL / ND of both plans."""
+    b, sq, h, _ = out.shape
+    args = (dout, out, delta, lse, nl, nd, scale, sq, h, b * sq * h, sq // _k.ROWS_DELTA, b * h, stream)
+    return _k.launch_delta, args
+
+
 def _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
-    """(launcher, args) of every kernel launch in issue order, and the (dq, dk, dv) they write."""
+    """The recompute plan's (launcher, args) in issue order, and the (dq, dk, dv) they write."""
     b, sq, h, _ = q.shape
     skv = k.shape[1]
     hg = _head_group(h)
     ngz = b * h // hg
     scale = float(softmax_scale)
     c = int(bool(causal))
-    delta = torch.empty((b, h, sq), device=q.device, dtype=torch.float32)
-    nl = torch.empty_like(delta)  # -LOG2E * lse
-    nd = torch.empty_like(delta)  # -scale * delta
-    dq, dk, dv = q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
-    launches = [
-        (
-            _k.launch_delta,
-            (dout, out, delta, lse, nl, nd, scale, sq, h, b * sq * h, sq // _k.ROWS_DELTA, b * h, stream),
-        )
-    ]
+    delta, nl, nd, (dq, dk, dv) = _buffers(q, k, v)
+    launches = [_delta_launch(dout, out, lse, delta, nl, nd, scale, stream)]
     # Hq, Hkv, G = h, h, 1: MHA
     dkdv = (q, k, v, dout, nl, nd, dv, dk, scale, sq, skv, h, h, 1, sq // 16, skv - sq, c)
     if b * h * (skv // _k.BLOCK_KV) < SMALL_GRID_WAVES["dkdv"]:
@@ -148,6 +157,8 @@ def _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
     nbytes = _d.ds_layout_bytes(b, sq, skv, h, c)
     if nbytes >= _DS_OOM_BYTES.get(q.device, math.inf):
         return None
+    # The scratch is the last allocation: when it fits, the plan fits (the recompute plan needs the other buffers too).
+    delta, nl, nd, (dq, dk, dv) = _buffers(q, k, v)
     try:
         ds = torch.empty((nbytes // 2,), device=q.device, dtype=torch.bfloat16)
     except torch.OutOfMemoryError:
@@ -159,20 +170,19 @@ def _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
         )
         return None
     scale = float(softmax_scale)
-    delta = torch.empty((b, h, sq), device=q.device, dtype=torch.float32)
-    nl = torch.empty_like(delta)  # -LOG2E * lse
-    nd = torch.empty_like(delta)  # -scale * delta
-    dq, dk, dv = q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
     hg_kv, hg_q = _d.head_group(h), _q.head_group(h)
     q_off, nhead, ntile = _q.dq_split(sq)
-    delta_args = (dout, out, delta, lse, nl, nd, scale, sq, h, b * sq * h, sq // _k.ROWS_DELTA, b * h, stream)
     # Hq, Hkv, G = h, h, 1: MHA. The kernels take only the scratch's base address: k_dkdv96ds gets a [blocks, 512]
     # view (FlyDSL packs tensor sizes as int32), k_dqds the address itself.
     dkdv = (q, k, v, dout, nl, nd, dv, dk, ds.view(-1, 512), scale, sq, skv, h, h, 1, sq // 16, skv - sq)
     dkdv += (c, b, hg_kv, 1, _d.nblk96(skv), b * h // hg_kv, stream)  # ds_mode 1: the dS^T stores on
     dqa = (ds.data_ptr(), k, dq, sq, skv, h, h, 1, skv // _q.KV32, skv - sq, c, q_off, ntile, hg_q)
     dqa += (_q.ds_blocks_per_head(sq, skv, c), b * sq * h * _k.D_QK * 2, ntile + nhead, b * h // hg_q, stream)
-    launches = [(_k.launch_delta, delta_args), (_d.launch_dkdv96ds, dkdv), (_q.launch_dqds, dqa)]
+    launches = [
+        _delta_launch(dout, out, lse, delta, nl, nd, scale, stream),
+        (_d.launch_dkdv96ds, dkdv),
+        (_q.launch_dqds, dqa),
+    ]
     return launches, (dq, dk, dv)
 
 

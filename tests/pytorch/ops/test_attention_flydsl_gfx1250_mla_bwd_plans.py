@@ -93,6 +93,29 @@ def test_ds_plan_grids_cover_every_row_and_head(dims):
     assert a["q_off"] + 384 * a["ntile"] == sq and a["ny"] == a["ntile"] + int(a["q_off"] > 0)
 
 
+def test_ds_plan_allocates_its_scratch_last(monkeypatch):
+    """The dS scratch is the plan's last allocation: when it fits, the row constants and gradients (which the recompute
+    plan needs too) already did, so the backward falls back instead of running out of memory after the scratch."""
+    bwd = _bwd()
+    b, sq, skv, h = 1, 384, 384, 2
+    q, k, v, out, lse = _meta(b, sq, skv, h)
+    sizes = []
+
+    def record(alloc):
+        def fn(*args, **kwargs):
+            t = alloc(*args, **kwargs)
+            sizes.append(t.numel())
+            return t
+
+        return fn
+
+    for owner, name in ((torch, "empty"), (torch, "empty_like"), (torch.Tensor, "new_empty")):
+        monkeypatch.setattr(owner, name, record(getattr(owner, name)))
+    bwd._ds_launches(out, q, k, v, out, lse, MLA_SCALE, True, None)
+    scratch = bwd._d.ds_layout_bytes(b, sq, skv, h) // 2
+    assert sizes[-1] == scratch and sizes.count(scratch) == 1, sizes
+
+
 # ---------------------------------------------------------------------------
 # Numerics (gfx1250)
 # ---------------------------------------------------------------------------
