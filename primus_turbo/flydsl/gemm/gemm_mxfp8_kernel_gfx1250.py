@@ -990,9 +990,50 @@ def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1
             _num_cus() if persist else 0, c_pre)
 
 
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _stream():
+    """The current stream of the current device as the launcher takes it (a raw handle: 10x cheaper than
+    ``torch.cuda.current_stream()``)."""
+    if _RAW_STREAM is None:
+        return torch.cuda.current_stream()
+    return _RAW_STREAM(torch._C._cuda_getDevice())
+
+
+# Host plans (PLAN_CACHE): a call signature -> (launcher, its int arguments, constexpr tuple, the storage slack the
+# config relied on, out shape), made by the full path; a later call with the same signature only checks alignment
+# (and that slack) and launches. The signature has every property the full path checks.
+PLAN_CACHE = True
+_PLANS: dict = {}
+
+
+def _plan_key(mode, a, b, sa, sb, out, out_dtype, accumulate, config, b_preshuffled, extra=()):
+    return (mode, a.shape, a.stride(), a.dtype, b.shape, b.stride(), b.dtype, sa.shape, sa.stride(), sa.dtype,
+            sb.shape, sb.stride(), sb.dtype, None if out is None else (out.shape, out.stride(), out.dtype), out_dtype,
+            accumulate, config, b_preshuffled, a.device, C_EARLY_ON, PERSIST_ON, XCD_REMAP_ON, STAGGER_ON, C_PRE_ON,
+            *extra)
+
+
+def _run_plan(plan, out, a, b, sa, sb, g0=None, g1=None) -> bool:
+    """Launch ``plan`` on these tensors; False (the caller takes the full path) if they are not 16-byte aligned or
+    lack the storage slack the plan's config relies on."""
+    fn, ints, const, slack, _ = plan
+    o, pa, pb = out.data_ptr(), a.data_ptr(), b.data_ptr()
+    if (o | pa | pb) & 15:
+        return False
+    for i, n in slack:
+        if _slack((a, b, sa, sb)[i]) < n:
+            return False
+    fn(o, pa, pb, sa.data_ptr(), sb.data_ptr(), o if g0 is None else g0.data_ptr(), o if g1 is None else g1.data_ptr(),
+       *ints, _stream(), *const)
+    return True
+
+
 def _launch(who, mode, cfg, out, a, b, sa, sb, g0, g1, M, N, K, lda, ldb, ldsa, ldsb, G, b_preshuffled, beta1,
-            k_tail):
-    """Validate the common layout rules, then run the cached compiled launcher of this constexpr tuple."""
+            k_tail, plan_key=None, slack=()):
+    """Validate the common layout rules, then run the cached compiled launcher of this constexpr tuple (and keep the
+    call's plan under ``plan_key``; ``slack``: the (operand index, bytes) the config relies on)."""
     if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
         raise ValueError(f"{who}: a / b must be float8_e4m3fn, got {a.dtype}, {b.dtype}")
     if a.stride(-1) != 1 or b.stride(-1) != 1 or lda % 16 or ldb % 16 or K % 16:
@@ -1006,17 +1047,21 @@ def _launch(who, mode, cfg, out, a, b, sa, sb, g0, g1, M, N, K, lda, ldb, ldsa, 
             raise ValueError(f"{who}: a, b and out must be 16-byte aligned")
     const = constexprs(mode, cfg, M, N, G, sa.dim() == 4, b_preshuffled, k_tail, _F16_OUT[out.dtype], beta1)
     tabs = (g0 if g0 is not None else out, g1 if g1 is not None else out)
-    args = (out.data_ptr(), a.data_ptr(), b.data_ptr(), sa.data_ptr(), sb.data_ptr(), tabs[0].data_ptr(),
-            tabs[1].data_ptr(), M, N, K, lda, ldb, out.stride(-2), ldsa, ldsb, torch.cuda.current_stream(), *const)
+    ints = (M, N, K, lda, ldb, out.stride(-2), ldsa, ldsb)
+    ptrs = (out.data_ptr(), a.data_ptr(), b.data_ptr(), sa.data_ptr(), sb.data_ptr(), tabs[0].data_ptr(),
+            tabs[1].data_ptr())
     fn = _COMPILED.get(const)
     if fn is None:
         ptr = lambda t: flyc.from_c_void_p(fx.Int8, t.data_ptr(), assumed_align=16)  # noqa: E731
-        first = (ptr(out), ptr(a), ptr(b), ptr(sa), ptr(sb), ptr(tabs[0]), ptr(tabs[1])) + args[7:]
+        first = (ptr(out), ptr(a), ptr(b), ptr(sa), ptr(sb), ptr(tabs[0]), ptr(tabs[1])) + ints + \
+            (torch.cuda.current_stream(),) + const
         fn = flyc.compile(_launch_gemm_mxfp8, *first)  # compiles and runs this call
         if fn is not None:
             _COMPILED[const] = fn
-        return out
-    fn(*args)
+    else:
+        fn(*ptrs, *ints, _stream(), *const)
+    if plan_key is not None and fn is not None:
+        _PLANS[plan_key] = (fn, ints, const, slack, tuple(out.shape))
     return out
 
 
@@ -1026,24 +1071,25 @@ def _slack(t: torch.Tensor) -> int:
     return t.untyped_storage().nbytes() - end * t.element_size()
 
 
-def _tail_safe(cfg: MXGemmConfig, v: int, tensors, b_preshuffled: bool, packed: bool, who: str) -> MXGemmConfig:
+def _tail_safe(cfg: MXGemmConfig, v: int, tensors, b_preshuffled: bool, packed: bool, who: str) -> tuple:
     """A partial last K step of ``v`` (mod 128 * kpair) loads whole tile rows and lets the TDM clamp the data (its
     inner extent bounds the data, not the addressing): the last row of a, b and the scales is read up to a step past
     its data. A half step (kpair 2, v <= 128) loads only its first half of a, a row-major b and packed scales, which
     then read nothing past the data at 128-aligned K; a preshuffled b (2 KiB group rows) and raw scales still do. So:
     ``cfg`` if the storages have that slack (the quantizers allocate it), else kpair 1 when K is 128-aligned (no
-    partial step); K % 128 != 0 without the slack is refused (pad K to 128, as the MX quantizers do)."""
+    partial step); K % 128 != 0 without the slack is refused (pad K to 128, as the MX quantizers do). Returns (config,
+    the (operand index, bytes) of slack it relies on or None when it fell back to kpair 1)."""
     v %= WMMA_K * cfg.kpair
     if v == 0:
-        return cfg
+        return cfg, ()
     width = WMMA_K if cfg.kpair == 1 or v <= WMMA_K else 2 * WMMA_K
     need = (width - v, (WMMA_K * cfg.kpair - v) * 16 if b_preshuffled else width - v,
             0 if packed else 4 * cfg.kpair - (v + 31) // 32)
     need = need + need[2:]
     if all(_slack(t) >= n for t, n in zip(tensors, need)):
-        return cfg
+        return cfg, tuple((i, n) for i, n in enumerate(need) if n)
     if v % WMMA_K == 0:  # kpair 2 with a half step: kpair 1 has none
-        return cfg._replace(kpair=1, num_buffers=min(4, 2 * cfg.num_buffers))
+        return cfg._replace(kpair=1, num_buffers=min(4, 2 * cfg.num_buffers)), None
     raise ValueError(f"{who}: K % 128 = {v % WMMA_K} would read up to {max(need)} B past the last row of a / b / the "
                      f"scales, more than their storages hold: pad K to a multiple of 128 or give them that slack")
 
@@ -1077,6 +1123,14 @@ def gemm_mxfp8_gfx1250(
     ``[rows, ceil(K/32)]``. ``b_preshuffled``: ``b`` in the 16x16 order ``[N/16][K/16][16][16]`` (N, K % 16 == 0).
     ``out`` bf16 or fp32, N a multiple of 8; ``accumulate``: ``out = round(out + fp32 result)``.
     ``config`` overrides the static per-shape table."""
+    key = None
+    if PLAN_CACHE:
+        key = _plan_key(DENSE, a, b, a_scale, b_scale, out, out_dtype, accumulate, config, b_preshuffled)
+        plan = _PLANS.get(key)
+        if plan is not None:
+            res = torch.empty(plan[4], dtype=out_dtype, device=a.device) if out is None else out
+            if _run_plan(plan, res, a, b, a_scale, b_scale):
+                return res
     _require_gfx1250(a.device)
     M, K = a.shape
     N = b.shape[0]
@@ -1089,10 +1143,11 @@ def gemm_mxfp8_gfx1250(
         return out if accumulate else out.zero_()
     cfg = config or pick_config(M, N, K, b_preshuffled)
     packed, ldsa, ldsb = _check_scales(a_scale, b_scale, M, N, K, "gemm_mxfp8_gfx1250")
-    cfg = _tail_safe(cfg, K, (a, b, a_scale, b_scale), b_preshuffled, packed, "gemm_mxfp8_gfx1250")
+    cfg, slack = _tail_safe(cfg, K, (a, b, a_scale, b_scale), b_preshuffled, packed, "gemm_mxfp8_gfx1250")
     k_tail = K % (WMMA_K * cfg.kpair) != 0
     return _launch("gemm_mxfp8_gfx1250", DENSE, cfg, out, a, b, a_scale, b_scale, None, None, M, N, K, a.stride(0),
-                   b.stride(0), ldsa, ldsb, 1, b_preshuffled, accumulate, k_tail)
+                   b.stride(0), ldsa, ldsb, 1, b_preshuffled, accumulate, k_tail, key if slack is not None else None,
+                   slack)
 
 
 def grouped_gemm_mxfp8_gfx1250(
@@ -1113,6 +1168,15 @@ def grouped_gemm_mxfp8_gfx1250(
     32: Turbo's rowwise-padded MX layout), ``b [G, N, K]`` (16x16-preshuffled per expert by default), scales packed
     ``[ceil(M_pad/32), ..]`` / ``[G, N/32, ..]`` (or raw), ``group_offs`` (int64 [G + 1]) the tight offsets of the
     ``m_out`` output rows. Device tables only: no host sync."""
+    key = None
+    if PLAN_CACHE:
+        key = _plan_key(GROUPED_M, a, b, a_scale, b_scale, out, out_dtype, False, config, b_preshuffled,
+                        (m_out, group_offs.shape, group_offs.dtype, group_offs_padded.shape, group_offs_padded.dtype))
+        plan = _PLANS.get(key)
+        if plan is not None:
+            res = torch.empty(plan[4], dtype=out_dtype, device=a.device) if out is None else out
+            if _run_plan(plan, res, a, b, a_scale, b_scale, group_offs, group_offs_padded):
+                return res
     _require_gfx1250(a.device)
     who = "grouped_gemm_mxfp8_gfx1250"
     G, N, K = b.shape
@@ -1130,11 +1194,12 @@ def grouped_gemm_mxfp8_gfx1250(
         return out.zero_()
     cfg = config or pick_grouped_config(GROUPED_M, m_out // max(G, 1), N, K, b_preshuffled)
     packed, ldsa, ldsb = _check_scales(a_scale, b_scale, a.shape[0], N, K, who, (G,))
-    cfg = _tail_safe(cfg, K, (a, b, a_scale, b_scale), b_preshuffled, packed, who)
+    cfg, slack = _tail_safe(cfg, K, (a, b, a_scale, b_scale), b_preshuffled, packed, who)
     if packed and N % 32:
         raise ValueError(f"{who}: packed b scales need N % 32 == 0")
     return _launch(who, GROUPED_M, cfg, out, a, b, a_scale, b_scale, group_offs, group_offs_padded, m_out, N, K,
-                   a.stride(0), b.stride(1), ldsa, ldsb, G, b_preshuffled, False, K % (WMMA_K * cfg.kpair) != 0)
+                   a.stride(0), b.stride(1), ldsa, ldsb, G, b_preshuffled, False, K % (WMMA_K * cfg.kpair) != 0,
+                   key if slack is not None else None, slack)
 
 
 def grouped_gemm_mxfp8_variable_k_gfx1250(
@@ -1154,6 +1219,15 @@ def grouped_gemm_mxfp8_variable_k_gfx1250(
     ``a [M, T]`` (dY^T), ``b [N, T]`` (X^T, 16x16-preshuffled by default), scales packed ``[M/32, T/128, 32, 4]`` /
     ``[N/32, ..]`` (or raw); ``out [G, M, N]`` bf16 or fp32, ``accumulate``: ``out[g] = round(out[g] + result)``
     (the fused main_grad update; an empty expert leaves its slice unchanged, or zero without ``accumulate``)."""
+    key = None
+    if PLAN_CACHE:
+        key = _plan_key(VARIABLE_K, a, b, a_scale, b_scale, out, out_dtype, accumulate, config, b_preshuffled,
+                        (group_offs.shape, group_offs.dtype))
+        plan = _PLANS.get(key)
+        if plan is not None:
+            res = torch.empty(plan[4], dtype=out_dtype, device=a.device) if out is None else out
+            if _run_plan(plan, res, a, b, a_scale, b_scale, group_offs):
+                return res
     _require_gfx1250(a.device)
     who = "grouped_gemm_mxfp8_variable_k_gfx1250"
     (M, T), N = a.shape, b.shape[0]
@@ -1167,6 +1241,7 @@ def grouped_gemm_mxfp8_variable_k_gfx1250(
         return out
     cfg = config or pick_grouped_config(VARIABLE_K, M, N, T // max(G, 1), b_preshuffled, out.dtype == torch.bfloat16)
     packed, ldsa, ldsb = _check_scales(a_scale, b_scale, M, N, T, who)
-    cfg = _tail_safe(cfg, WMMA_K, (a, b, a_scale, b_scale), b_preshuffled, packed, who)  # any expert: 128 * odd
+    cfg, slack = _tail_safe(cfg, WMMA_K, (a, b, a_scale, b_scale), b_preshuffled, packed, who)  # any expert: 128 * odd
     return _launch(who, VARIABLE_K, cfg, out, a, b, a_scale, b_scale, group_offs, None, M, N, T, a.stride(0),
-                   b.stride(0), ldsa, ldsb, G, b_preshuffled, accumulate, True)
+                   b.stride(0), ldsa, ldsb, G, b_preshuffled, accumulate, True, key if slack is not None else None,
+                   slack)
