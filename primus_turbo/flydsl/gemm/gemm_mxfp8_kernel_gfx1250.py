@@ -1165,7 +1165,7 @@ def grouped_gemm_mxfp8_variable_k_gfx1250(
         raise ValueError(f"{who}: out must be [G, M, ldc] with expert stride M * ldc")
     if M == 0 or N == 0 or G == 0:
         return out
-    cfg = config or pick_grouped_config(VARIABLE_K, M, N, T // max(G, 1), b_preshuffled)
+    cfg = config or pick_grouped_config(VARIABLE_K, M, N, T // max(G, 1), b_preshuffled, out.dtype == torch.bfloat16)
     packed, ldsa, ldsb = _check_scales(a_scale, b_scale, M, N, T, who)
     cfg = _tail_safe(cfg, WMMA_K, (a, b, a_scale, b_scale), b_preshuffled, packed, who)  # any expert: 128 * odd
     return _launch(who, VARIABLE_K, cfg, out, a, b, a_scale, b_scale, group_offs, None, M, N, T, a.stride(0),
