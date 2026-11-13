@@ -18,14 +18,15 @@ The FlyDSL form of the HipKittens kernel k_dkdv96ds (csrc/kernels/attention/hipk
 the 48 kv rows from 96 bid + 48 w: NKV 3 sub-tiles of 16), the 0..2 blocks after them 64-row tail blocks (NKV 2),
 two bodies behind a uniform branch. A workgroup runs one sequence of query tiles (q pairs of 32 queries; MHA, the
 kernel is specialized for G = Hq / Hkv = 1) over its block: first the n_mask tiles that straddle the diagonal
-(causal mask on), then the n_full tiles below it. Q / dO tiles go through a 3-stage LDS ring filled by the TDM (a stage = [32][D_V] dO + [32][D_QK] Q, each
-wave moving its 16 rows); K / V of the wave's rows stay in registers (the S / dP B operands); dV / dK accumulate in
-registers and leave through per-wave row-major images in LDS (whole-line global stores).
+(causal mask on), then the n_full tiles below it. Q / dO tiles go through a 3-stage LDS ring filled by the TDM (a
+stage = [32][D_V] dO + [32][D_QK] Q, each wave moving its 16 rows); K / V of the wave's rows stay in registers (the
+S / dP B operands); dV / dK accumulate in registers and leave through per-wave row-major images in LDS (whole-line
+global stores).
 
-Every bf16 dS^T tile the kernel feeds its dK WMMA is also stored into the dS scratch (DS_LAYOUT_VERSION 2, the
-HipKittens dslayout.h): one region per (batch, q head), inside it the kv16 rows in order, each holding the q pairs
-from dsl_qp_first(kt) on as 1 KiB blocks [16 kv][32 q] in the dK operand's chunk order, with the softmax scale
-inside dS. k_dqds reads it back for dQ = dS K.
+Every bf16 dS^T tile the kernel feeds its dK WMMA is also stored into the dS scratch (the HipKittens dslayout.h,
+version 2): one region per (batch, q head), inside it the kv16 rows in order, row kt holding the q pairs from
+qp_first(kt) = max(0, kt // 2 - (Skv - Sq) // 32) on as 1 KiB blocks [16 kv][32 q] in the dK operand's chunk
+order, with the softmax scale inside dS. k_dqds reads it back for dQ = dS K.
 
 Numerics: P = exp2(c1 S + NL), c1 = scale * log2(e), dS = P (scale dP + ND), with k_delta_bshd's NL = -log2(e) lse
 and ND = -scale delta: the FlyDSL backward's operations in its order, so dK and dV are bitwise those of k_dkdv64.
@@ -86,26 +87,16 @@ NKV3 = 3
 ROWS3 = 32 * NKV3  # 96
 KH0_SALU = 2  # SALU per WMMA of a TDM-prep run
 SB_ALU = 0x002 | 0x004 | 0x400  # sched_barrier: VALU, SALU and transcendental may cross
-# head-group target of the grid (x = the heads of a group, fastest): 8 = the XCD count, so under the round-robin
-# dispatch each XCD runs one head's kv blocks at a time and that head's Q / dO stay in its L2 (b2 s4096 h128 hot:
-# 8 1.329, 16 1.339, 32 1.356, 64 1.369, 128 1.403 ms)
+# Head-group target of the grid (x = the heads of a group, fastest): 8 = the XCD count, so under the round-robin
+# dispatch each XCD runs one head's kv blocks at a time and that head's Q / dO tiles stay in its L2.
 HEAD_GROUP = 8
-# The 96-row tile body (below) was chosen by measurement, b2 s4096 h128 hot ms on MI455X (11-11; all bitwise equal;
-# HK LLVM k_dkdv96ds 1.429): per kv sub-tile S / dP chains then softmax (the HK LLVM order) 1.573; hh0's six chains
-# k-step by k-step and hh1's WMMAs interleaved with hh0's softmax 1.492; + all 40 dV / dK A-operand tr16 issued under
-# hh1's softmax into the dead S / dP operand registers 1.382 (in the HK order each Q^T tr16 of the dV run reused a
-# register the previous dV WMMA still read: an expert-mode va_vdst(0) drain per load); + the barrier wait after dK
-# kh1 with the next hh0 readback under dK kh2 1.374; + the softmax emitted stage by stage 1.351; + 8 heads per grid
-# row 1.329. Measured and dropped: hh1 operands streamed behind hh0's WMMAs, dV sub-tile by sub-tile under hh1's
-# softmax, part of hh1's softmax inside its WMMA window, the hh1 burst interleaved with hh0's WMMAs or carried from
-# the previous tile, the prologue's TDM issued first, the HipKittens generator's folded numerics (slower here).
-# Also measured and dropped: the dS windows by kv sub-tile instead of by query half (spills), the epilogue's line
-# readbacks batched ahead of its stores, non-temporal K / V fragment loads (+9.5%), the dP fmas first in the softmax.
-# The dS^T stores are non-temporal (written once, read by the dQ kernel later: they need not stay in L2; -0.8%) and
-# a prefetch past the last tile is the NULL TDM descriptor (count 0: moves nothing, still counted; -0.6%).
-DS_TH = 1  # gfx12 TH_STORE_NT in the buffer stores' aux (cache policy) operand
-# dS scratch layout (HipKittens dslayout.h v2)
-DS_LAYOUT_VERSION = 2
+# The 96-row body below was chosen by measurement (MI455X, b2 s4096 h128): hh0's S / dP chains run k-step by k-step
+# with hh1's WMMAs interleaved into hh0's softmax, emitted stage by stage; the 40 dV / dK A-operand tr16 loads issue
+# under hh1's softmax into the dead S / dP operand registers (a load into a register an in-flight WMMA still reads
+# costs a va_vdst drain in expert scheduling mode); the ring barrier waits after dK sub-tile 1, so the next stage's
+# hh0 readback runs under sub-tile 2. The HipKittens schedule and its generator's folded numerics measured slower.
+DS_TH = 1  # TH_STORE_NT for the dS^T stores: written once and read once by k_dqds, they need not stay in L2
+# dS scratch layout (HipKittens dslayout.h, version 2)
 DSL_KV = 16
 DSL_Q = 32
 DSL_BLK_B = 1024
@@ -412,8 +403,8 @@ def _dkdv96_impl(
 
     zero8 = _ir(fx.Vector.filled(8, 0.0, fx.Float32))
 
-    # ---- dS^T export: DS is the scratch (only its base address is used); the per-wave descriptor (base region bh0, row kt0) is built in
-    # the body; ds_rc[kh] row constants; voffset lane * 16
+    # ---- dS^T export: DS is the scratch (only its base address is used); the per-wave descriptor (base region bh0,
+    # row kt0) is built in the body; ds_rc[kh] row constants; voffset lane * 16
     nqp = Sq // fx.Int32(DSL_Q)
     mm = cshift >> fx.Int32(5)
     nblk_bh = _row_off(Skv // fx.Int32(DSL_KV), nqp, mm, causal)

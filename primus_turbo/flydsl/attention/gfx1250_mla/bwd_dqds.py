@@ -15,7 +15,8 @@
 
 dS is the scratch the dK / dV kernel writes (bf16, softmax scale included, packed causal), in the layout of
 ``csrc/kernels/attention/hipkittens/gfx1250_mla/include/dslayout.h`` (version 2):
-  * one region per (batch, q head) bh = bat * Hq + qh, regions back to back, ``bwd_dkdv96.ds_blocks_per_head`` blocks each;
+  * one region per (batch, q head) bh = bat * Hq + qh, regions back to back, ``bwd_dkdv96.ds_blocks_per_head``
+    blocks each;
   * inside a region the kv16 rows kt = 0 .. Skv / 16 - 1 in order; row kt holds the q pairs (32 queries)
     qp = qp_first(kt) .. Sq / 32 - 1, qp_first(kt) = causal ? max(0, kt // 2 - (Skv - Sq) // 32) : 0;
   * a block is a [16 kv][32 q] bf16 tile, 1 KiB: chunk (kv, c) = queries [8 c, 8 c + 8) of kv row kv at block byte

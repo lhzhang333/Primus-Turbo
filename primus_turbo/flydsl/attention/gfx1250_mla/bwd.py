@@ -177,7 +177,8 @@ def _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
     q_off, nhead, ntile = _q.dq_split(sq)
     # Hq, Hkv, G = h, h, 1: MHA. The kernels take only the scratch's base address: k_dkdv96ds gets a [blocks, 512]
     # view (FlyDSL packs tensor sizes as int32), k_dqds the address itself.
-    dkdv = (q, k, v, dout, nl, nd, dv, dk, ds.view(-1, 512), scale, sq, skv, h, h, 1, sq // 16, skv - sq)
+    ds_blocks = ds.view(-1, _d.DSL_BLK_B // 2)
+    dkdv = (q, k, v, dout, nl, nd, dv, dk, ds_blocks, scale, sq, skv, h, h, 1, sq // 16, skv - sq)
     dkdv += (c, b, hg_kv, 1, _d.nblk96(skv), b * h // hg_kv, stream)  # ds_mode 1: the dS^T stores on
     dqa = (ds.data_ptr(), k, dq, sq, skv, h, h, 1, skv // _q.KV32, skv - sq, c, q_off, ntile, hg_q)
     dqa += (_d.ds_blocks_per_head(sq, skv, c), b * sq * h * _k.D_QK * 2, ntile + nhead, b * h // hg_q, stream)
