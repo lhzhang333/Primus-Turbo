@@ -181,18 +181,26 @@ def _get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tenso
 
     Supports arbitrary rank (2D for plain Linear weights, 3D for stacked
     grouped-linear weights ``(num_gemms, out_features, in_features)``, etc.).
-    Tensors are cached by ``(shape, dtype)`` so each distinct weight layout
-    only allocates one persistent buffer that gets reused across steps.
+    One flat buffer per dtype serves every shape: the dummy is a contiguous view of
+    its first ``numel`` elements, so the dummies cost the largest weight once instead
+    of one persistent buffer per distinct weight shape (DeepSeek-V3 with MXFP8 experts
+    and dense linears: 1.75 GiB instead of 3.1 GiB). The buffer only grows; views
+    handed out earlier keep the old one alive until autograd drops them (the
+    framework's hook sets ``param.grad = None`` right after). The contents are never
+    read (``zero=True``: zeroed for frameworks that add the dummy, e.g. Megatron's
+    ``zero_out_wgrad``); views of one buffer may alias each other, which is harmless
+    for the same reason. A contiguous view keeps the gradient layout contract, so
+    AccumulateGrad still takes it without a copy.
     """
     global _dummy_wgrads
-    key = (tuple(shape), dtype)
-    if key not in _dummy_wgrads:
-        _dummy_wgrads[key] = torch.empty(
-            shape,
-            dtype=dtype,
-            device="cuda",
-            requires_grad=False,
-        )
+    numel = 1
+    for d in shape:
+        numel *= int(d)
+    key = (dtype, torch.cuda.current_device())
+    buf = _dummy_wgrads.get(key)
+    if buf is None or buf.numel() < numel:
+        buf = _dummy_wgrads[key] = torch.empty(numel, dtype=dtype, device="cuda", requires_grad=False)
+    view = buf[:numel].view(*shape)
     if zero:
-        _dummy_wgrads[key].fill_(0)
-    return _dummy_wgrads[key].detach()
+        view.fill_(0)
+    return view.detach()

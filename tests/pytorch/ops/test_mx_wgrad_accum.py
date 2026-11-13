@@ -203,3 +203,32 @@ def test_fused_matches_unfused(grouped, main_grad_dtype, pinned):
     # the same quantized operands either way: the fused epilogue rounds once, the unfused path twice
     torch.testing.assert_close(fused, unfused, rtol=1e-2, atol=1e-2)
     assert not torch.equal(fused, main_grad0), "main_grad was not accumulated into"
+
+
+@requires_mxfp8
+@pytest.mark.parametrize("main_grad_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_dummy_wgrad_is_a_view_of_one_buffer(grouped, main_grad_dtype):
+    """With the wgrad fused into main_grad, autograd gets a dummy: a view of one flat buffer per dtype (whatever the
+    weight's shape), which AccumulateGrad takes over as the weight's .grad without a copy; ``zero=True`` zeroes
+    just that view."""
+    if not mx_wgrad_accum_supported(grouped, main_grad_dtype):
+        pytest.skip(f"no MXFP8 beta=1 wgrad into {main_grad_dtype} here")
+    torch.manual_seed(0)
+    shape = (4, 512, 384) if grouped else (768, 384)
+    rows = 4 * 256 if grouped else 512
+    w = torch.nn.Parameter(torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 16)
+    w.main_grad = torch.zeros(shape, device="cuda", dtype=main_grad_dtype)
+    w.grad_added_to_main_grad = False
+    x = torch.randn(rows, shape[-1], device="cuda", dtype=torch.bfloat16)
+    if grouped:
+        lens = torch.full((4,), 256, device="cuda", dtype=torch.int64)
+        out = grouped_gemm_fp8(x, w, lens, trans_b=True, config=MX, fuse_bgrad_accum_pattern="megatron")
+    else:
+        out = gemm_fp8(x, w, trans_b=True, out_dtype=torch.bfloat16, config=MX, fuse_bgrad_accum_pattern="megatron")
+    out.backward(torch.randn_like(out))
+    buf = ops_utils._dummy_wgrads[(torch.bfloat16, torch.cuda.current_device())]
+    assert w.grad_added_to_main_grad and w.main_grad.abs().sum() > 0
+    assert w.grad.shape == w.shape and w.grad.data_ptr() == buf.data_ptr(), "the dummy was copied, not taken over"
+    small = ops_utils._get_dummy_wgrad([3, 5], torch.bfloat16, zero=True)
+    assert small.data_ptr() == buf.data_ptr() and not small.any()
