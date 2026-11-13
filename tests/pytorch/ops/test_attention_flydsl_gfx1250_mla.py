@@ -564,19 +564,25 @@ def test_matches_reference(monkeypatch, dims, layout, scale, bwd_launches):
     if bwd_launches == "two_wave":
         from primus_turbo.flydsl.attention.gfx1250_mla import bwd
 
+        # the recompute plan's two-wave kernels (the s256 shapes would otherwise take the dS plan)
         monkeypatch.setattr(bwd, "SMALL_GRID_WAVES", {"dkdv": 0, "dq": 0})
+        monkeypatch.setattr(bwd, "DS_PLAN", False)
     q, k, v, dout = _inputs(*dims, layout=layout)
     ref = _reference(q, k, v, dout, D_QK**-0.5 if scale is None else scale)
     _check(_run(q, k, v, dout, scale), ref)
 
 
 @needs_gfx1250
-def test_production_dispatch_matches_reference():
-    """(1, 4096, 4096, 16) takes the DeepSeek-V3 dispatch: grouped longest-first forward blocks,
-    k_dkdv64, k_dqg96 from q_off 64 and k_dqg with the XCD head remap. A rerun is bitwise identical."""
+def test_production_dispatch_matches_reference(monkeypatch):
+    """(1, 4096, 4096, 16) takes the DeepSeek-V3 dispatch: grouped longest-first forward blocks and the
+    backward's dS plan (k_dkdv96ds, k_dqds from q_off 256 with the XCD head remap). The recompute plan
+    (k_dkdv64, k_dqg96 from q_off 64, k_dqg) gives the same bits."""
+    from primus_turbo.flydsl.attention.gfx1250_mla import bwd
+
     q, k, v, dout = _inputs(1, 4096, 4096, 16, layout="bshd")
     got = _run(q, k, v, dout)
     _check(got, _reference_by_heads(q, k, v, dout, MLA_SCALE))
+    monkeypatch.setattr(bwd, "DS_PLAN", False)
     assert all(torch.equal(a, b) for a, b in zip(got, _run(q, k, v, dout)))
 
 
