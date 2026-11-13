@@ -12,7 +12,9 @@ The measured path is GPT-OSS on MI355X/gfx950, with TP=1, EP=1, BF16 activations
 Backward fusion additionally restricts the source to at most 32768 tokens, no
 merging probabilities or capacity padding at unpermute, and ordinary first-order
 backward outside CUDA graph capture. Unsupported backward consumers materialize
-the existing gather. Tensor hooks and aliases share that materialized storage.
+the existing gather. The backward plan itself takes any hidden width, the expert count of
+`row_id_map` and the top-k of `dest2src`; Turbo's fused grouped MXFP8 MLP (gfx1250)
+consumes the same handoffs. Tensor hooks and aliases share that materialized storage.
 Changing routing/source tensors before consumption raises an error.
 
 Both repositories need their paired gather-fusion implementation. Enable in the
