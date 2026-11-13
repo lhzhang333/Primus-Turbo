@@ -301,7 +301,7 @@ def _mx1250_can_handle(a, sa, b, sb, out_dtype, accumulate, out, kw) -> bool:
     return ok and (not accumulate or mx1250_gemm()[1]) and mx1250_out_ok(out, (m, n), accumulate, out_dtype)
 
 
-_MX1250_DIRECT: dict = {}  # operand signature -> whether gemm_mxfp8_gfx1250 takes it (the FlyDSL can_handle)
+_MX1250_DIRECT: dict = {}  # operand signature -> gemm_mxfp8_gfx1250, or None where the FlyDSL can_handle said no
 
 
 def mx1250_gemm_direct(a, sa, b, sb, out_dtype, b_preshuffled=False, out=None):
@@ -309,7 +309,8 @@ def mx1250_gemm_direct(a, sa, b, sb, out_dtype, b_preshuffled=False, out=None):
     of gfx1250's ``gemm_mxfp8_gfx1250``: the same kernel with the same arguments, without torch.library's per-call
     dispatch or the backend dispatcher. Taken when nothing needs those -- eager mode (no torch.compile, no dispatch
     mode), no FP8 GEMM backend pinned, no auto-tune -- and the FlyDSL backend's ``can_handle`` accepted this operand
-    signature (shapes, strides, dtypes, 16-byte alignment) once; else None, and the caller runs the custom op."""
+    signature once (shapes, row strides, dtypes, 16-byte alignment; the scales' layout follows from their shapes for
+    the quantizers' outputs, and the kernel re-checks it); else None, and the caller runs the custom op."""
     if torch.compiler.is_compiling() or torch._C._len_torch_dispatch_stack() or not is_gfx1250():
         return None
     pinned = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
@@ -317,19 +318,19 @@ def mx1250_gemm_direct(a, sa, b, sb, out_dtype, b_preshuffled=False, out=None):
         GlobalBackendManager.auto_tune_enabled()
     ):
         return None
-    acc = out is not None
-    sig = (a.shape, a.stride(), a.dtype, sa.shape, sa.stride(), b.shape, b.stride(), b.dtype, sb.shape, sb.stride(),
-           out_dtype, bool(b_preshuffled), (out.shape, out.stride(), out.dtype) if acc else None,
-           (a.data_ptr() | b.data_ptr() | (out.data_ptr() if acc else 0)) & 15)  # fmt: skip
-    ok = _MX1250_DIRECT.get(sig)
-    if ok is None:
+    sig = (a.shape, a.stride(), b.shape, b.stride(), sa.shape, sb.shape, a.dtype, b.dtype, out_dtype, b_preshuffled,
+           None if out is None else (out.shape, out.stride(), out.dtype),
+           (a.data_ptr() | b.data_ptr() | (0 if out is None else out.data_ptr())) & 15)  # fmt: skip
+    fn = _MX1250_DIRECT.get(sig, False)
+    if fn is False:
         kw = {"b_preshuffled": bool(b_preshuffled)}
-        ok = _MX1250_DIRECT[sig] = _mx1250_can_handle(a, sa, b, sb, out_dtype, acc, out, kw)
-    if not ok:
+        ok = _mx1250_can_handle(a, sa, b, sb, out_dtype, out is not None, out, kw)
+        fn = _MX1250_DIRECT[sig] = mx1250_gemm()[0] if ok else None
+    if fn is None:
         return None
-    if not acc:
-        return mx1250_gemm()[0](a, sa, b, sb, b_preshuffled=bool(b_preshuffled))
-    mx1250_gemm()[0](a, sa, b, sb, out_dtype=out.dtype, out=out, accumulate=True, b_preshuffled=bool(b_preshuffled))
+    if out is None:
+        return fn(a, sa, b, sb, b_preshuffled=b_preshuffled)
+    fn(a, sa, b, sb, out_dtype=out.dtype, out=out, accumulate=True, b_preshuffled=b_preshuffled)
     torch.autograd.graph.increment_version(out)  # what the custom op's ADInplaceOrView step does
     return out
 
