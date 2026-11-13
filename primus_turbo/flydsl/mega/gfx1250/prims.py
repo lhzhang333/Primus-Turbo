@@ -296,6 +296,17 @@ def copy_warp(
         buffer_store(v, dst, dst_off + o, cache_modifier=store_cache_modifier)
 
 
+def wave_inclusive_scan(value: ArithValue) -> ArithValue:
+    """Inclusive prefix sum of an i32 over the lanes of one hardware wave, lane 0 first."""
+    lane = fx.Int32(fx.thread_idx.x) % fx.Int32(WAVE)
+    step = 1
+    while step < WAVE:
+        moved = fx.gpu.shuffle_up(value, step, WAVE)
+        value = value + arith.select(lane >= fx.Int32(step), moved, fx.Int32(0))
+        step *= 2
+    return value
+
+
 def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -307,4 +318,10 @@ def _readfirstlane_i32(v):
     buffer descriptor built from one puts every store behind a readfirstlane/saveexec
     waterfall. Pinning the value collapses the SRD to scalar regs and drops the waterfall."""
     op = rocdl.readfirstlane(res=_raw(v).type, src=_raw(v))
+    return ArithValue(op.result if hasattr(op, "result") else op)
+
+
+def _readlane_i32(v, lane):
+    """Lane ``lane`` (a wave-uniform i32; its low bits pick the lane) of the i32 ``v``, as an SGPR value."""
+    op = rocdl.readlane(_raw(v).type, _raw(v), _raw(lane))
     return ArithValue(op.result if hasattr(op, "result") else op)

@@ -25,7 +25,8 @@ workgroups, pool blocks past this call's tile count): a dynamic branch over the 
 is what the grouped kernel's ``dead_tile_exit`` found to fault intermittently.
 
 Every workgroup is ``m_warp * n_warp`` wave32 waves; the comm role runs the shared
-``dispatch_bf16_tile`` on that many threads (64-lane copy warps).
+``dispatch_bf16_tile`` on that many threads (one hardware wave per copy). ``DISPATCH_ONLY`` compiles
+the GEMM role out: the launch is the comm workgroups and one workgroup that waits for every sender.
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
 from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
     dispatch_bf16_tile,
+    dispatch_table_lds_words,
     spin_until_flag_reaches,
 )
 from primus_turbo.flydsl.mega.gfx1250.prims import cast, ld, st
@@ -118,10 +120,12 @@ def _launch_dispatch_gemm_nt(
     block = m_warp * n_warp * WAVE
     if MX and not DISPATCH_ONLY:
         raise ValueError("MXFP8 tokens only go through the dispatch-only launch (the GEMM tile is bf16)")
-    arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
+    num_experts_per_rank = NUM_EXPERTS // NUM_RANKS
+    # the comm role's send table sits at the arena base; DISPATCH_ONLY holds nothing else
+    comm_bytes = dispatch_table_lds_words(num_experts_per_rank, block) * 4
+    arena_bytes = max(comm_bytes, 0 if DISPATCH_ONLY else tile_geometry(tile_m, tile_n, tile_k, B_NN)[3])
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
-    num_experts_per_rank = NUM_EXPERTS // NUM_RANKS
     if DISPATCH_ONLY and num_experts_per_rank > block:
         raise ValueError(
             f"the dispatch-only wait gives each of {num_experts_per_rank} experts a lane of {block}"
@@ -199,14 +203,13 @@ def _launch_dispatch_gemm_nt(
                 num_ranks=NUM_RANKS,
                 num_experts_per_rank=num_experts_per_rank,
                 rank=RANK,
+                lds_base=_addr(base_ptr),
                 block_threads=block,
                 experts_per_publish=EXPERTS_PER_PUBLISH,
                 scale_res=create_buffer_resource_from_addr(_addr(arg_x_scale)) if const_expr(MX) else None,
             )
 
-        # ---- GEMM role: straight-line for every workgroup, masked by `live` ----
         pid = bid - fx.Int32(NUM_DISPATCH_CU)
-        real_tiles = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tile_blocks)[fx.Int32(0)])
         if const_expr(DISPATCH_ONLY):
             # No GEMM tile waits on the expert flags, so the one workgroup past the comm ones
             # holds the launch open until every sender has pushed every expert of this rank: the
@@ -220,70 +223,72 @@ def _launch_dispatch_gemm_nt(
                     RANK,
                     "dispatch_only",
                 )
-            real_tiles = fx.Int32(0)
-        live = (pid >= fx.Int32(0)) & (pid < real_tiles * fx.Int32(N_BLOCKS_N))
-        pid = live.select(pid, fx.Int32(0))
-        num_pid_in_group = fx.Int32(group_m * N_BLOCKS_N)
-        first_pid_m = (pid // num_pid_in_group) * fx.Int32(group_m)
-        remaining_m = real_tiles - first_pid_m
-        group_size_m = (remaining_m < fx.Int32(group_m)).select(remaining_m, fx.Int32(group_m))
-        group_size_m = (group_size_m > fx.Int32(0)).select(group_size_m, fx.Int32(1))
-        pid_in_group = pid % num_pid_in_group
-        block_m = rocdl.readfirstlane(
-            T.i32, live.select(first_pid_m + pid_in_group % group_size_m, fx.Int32(0))
-        )
-        block_n = rocdl.readfirstlane(T.i32, live.select(pid_in_group // group_size_m, fx.Int32(0)))
-        expert = rocdl.readfirstlane(T.i32, _i32_table(arg_tile_to_expert)[block_m])
-        expert = live.select(expert, fx.Int32(0))
-
-        # every sender has pushed this expert (and, by push order, every lower one); a masked
-        # tile waits for 0, which any flag already meets
-        if fx.Int32(tid) == fx.Int32(0):
-            spin_until_flag_reaches(
-                dispatch_flag_base,
-                parity * fx.Int32(num_pool_blocks) + expert,
-                live.select(expected, fx.Int64(0)),
-                "sys",
-                RANK,
-                "dispatch_gemm",
+        else:
+            # ---- GEMM role: straight-line for every workgroup, masked by `live` ----
+            real_tiles = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tile_blocks)[fx.Int32(0)])
+            live = (pid >= fx.Int32(0)) & (pid < real_tiles * fx.Int32(N_BLOCKS_N))
+            pid = live.select(pid, fx.Int32(0))
+            num_pid_in_group = fx.Int32(group_m * N_BLOCKS_N)
+            first_pid_m = (pid // num_pid_in_group) * fx.Int32(group_m)
+            remaining_m = real_tiles - first_pid_m
+            group_size_m = (remaining_m < fx.Int32(group_m)).select(remaining_m, fx.Int32(group_m))
+            group_size_m = (group_size_m > fx.Int32(0)).select(group_size_m, fx.Int32(1))
+            pid_in_group = pid % num_pid_in_group
+            block_m = rocdl.readfirstlane(
+                T.i32, live.select(first_pid_m + pid_in_group % group_size_m, fx.Int32(0))
             )
-        fx.gpu.barrier()
+            block_n = rocdl.readfirstlane(T.i32, live.select(pid_in_group // group_size_m, fx.Int32(0)))
+            expert = rocdl.readfirstlane(T.i32, _i32_table(arg_tile_to_expert)[block_m])
+            expert = live.select(expert, fx.Int32(0))
 
-        blk_n = block_n * fx.Int32(tile_n)
-        m_row = block_m * fx.Int32(tile_m)
-        c_addr = _addr(fx.recast_iter(fx.Int8, arg_out)) + (
-            fx.Int64(m_row) * fx.Int64(N) + fx.Int64(blk_n)
-        ) * fx.Int64(EB)
-        nt_gemm_tile(
-            base_ptr,
-            gA_base=fx.recast_iter(fx.Int8, arg_token_buffer),
-            lda=HIDDEN,
-            a_row0=m_row,
-            a_rows=a_rows,
-            row_idx_table=_i32_table(arg_row_idx),
-            row_idx_base=m_row,
-            gB_base=fx.recast_iter(fx.Int8, arg_w),
-            ldb=N if B_NN else HIDDEN,
-            b_slab=fx.Int64(expert) * fx.Int64(N * HIDDEN * EB),
-            blk_n=blk_n,
-            c_addr=c_addr,
-            ldc=N,
-            m_rows=fx.Int32(tile_m),
-            n_valid=fx.Int32(N) - blk_n,
-            i32_k=fx.Int32(HIDDEN),
-            live=live,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            m_warp=m_warp,
-            n_warp=n_warp,
-            gather=True,
-            idx_bits=idx_bits,
-            b_nn=B_NN,
-            issue_first=bool(issue_first),
-            lds_cosched=bool(lds_cosched),
-            i32_n=fx.Int32(N),
-        )
+            # every sender has pushed this expert (and, by push order, every lower one); a masked
+            # tile waits for 0, which any flag already meets
+            if fx.Int32(tid) == fx.Int32(0):
+                spin_until_flag_reaches(
+                    dispatch_flag_base,
+                    parity * fx.Int32(num_pool_blocks) + expert,
+                    live.select(expected, fx.Int64(0)),
+                    "sys",
+                    RANK,
+                    "dispatch_gemm",
+                )
+            fx.gpu.barrier()
+
+            blk_n = block_n * fx.Int32(tile_n)
+            m_row = block_m * fx.Int32(tile_m)
+            c_addr = _addr(fx.recast_iter(fx.Int8, arg_out)) + (
+                fx.Int64(m_row) * fx.Int64(N) + fx.Int64(blk_n)
+            ) * fx.Int64(EB)
+            nt_gemm_tile(
+                base_ptr,
+                gA_base=fx.recast_iter(fx.Int8, arg_token_buffer),
+                lda=HIDDEN,
+                a_row0=m_row,
+                a_rows=a_rows,
+                row_idx_table=_i32_table(arg_row_idx),
+                row_idx_base=m_row,
+                gB_base=fx.recast_iter(fx.Int8, arg_w),
+                ldb=N if B_NN else HIDDEN,
+                b_slab=fx.Int64(expert) * fx.Int64(N * HIDDEN * EB),
+                blk_n=blk_n,
+                c_addr=c_addr,
+                ldc=N,
+                m_rows=fx.Int32(tile_m),
+                n_valid=fx.Int32(N) - blk_n,
+                i32_k=fx.Int32(HIDDEN),
+                live=live,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                m_warp=m_warp,
+                n_warp=n_warp,
+                gather=True,
+                idx_bits=idx_bits,
+                b_nn=B_NN,
+                issue_first=bool(issue_first),
+                lds_cosched=bool(lds_cosched),
+                i32_n=fx.Int32(N),
+            )
 
     epoch_bump(arg_parity, arg_expected).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
     dispatch_gemm_nt(

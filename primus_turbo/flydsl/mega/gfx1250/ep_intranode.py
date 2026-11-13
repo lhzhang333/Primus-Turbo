@@ -23,7 +23,9 @@ from primus_turbo.flydsl.mega.gfx1250.prims import (
     CPOL_DEVICE_STREAM,
     CPOL_SYSTEM_STREAM,
     WAVE,
+    _COPY_VEC_I32,
     _readfirstlane_i32,
+    _readlane_i32,
     atomic_add,
     cast,
     ceildiv,
@@ -33,6 +35,7 @@ from primus_turbo.flydsl.mega.gfx1250.prims import (
     spin_timed_out,
     st,
     wait_mem_all,
+    wave_inclusive_scan,
 )
 from primus_turbo.flydsl.mega.gfx1250.symm_buffer import BLOCK_M as POOL_BLOCK_M
 from primus_turbo.flydsl.mega.gfx1250.symm_buffer import SymBuffer, Workspace
@@ -46,10 +49,13 @@ _WARP = 64
 _BLOCK_THREADS = 512
 _PVEC = 8
 _NUM_WARPS = _BLOCK_THREADS // _WARP
-# fold rows a combine warp pushes per group; their index loads and payload stores overlap
-_ROW_UNROLL = 4
+# fold rows a combine wave pushes per group; their index loads and store retire overlap (a 16-row chunk
+# gives each of a default workgroup's 8 waves two rows)
+_ROW_UNROLL = 2
 # per-warp ceiling on bf16x8 loads in flight in _sum_pool_rows; above it the 8-row sum spills
 _MAX_LOADS_IN_FLIGHT = 64
+# per-lane ceiling on the b128 loads of one dispatch copy batch (4 VGPRs each)
+_MAX_COPY_LOADS = 64
 
 
 @ASTRewriter.transform
@@ -60,11 +66,16 @@ def spin_until_flag_reaches(
     scope: str,
     rank: int,
     tag: str,
+    drain: bool = True,
 ):
-    """Spin the calling lane until the i64 flag at flag_base[flag_idx] is at least expected."""
+    """Spin the calling lane until the i64 flag at flag_base[flag_idx] is at least expected.
+
+    ``drain`` first retires the wave's outstanding memory operations; a consumer whose earlier stores do not
+    feed the flag (the reduce's previous token) passes False so its first poll does not wait for them."""
     message = f"[MEGA rank={rank} {tag}] flag wait timeout: flag_idx={{}} flag={{}} expected={{}}\n"
     spin_start = read_clock()
-    wait_mem_all()
+    if const_expr(drain):
+        wait_mem_all()
     flag = ld(flag_base, flag_idx, scope=scope, dtype=fx.T.i64)
     while flag < expected:
         fx.rocdl.s_sleep(fx.Int32(1))
@@ -103,6 +114,111 @@ def is_primary_route(expert_ids, topk_position, num_experts_per_rank):
 
 
 @ASTRewriter.transform
+def block_exclusive_scan_lds(
+    thread_index: fx.Int32,
+    block_threads: int,
+    lds_base: ArithValue,
+    wave_total_word: int,
+    prefix_word: int,
+    num_items: int,
+    load_item,
+):
+    """Exclusive prefix sum over ``num_items`` items into LDS, lane-parallel: ``load_item(item, is_item)`` gives
+    item ``item``'s i32 count (ignored past ``num_items``) and ``[(lds_word, value), ...]`` to store at
+    ``lds_word + item``; the prefix lands at ``prefix_word + item`` and the total at ``prefix_word + num_items``.
+    Items go a block-sized page at a time (a wave scan, then the waves' totals through ``block_threads / WAVE``
+    scratch words at ``wave_total_word``). Every thread of the block calls it; it ends on a barrier."""
+    num_waves = block_threads // WAVE
+    lane = thread_index % fx.Int32(WAVE)
+    wave = thread_index // fx.Int32(WAVE)
+    carry = fx.Int32(0)
+    for page in range_constexpr(ceildiv(num_items, block_threads)):
+        item = fx.Int32(page * block_threads) + thread_index
+        is_item = item < fx.Int32(num_items)
+        count, extras = load_item(item, is_item)
+        count = arith.select(is_item, count, fx.Int32(0))
+        inclusive = wave_inclusive_scan(count)
+        if lane == fx.Int32(WAVE - 1):
+            st(lds_base, fx.Int32(wave_total_word) + wave, inclusive, scope="workgroup", space=3)
+        fx.gpu.barrier()
+        before_wave = fx.Int32(0)
+        page_total = fx.Int32(0)
+        for w in range_constexpr(num_waves):
+            wave_total = ld(lds_base, fx.Int32(wave_total_word + w), scope="workgroup", space=3)
+            before_wave = before_wave + arith.select(wave > fx.Int32(w), wave_total, fx.Int32(0))
+            page_total = page_total + wave_total
+        exclusive = carry + before_wave + inclusive - count
+        if is_item:
+            st(lds_base, fx.Int32(prefix_word) + item, exclusive, scope="workgroup", space=3)
+            for k in range_constexpr(len(extras)):
+                st(lds_base, fx.Int32(extras[k][0]) + item, extras[k][1], scope="workgroup", space=3)
+        carry = carry + page_total
+        fx.gpu.barrier()  # the wave totals are rewritten by the next page
+    if thread_index == fx.Int32(0):
+        st(lds_base, fx.Int32(prefix_word + num_items), carry, scope="workgroup", space=3)
+    fx.gpu.barrier()
+
+
+def dispatch_table_lds_words(num_experts_per_rank: int, block_threads: int = _BLOCK_THREADS) -> int:
+    """i32 words of LDS :func:`dispatch_bf16_tile` takes at ``lds_base``: per-wave scan totals, the exclusive prefix
+    of the tasks' token counts plus their total, and each task's offset in ``dispatched_token_idx``."""
+    return block_threads // WAVE + 2 * num_experts_per_rank + 1
+
+
+def _wave_copy_offsets(nbytes: int):
+    """i32-word (load, store) offsets of this lane's b128 pieces of an ``nbytes`` row copied by one hardware wave;
+    idle lanes of a ragged tail read word 0 and store one row past the end, where a row-sized destination drops it."""
+    assert nbytes % (_COPY_VEC_I32 * 4) == 0, "rows are whole 16-byte words"
+    cols = WAVE * _COPY_VEC_I32  # i32 words one wave instruction moves
+    row_words = nbytes // 4
+    num_full = row_words // cols
+    tail_words = row_words - num_full * cols
+    lane_off = (fx.Int32(fx.thread_idx.x) % fx.Int32(WAVE)) * fx.Int32(_COPY_VEC_I32)
+    offsets = [fx.Int32(c * cols) + lane_off for c in range_constexpr(num_full)]
+    load_offsets, store_offsets = list(offsets), list(offsets)
+    if tail_words:
+        in_tail = lane_off < fx.Int32(tail_words)
+        tail_off = fx.Int32(num_full * cols) + lane_off
+        load_offsets.append(arith.select(in_tail, tail_off, fx.Int32(0)))
+        store_offsets.append(arith.select(in_tail, tail_off, fx.Int32(row_words)))
+    return load_offsets, store_offsets
+
+
+def _copy_rows(rows, load_cache_modifier: int, store_cache_modifier: int) -> None:
+    """Copy rows with one hardware wave, every row's loads issued before the first store so their round trips
+    overlap. ``rows``: ``(src_res, src_word_offset, dst_address_i64, nbytes, is_valid)``; an invalid row's stores
+    are dropped (its destination holds no records), so its source offset need only be in bounds."""
+    offsets = {nbytes: _wave_copy_offsets(nbytes) for _, _, _, nbytes, _ in rows}
+    values = [
+        [
+            buffer_load(src_res, src_off + o, vec_width=_COPY_VEC_I32, dtype=fx.T.i32, cache_modifier=load_cache_modifier)
+            for o in offsets[nbytes][0]
+        ]
+        for src_res, src_off, _, nbytes, _ in rows
+    ]
+    for (_, _, dst_address, nbytes, is_valid), row_values in zip(rows, values):
+        dst_res = create_buffer_resource_from_addr(
+            dst_address, num_records_bytes=arith.select(is_valid, fx.Int32(nbytes), fx.Int32(0))
+        )
+        for o, v in zip(offsets[nbytes][1], row_values):
+            buffer_store(v, dst_res, o, cache_modifier=store_cache_modifier)
+
+
+def _last_expert_at_or_before(lds_base, lds_prefix: int, first_expert, num_experts: int, flat):
+    """Per lane, the last expert of ``[first_expert, + num_experts)`` whose LDS prefix entry is <= ``flat`` (a
+    branchless binary search; the first expert's entry must be <= ``flat``)."""
+    expert = first_expert
+    span = num_experts
+    while span > 1:
+        half = span // 2
+        probe = expert + fx.Int32(half)
+        probe_start = ld(lds_base, fx.Int32(lds_prefix) + probe, scope="workgroup", space=3)
+        expert = arith.select(probe_start <= flat, probe, expert)
+        span -= half
+    return expert
+
+
+@ASTRewriter.transform
 def dispatch_bf16_tile(
     sym: SymBuffer,
     workspace: Workspace,
@@ -120,96 +236,140 @@ def dispatch_bf16_tile(
     num_ranks: int,
     num_experts_per_rank: int,
     rank: int,
+    lds_base: ArithValue,
     block_threads: int = _BLOCK_THREADS,
     experts_per_publish: int = 1,
     scale_res: Optional[ArithValue] = None,
 ):
-    """Push this block's chunk of every expert's task to one dst rank, in ascending expert order.
+    """Push this block's share of every expert task's tokens to one dst rank, publish group by publish group.
 
-    ``experts_per_publish`` experts share one store retire + barrier before their flags go out (in
-    ascending order, so the single-flag wait still holds); it must divide ``num_experts_per_rank``.
+    A publish group is ``experts_per_publish`` consecutive local experts (it must divide ``num_experts_per_rank``):
+    the block pushes the group's tokens, retires its stores, then adds one to the group's chunk counter (the counter
+    of the group's first task); the last of the dst rank's ``num_chunks`` blocks to do so rearms that counter and
+    bumps the dst rank's flag of every expert in the group. Groups go in ascending expert order, so an expert's flag
+    at its epoch implies every lower expert landed too (the single-flag wait of the GEMM tiles).
+
+    The tasks' counts and offsets are read once, lane-parallel, into an exclusive-prefix table in LDS (``lds_base``,
+    :func:`dispatch_table_lds_words` words). A group's tokens are then one flat range that the dst rank's copy
+    waves (``num_chunks * block_threads / WAVE`` hardware waves) stride over: a wave resolves up to WAVE of its
+    tokens with one index load per lane and copies them in batches that keep up to ``_MAX_COPY_LOADS`` b128 loads
+    per lane in flight.
 
     With ``scale_res`` the tokens are MXFP8: ``input_res`` holds E4M3 rows of ``hidden_size`` bytes and
-    ``scale_res`` their raw E8M0 scale rows (``hidden_size / 32`` bytes); they land in the dispatch
-    token buffer's fp8 view (``SymmBuffer.dispatch_fp8_views``: the rows, then their scale rows after
-    ``num_max_recv_tokens`` of them)."""
+    ``scale_res`` their raw E8M0 scale rows (``hidden_size / 32`` bytes); they land in the dispatch token buffer's
+    fp8 view (``SymmBuffer.dispatch_fp8_views``: the rows, then their scale rows after ``num_max_recv_tokens`` of
+    them)."""
     assert num_experts_per_rank % experts_per_publish == 0, "publish groups tile the local experts"
     mx = scale_res is not None
     hidden_bytes = hidden_size * (1 if mx else 2)
     assert hidden_bytes % 16 == 0, "a token row is whole 16-byte words"
     assert not mx or hidden_size % 512 == 0, "an E8M0 scale row is whole 16-byte words: hidden % 512 == 0"
-    scale_i32 = hidden_size // 128  # i32 words per E8M0 scale row
-    assert block_threads % _WARP == 0, "a block is a whole number of 64-lane copy warps"
-    num_warps = block_threads // _WARP
-    hidden_i32 = hidden_bytes // 4  # row stride in i32 words
-    row_stride = num_chunks * num_warps
+    assert block_threads % WAVE == 0, "a block is a whole number of copy waves"
+    num_waves = block_threads // WAVE
+    row_stride = num_chunks * num_waves  # copy waves per dst rank
+    scale_bytes = hidden_size // 32
+    loads_per_row = ceildiv(hidden_bytes, WAVE * _COPY_VEC_I32 * 4) + (1 if mx else 0)
+    rows_per_batch = max(1, _MAX_COPY_LOADS // loads_per_row)
     num_max_pool_blocks = int(workspace.num_max_pool_blocks)
     recv_token_base = rank * int(workspace.num_max_tokens_per_rank)
     # hoist workspace-derived values before any dynamic control flow (rewriter can't carry Workspace)
     token_buffer_ptr = workspace.get_dispatch_token_buffer_ptr()
     scale_buffer_ptr = token_buffer_ptr + int(workspace.num_max_recv_tokens) * hidden_size
     dispatch_flag_ptr = workspace.get_dispatch_flag_ptr()
+    # LDS words: [0, num_waves) scan scratch, then the prefix (one per expert + the total), then the offsets
+    lds_prefix = num_waves
+    lds_source_offset = num_waves + num_experts_per_rank + 1
 
+    lane = thread_index % fx.Int32(WAVE)
+    wave = thread_index // fx.Int32(WAVE)
     block_dst_rank = block_index % fx.Int32(num_ranks)
-    chunk_index = block_index // fx.Int32(num_ranks)
-    warp_id = chunk_index * fx.Int32(num_warps) + thread_index // fx.Int32(_WARP)
+    wave_id = (block_index // fx.Int32(num_ranks)) * fx.Int32(num_waves) + wave
 
-    # ascending expert order: flag[g] complete implies every expert <= g landed (single-flag wait)
-    for expert_group in range(fx.Int32(num_experts_per_rank // experts_per_publish)):
-        first_expert = expert_group * fx.Int32(experts_per_publish)
-        for local_expert in range(first_expert, first_expert + fx.Int32(experts_per_publish)):
-            task_index = local_expert * fx.Int32(num_ranks) + block_dst_rank
-            dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32)
-            source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32)
-            token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32)
-            token_buffer_address = sym.map(token_buffer_ptr, dst_rank)
-            scale_buffer_address = sym.map(scale_buffer_ptr, dst_rank) if const_expr(mx) else None
+    # task = local expert * num_ranks + dst rank: this block's tasks share one dst rank, read off its first task
+    dst_rank = _readfirstlane_i32(
+        buffer_load(expert_send_dst_rank_res, block_dst_rank, vec_width=1, dtype=fx.T.i32)
+    )
+    token_buffer_address = sym.map(token_buffer_ptr, dst_rank)
+    scale_buffer_address = sym.map(scale_buffer_ptr, dst_rank) if const_expr(mx) else None
+    dispatch_flag_address = sym.map(dispatch_flag_ptr, dst_rank)
 
-            local_count = (token_count - warp_id + fx.Int32(row_stride - 1)) // fx.Int32(row_stride)
+    def load_task(expert, is_expert):
+        task_index = arith.select(is_expert, expert, fx.Int32(0)) * fx.Int32(num_ranks) + block_dst_rank
+        task_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32)
+        source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32)
+        return task_count, [(lds_source_offset, source_offset)]
 
-            for i in range(local_count):
-                token_idx = buffer_load(
-                    dispatched_token_idx_res,
-                    source_offset + warp_id + i * fx.Int32(row_stride),
-                    vec_width=1,
-                    dtype=fx.T.i32,
-                )
-                # dst = peer dispatch_token_buffer row of this recv token, src = local input; offsets in i32 words
-                copy_warp(
-                    token_buffer_address,
-                    input_res,
-                    hidden_bytes,
-                    dst_off=(fx.Int32(recv_token_base) + token_idx) * fx.Int32(hidden_i32),
-                    src_off=token_idx * fx.Int32(hidden_i32),
-                    load_cache_modifier=CPOL_DEVICE_STREAM,  # read data produced by the same agent
-                    store_cache_modifier=CPOL_SYSTEM_STREAM,
-                )
-                if const_expr(mx):
-                    copy_warp(
-                        scale_buffer_address,
-                        scale_res,
-                        hidden_size // 32,
-                        dst_off=(fx.Int32(recv_token_base) + token_idx) * fx.Int32(scale_i32),
-                        src_off=token_idx * fx.Int32(scale_i32),
-                        load_cache_modifier=CPOL_DEVICE_STREAM,
-                        store_cache_modifier=CPOL_SYSTEM_STREAM,
+    # the send table, read once: the tasks' token counts as an exclusive prefix, and their source offsets
+    block_exclusive_scan_lds(
+        thread_index, block_threads, lds_base, 0, lds_prefix, num_experts_per_rank, load_task
+    )
+
+    for group in range(fx.Int32(num_experts_per_rank // experts_per_publish)):
+        first_expert = group * fx.Int32(experts_per_publish)
+        group_start = _readfirstlane_i32(ld(lds_base, fx.Int32(lds_prefix) + first_expert, scope="workgroup", space=3))
+        group_end = _readfirstlane_i32(
+            ld(lds_base, fx.Int32(lds_prefix + experts_per_publish) + first_expert, scope="workgroup", space=3)
+        )
+        # this wave's tokens of the group: flat positions group_start + wave_id + k * row_stride
+        num_rows = (group_end - group_start - wave_id + fx.Int32(row_stride - 1)) // fx.Int32(row_stride)
+        for round_start in range(fx.Int32(0), num_rows, fx.Int32(WAVE)):
+            # lane l resolves the wave's row round_start + l: its expert is the last one whose prefix is <= its
+            # flat position (binary search over the group), its token the task's dispatched_token_idx entry
+            row = round_start + lane
+            flat = group_start + wave_id + row * fx.Int32(row_stride)
+            expert = _last_expert_at_or_before(lds_base, lds_prefix, first_expert, experts_per_publish, flat)
+            expert_start = ld(lds_base, fx.Int32(lds_prefix) + expert, scope="workgroup", space=3)
+            source_offset = ld(lds_base, fx.Int32(lds_source_offset) + expert, scope="workgroup", space=3)
+            source_position = source_offset + flat - expert_start
+            token_of_lane = buffer_load(
+                dispatched_token_idx_res,
+                arith.select(row < num_rows, source_position, fx.Int32(0)),
+                vec_width=1,
+                dtype=fx.T.i32,
+            )
+            round_rows = arith.select(
+                num_rows - round_start < fx.Int32(WAVE), num_rows - round_start, fx.Int32(WAVE)
+            )
+            for batch_start in range(fx.Int32(0), round_rows, fx.Int32(rows_per_batch)):
+                copies = []
+                for u in range_constexpr(rows_per_batch):
+                    is_valid = batch_start + fx.Int32(u) < round_rows
+                    # an idle slot copies token 0 (the batch's first slot is always a real row) into nothing
+                    token = arith.select(is_valid, _readlane_i32(token_of_lane, batch_start + fx.Int32(u)), fx.Int32(0))
+                    recv_row = cast(fx.Int32(recv_token_base) + token, fx.T.i64)
+                    copies.append(
+                        (
+                            input_res,
+                            token * fx.Int32(hidden_bytes // 4),
+                            token_buffer_address + recv_row * fx.Int64(hidden_bytes),
+                            hidden_bytes,
+                            is_valid,
+                        )
                     )
+                    if const_expr(mx):
+                        copies.append(
+                            (
+                                scale_res,
+                                token * fx.Int32(scale_bytes // 4),
+                                scale_buffer_address + recv_row * fx.Int64(scale_bytes),
+                                scale_bytes,
+                                is_valid,
+                            )
+                        )
+                # read data produced by the same agent; publish to a remote agent
+                _copy_rows(copies, CPOL_DEVICE_STREAM, CPOL_SYSTEM_STREAM)
 
         wait_mem_all()
         fx.gpu.barrier()
         if thread_index == fx.Int32(0):
-            for local_expert in range(first_expert, first_expert + fx.Int32(experts_per_publish)):
-                task_index = local_expert * fx.Int32(num_ranks) + block_dst_rank
-                dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32)
-                dispatch_flag_address = sym.map(dispatch_flag_ptr, dst_rank)
-                # each chunk's stores retired before its counter add, so the last chunk's flag add publishes them all
-                chunk_count_before_add = atomic_add(
-                    dispatch_chunk_counter_ptr, task_index, fx.Int64(1), scope="agent"
-                )
-                if chunk_count_before_add == fx.Int64(num_chunks - 1):
-                    # the last chunk rearms the counter, so every launch starts from 0 whatever its chunk count
-                    st(dispatch_chunk_counter_ptr, task_index, fx.Int64(0), scope="agent")
-                    bank = dispatch_parity * fx.Int32(num_max_pool_blocks)
+            counter_index = first_expert * fx.Int32(num_ranks) + block_dst_rank
+            # each chunk's stores retired before its counter add, so the last chunk's flag adds publish them all
+            chunk_count_before_add = atomic_add(dispatch_chunk_counter_ptr, counter_index, fx.Int64(1), scope="agent")
+            if chunk_count_before_add == fx.Int64(num_chunks - 1):
+                # the last chunk rearms the counter, so every launch starts from 0 whatever its chunk count
+                st(dispatch_chunk_counter_ptr, counter_index, fx.Int64(0), scope="agent")
+                bank = dispatch_parity * fx.Int32(num_max_pool_blocks)
+                for local_expert in range(first_expert, first_expert + fx.Int32(experts_per_publish)):
                     atomic_add(dispatch_flag_address, bank + local_expert, fx.Int64(1), scope="sys")
 
 
@@ -260,21 +420,28 @@ def _sum_pool_rows(
             )
 
     def accumulate(cols):
-        sums = [None] * len(cols)
-        for row_res in row_resources:
+        # every load of the pass goes out before the first add: emitted row by row between the adds, the
+        # loads left one row at a time, a round trip per row. The adds keep the row order of the sum.
+        row_values = [
             # read the same-agent GEMM stage
-            cpol = CPOL_DEVICE_STREAM
-            values = [
-                buffer_load(row_res, col, vec_width=_PVEC, dtype=fx.T.bf16, cache_modifier=cpol)
+            [
+                buffer_load(row_res, col, vec_width=_PVEC, dtype=fx.T.bf16, cache_modifier=CPOL_DEVICE_STREAM)
                 for col in cols
             ]
-            for i, value in enumerate(values):
-                term = fx.arith.extf(f32_vec, value)
-                sums[i] = term if sums[i] is None else fx.arith.addf(sums[i], term)
-        for bias_res, weight in bias_terms:
-            values = [buffer_load(bias_res, col, vec_width=_PVEC, dtype=fx.T.bf16) for col in cols]
-            for i, value in enumerate(values):
-                sums[i] = fx.arith.addf(sums[i], fx.arith.mulf(fx.arith.extf(f32_vec, value), weight))
+            for row_res in row_resources
+        ]
+        bias_values = [
+            [buffer_load(bias_res, col, vec_width=_PVEC, dtype=fx.T.bf16) for col in cols]
+            for bias_res, _ in bias_terms
+        ]
+        sums = []
+        for i in range(len(cols)):
+            row_sum = fx.arith.extf(f32_vec, row_values[0][i])
+            for values in row_values[1:]:
+                row_sum = fx.arith.addf(row_sum, fx.arith.extf(f32_vec, values[i]))
+            for (_, weight), values in zip(bias_terms, bias_values):
+                row_sum = fx.arith.addf(row_sum, fx.arith.mulf(fx.arith.extf(f32_vec, values[i]), weight))
+            sums.append(row_sum)
         return sums
 
     # passes bound the loads in flight so the sum stays inside the GEMM's VGPR budget
@@ -467,6 +634,20 @@ def _steps(first: int, count: int, end: int) -> list:
     return list(range(first, min(first + count, end)))
 
 
+def _pack_primary_routes(is_primary, route_base, hidden: int, num_slots: int, num_max_routes: int):
+    """Row offsets of a token's primary routes packed in route order into ``num_slots`` slots (an empty slot points
+    past num_records, so it reads 0 and moves no bytes), and whether the token has a non-primary route."""
+    absent = fx.Int32(num_max_routes * hidden)
+    slots = [absent] * num_slots
+    num_primary = fx.Int32(0)
+    for j, primary in enumerate(is_primary):
+        offset = (route_base + fx.Int32(j)) * fx.Int32(hidden)
+        for slot in range(num_slots):
+            slots[slot] = arith.select(primary & (num_primary == fx.Int32(slot)), offset, slots[slot])
+        num_primary = num_primary + arith.select(primary, fx.Int32(1), fx.Int32(0))
+    return slots, num_primary < fx.Int32(len(is_primary))
+
+
 @ASTRewriter.transform
 def topk_reduce_bf16_tile(
     thread_index: fx.Int32,
@@ -490,11 +671,17 @@ def topk_reduce_bf16_tile(
     has_grad_gate: bool = False,
     block_threads: int = _BLOCK_THREADS,
     vec_unroll: int = 1,
+    num_route_slots: int = 0,
 ):
     """Sum each token's primary-route combine rows into its output row once their reduce flags reach epoch.
 
     ``vec_unroll`` > 1 issues the loads of that many 64-lane column steps before summing any, so
-    a warp keeps more of the row in flight; 1 is the one-step-at-a-time loop."""
+    a warp keeps more of the row in flight; 1 is the one-step-at-a-time loop.
+
+    ``num_route_slots`` > 0 packs the token's primary routes (one per rank holding its experts, so
+    ``min(num_topk, num_ranks)`` slots always suffice) into that many slots before loading: a column step
+    loads one row per slot instead of one per route. The sum is the route-order sum bit for bit: the absent
+    routes' zero rows only turned a -0.0 partial sum into +0.0, which one +0.0 added at the end redoes."""
     f32_vec = fx.T.vec(_PVEC, fx.T.f32)
     bf16_vec = fx.T.vec(_PVEC, fx.T.bf16)
     num_vec_chunks = hidden // _PVEC
@@ -506,6 +693,8 @@ def topk_reduce_bf16_tile(
     # (a workgroup barrier would pair with another warp whose token count differs).
     hw_wave = WAVE
     is_wave_leader = thread_index % fx.Int32(hw_wave) == fx.Int32(0)
+    assert not has_grad_gate or num_topk <= hw_wave, "lane j of the first wave moves route j's gate gradient"
+    plus_zero = _vector.broadcast(f32_vec, fx.arith.constant(0.0)) if const_expr(num_route_slots > 0) else None
     while token < num_tokens:
         route_base = token * fx.Int32(num_topk)
         expert_ids = []
@@ -517,18 +706,31 @@ def topk_reduce_bf16_tile(
         for j in range_constexpr(num_topk):
             if is_primary[j]:
                 if is_wave_leader:
+                    # the previous token's output stores feed no flag: the first poll need not wait for them
                     spin_until_flag_reaches(
-                        reduce_flag_base, reduce_bank + route_base + fx.Int32(j), epoch, "sys", rank, "reduce"
+                        reduce_flag_base,
+                        reduce_bank + route_base + fx.Int32(j),
+                        epoch,
+                        "sys",
+                        rank,
+                        "reduce",
+                        drain=num_route_slots == 0,
                     )
-        # a non-primary route points past num_records, so its load reads 0 and moves no bytes
-        route_offsets = [
-            arith.select(
-                is_primary[j],
-                (route_base + fx.Int32(j)) * fx.Int32(hidden),
-                fx.Int32(num_max_routes * hidden),
+        if const_expr(num_route_slots > 0):
+            route_offsets, has_absent_route = _pack_primary_routes(
+                is_primary, route_base, hidden, num_route_slots, num_max_routes
             )
-            for j in range(num_topk)
-        ]
+        else:
+            # a non-primary route points past num_records, so its load reads 0 and moves no bytes
+            route_offsets = [
+                arith.select(
+                    is_primary[j],
+                    (route_base + fx.Int32(j)) * fx.Int32(hidden),
+                    fx.Int32(num_max_routes * hidden),
+                )
+                for j in range(num_topk)
+            ]
+        num_rows = len(route_offsets)
         if const_expr(vec_unroll > 1):
             num_steps = ceildiv(num_vec_chunks, _WARP)
             for first_step in range_constexpr(0, num_steps, vec_unroll):
@@ -549,14 +751,16 @@ def topk_reduce_bf16_tile(
                             dtype=fx.T.bf16,
                             cache_modifier=CPOL_SYSTEM_STREAM,  # system-visible non-temporal read
                         )
-                        for j in range_constexpr(num_topk)
+                        for j in range_constexpr(num_rows)
                     ]
                     for col in cols
                 ]
                 for u in range_constexpr(len(vec_ids)):
                     row_sum = fx.arith.extf(f32_vec, values[u][0])
-                    for j in range_constexpr(1, num_topk):
+                    for j in range_constexpr(1, num_rows):
                         row_sum = fx.arith.addf(row_sum, fx.arith.extf(f32_vec, values[u][j]))
+                    if const_expr(num_route_slots > 0):
+                        row_sum = arith.select(has_absent_route, fx.arith.addf(row_sum, plus_zero), row_sum)
                     if vec_ids[u] < fx.Int32(num_vec_chunks):
                         buffer_store(
                             fx.arith.trunc_f(bf16_vec, row_sum),
@@ -568,7 +772,7 @@ def topk_reduce_bf16_tile(
             while vec_idx < fx.Int32(num_vec_chunks):
                 col = vec_idx * fx.Int32(_PVEC)
                 row_sum = None
-                for j in range_constexpr(num_topk):
+                for j in range_constexpr(num_rows):
                     value = buffer_load(
                         combine_token_res,
                         route_offsets[j] + col,
@@ -578,20 +782,24 @@ def topk_reduce_bf16_tile(
                     )
                     term = fx.arith.extf(f32_vec, value)
                     row_sum = term if row_sum is None else fx.arith.addf(row_sum, term)
+                if const_expr(num_route_slots > 0):
+                    row_sum = arith.select(has_absent_route, fx.arith.addf(row_sum, plus_zero), row_sum)
                 buffer_store(fx.arith.trunc_f(bf16_vec, row_sum), output_res, token * fx.Int32(hidden) + col)
                 vec_idx = vec_idx + fx.Int32(_WARP)
         if const_expr(has_grad_gate):
-            # every valid route's dst has a primary route whose flag was awaited above
-            for j in range_constexpr(num_topk):
-                if lane_id == fx.Int32(0):
-                    gate_value = buffer_load(
-                        combine_gate_res,
-                        route_base + fx.Int32(j),
-                        vec_width=1,
-                        dtype=fx.T.f32,
-                        cache_modifier=CPOL_SYSTEM_STREAM,
-                    )
-                    is_valid = expert_ids[j] >= fx.Int32(0)
-                    gate_value = arith.select(is_valid, gate_value, fx.Float32(0.0))
-                    buffer_store(gate_value, grad_topk_weights_res, route_base + fx.Int32(j))
+            # every valid route's dst has a primary route whose flag the first wave awaited above; lane j of
+            # that wave moves route j's gate gradient, so the routes take one round trip, not one each
+            is_valid_route = expert_ids[0] >= fx.Int32(0)
+            for j in range_constexpr(1, num_topk):
+                is_valid_route = arith.select(lane_id == fx.Int32(j), expert_ids[j] >= fx.Int32(0), is_valid_route)
+            if lane_id < fx.Int32(num_topk):
+                gate_value = buffer_load(
+                    combine_gate_res,
+                    route_base + lane_id,
+                    vec_width=1,
+                    dtype=fx.T.f32,
+                    cache_modifier=CPOL_SYSTEM_STREAM,
+                )
+                gate_value = arith.select(is_valid_route, gate_value, fx.Float32(0.0))
+                buffer_store(gate_value, grad_topk_weights_res, route_base + lane_id)
         token = token + fx.Int32(num_reduce_warps)
