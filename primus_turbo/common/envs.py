@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_SPARSE_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_MLA_BWD_IMPL: str = "flydsl"
+    PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB: int = 5120
     PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND: str | None = None
     PRIMUS_TURBO_AUTO_TUNE: bool = False
     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32: bool = True
@@ -143,6 +144,20 @@ def _mla_bwd_impl() -> str:
     return value
 
 
+def _mla_bwd_ds_scratch_mb() -> int:
+    """PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB: a non-negative integer (MiB), 5120 when unset or blank."""
+    raw = os.getenv("PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB", "").strip()
+    if not raw:
+        return 5120
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise ValueError(f"PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB={raw!r}: expected a non-negative integer (MiB)")
+    return value
+
+
 def _deepep_cpu_timeout() -> int:
     raw = os.getenv("PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT")
     if not raw:
@@ -181,6 +196,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cannot take to FlyDSL (e.g. seqlen_q % 384 not 0 or 256, see their README). Read at the first
     # MLA backward (attention_flydsl_gfx1250_mla_impl.mla_bwd_impl); another value raises ValueError.
     "PRIMUS_TURBO_MLA_BWD_IMPL": _mla_bwd_impl,
+    # Most dS scratch, in MiB, the FlyDSL gfx1250 MLA backward holds at once (5120 when unset). Its dS plan stores dS
+    # between its dK / dV and dQ kernels, about batch * heads * seqlen_q * seqlen_kv bytes in all (4.33 GB at b2 s4096
+    # h128), and runs the heads in chunks, two in flight, to stay under this (gfx1250_mla.bwd.ds_chunkings); 0 runs
+    # the plan that recomputes dS instead, without scratch. Read at every MLA backward (through the cache); a value
+    # that is not a non-negative integer raises ValueError.
+    "PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB": _mla_bwd_ds_scratch_mb,
     # MoE dispatch/combine EP backend: TURBO (the default when unset), DEEP_EP, or a custom EP name
     # such as UCCL_EP. "autotune" is rejected with an AssertionError.
     "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend_spec("PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"),

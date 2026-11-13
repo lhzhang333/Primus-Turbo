@@ -15,14 +15,15 @@
 
 dS is the scratch the dK / dV kernel writes (bf16, softmax scale included, packed causal), in the layout of
 ``csrc/kernels/attention/hipkittens/gfx1250_mla/include/dslayout.h`` (version 2):
-  * one region per (batch, q head) bh = bat * Hq + qh, regions back to back, ``bwd_dkdv96.ds_blocks_per_head``
-    blocks each;
+  * one region per (batch, q head) of the launch, bh = bat * HC + qh - H0, regions back to back,
+    ``bwd_dkdv96.ds_blocks_per_head`` blocks each;
   * inside a region the kv16 rows kt = 0 .. Skv / 16 - 1 in order; row kt holds the q pairs (32 queries)
     qp = qp_first(kt) .. Sq / 32 - 1, qp_first(kt) = causal ? max(0, kt // 2 - (Skv - Sq) // 32) : 0;
   * a block is a [16 kv][32 q] bf16 tile, 1 KiB: chunk (kv, c) = queries [8 c, 8 c + 8) of kv row kv at block byte
     (c // 2) * 512 + ((c % 2) * 16 + kv) * 16; masked entries hold +-0.
 
-k_dqds: grid (HG, ntile + nhead, B * Hq / HG), block 128 = 4 waves (one per SIMD, one workgroup per CU).
+k_dqds: grid (HG, ntile + nhead, B * HC / HG) over the q heads [H0, H0 + HC) (the host launches the heads in
+chunks to bound the scratch), block 128 = 4 waves (one per SIMD, one workgroup per CU).
 grid.y < ntile is a 384-query tile of [q_off, Sq) (4 waves x 96 queries, NQW 6 sub-tiles of 16 per wave), longest
 first; grid.y = ntile + j (j < nhead = q_off / 256, q_off in {0, 256, 512}) the 256-query head tile
 [q_off - 256 (j + 1), q_off - 256 j) as 4 waves x 64 queries (NQW 4): one head tile when Sq % 384 == 256, two when
@@ -214,7 +215,9 @@ def _wmma_if(live, accs, a_ops, b_ops):
 
 
 # --------------------------------------------------------------------------------------------- the body
-def _dqds_body(nqw, DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q0g, HG, nblk, dq_bytes, lds0):
+def _dqds_body(
+    nqw, DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, H0, HC, q0g, HG, nblk, dq_bytes, lds0
+):
     nb_g = _nbg(nqw)
     nacc = nqw * NDT
     slot_b, dsstg_b = _slot_b(nqw), _dsstg_b(nqw)
@@ -232,9 +235,10 @@ def _dqds_body(nqw, DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q0g, H
     xr = (HG % fx.Int32(8) == fx.Int32(0)).select(
         (gx % fx.Int32(8)) * (HG // fx.Int32(8)) + gx // fx.Int32(8), gx
     )
-    hb = gz * HG + xr  # bat * Hq + qh = the dS region
-    bat = hb // Hq
-    qh = hb - bat * Hq
+    # The launch covers the q heads [H0, H0 + HC) of every batch; hb = bat * HC + (qh - H0) is the dS region.
+    hb = gz * HG + xr
+    bat = hb // HC
+    qh = H0 + hb - bat * HC
     hkv = qh // G
     qp0g = q0g // fx.Int32(32)
     mshift = cshift // fx.Int32(32)
@@ -601,11 +605,13 @@ def k_dqds(
     HG: fx.Int32,
     nblk: fx.Int32,
     dq_bytes: fx.Int32,
+    H0: fx.Int32,
+    HC: fx.Int32,
 ):
     rocdl.disable_xdl_arb_stall()  # no WMMA multicycle arbitration stall (SCHED_MODE)
     lds0 = fx.Int32(fx.ptrtoint(fx.SharedAllocator().allocate(LDS_BYTES).peek().ptr))
     gy = fx.Int32(fx.block_idx.y)
-    args = (DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal)
+    args = (DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, H0, HC)
     if gy < ntile:
         # the 384-query tiles of [q_off, Sq), longest first
         _dqds_body(
@@ -641,15 +647,18 @@ def launch_dqds(
     HG: fx.Int32,
     nblk: fx.Int32,
     dq_bytes: fx.Int32,
+    H0: fx.Int32,
+    HC: fx.Int32,
     ny: fx.Int32,
     ngz: fx.Int32,
     stream: fx.Stream,
 ):
     _ = SOURCE_DIGEST  # FlyDSL disk-cache key
-    # grid = (HG q heads of a head group, ntile main tiles + the head tile, B*Hq/HG head groups)
-    k_dqds(DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, HG, nblk, dq_bytes).launch(
-        grid=(HG, ny, ngz), block=(BLOCK, 1, 1), stream=stream
-    )
+    # grid = (HG q heads of a head group, ntile main tiles + the head tiles, B * HC / HG head groups): the q heads
+    # [H0, H0 + HC)
+    k_dqds(
+        DS, K, DQ, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, HG, nblk, dq_bytes, H0, HC
+    ).launch(grid=(HG, ny, ngz), block=(BLOCK, 1, 1), stream=stream)
 
 
 # Expert scheduling mode: the hardware dependency interlocks off, LLVM inserts the dependency-counter waits (a DS

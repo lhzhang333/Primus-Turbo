@@ -14,9 +14,10 @@
 """dK / dV of the gfx1250 MLA attention backward over 96-row kv blocks, plus the dS^T scratch (k_dkdv96ds).
 
 The FlyDSL form of the HipKittens kernel k_dkdv96ds (csrc/kernels/attention/hipkittens/gfx1250_mla): grid
-(HG, nblk(Skv), B*Hkv/HG), block 64 = 2 waves (one per SIMD). Blocks [0, n96) are 96-row kv blocks (wave w owns
-the 48 kv rows from 96 bid + 48 w: NKV 3 sub-tiles of 16), the 0..2 blocks after them 64-row tail blocks (NKV 2),
-two bodies behind a uniform branch. A workgroup runs one sequence of query tiles (q pairs of 32 queries; MHA, the
+(HG, nblk(Skv), B*HC/HG) over the heads [H0, H0 + HC) (the host launches the heads in chunks to bound the scratch),
+block 64 = 2 waves (one per SIMD). Blocks [0, n96) are 96-row kv blocks (wave w owns the 48 kv rows from
+96 bid + 48 w: NKV 3 sub-tiles of 16), the 0..2 blocks after them 64-row tail blocks (NKV 2), two bodies behind a
+uniform branch. A workgroup runs one sequence of query tiles (q pairs of 32 queries; MHA, the
 kernel is specialized for G = Hq / Hkv = 1) over its block: first the n_mask tiles that straddle the diagonal
 (causal mask on), then the n_full tiles below it. Q / dO tiles go through a 3-stage LDS ring filled by the TDM (a
 stage = [32][D_V] dO + [32][D_QK] Q, each wave moving its 16 rows); K / V of the wave's rows stay in registers (the
@@ -24,9 +25,9 @@ S / dP B operands); dV / dK accumulate in registers and leave through per-wave r
 global stores).
 
 Every bf16 dS^T tile the kernel feeds its dK WMMA is also stored into the dS scratch (the HipKittens dslayout.h,
-version 2): one region per (batch, q head), inside it the kv16 rows in order, row kt holding the q pairs from
-qp_first(kt) = max(0, kt // 2 - (Skv - Sq) // 32) on as 1 KiB blocks [16 kv][32 q] in the dK operand's chunk
-order, with the softmax scale inside dS. k_dqds reads it back for dQ = dS K.
+version 2): one region per (batch, q head) of the launch, inside it the kv16 rows in order, row kt holding the q
+pairs from qp_first(kt) = max(0, kt // 2 - (Skv - Sq) // 32) on as 1 KiB blocks [16 kv][32 q] in the dK operand's
+chunk order, with the softmax scale inside dS. k_dqds reads it back for dQ = dS K.
 
 Numerics: P = exp2(c1 S + NL), c1 = scale * log2(e), dS = P (scale dP + ND), with k_delta_bshd's NL = -log2(e) lse
 and ND = -scale delta: the FlyDSL backward's operations in its order, so dK and dV are bitwise those of k_dkdv64.
@@ -248,7 +249,7 @@ def ds_blocks_per_head(sq, skv, causal=True):
 
 # ------------------------------------------------------------------------------------------------------ kernel
 def _dkdv96_impl(
-    Q, K, V, DO, NL, ND, DV_, DK, DS, scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, HG, ds_mode
+    Q, K, V, DO, NL, ND, DV_, DK, DS, scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, HG, ds_mode, H0, HC
 ):
     rocdl.disable_xdl_arb_stall()  # SCHED_MODE.DISABLE_XDL_ARB_STALL
     v8b = fx.Vector.make_type(8, fx.BFloat16)
@@ -261,9 +262,11 @@ def _dkdv96_impl(
     wv = _uniform(tid) >> fx.Int32(5)
     half = lane >> fx.Int32(4)
     row = lane & fx.Int32(15)
+    # The launch covers the heads [H0, H0 + HC) of every batch; hb = bat * HC + (head - H0) is the dS region of the
+    # (batch, head) in the launch's scratch.
     hb = fx.Int32(fx.block_idx.z) * HG + fx.Int32(fx.block_idx.x)
-    bat = hb // Hkv
-    hkv = hb - bat * Hkv
+    bat = hb // HC
+    hkv = H0 + hb - bat * HC
     bid = fx.Int32(fx.block_idx.y)
     n96 = _n96(Skv)
     nqt2 = nqt // fx.Int32(2)
@@ -479,7 +482,7 @@ def _dkdv96_impl(
         # dS^T export of this wave: descriptor over [region bh0 row kt0, +true extent)
         kt0 = kv0 >> fx.Int32(4)
         ro = [_row_off(kt0 + fx.Int32(kh), nqp, mm, causal) for kh in range_constexpr(NKV + 1)]
-        ds_off = (fx.Int64(bat * Hq + qh0) * fx.Int64(nblk_bh) + fx.Int64(ro[0])) * fx.Int64(DSL_BLK_B)
+        ds_off = (fx.Int64(hb) * fx.Int64(nblk_bh) + fx.Int64(ro[0])) * fx.Int64(DSL_BLK_B)
         ext = (ro[NKV] - ro[0]) * fx.Int32(DSL_BLK_B)  # rows kt0 .. kt0 + NKV - 1
         nrec = fx.Int64(_sel(ds_mode != fx.Int32(0), ext, fx.Int32(0)))
         r_ds = create_buffer_resource(DS, num_records_bytes=nrec, base_byte_offset=ds_off)
@@ -909,9 +912,33 @@ def k_dkdv96ds(
     B_: fx.Int32,
     HG: fx.Int32,
     ds_mode: fx.Int32,
+    H0: fx.Int32,
+    HC: fx.Int32,
 ):
     _dkdv96_impl(
-        Q, K, V, DO, NL, ND, DV_, DK, DS, scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, HG, ds_mode
+        Q,
+        K,
+        V,
+        DO,
+        NL,
+        ND,
+        DV_,
+        DK,
+        DS,
+        scale,
+        Sq,
+        Skv,
+        Hq,
+        Hkv,
+        G,
+        nqt,
+        cshift,
+        causal,
+        B_,
+        HG,
+        ds_mode,
+        H0,
+        HC,
     )
 
 
@@ -938,13 +965,38 @@ def launch_dkdv96ds(
     B_: fx.Int32,
     HG: fx.Int32,
     ds_mode: fx.Int32,
+    H0: fx.Int32,
+    HC: fx.Int32,
     nblk: fx.Int32,
     ngz: fx.Int32,
     stream: fx.Stream,
 ):
     _ = SOURCE_DIGEST  # FlyDSL disk-cache key
+    # grid = (HG heads of a head group, kv blocks, B * HC / HG head groups): the heads [H0, H0 + HC)
     k_dkdv96ds(
-        Q, K, V, DO, NL, ND, DV_, DK, DS, scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, HG, ds_mode
+        Q,
+        K,
+        V,
+        DO,
+        NL,
+        ND,
+        DV_,
+        DK,
+        DS,
+        scale,
+        Sq,
+        Skv,
+        Hq,
+        Hkv,
+        G,
+        nqt,
+        cshift,
+        causal,
+        B_,
+        HG,
+        ds_mode,
+        H0,
+        HC,
     ).launch(grid=(HG, nblk, ngz), block=(32 * NW, 1, 1), stream=stream)
 
 
