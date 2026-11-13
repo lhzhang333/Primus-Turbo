@@ -84,6 +84,10 @@ _TABLE_BSH: dict = {
     (8192, 7168, 576): C(256, 256, 3, 1, 2, 2),  # kv_down dgrad   22.6 (28.6)
     (8192, 7168, 16384): C(256, 256, 4, 1, 1, 4),  # o_proj fwd  263.9 (281.1)
     (7168, 2048, 8192): C(256, 256, 4, 1, 1, 4),  # shared fc2 wgrad 35.6 (36.7)
+    # 11-13 in-job A/B across pipeline depth x clusters (scratch_mxd/results/kprobe2.json, 2 rounds): the deep kpair-1
+    # pipeline with 2x2 multicast beats the table's kpair-2 c2x2 where the loop is bound by the global -> LDS traffic
+    (8192, 16384, 7168): C(256, 256, 4, 1, 2, 2),  # o_proj dgrad 259.4 (nb2 kp2 c2x2 283.8)
+    (8192, 4096, 7168): C(256, 256, 4, 1, 2, 2),  # shared fc1 fwd 67.4 (70.7)
 }
 
 
