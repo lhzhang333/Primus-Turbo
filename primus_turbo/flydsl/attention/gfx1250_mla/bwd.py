@@ -11,22 +11,20 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Host side of the gfx1250 MLA flash-attention backward: shape rules, launch plans, entry point.
+"""Host side of the gfx1250 MLA flash-attention backward: shape rules, launch plan, entry point.
 
-Two launch plans; their gradients are bitwise the same:
-  dS plan, where it applies: k_delta_bshd (the row constants NL / ND), k_dkdv96ds (bwd_dkdv96: dK and dV over 96-row kv
-    blocks, and every bf16 dS^T tile it feeds its dK WMMA also into a scratch laid out as dslayout v2), then k_dqds
-    (bwd_dqds: dQ = dS K from that scratch, so S and dP are computed once). It takes every shape the gate takes.
-  recompute plan, when no scratch can be allocated: k_delta_bshd, k_dkdv64 / k_dkdv and k_dqg96 / k_dqg, whose dQ
-    kernels recompute S and dP.
+k_delta_bshd (bwd_delta: delta and the row constants NL / ND), then per head chunk k_dkdv96ds (bwd_dkdv96: dK and dV
+over 96-row kv blocks, and every bf16 dS^T tile it feeds its dK WMMA also into a scratch laid out as dslayout v2) and
+k_dqds (bwd_dqds: dQ = dS K from that scratch, so S and dP are computed once).
 
 The whole dS^T scratch is about batch * heads * seqlen_q * seqlen_kv bytes under the causal mask (4.33 GB at b2 s4096
-h128). The dS plan runs the heads in chunks instead, k_dkdv96ds and k_dqds per chunk, the chunks alternating between
-the current stream and a side stream with a scratch each: one chunk's kernels fill the CUs the other chunk's tail
-leaves idle, and the plan holds two chunks' scratch (ds_chunkings). It takes the most chunks whose k_dqds still has
-two workgroups per CU, within PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB (a problem too small for two such chunks runs
-whole); the scratch is the last buffer it allocates, from the caching allocator on the current stream. Every head's
-arithmetic is the same either way, so the gradients are too.
+h128). The backward runs the heads in chunks instead, alternating between the current stream and a side stream with a
+scratch each: one chunk's kernels fill the CUs the other chunk's tail leaves idle, and two chunks' scratch is held at
+once (ds_chunkings). It takes the most chunks whose k_dqds still has two workgroups per CU, within
+PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB; a problem too small for two such chunks runs whole, and a budget below two heads'
+scratch runs one head at a time on one stream. The scratch is the last buffer it allocates, from the caching allocator
+on the current stream; one that cannot be allocated sends the call to smaller chunks. Every head's arithmetic is the
+same however the heads are chunked, so the gradients are too.
 """
 
 import math
@@ -38,29 +36,17 @@ import torch
 import primus_turbo.common.envs as envs
 from primus_turbo.common.logger import logger
 
+from . import bwd_delta as _delta
 from . import bwd_dkdv96 as _d
 from . import bwd_dqds as _q
-from . import bwd_kernels as _k
 
 _NUM_CU = 256  # MI455X
-# A gradient chain whose one-wave grid has fewer workgroups than this launches its one-wave kernel
-# (k_dkdv; one k_dqg over all queries): on small grids two-wave workgroups only crowd fewer CUs.
-# Tests patch this table to force either launch set.
-SMALL_GRID_WAVES = {"dkdv": 4 * _NUM_CU, "dq": 8 * _NUM_CU}
-# Heads per grid row of the recompute plan's head-grouped launches (the dS plan's kernels keep their own
-# HEAD_GROUP): fewer heads per row keep more tiles of one head in flight, so a Q/dO or K/V tile fetched by
-# one workgroup is more often still in L2 for the next.
-_HEAD_GROUP = 64
-_DQ_SPLITS = (0, 32, 64)  # one of these leaves a multiple of 96 queries for any Sq % 32 == 0
-
-# The dS plan where it applies (tests patch this to force the recompute plan).
-DS_PLAN = True
 # device -> the smallest dS scratch whose allocation failed there: a failed allocation costs the caching allocator a
-# synchronize and its whole cache, so a scratch at least as large is not tried there again.
+# synchronize and its whole cache, so a scratch at least as large is not tried there again (except the smallest).
 _DS_OOM_BYTES = {}
-# device -> the side stream of a chunked dS plan
+# device -> the side stream of a chunked backward
 _SIDE_STREAMS = {}
-# The smallest head chunk the dS plan launches by choice: its k_dqds keeps two workgroups per CU busy (smaller chunks
+# The smallest head chunk the backward launches by choice: its k_dqds keeps two workgroups per CU busy (smaller chunks
 # leave CUs idle in each kernel's tail faster than the other stream's chunk can fill them).
 _CHUNK_MIN_DQ_WORKGROUPS = 2 * _NUM_CU
 
@@ -73,19 +59,20 @@ def shape_unsupported_reason(batch: int, seqlen_q: int, seqlen_kv: int, num_head
     """Why the backward cannot run these MHA sizes, or None."""
     if batch <= 0 or num_heads <= 0:
         return f"batch and num_heads must be positive, got {batch} / {num_heads}"
-    if seqlen_q <= 0 or seqlen_q % 64:  # k_dkdv walks query pairs of 32 rows
+    if seqlen_q <= 0 or seqlen_q % 64:  # k_dkdv96ds walks query pairs of 32 rows two at a time
         return f"seqlen_q must be a positive multiple of 64, got {seqlen_q}"
-    kv_mult = _k.BLOCK_KV * _k.DKDV_NW
-    if seqlen_kv <= 0 or seqlen_kv % kv_mult:
-        return f"seqlen_kv must be a positive multiple of {kv_mult}, got {seqlen_kv}"
+    if seqlen_kv <= 0 or seqlen_kv % 64:
+        return f"seqlen_kv must be a positive multiple of 64, got {seqlen_kv}"
     if seqlen_q > seqlen_kv:
         # bottom-right causal leaves the first seqlen_q - seqlen_kv queries without keys
         return f"causal needs seqlen_q <= seqlen_kv, got {seqlen_q} > {seqlen_kv}"
-    # k_dqg's fixed descriptor extents (1 GiB q/do/dq, 256 MiB lse/delta), k_dkdv's int32 k/v sizes
+    # The sizes the attention is verified for: q / dq up to 1 GiB, lse up to 256 MiB, k under 2 GiB (the kernels'
+    # own 32-bit byte offsets would allow q / dq and k up to 2 GiB).
     rows_q, rows_kv = batch * seqlen_q * num_heads, batch * seqlen_kv * num_heads
-    if rows_q * _k.D_QK * 2 > (1 << 30) or rows_q * 4 > (1 << 28) or rows_kv * _k.D_QK * 2 >= (1 << 31):
-        return "q/k/lse too large for the backward's 32-bit descriptor extents"
-    return None
+    if rows_q * _d.D_QK * 2 > (1 << 30) or rows_q * 4 > (1 << 28) or rows_kv * _d.D_QK * 2 >= (1 << 31):
+        return "q/k/lse too large for the backward's verified sizes"
+    reason = _d.unsupported_reason(batch, seqlen_q, seqlen_kv, num_heads, num_heads)
+    return reason or _q.dqds_unsupported_reason(batch, seqlen_q, seqlen_kv, num_heads, num_heads)
 
 
 def _head_group(nh, target):
@@ -96,91 +83,35 @@ def _head_group(nh, target):
     return next((d for d in range(target, 7, -8) if nh % d == 0), nh)
 
 
-def _dq_split(sq):
-    """(q_split, n32, n96): k_dqg covers queries [0, q_split) in n32 tiles of 32, k_dqg96 covers
-    [q_split, sq) in n96 tiles of 96."""
-    for qs in _DQ_SPLITS:
-        if qs <= sq and (sq - qs) % _k.DQ_BQW96 == 0:
-            return qs, qs // _k.DQ_BQW, (sq - qs) // _k.DQ_BQW96
-    raise ValueError(f"no dQ split for seqlen_q {sq}")
-
-
-def _buffers(q, k, v):
-    """(delta, NL, ND, (dq, dk, dv)): the buffers of both plans."""
-    b, sq, h, _ = q.shape
-    delta = torch.empty((b, h, sq), device=q.device, dtype=torch.float32)
-    nl = torch.empty_like(delta)  # -LOG2E * lse
-    nd = torch.empty_like(delta)  # -scale * delta
-    return delta, nl, nd, (q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape))
-
-
-def _delta_launch(dout, out, lse, delta, nl, nd, scale, stream):
-    """k_delta_bshd: delta = rowsum(dO * O) and the row constants NL / ND of both plans."""
-    b, sq, h, _ = out.shape
-    args = (dout, out, delta, lse, nl, nd, scale, sq, h, b * sq * h, sq // _k.ROWS_DELTA, b * h, stream)
-    return _k.launch_delta, args
-
-
-def _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
-    """The recompute plan's (launcher, args) in issue order, and the (dq, dk, dv) they write."""
-    b, sq, h, _ = q.shape
-    skv = k.shape[1]
-    hg = _head_group(h, _HEAD_GROUP)
-    ngz = b * h // hg
-    scale = float(softmax_scale)
-    c = int(bool(causal))
-    delta, nl, nd, (dq, dk, dv) = _buffers(q, k, v)
-    launches = [_delta_launch(dout, out, lse, delta, nl, nd, scale, stream)]
-    # Hq, Hkv, G = h, h, 1: MHA
-    dkdv = (q, k, v, dout, nl, nd, dv, dk, scale, sq, skv, h, h, 1, sq // 16, skv - sq, c)
-    if b * h * (skv // _k.BLOCK_KV) < SMALL_GRID_WAVES["dkdv"]:
-        launches.append((_k.launch_dkdv, dkdv + (skv // _k.BLOCK_KV, h, b, stream)))
-    else:
-        nblk = skv // (_k.BLOCK_KV * _k.DKDV_NW)
-        launches.append((_k.launch_dkdv64, dkdv + (nblk, hg, ngz, b, stream)))
-    dqa = (q, k, v, dout, out, lse, delta, dq, scale, sq, skv, h, h, 1, skv // _k.KV_STEP, skv - sq, c)
-    if b * h * (sq // _k.DQ_BQW) < SMALL_GRID_WAVES["dq"]:
-        launches.append((_k.launch_dqg, dqa + (0, sq // _k.DQ_BQW, hg, ngz, stream)))
-    else:
-        # k_dqg96 over [q_split, sq) longest tiles first, then k_dqg over the short head [0, q_split)
-        q_split, n32, n96 = _dq_split(sq)
-        if n96:
-            launches.append((_k.launch_dqg96, dqa + (q_split, n96, hg, ngz, stream)))
-        if n32:
-            launches.append((_k.launch_dqg, dqa + (0, n32, hg, ngz, stream)))
-    return launches, (dq, dk, dv)
-
-
 def ds_scratch_bytes(batch: int, seqlen_q: int, seqlen_kv: int, num_heads: int, causal: bool = True) -> int:
-    """Bytes of the whole dS^T scratch of these MHA sizes (the dS plan holds at most two head chunks of it)."""
+    """Bytes of the whole dS^T scratch of these MHA sizes (the backward holds at most two head chunks of it)."""
     return batch * num_heads * _d.ds_blocks_per_head(seqlen_q, seqlen_kv, causal) * _d.DSL_BLK_B
 
 
 def ds_chunkings(
     batch: int, seqlen_q: int, seqlen_kv: int, num_heads: int, budget: int
-) -> List[Tuple[int, int]]:
-    """[(heads per chunk, scratch bytes)] the dS plan tries in order, all within ``budget`` bytes: all heads in one
-    scratch, or chunks of ceil(heads / 2^i) heads in two scratches (the chunks alternate between two streams). It
-    starts at the most chunks whose k_dqds still has _CHUNK_MIN_DQ_WORKGROUPS (else at the fewest chunks within the
-    budget) and goes on to more, smaller chunks, for a scratch that cannot be allocated."""
+) -> List[Tuple[int, int, int]]:
+    """[(heads per chunk, streams, scratch bytes)] the backward tries in order: all heads in one scratch; chunks of
+    ceil(heads / 2^i) heads alternating between two streams with a scratch each; last, one head at a time on one
+    stream. It starts within ``budget`` bytes at the most chunks whose k_dqds still has _CHUNK_MIN_DQ_WORKGROUPS (else
+    at the fewest chunks) and goes on to more, smaller chunks, for a scratch that cannot be allocated. When nothing
+    fits the budget, only the last."""
     per_head = ds_scratch_bytes(batch, seqlen_q, seqlen_kv, 1)
     dq_workgroups = batch * sum(_q.dq_split(seqlen_q)[1:])  # k_dqds workgroups of one head
     opts, hc = [], num_heads
     while True:
-        nbytes = per_head * hc * (1 if hc == num_heads else 2)
-        if nbytes <= budget:
-            opts.append((hc, nbytes))
+        streams = 1 if hc == num_heads else 2
+        opts.append((hc, streams, per_head * hc * streams))
         if hc == 1:
             break
         hc = -(-hc // 2)
-    busy = [i for i, (hc, _) in enumerate(opts) if hc * dq_workgroups >= _CHUNK_MIN_DQ_WORKGROUPS]
-    return opts[busy[-1] if busy else 0 :]
-
-
-def ds_plan_unsupported_reason(batch: int, seqlen_q: int, seqlen_kv: int, num_heads: int) -> Optional[str]:
-    """Why the dS plan cannot take these MHA sizes (the recompute plan then runs), or None."""
-    reason = _d.unsupported_reason(batch, seqlen_q, seqlen_kv, num_heads, num_heads)
-    return reason or _q.dqds_unsupported_reason(batch, seqlen_q, seqlen_kv, num_heads, num_heads)
+    if num_heads > 1:
+        opts.append((1, 1, per_head))
+    fit = [o for o in opts if o[2] <= budget]  # the scratch shrinks along opts: a suffix
+    if not fit:
+        return opts[-1:]
+    busy = [i for i, (hc, _, _) in enumerate(fit) if hc * dq_workgroups >= _CHUNK_MIN_DQ_WORKGROUPS]
+    return fit[busy[-1] if busy else 0 :]
 
 
 def _side_stream(device):
@@ -190,43 +121,66 @@ def _side_stream(device):
     return stream
 
 
-def _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
-    """The dS plan's (launcher, args) in issue order and the (dq, dk, dv) they write, or None when no scratch within
-    the budget can be allocated. The caller checked ds_plan_unsupported_reason."""
+def _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
+    """(launcher, args) of every launch in issue order, and the (dq, dk, dv) they write: k_delta_bshd, then
+    k_dkdv96ds and k_dqds per head chunk. torch.OutOfMemoryError when even one head's scratch cannot be allocated."""
     b, sq, h, _ = q.shape
     skv = k.shape[1]
     c = int(bool(causal))
-    budget = min(envs.PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB << 20, _DS_OOM_BYTES.get(q.device, math.inf) - 1)
+    budget = envs.PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB << 20
     tries = ds_chunkings(b, sq, skv, h, budget)
-    if not tries:
-        return None
-    # The scratch is the last allocation: when it fits, the plan fits (the recompute plan needs the other buffers too).
-    delta, nl, nd, (dq, dk, dv) = _buffers(q, k, v)
-    for hc, nbytes in tries:
-        if nbytes >= _DS_OOM_BYTES.get(q.device, math.inf):
+    if tries[0][2] > budget:
+        logger.warning(
+            f"MLA backward: one head's dS scratch, {tries[0][2]} bytes, is over the {budget}-byte budget "
+            "(PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB); the heads run one at a time",
+            once=True,
+        )
+    # The scratch is the last allocation: when it fits, the backward fits.
+    delta = torch.empty((b, h, sq), device=q.device, dtype=torch.float32)
+    nl = torch.empty_like(delta)  # -LOG2E * lse
+    nd = torch.empty_like(delta)  # -scale * delta
+    dq, dk, dv = q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape)
+    for i, (hc, streams, nbytes) in enumerate(tries):
+        last = i == len(tries) - 1
+        if not last and nbytes >= _DS_OOM_BYTES.get(q.device, math.inf):
             continue
         try:
             ds = torch.empty((nbytes // 2,), device=q.device, dtype=torch.bfloat16)
             break
         except torch.OutOfMemoryError:
+            if last:
+                raise
             _DS_OOM_BYTES[q.device] = nbytes
             logger.warning(
-                f"MLA backward: no memory for a {nbytes}-byte dS scratch on {q.device}; smaller head chunks or the "
-                "recompute plan run (a scratch at least as large is not tried again)",
+                f"MLA backward: no memory for a {nbytes}-byte dS scratch on {q.device}; smaller head chunks run (a "
+                "scratch at least as large is not tried again)",
                 once=True,
             )
-    else:
-        return None
     scale = float(softmax_scale)
     q_off, nhead, ntile = _q.dq_split(sq)
     nblk = _d.ds_blocks_per_head(sq, skv, c)
-    scratches = ds.view(1 if hc == h else 2, -1)
+    scratches = ds.view(streams, -1)
     side = (
-        stream if hc == h or q.device.type != "cuda" else _side_stream(q.device)
+        stream if streams == 1 or q.device.type != "cuda" else _side_stream(q.device)
     )  # meta tensors: one stream
-    launches = [_delta_launch(dout, out, lse, delta, nl, nd, scale, stream)]
+    delta_args = (
+        dout,
+        out,
+        delta,
+        lse,
+        nl,
+        nd,
+        scale,
+        sq,
+        h,
+        b * sq * h,
+        sq // _delta.ROWS_DELTA,
+        b * h,
+        stream,
+    )
+    launches = [(_delta.launch_delta, delta_args)]
     for i, h0 in enumerate(range(0, h, hc)):
-        nh, st, ds_c = min(hc, h - h0), (stream, side)[i % 2], scratches[i % len(scratches)]
+        nh, st, ds_c = min(hc, h - h0), (stream, side)[i % 2], scratches[i % streams]
         hg_kv, hg_q = _head_group(nh, _d.HEAD_GROUP), _head_group(nh, _q.HEAD_GROUP)
         # Hq, Hkv, G = h, h, 1: MHA; the heads [h0, h0 + nh). The kernels take only the scratch's base address:
         # k_dkdv96ds gets a [blocks, 512] view (FlyDSL packs tensor sizes as int32), k_dqds the address itself.
@@ -277,7 +231,7 @@ def _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
             hg_q,
             nblk,
         )
-        dqa += (b * sq * h * _k.D_QK * 2, h0, nh, ntile + nhead, b * nh // hg_q, st)
+        dqa += (b * sq * h * _d.D_QK * 2, h0, nh, ntile + nhead, b * nh // hg_q, st)
         launches += [(_d.launch_dkdv96ds, dkdv), (_q.launch_dqds, dqa)]
     return launches, (dq, dk, dv)
 
@@ -313,11 +267,11 @@ def flash_attn_mla_bwd(
     if not causal:
         raise ValueError("the gfx1250 MLA attention backward supports causal attention only")
     named = (
-        ("dout", dout, _k.D_V),
-        ("q", q, _k.D_QK),
-        ("k", k, _k.D_QK),
-        ("v", v, _k.D_V),
-        ("out", out, _k.D_V),
+        ("dout", dout, _d.D_V),
+        ("q", q, _d.D_QK),
+        ("k", k, _d.D_QK),
+        ("v", v, _d.D_V),
+        ("out", out, _d.D_V),
     )
     for name, t, dim in named:
         if t.dtype != torch.bfloat16 or t.dim() != 4 or t.shape[-1] != dim or not t.is_contiguous():
@@ -340,12 +294,7 @@ def flash_attn_mla_bwd(
         raise ValueError(reason)
     lse = lse.contiguous().float()
     stream = torch.cuda.current_stream()
-    plan = None
-    if DS_PLAN and ds_plan_unsupported_reason(b, sq, skv, h) is None:
-        plan = _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream)
-    if plan is None:
-        plan = _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream)
-    launches, grads = plan
+    launches, grads = _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream)
     _launch(*launches[0])  # k_delta_bshd: the row constants every later launch reads
     side = next((args[-1] for _, args in launches[1:] if args[-1] is not stream), None)
     if (

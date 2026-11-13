@@ -683,6 +683,7 @@ def test_hk_delta_matches_flydsl(dims, special):
     """k_delta's NL / ND bitwise equal the FlyDSL k_delta's, also for denormals, underflowing products, signed zeros
     and overflowing NL."""
     from primus_turbo.flydsl.attention.gfx1250_mla import bwd as fly
+    from primus_turbo.flydsl.attention.gfx1250_mla import bwd_delta
 
     do, o, lse = _delta_inputs(*dims, special)
     b, s, h, _ = do.shape
@@ -694,8 +695,8 @@ def test_hk_delta_matches_flydsl(dims, special):
     hk._mla_kernel(name)(grid, values, stream)
     delta, nl, nd = (torch.full((b, h, s), float("nan"), device="cuda") for _ in range(3))
     fly._launch(
-        fly._k.launch_delta,
-        (do, o, delta, lse, nl, nd, MLA_SCALE, s, h, b * s * h, s // fly._k.ROWS_DELTA, b * h, stream),
+        bwd_delta.launch_delta,
+        (do, o, delta, lse, nl, nd, MLA_SCALE, s, h, b * s * h, s // bwd_delta.ROWS_DELTA, b * h, stream),
     )
     for label, x, y in zip(("NL", "ND"), (values[3], values[4]), (nl, nd)):
         assert not torch.isnan(x).any(), label

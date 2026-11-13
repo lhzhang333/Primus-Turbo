@@ -30,7 +30,7 @@ pairs from qp_first(kt) = max(0, kt // 2 - (Skv - Sq) // 32) on as 1 KiB blocks 
 chunk order, with the softmax scale inside dS. k_dqds reads it back for dQ = dS K.
 
 Numerics: P = exp2(c1 S + NL), c1 = scale * log2(e), dS = P (scale dP + ND), with k_delta_bshd's NL = -log2(e) lse
-and ND = -scale delta: the FlyDSL backward's operations in its order, so dK and dV are bitwise those of k_dkdv64.
+and ND = -scale delta, in the order of the HipKittens k_dkdv96ds, so dK and dV are bitwise that kernel's.
 
 Ring protocol (one barrier per tile; tile j lives in stage sigma(j) = (j - n_mask) mod 3; every prefetch is clamped
 to the last tile T_{N-1}):

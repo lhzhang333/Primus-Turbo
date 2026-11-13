@@ -41,8 +41,8 @@ the op of unit u + 3 goes into the freed stages. Fully masked q pairs are never 
 wave-uniform branch skips their WMMAs (exact: they would add +-0). dQ leaves through per-wave row-major LDS images
 as whole 128-B lines.
 
-The arithmetic is that of ``k_dqds_c`` (and of the FlyDSL k_dqg dQ): every accumulator chains its kv32 rows in
-ascending order from +0, so dQ is bitwise that of those kernels on the same dS.
+The arithmetic is that of the HipKittens ``k_dqds_c``: every accumulator chains its kv32 rows in ascending order
+from +0, so dQ is bitwise that kernel's on the same dS.
 """
 
 import flydsl.compiler as flyc

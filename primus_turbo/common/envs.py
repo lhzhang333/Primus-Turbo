@@ -196,11 +196,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cannot take to FlyDSL (e.g. seqlen_q % 384 not 0 or 256, see their README). Read at the first
     # MLA backward (attention_flydsl_gfx1250_mla_impl.mla_bwd_impl); another value raises ValueError.
     "PRIMUS_TURBO_MLA_BWD_IMPL": _mla_bwd_impl,
-    # Most dS scratch, in MiB, the FlyDSL gfx1250 MLA backward holds at once (5120 when unset). Its dS plan stores dS
+    # Most dS scratch, in MiB, the FlyDSL gfx1250 MLA backward holds at once (5120 when unset). The backward stores dS
     # between its dK / dV and dQ kernels, about batch * heads * seqlen_q * seqlen_kv bytes in all (4.33 GB at b2 s4096
-    # h128), and runs the heads in chunks, two in flight, to stay under this (gfx1250_mla.bwd.ds_chunkings); 0 runs
-    # the plan that recomputes dS instead, without scratch. Read at every MLA backward (through the cache); a value
-    # that is not a non-negative integer raises ValueError.
+    # h128), and runs the heads in chunks, two in flight, to stay under this (gfx1250_mla.bwd.ds_chunkings); below
+    # two heads' scratch (0 included) it runs one head at a time. Read at every MLA backward (through the cache); a
+    # value that is not a non-negative integer raises ValueError.
     "PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB": _mla_bwd_ds_scratch_mb,
     # MoE dispatch/combine EP backend: TURBO (the default when unset), DEEP_EP, or a custom EP name
     # such as UCCL_EP. "autotune" is rejected with an AssertionError.

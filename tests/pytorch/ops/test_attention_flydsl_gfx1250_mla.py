@@ -11,7 +11,6 @@ they run anywhere. The numeric tests need a gfx1250 card; their fp32 reference r
 """
 
 import contextlib
-import inspect
 import sys
 
 import pytest
@@ -429,78 +428,6 @@ def test_torch_compile_traces_the_custom_ops(monkeypatch, layout, dynamic):
         assert x.transpose(0, 1).is_contiguous() == (layout == "sbhd")
 
 
-@pytest.mark.parametrize(
-    ("dims", "waves", "launchers"),
-    [
-        pytest.param((1, 256, 256, 2), None, ["delta", "dkdv", "dqg"], id="b1_s256_h2"),
-        pytest.param(
-            (1, 256, 256, 2),
-            {"dkdv": 0, "dq": 0},
-            ["delta", "dkdv64", "dqg96", "dqg"],
-            id="b1_s256_h2_two_wave",
-        ),
-        pytest.param((1, 2048, 2048, 16), None, ["delta", "dkdv64", "dqg"], id="b1_s2048_h16"),
-        pytest.param((1, 2048, 2048, 32), None, ["delta", "dkdv64", "dqg96", "dqg"], id="b1_s2048_h32"),
-        pytest.param((2, 4096, 4096, 128), None, ["delta", "dkdv64", "dqg96", "dqg"], id="dsv3_b2"),
-        pytest.param((1, 4096, 4096, 256), None, ["delta", "dkdv64", "dqg96", "dqg"], id="dsv3_b2_folded"),
-    ],
-)
-def test_backward_launch_sets(monkeypatch, dims, waves, launchers):
-    """Small grids launch the one-wave dK/dV kernel and one dQ kernel over all queries, the
-    DeepSeek-V3 shapes the two-wave kernels; the numeric tests force the latter as here."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd, bwd_kernels
-
-    if waves is not None:
-        monkeypatch.setattr(bwd, "SMALL_GRID_WAVES", waves)
-    b, sq, skv, h = dims
-    q, k, v = _meta(b, sq, skv, h)
-    out = torch.empty(b, sq, h, D_V, dtype=torch.bfloat16, device="meta")
-    lse = torch.empty(b, h, sq, device="meta")
-    launches, _ = bwd._launches(out, q, k, v, out, lse, MLA_SCALE, True, None)
-    assert [fn for fn, _ in launches] == [getattr(bwd_kernels, f"launch_{n}") for n in launchers]
-
-
-@pytest.mark.parametrize("waves", [None, {"dkdv": 0, "dq": 0}], ids=["default", "two_wave"])
-@pytest.mark.parametrize(
-    "dims",
-    [
-        pytest.param((1, 64, 64, 1), id="b1_s64_h1"),
-        pytest.param((1, 192, 448, 2), id="b1_s192_skv448_h2"),
-        pytest.param((1, 2048, 2048, 32), id="b1_s2048_h32"),
-        pytest.param((2, 4096, 4096, 128), id="dsv3_b2"),
-        pytest.param((1, 4096, 4096, 256), id="dsv3_b2_folded"),
-        pytest.param((1, 512, 512, 96), id="b1_s512_h96"),
-    ],
-)
-def test_backward_launches_cover_every_row_and_head(monkeypatch, dims, waves):
-    """The dK/dV grids cover every kv row and head, and the dQ tiles partition the queries."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd_kernels as K
-
-    if waves is not None:
-        monkeypatch.setattr(bwd, "SMALL_GRID_WAVES", waves)
-    b, sq, skv, h = dims
-    q, k, v = _meta(b, sq, skv, h)
-    out = torch.empty(b, sq, h, D_V, dtype=torch.bfloat16, device="meta")
-    launches, _ = bwd._launches(
-        out, q, k, v, out, torch.empty(b, h, sq, device="meta"), MLA_SCALE, True, None
-    )
-    tiles = []
-    for fn, args in launches[1:]:
-        a = inspect.signature(fn.func).bind(*args).arguments
-        if fn is K.launch_dkdv:
-            assert (a["nblk"] * K.BLOCK_KV, a["nhkv"] * a["nb"]) == (skv, b * h)
-        elif fn is K.launch_dkdv64:
-            assert (a["nblk"] * K.BLOCK_KV * K.DKDV_NW, a["hg"] * a["ngz"]) == (skv, b * h)
-        else:
-            assert a["hg"] * a["ngz"] == b * h
-            tiles.append(
-                (a["q_off"], a["q_off"] + a["ntile"] * (K.DQ_BQW96 if fn is K.launch_dqg96 else K.DQ_BQW))
-            )
-    tiles.sort()
-    assert tiles[0][0] == 0 and tiles[-1][1] == sq and all(x[1] == y[0] for x, y in zip(tiles, tiles[1:]))
-
-
 def test_importing_primus_turbo_does_not_import_the_kernels():
     assert _KERNEL_MODULES_AT_IMPORT == []
 
@@ -547,7 +474,6 @@ def _check(got, ref):
 
 
 @needs_gfx1250
-@pytest.mark.parametrize("bwd_launches", ["default", "two_wave"])
 @pytest.mark.parametrize(
     ("dims", "layout", "scale"),
     [
@@ -557,16 +483,14 @@ def _check(got, ref):
         pytest.param((2, 128, 384, 2), "bshd", MLA_SCALE, id="b2_bshd_sq_lt_skv"),
         pytest.param((2, 256, 256, 2), "bhsd", MLA_SCALE, id="b2_bhsd_copied"),
         pytest.param((1, 64, 128, 2), "sbhd", MLA_SCALE, id="sq64_skv128"),
+        pytest.param((1, 320, 576, 2), "bshd", MLA_SCALE, id="sq320_skv576_partial_dq_head_tile"),
+        pytest.param((2, 576, 576, 2), "sbhd", MLA_SCALE, id="b2_s576_main_and_head_tiles"),
         pytest.param((1, 256, 256, 2), "bshd", None, id="default_scale"),
     ],
 )
-def test_matches_reference(monkeypatch, dims, layout, scale, bwd_launches):
-    if bwd_launches == "two_wave":
-        from primus_turbo.flydsl.attention.gfx1250_mla import bwd
-
-        # the recompute plan's two-wave kernels (the s256 shapes would otherwise take the dS plan)
-        monkeypatch.setattr(bwd, "SMALL_GRID_WAVES", {"dkdv": 0, "dq": 0})
-        monkeypatch.setattr(bwd, "DS_PLAN", False)
+def test_matches_reference(dims, layout, scale):
+    """The dQ head tiles start below query 0 at seqlen_q 64, 128, 192 (sq % 384 of 64, 128, 192) and 320; s576
+    has a 384-query tile and one head tile."""
     q, k, v, dout = _inputs(*dims, layout=layout)
     ref = _reference(q, k, v, dout, D_QK**-0.5 if scale is None else scale)
     _check(_run(q, k, v, dout, scale), ref)
@@ -575,14 +499,17 @@ def test_matches_reference(monkeypatch, dims, layout, scale, bwd_launches):
 @needs_gfx1250
 def test_production_dispatch_matches_reference(monkeypatch):
     """(1, 4096, 4096, 16) takes the DeepSeek-V3 dispatch: grouped longest-first forward blocks and the
-    backward's dS plan (k_dkdv96ds, k_dqds from q_off 256 with the XCD head remap). The recompute plan
-    (k_dkdv64, k_dqg96 from q_off 64, k_dqg) gives the same bits."""
+    backward's k_dkdv96ds / k_dqds (q_off 256, XCD head remap) on all heads at once. The backward in four head
+    chunks on two streams gives the same bits."""
     from primus_turbo.flydsl.attention.gfx1250_mla import bwd
 
     q, k, v, dout = _inputs(1, 4096, 4096, 16, layout="bshd")
     got = _run(q, k, v, dout)
     _check(got, _reference_by_heads(q, k, v, dout, MLA_SCALE))
-    monkeypatch.setattr(bwd, "DS_PLAN", False)
+    per_head = bwd.ds_scratch_bytes(1, 4096, 4096, 1)
+    monkeypatch.setenv("PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB", str(-(-per_head * 4 * 2 // (1 << 20))))
+    envs.reset_cache("PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB")
+    assert bwd.ds_chunkings(1, 4096, 4096, 16, envs.PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB << 20)[0][:2] == (4, 2)
     assert all(torch.equal(a, b) for a, b in zip(got, _run(q, k, v, dout)))
 
 
