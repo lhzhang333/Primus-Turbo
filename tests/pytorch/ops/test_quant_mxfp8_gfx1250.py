@@ -174,7 +174,12 @@ def _moe_lens(case, seed):
 def _check_grouped(out, vals, lens, rule, lay=0):
     """An 8-tuple against mxfp8_ref.quant_grouped of the bf16 values it quantized: the allocation bounds, the
     32-row / 128-token padded lens and offsets of both copies, the rows / columns up to them in layout ``lay``."""
-    q_row, s_row, q_col, s_col, lens_c, offs_c, lens_r, offs_r = R.quant_grouped(vals.cpu(), lens, rule)
+    _check_grouped_ref(out, R.quant_grouped(vals.cpu(), lens, rule), lens, lay)
+
+
+def _check_grouped_ref(out, ref, lens, lay=0):
+    """``_check_grouped`` against a given reference 8-tuple."""
+    q_row, s_row, q_col, s_col, lens_c, offs_c, lens_r, offs_r = ref
     M, G, Mr, Mc = int(lens.sum()), len(lens), int(offs_r[-1]), int(offs_c[-1])
     assert out[0].shape[0] == -(-(M + 32 * G) // 32) * 32 and out[2].shape[1] == -(-(M + 128 * G) // 128) * 128
     for got, ref, what in zip(out[4:], (lens_r, offs_r, lens_c, offs_c), ("lens_row", "offs_row", "lens_col", "offs_col")):
@@ -246,6 +251,27 @@ def test_gather(Q, case, H, with_probs, rule):
     offs = torch.nn.functional.pad(torch.cumsum(lens_d, 0), (1, 0))
     out = Q.grouped_gather_quant_mxfp8(x, d2s, lens_d, offs, pp, rule=rule)
     _check_grouped(out, R.gather_rows(x.cpu(), d2s.cpu(), None if pp is None else pp.cpu()), lens, rule)
+
+
+@pytest.mark.parametrize("lay", [0, PACK_ROW | PACK_COL | SHUF_COL])
+@pytest.mark.parametrize("H", [512, 7168])
+@pytest.mark.parametrize("case", [[0, 5, 0], [31, 32, 33, 1, 0, 127, 128, 129], "skew"])
+def test_gather_fp8(Q, case, H, lay):
+    """MegaMoE's pool gather of dispatched MX rows: codes and scales kept by the row copy, columns re-quantized."""
+    lens = _moe_lens(case, H)
+    M = int(lens.sum())
+    T = max(1, M // 3)
+    x = _x(T, H, seed=H, special=False)
+    x[::7, :32] = 0
+    q, s = R.quant_rows(x.cpu())
+    g = torch.Generator(device="cuda").manual_seed(M + H)
+    d2s = torch.randint(-1, T, (M,), generator=g, device="cuda", dtype=torch.int32)
+    if M > 4:
+        d2s[3] = T + 5
+    lens_d = lens.cuda()
+    offs = torch.nn.functional.pad(torch.cumsum(lens_d, 0), (1, 0))
+    out = Q.grouped_gather_fp8_quant_mxfp8(q.cuda(), s.cuda(), d2s, lens_d, offs, layout=lay)
+    _check_grouped_ref(out, R.quant_grouped_fp8(q, s, d2s.cpu(), lens), lens, lay)
 
 
 @pytest.mark.parametrize("H", [384, 7168])
