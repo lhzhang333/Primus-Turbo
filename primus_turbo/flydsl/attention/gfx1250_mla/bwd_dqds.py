@@ -139,11 +139,6 @@ def _ir(v):
 
 
 # ------------------------------------------------------------------------------------------- host-side layout
-def ds_qp_first(kt, cshift, causal):
-    f = kt // 2 - cshift // 32
-    return f if (causal and f > 0) else 0
-
-
 def _ds_tri(k):
     p = k // 2
     return p * (p - 1) + (k % 2) * p
@@ -161,10 +156,6 @@ def _ds_skip(k, cshift, causal):
 def ds_blocks_per_head(sq, skv, causal):
     """dslayout v2 blocks of one (batch, q head) region."""
     return (skv // 16) * (sq // 32) - _ds_skip(skv // 16, skv - sq, causal)
-
-
-def ds_scratch_bytes(b, sq, skv, hq, causal):
-    return b * hq * ds_blocks_per_head(sq, skv, causal) * 1024
 
 
 # ------------------------------------------------------------------------------------------- device helpers
@@ -686,7 +677,6 @@ launch_dqds.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": Tr
 # ------------------------------------------------------------------------------------------------ host entry
 _HEAD_GROUP = 32
 _MAX_BH_S = 512 * 4096  # largest batch * heads * seqlen the 32-bit offsets are checked for
-_COMPILED = {}
 
 
 def head_group(nh):
@@ -718,50 +708,3 @@ def dqds_unsupported_reason(b, sq, skv, hq, hkv, causal=True):
     if b * hq * skv > _MAX_BH_S or b * sq * hq * D_QK * 2 >= 1 << 31:
         return "too large for the 32-bit offsets"
     return None
-
-
-def flash_attn_mla_dq_from_ds(ds, k, sq, hq, causal=True, dq=None):
-    """dQ [B, Sq, Hq, 192] bf16 = dS K, dS from the dslayout v2 scratch ``ds`` (any dtype, bytes as written by the
-    dK / dV kernel), k [B, Skv, Hkv, 192] contiguous bf16. ``dq``: an optional output tensor."""
-    import torch
-
-    b, skv, hkv, _ = k.shape
-    reason = dqds_unsupported_reason(b, sq, skv, hq, hkv, causal)
-    if reason is not None:
-        raise ValueError(reason)
-    if dq is None:
-        dq = torch.empty((b, sq, hq, D_QK), dtype=k.dtype, device=k.device)
-    c = int(bool(causal))
-    q_off, nhead, ntile = dq_split(sq)
-    hg = head_group(hq)
-    nblk = ds_blocks_per_head(sq, skv, c)
-    args = (
-        ds.data_ptr(),
-        k,
-        dq,
-        sq,
-        skv,
-        hq,
-        hkv,
-        hq // hkv,
-        skv // KV32,
-        skv - sq,
-        c,
-        q_off,
-        ntile,
-        hg,
-        nblk,
-        b * sq * hq * D_QK * 2,
-        ntile + nhead,
-        b * hq // hg,
-        torch.cuda.current_stream(),
-    )
-    key = k.device.index
-    fn = _COMPILED.get(key)
-    if fn is not None:
-        fn(*args)
-    else:
-        fn = flyc.compile(launch_dqds, *args)  # compiles and issues this launch
-        if fn is not None:
-            _COMPILED[key] = fn
-    return dq

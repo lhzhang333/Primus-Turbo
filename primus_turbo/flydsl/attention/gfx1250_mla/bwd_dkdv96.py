@@ -44,7 +44,6 @@ to the last tile T_{N-1}):
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 
 # UNSTABLE(gfx1250): WMMA, ds_load_tr16, the raw TDM load and tensor_wait, the split barrier, sched barriers,
 # readfirstlane, raw buffer loads / stores and disable_xdl_arb_stall have no stable API in FlyDSL 0.3.4.1.
@@ -994,63 +993,3 @@ def unsupported_reason(b, sq, skv, hq, hkv, causal=True):
     if b * hkv * skv * D_QK * 2 >= 1 << 31 or b * hq * sq * 4 >= 1 << 31:
         return "k / NL too large for the kernel's 32-bit buffer offsets"
     return None
-
-
-_COMPILED = {}
-
-
-def dkdv96ds(q, k, v, do, nl, nd, scale, causal=True, ds=None, ds_mode=1):
-    """dK, dV and the dS^T scratch of the MLA backward on gfx1250.
-
-    q [B, Sq, H, 192], k [B, Skv, H, 192], v [B, Skv, H, 128], do [B, Sq, H, 128] contiguous bf16; nl / nd
-    [B, H, Sq] fp32 = k_delta_bshd's NL (-log2(e) lse) / ND (-scale delta). ds: a bf16 tensor of at least
-    ds_layout_bytes(...) / 2 elements (allocated when None). Returns (dk, dv, ds)."""
-    b, sq, hq, _ = q.shape
-    skv, hkv = k.shape[1], k.shape[2]
-    reason = unsupported_reason(b, sq, skv, hq, hkv, causal)
-    if reason is not None:
-        raise ValueError(f"k_dkdv96ds: {reason}")
-    nbytes = ds_layout_bytes(b, sq, skv, hq, causal)
-    if ds is None:
-        ds = torch.empty((nbytes // 2,), device=q.device, dtype=torch.bfloat16)
-    elif ds.numel() * ds.element_size() < nbytes:
-        raise ValueError(f"dS scratch too small: {ds.numel() * ds.element_size()} < {nbytes} bytes")
-    dk, dv = torch.empty_like(k), torch.empty_like(v)
-    hg = head_group(hkv)
-    # the kernel only takes the scratch's base address; a [blocks, 512] view keeps FlyDSL's 32-bit shape fields
-    ds_k = ds.view(-1)[: nbytes // 2].view(-1, DSL_BLK_B // 2)
-    args = (
-        q,
-        k,
-        v,
-        do,
-        nl,
-        nd,
-        dv,
-        dk,
-        ds_k,
-        float(scale),
-        sq,
-        skv,
-        hq,
-        hkv,
-        hq // hkv,
-        sq // 16,
-        skv - sq,
-        int(bool(causal)),
-        b,
-        hg,
-        int(ds_mode),
-        nblk96(skv),
-        b * hkv // hg,
-        torch.cuda.current_stream(),
-    )
-    key = (q.device.index,)
-    fn = _COMPILED.get(key)
-    if fn is not None:
-        fn(*args)
-    else:
-        fn = flyc.compile(launch_dkdv96ds, *args)
-        if fn is not None:
-            _COMPILED[key] = fn
-    return dk, dv, ds

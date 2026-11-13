@@ -24,9 +24,9 @@ from the accumulators through padded LDS to global memory with ``global_store_as
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-# UNSTABLE(gfx1250): the TDM atom, tensor_load_to_lds with hand-built descriptors, tensor_wait,
-# ds_load_tr16_b128, the async LDS->global store, sched_barrier and s_wait_dscnt have no stable API in
-# FlyDSL 0.3.4.1; LDS loads/stores are raw LLVM ops on pointers built from i32 byte addresses.
+# UNSTABLE(gfx1250): tensor_load_to_lds with hand-built descriptors, ds_load_tr16_b128, the async
+# LDS->global store, sched_barrier and s_wait_dscnt have no stable API in FlyDSL 0.3.4.1; LDS
+# loads/stores are raw LLVM ops on pointers built from i32 byte addresses.
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
 
@@ -50,10 +50,8 @@ Q_ROW_ELEMS = D_QK + 8
 K_ROW_ELEMS = D_QK + 8
 V_ROW_ELEMS = D_V + 16
 O_ROW_ELEMS = D_V + 8
-Q_LDS_BYTES = BLOCK_M * Q_ROW_ELEMS * 2
 K_LDS_BYTES = N_BLOCK * K_ROW_ELEMS * 2
 V_LDS_BYTES = N_BLOCK * V_ROW_ELEMS * 2
-O_LDS_BYTES = BLOCK_M * O_ROW_ELEMS * 2
 
 
 def pow2_segments(width):
@@ -77,10 +75,6 @@ def global_ptr(addr):
     """Raw ``!llvm.ptr<1>`` for a global byte address."""
     pt = fx.PointerType.get(fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4)
     return fx.to_llvm_ptr(fx.inttoptr(pt, addr))
-
-
-def _lds_bf16_ptr_type():
-    return fx.PointerType.get(elem_ty=fx.BFloat16.ir_type, address_space=fx.AddressSpace.Shared, alignment=16)
 
 
 def _tdm_cfg(w, row_elems):
