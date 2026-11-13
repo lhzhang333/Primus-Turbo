@@ -173,6 +173,7 @@ def _grads(monkeypatch, problem, ds_plan):
         pytest.param((1, 768, 832, 4), id="s768_skv832_tail64"),
         pytest.param((1, 1024, 1024, 40), id="s1024_h40_head_groups"),
         pytest.param((1, 4096, 4096, 16), id="s4096_h16"),
+        pytest.param((1, 4096, 4096, 256), id="dsv3_b2_folded"),
     ],
 )
 def test_ds_plan_equals_recompute_plan(monkeypatch, dims):

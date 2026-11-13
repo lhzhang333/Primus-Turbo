@@ -608,6 +608,38 @@ def test_torch_compile_fullgraph():
 
 
 @needs_gfx1250
+@pytest.mark.parametrize(
+    "dims",
+    [
+        pytest.param((1, 4096, 4096, 32), id="two_blocks_per_cu"),
+        pytest.param((1, 4096, 4096, 256), id="dsv3_b2_folded"),
+        pytest.param((2, 8192, 8192, 16), id="b2_two_q_groups"),
+    ],
+)
+def test_persistent_forward_equals_one_block_per_workgroup(monkeypatch, dims):
+    """The persistent forward (at most one workgroup per CU, taking q blocks from ticket counters and staging the next
+    block during the current one) gives the bits of one workgroup per q block. NaN-filled outputs expose a block no
+    workgroup took."""
+    from primus_turbo.flydsl.attention.gfx1250_mla import fwd
+
+    b, sq, skv, h = dims
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v = (
+        torch.randn(b, s, h, d, device="cuda", generator=g).to(torch.bfloat16)
+        for s, d in ((sq, D_QK), (skv, D_QK), (skv, D_V))
+    )
+    assert fwd.persist_mode(q, k)[1], "not a persistent shape"
+    with _nan_filled_outputs():
+        got = fwd.flash_attn_mla_fwd(q, k, v, MLA_SCALE)
+        monkeypatch.setattr(fwd, "PERSIST", False)
+        ref = fwd.flash_attn_mla_fwd(q, k, v, MLA_SCALE)
+    torch.cuda.synchronize()
+    for name, x, r in zip(("out", "lse"), got, ref):
+        assert torch.isfinite(x).all(), name
+        assert torch.equal(x, r), name
+
+
+@needs_gfx1250
 def test_persistent_forward_under_cuda_graphs():
     """Two graphs captured on torch's shared capture stream, the second replayed first: every captured launch of the
     persistent forward has its own ticket counters, zero-filled by its graph, so both replays give the eager bits and
