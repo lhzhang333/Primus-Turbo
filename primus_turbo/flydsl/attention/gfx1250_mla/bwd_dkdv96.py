@@ -246,13 +246,13 @@ def _row_off(kt, nqp, m, causal):
     return kt * nqp - _skip(kt, m, causal)
 
 
-def ds_layout_bytes(b, sq, skv, h, causal=True):
-    """Bytes of the dS^T scratch (dslayout v2) of a [b, sq, h] x [b, skv, h] problem (host integers)."""
-    nqp, nkt, m = sq // 32, skv // 16, (skv - sq) // 32
+def ds_blocks_per_head(sq, skv, causal=True):
+    """DSL_BLK_B blocks of one (batch, q head) region of the dS^T scratch (host integers, skv >= sq)."""
+    nqp, nkt, m = sq // DSL_Q, skv // DSL_KV, (skv - sq) // DSL_Q
     # under the mask, kv16 row k >= 2m (seqlen_kv >= seqlen_q: m >= 0) skips its first k // 2 - m q pairs
     r = max(nkt - 2 * m, 0)
     skip = (r // 2) * (r // 2 - 1) + (r % 2) * (r // 2) if causal else 0
-    return b * h * (nkt * nqp - skip) * DSL_BLK_B
+    return nkt * nqp - skip
 
 
 # ------------------------------------------------------------------------------------------------------ kernel
@@ -967,14 +967,6 @@ launch_dkdv96ds.compile_hints["waves_per_eu"] = 1
 
 
 # ------------------------------------------------------------------------------------------------------- host
-def head_group(nh):
-    """Heads per grid group: nh when nh <= HEAD_GROUP, else the largest multiple of 8 (one head's workgroups on
-    one XCD) that divides nh and is at most HEAD_GROUP, else nh."""
-    if nh <= HEAD_GROUP:
-        return nh
-    return next((d for d in range(HEAD_GROUP, 7, -8) if nh % d == 0), nh)
-
-
 def nblk96(skv):
     """kv blocks: 96-row ones, then one 64-row tail for skv % 96 == 64 or two for 32 (the last 128 rows)."""
     return -(-skv // ROWS3)

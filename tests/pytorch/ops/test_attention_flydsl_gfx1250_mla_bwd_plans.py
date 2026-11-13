@@ -112,7 +112,7 @@ def test_ds_plan_allocates_its_scratch_last(monkeypatch):
     for owner, name in ((torch, "empty"), (torch, "empty_like"), (torch.Tensor, "new_empty")):
         monkeypatch.setattr(owner, name, record(getattr(owner, name)))
     bwd._ds_launches(out, q, k, v, out, lse, MLA_SCALE, True, None)
-    scratch = bwd._d.ds_layout_bytes(b, sq, skv, h) // 2
+    scratch = bwd.ds_scratch_bytes(b, sq, skv, h) // 2
     assert sizes[-1] == scratch and sizes.count(scratch) == 1, sizes
 
 
@@ -202,7 +202,7 @@ def test_scratch_oom_runs_the_recompute_plan(monkeypatch):
     bwd = _bwd()
     problem = _problem(1, 384, 384, 2, seed=5)
     ref = _grads(monkeypatch, problem, False)
-    nbytes = bwd._d.ds_layout_bytes(1, 384, 384, 2, 1)
+    nbytes = bwd.ds_scratch_bytes(1, 384, 384, 2)
     tried = []
     real_empty = torch.empty
 

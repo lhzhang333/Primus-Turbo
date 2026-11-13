@@ -15,7 +15,7 @@
 
 dS is the scratch the dK / dV kernel writes (bf16, softmax scale included, packed causal), in the layout of
 ``csrc/kernels/attention/hipkittens/gfx1250_mla/include/dslayout.h`` (version 2):
-  * one region per (batch, q head) bh = bat * Hq + qh, regions back to back, ``ds_blocks_per_head`` blocks each;
+  * one region per (batch, q head) bh = bat * Hq + qh, regions back to back, ``bwd_dkdv96.ds_blocks_per_head`` blocks each;
   * inside a region the kv16 rows kt = 0 .. Skv / 16 - 1 in order; row kt holds the q pairs (32 queries)
     qp = qp_first(kt) .. Sq / 32 - 1, qp_first(kt) = causal ? max(0, kt // 2 - (Skv - Sq) // 32) : 0;
   * a block is a [16 kv][32 q] bf16 tile, 1 KiB: chunk (kv, c) = queries [8 c, 8 c + 8) of kv row kv at block byte
@@ -136,26 +136,6 @@ def _c32(v):
 
 def _ir(v):
     return fx.as_ir_value(v)
-
-
-# ------------------------------------------------------------------------------------------- host-side layout
-def _ds_tri(k):
-    p = k // 2
-    return p * (p - 1) + (k % 2) * p
-
-
-def _ds_skip(k, cshift, causal):
-    m = cshift // 32
-    if not causal or k <= 0:
-        return 0
-    if m <= 0:
-        return _ds_tri(k) - m * k
-    return _ds_tri(k - 2 * m) if k > 2 * m else 0
-
-
-def ds_blocks_per_head(sq, skv, causal):
-    """dslayout v2 blocks of one (batch, q head) region."""
-    return (skv // 16) * (sq // 32) - _ds_skip(skv // 16, skv - sq, causal)
 
 
 # ------------------------------------------------------------------------------------------- device helpers
@@ -675,16 +655,8 @@ launch_dqds.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": Tr
 
 
 # ------------------------------------------------------------------------------------------------ host entry
-_HEAD_GROUP = 32
+HEAD_GROUP = 32  # head-group target of the grid (bwd._head_group)
 _MAX_BH_S = 512 * 4096  # largest batch * heads * seqlen the 32-bit offsets are checked for
-
-
-def head_group(nh):
-    """Heads per grid group: nh when nh <= 32, else the largest multiple of 8 (one head's workgroups on one XCD)
-    that divides nh and is at most 32, else nh."""
-    if nh <= _HEAD_GROUP:
-        return nh
-    return next((d for d in range(_HEAD_GROUP, 7, -8) if nh % d == 0), nh)
 
 
 def dq_split(sq):

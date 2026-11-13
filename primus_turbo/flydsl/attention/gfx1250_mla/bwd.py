@@ -41,8 +41,9 @@ _NUM_CU = 256  # MI455X
 # (k_dkdv; one k_dqg over all queries): on small grids two-wave workgroups only crowd fewer CUs.
 # Tests patch this table to force either launch set.
 SMALL_GRID_WAVES = {"dkdv": 4 * _NUM_CU, "dq": 8 * _NUM_CU}
-# Heads per grid row of the head-grouped launches: fewer heads per row keep more tiles of one head
-# in flight, so a Q/dO or K/V tile fetched by one workgroup is more often still in L2 for the next.
+# Heads per grid row of the recompute plan's head-grouped launches (the dS plan's kernels keep their own
+# HEAD_GROUP): fewer heads per row keep more tiles of one head in flight, so a Q/dO or K/V tile fetched by
+# one workgroup is more often still in L2 for the next.
 _HEAD_GROUP = 64
 _DQ_SPLITS = (0, 32, 64)  # one of these leaves a multiple of 96 queries for any Sq % 32 == 0
 
@@ -76,15 +77,12 @@ def shape_unsupported_reason(batch: int, seqlen_q: int, seqlen_kv: int, num_head
     return None
 
 
-def _head_group(nh):
-    """Heads per grid row: nh up to _HEAD_GROUP, else the largest multiple of 8 (one XCD per head
-    under round-robin dispatch) that divides nh and is at most _HEAD_GROUP, else nh."""
-    if nh <= _HEAD_GROUP:
+def _head_group(nh, target):
+    """Heads per grid row: nh up to ``target``, else the largest multiple of 8 (one XCD per head under
+    round-robin dispatch) that divides nh and is at most ``target``, else nh."""
+    if nh <= target:
         return nh
-    for d in range(_HEAD_GROUP, 0, -8):
-        if nh % d == 0:
-            return d
-    return nh
+    return next((d for d in range(target, 7, -8) if nh % d == 0), nh)
 
 
 def _dq_split(sq):
@@ -116,7 +114,7 @@ def _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
     """The recompute plan's (launcher, args) in issue order, and the (dq, dk, dv) they write."""
     b, sq, h, _ = q.shape
     skv = k.shape[1]
-    hg = _head_group(h)
+    hg = _head_group(h, _HEAD_GROUP)
     ngz = b * h // hg
     scale = float(softmax_scale)
     c = int(bool(causal))
@@ -142,6 +140,11 @@ def _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
     return launches, (dq, dk, dv)
 
 
+def ds_scratch_bytes(batch: int, seqlen_q: int, seqlen_kv: int, num_heads: int, causal: bool = True) -> int:
+    """Bytes of the dS plan's scratch for these MHA sizes."""
+    return batch * num_heads * _d.ds_blocks_per_head(seqlen_q, seqlen_kv, causal) * _d.DSL_BLK_B
+
+
 def ds_plan_unsupported_reason(batch: int, seqlen_q: int, seqlen_kv: int, num_heads: int) -> Optional[str]:
     """Why the dS plan cannot take these MHA sizes (the recompute plan then runs), or None."""
     reason = _d.unsupported_reason(batch, seqlen_q, seqlen_kv, num_heads, num_heads)
@@ -154,7 +157,7 @@ def _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
     b, sq, h, _ = q.shape
     skv = k.shape[1]
     c = int(bool(causal))
-    nbytes = _d.ds_layout_bytes(b, sq, skv, h, c)
+    nbytes = ds_scratch_bytes(b, sq, skv, h, c)
     if nbytes >= _DS_OOM_BYTES.get(q.device, math.inf):
         return None
     # The scratch is the last allocation: when it fits, the plan fits (the recompute plan needs the other buffers too).
@@ -170,14 +173,14 @@ def _ds_launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
         )
         return None
     scale = float(softmax_scale)
-    hg_kv, hg_q = _d.head_group(h), _q.head_group(h)
+    hg_kv, hg_q = _head_group(h, _d.HEAD_GROUP), _head_group(h, _q.HEAD_GROUP)
     q_off, nhead, ntile = _q.dq_split(sq)
     # Hq, Hkv, G = h, h, 1: MHA. The kernels take only the scratch's base address: k_dkdv96ds gets a [blocks, 512]
     # view (FlyDSL packs tensor sizes as int32), k_dqds the address itself.
     dkdv = (q, k, v, dout, nl, nd, dv, dk, ds.view(-1, 512), scale, sq, skv, h, h, 1, sq // 16, skv - sq)
     dkdv += (c, b, hg_kv, 1, _d.nblk96(skv), b * h // hg_kv, stream)  # ds_mode 1: the dS^T stores on
     dqa = (ds.data_ptr(), k, dq, sq, skv, h, h, 1, skv // _q.KV32, skv - sq, c, q_off, ntile, hg_q)
-    dqa += (_q.ds_blocks_per_head(sq, skv, c), b * sq * h * _k.D_QK * 2, ntile + nhead, b * h // hg_q, stream)
+    dqa += (_d.ds_blocks_per_head(sq, skv, c), b * sq * h * _k.D_QK * 2, ntile + nhead, b * h // hg_q, stream)
     launches = [
         _delta_launch(dout, out, lse, delta, nl, nd, scale, stream),
         (_d.launch_dkdv96ds, dkdv),
