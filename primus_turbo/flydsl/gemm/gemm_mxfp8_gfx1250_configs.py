@@ -137,14 +137,15 @@ def pick_grouped_config(mode: int, M: int, N: int, K: int, b_preshuffled: bool =
                         bf16_out: bool = True) -> MXGemmConfig:
     """Routed experts. ``mode`` 1 (grouped-M fwd / dgrad: M = rows per expert, multicast along N only) or 2
     (variable-K wgrad: K = tokens per expert). In-job A/B on the DSv3 experts, 32 x 2048 rows balanced and skewed
-    (scratch_mxd/results/kg3c_*.json, 11-12): grouped-M with K = 7168 (fc1 fwd, fc2 dgrad) runs best as the deep
-    kpair-1 pipeline (preshuffled B), the shorter K (fc1 dgrad 4096, fc2 fwd 2048) persistent (2-4%, skewed up to 9%);
+    (scratch_mxd/results/kg3c_*.json, 11-12; kg5_*.json, 11-13): grouped-M with a preshuffled B runs best as the deep
+    kpair-1 pipeline, K = 7168 (fc1 fwd, fc2 dgrad) and the shorter K too (fc1 dgrad 4096: 0.913 / 0.921 balanced /
+    skewed, fc2 fwd 2048: 0.923 / 0.952 vs persistent nb2 kp2 c1x4; below K 2048 unmeasured, persistent kept);
     variable-K into a bf16 main_grad persistent (6-10%: the next tile loads while a tile stores) with the old C's first
     rows fetched during the previous tile's epilogue (c_pre: 2.5-3.2% balanced, 2-8% skewed; 11-13
     results/kw1_vk_*.json), c2x2 except for a narrow N into bf16 (fc2 wgrad, N = 2048: c1x1, 8% faster skewed; fp32
     out is not persistent, where c2x2 stays 8% faster)."""
     if mode == 1:
-        if b_preshuffled and K > 4096:
+        if b_preshuffled and K >= 2048:
             return MXGemmConfig(256, 256, 4, 1, 1, 4)
         return MXGemmConfig(256, 256, 2, 2, 1, 4, persist=True)
     c = 1 if N <= 2048 and bf16_out else 2
