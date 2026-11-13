@@ -42,7 +42,8 @@ per slot, cluster multicast of the shared tiles. Changes: row-major A (and B whe
 mx32 scales, M / N / K tails by TDM out-of-bounds zero fill (no padding of the data; a half last K step loads half
 rows), an LDS-staged epilogue with 16-byte buffer stores (no TDM store: the suspect of the grouped kernel's rare silent
 error). No branch skips the TDM pipeline inside a tile; a grouped-M tile past the experts' ends its workgroup at once
-(whole clusters: a cluster never mixes experts).
+(whole clusters). A grouped-M cluster along M (non-persistent) whose m tiles straddle two experts (or the end) loads B
+per workgroup instead of multicasting it; its dead workgroups run the K loop (the cluster barriers), storing nothing.
 """
 
 from __future__ import annotations
@@ -290,9 +291,10 @@ def _launch_gemm_mxfp8(
                 acc = acc + fx.Int32(rocdl.readlane(T.i32, incl, 31))
             return chunks, acc
 
-        def _decode_gm(tab, t, blk_n):
+        def _decode_gm(tab, t, blk_n, pair=False):
             """grouped-M: m tile t of the experts' tiles in order; a tile past them is dead (no rows, no B). A ballot
-            of the expert whose tiles hold t, its entries by readlane (no load)."""
+            of the expert whose tiles hold t, its entries by readlane (no load). ``pair`` (cluster_m > 1): also
+            whether the cluster's m tiles t - t % cluster_m ... all belong to t's expert (they share its B)."""
             chunks, acc = tab
             first, len_g, in0, out0, expert = zero, zero, zero, zero, zero
             for ch, (excl, n_g, ln, p0, o0) in enumerate(chunks):
@@ -310,8 +312,14 @@ def _launch_gemm_mxfp8(
             m_valid = (rows < tile_m).select(rows, fx.Int32(tile_m))
             m_valid = (t < acc).select(m_valid, zero)
             n_valid = (t < acc).select(i32_n - blk_n, zero)
-            supers = (t < acc).select((i32_k + (SUPER_K - 1)) // SUPER_K, fx.Int32(1))
-            return in0 + local, out0 + local, m_valid, blk_n, n_valid, expert, zero, i32_k, supers
+            supers = (i32_k + (SUPER_K - 1)) // SUPER_K
+            if const_expr(cluster_m == 1):  # (else a dead tile of a live cluster runs the K loop: cluster barriers)
+                supers = (t < acc).select(supers, fx.Int32(1))
+            dec = (in0 + local, out0 + local, m_valid, blk_n, n_valid, expert, zero, i32_k, supers)
+            if const_expr(pair):
+                t0 = t // cluster_m * cluster_m
+                return dec, (t0 >= first) & ((t0 + (cluster_m - 1) - first) * tile_m < len_g)
+            return dec
 
         if const_expr(mode == DENSE and not persist):
             blk_n = fx.Int32(bid_y) * tile_n
@@ -329,10 +337,14 @@ def _launch_gemm_mxfp8(
             t = fx.Int32(bid_z) * fx.Int32(fx.grid_dim.x) + t_x
             gm_tab = _gm_table()
             acc = gm_tab[1]
-            dec = _decode_gm(gm_tab, t, fx.Int32(bid_y) * tile_n)
+            if const_expr(cluster_m > 1):  # (consecutive m tiles: grid.x is a multiple of cluster_m)
+                dec, gm_same = _decode_gm(gm_tab, t, fx.Int32(bid_y) * tile_n, pair=True)
+                t_end = t // cluster_m * cluster_m
+            else:
+                dec, t_end = _decode_gm(gm_tab, t, fx.Int32(bid_y) * tile_n), t
             # a tile past the experts' (the grid is an upper bound) ends its workgroup here: uniform, and a cluster
-            # (along N) shares the m tile, so whole clusters end
-            _llvm.inline_asm(None, [as_ir_value(t), as_ir_value(acc)],
+            # (along N) shares the m tile, so whole clusters end (along M: when its first m tile is past them)
+            _llvm.inline_asm(None, [as_ir_value(t_end), as_ir_value(acc)],
                              "s_cmp_lt_u32 $0, $1\n\ts_cbranch_scc1 1f\n\ts_endpgm\n\t1:", "s,s,~{scc},~{memory}",
                              has_side_effects=True)
         elif const_expr(mode == VARIABLE_K and not persist):
@@ -344,6 +356,8 @@ def _launch_gemm_mxfp8(
             # flat id in the cluster = x + y * cluster_m; A is shared along y (same M tile), B along x
             a_mask = fx.Int32(sum(1 << (y * cluster_m) for y in range(cluster_n))) << lx
             b_mask = fx.Int32((1 << cluster_m) - 1) << (ly * cluster_m)
+            if const_expr(mode == GROUPED_M and cluster_m > 1):  # m tiles of two experts: B per workgroup
+                b_mask = gm_same.select(b_mask, zero)
 
         arena = fx.SharedAllocator(static=False)
         arena.allocate(ARENA)
@@ -972,8 +986,15 @@ def _num_cus() -> int:
 def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1) -> tuple:
     """The constexpr tail of ``_launch_gemm_mxfp8`` (and the compiled-kernel key) of a call. A cluster must tile the
     grid exactly (a workgroup wholly past M or N would sit in a multicast group): it shrinks to what the tiles
-    divide; grouped-M m tiles belong to different experts, so it multicasts A along N only."""
-    cm = 1 if mode == GROUPED_M else _divisor_cluster((M + cfg.tile_m - 1) // cfg.tile_m, cfg.cluster_m)
+    divide; grouped-M m tiles belong to different experts: along M only non-persistent (the kernel multicasts B where
+    the cluster's m tiles share an expert). ``persist`` needs 2 slots of kpair 2 (the next tile loads into the free
+    one): a config asking for it otherwise is an error (fp32 out / beta = 1 without the early C fall back quietly)."""
+    if cfg.persist and not (cfg.num_buffers == 2 and c_early_fits(cfg)):
+        raise ValueError(f"persist=True needs num_buffers 2 and kpair 2, got {tuple(cfg)}")
+    if mode == GROUPED_M:
+        cm = 1 if _sw(PERSIST_ON, cfg.persist) else cfg.cluster_m
+    else:
+        cm = _divisor_cluster((M + cfg.tile_m - 1) // cfg.tile_m, cfg.cluster_m)
     cn = _divisor_cluster((N + cfg.tile_n - 1) // cfg.tile_n, cfg.cluster_n)
     c_early = C_EARLY_ON and beta1 and not out_f32 and N % cfg.tile_n == 0 and \
         c_early_fits(cfg._replace(cluster_m=cm, cluster_n=cn))
@@ -986,7 +1007,8 @@ def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1
         c_pre = min(free // (cfg.tile_n * 2 + C_PAD_B) // 16 * 16, cfg.tile_m // 2)
     return (cfg.tile_m, cfg.tile_n, cfg.num_buffers, cfg.kpair, cm, cn, bool(packed), bool(b_preshuffled),
             bool(k_tail), mode, G, bool(out_f32), bool(beta1), bool(c_early), bool(persist),
-            bool(_sw(XCD_REMAP_ON, cfg.xcd_remap) and mode == GROUPED_M and not persist), int(_sw(STAGGER_ON, cfg.stagger)),
+            bool(_sw(XCD_REMAP_ON, cfg.xcd_remap) and mode == GROUPED_M and not persist and cm == 1),
+            int(_sw(STAGGER_ON, cfg.stagger)),
             _num_cus() if persist else 0, c_pre)
 
 
