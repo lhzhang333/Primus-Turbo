@@ -14,7 +14,9 @@ class MXGemmConfig(NamedTuple):
     A (along N) and B (along M) tiles; 1x1 is the no-multicast config. ``scale_4d`` / ``b_preshuffle`` describe the
     inputs (the entry point sets them from the scale tensors' rank and its ``b_preshuffled`` flag). ``persist``:
     persistent workgroups (bf16 out, kpair 2 x 2 slots; the next tile loads during the stores); ``stagger``: the (first wave of) workgroups start in that many phases; ``xcd_remap``: grouped-M m tiles
-    grouped per XCD. The three are dropped where they do not apply."""
+    grouped per XCD; ``c_pre`` (persistent beta = 1 into bf16 with the early old-C fetch): the old C's first rows (as
+    many as the LDS past the slots holds, 80 at 256x256) come during the previous tile's epilogue, only the rest
+    during the last K step. They are dropped where they do not apply."""
 
     tile_m: int = 256
     tile_n: int = 256
@@ -27,6 +29,7 @@ class MXGemmConfig(NamedTuple):
     persist: bool = False
     stagger: int = 0
     xcd_remap: bool = False
+    c_pre: bool = False
 
 
 DEFAULT = MXGemmConfig()
@@ -99,14 +102,19 @@ def pick_config(M: int, N: int, K: int, b_preshuffled: bool = False, num_cus: in
     return MXGemmConfig(128, 128, 2, 2, 1, 1)
 
 
-def pick_grouped_config(mode: int, M: int, N: int, K: int, b_preshuffled: bool = True) -> MXGemmConfig:
+def pick_grouped_config(mode: int, M: int, N: int, K: int, b_preshuffled: bool = True,
+                        bf16_out: bool = True) -> MXGemmConfig:
     """Routed experts. ``mode`` 1 (grouped-M fwd / dgrad: M = rows per expert, multicast along N only) or 2
     (variable-K wgrad: K = tokens per expert). In-job A/B on the DSv3 experts, 32 x 2048 rows balanced and skewed
     (scratch_mxd/results/kg3c_*.json, 11-12): grouped-M with K = 7168 (fc1 fwd, fc2 dgrad) runs best as the deep
     kpair-1 pipeline (preshuffled B), the shorter K (fc1 dgrad 4096, fc2 fwd 2048) persistent (2-4%, skewed up to 9%);
-    variable-K into a bf16 main_grad persistent (6-10%: the next tile loads while a tile stores)."""
+    variable-K into a bf16 main_grad persistent (6-10%: the next tile loads while a tile stores) with the old C's first
+    rows fetched during the previous tile's epilogue (c_pre: 2.5-3.2% balanced, 2-8% skewed; 11-13
+    results/kw1_vk_*.json), c2x2 except for a narrow N into bf16 (fc2 wgrad, N = 2048: c1x1, 8% faster skewed; fp32
+    out is not persistent, where c2x2 stays 8% faster)."""
     if mode == 1:
         if b_preshuffled and K > 4096:
             return MXGemmConfig(256, 256, 4, 1, 1, 4)
         return MXGemmConfig(256, 256, 2, 2, 1, 4, persist=True)
-    return MXGemmConfig(256, 256, 2, 2, 2, 2, persist=True)
+    c = 1 if N <= 2048 and bf16_out else 2
+    return MXGemmConfig(256, 256, 2, 2, c, c, persist=True, c_pre=True)
