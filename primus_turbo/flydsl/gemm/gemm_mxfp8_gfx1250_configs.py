@@ -87,9 +87,33 @@ _TABLE_BSH: dict = {
 }
 
 
-def pick_config(M: int, N: int, K: int, b_preshuffled: bool = False, num_cus: int = 256) -> MXGemmConfig:
+# beta = 1 into a bf16 out (a wgrad fused into main_grad): (M, N, K) -> config. The kpair-1 entries above have no early
+# old-C fetch there (their epilogue reads it at the stores, ~1.4x slower); in-job A/B of the 21 dense GEMMs as the op
+# layer runs them (scratch_mxd/results/kd21_p.json, 11-13: the pick first, 2 rounds).
+_TABLE_ACC: dict = {
+    (1536, 7168, 8192): C(256, 256, 2, 2, 2, 2, persist=True, c_pre=True),  # q_down wgrad 45.3 us (kpair 1: 63.4)
+    (24576, 1536, 8192): C(256, 256, 2, 2, 1, 4, persist=True, c_pre=True),  # q_up wgrad 122.2 (182.2)
+    (7168, 16384, 8192): C(256, 256, 2, 2, 2, 2, persist=True, c_pre=True),  # o_proj wgrad 305.9 (c4x1: 313.5)
+    (7168, 2048, 8192): C(256, 256, 2, 2, 2, 2, persist=True, c_pre=True),  # shared fc2 wgrad 47.2 (kpair 1: 67.0)
+}
+
+
+def pick_config(M: int, N: int, K: int, b_preshuffled: bool = False, num_cus: int = 256,
+                beta1: bool = False) -> MXGemmConfig:
     """The measured config of (M, N, K), else by grid fill: 256x256 while it gives at least ~3/4 of a wave, then
-    128x256, then 128x128 (two workgroups per CU). The entry point shrinks the cluster to what the grid divides."""
+    128x256, then 128x128 (two workgroups per CU). The entry point shrinks the cluster to what the grid divides.
+    ``beta1``: accumulating into a bf16 out (the old C fetched early wants kpair 2: a kpair-1 pick becomes the
+    persistent c2x2 with c_pre)."""
+    cfg = beta1 and _TABLE_ACC.get((M, N, K))
+    if cfg:
+        return cfg
+    cfg = _pick(M, N, K, b_preshuffled, num_cus)
+    if beta1 and cfg.kpair == 1:
+        return MXGemmConfig(256, 256, 2, 2, 2, 2, persist=True, c_pre=True)
+    return cfg
+
+
+def _pick(M: int, N: int, K: int, b_preshuffled: bool, num_cus: int) -> MXGemmConfig:
     cfg = (b_preshuffled and _TABLE_BSH.get((M, N, K))) or _TABLE.get((M, N, K))
     if cfg is not None:
         return cfg

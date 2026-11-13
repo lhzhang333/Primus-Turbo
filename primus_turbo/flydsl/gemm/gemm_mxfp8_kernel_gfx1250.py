@@ -1141,7 +1141,7 @@ def gemm_mxfp8_gfx1250(
         return out
     if K == 0:
         return out if accumulate else out.zero_()
-    cfg = config or pick_config(M, N, K, b_preshuffled)
+    cfg = config or pick_config(M, N, K, b_preshuffled, beta1=accumulate and out.dtype == torch.bfloat16)
     packed, ldsa, ldsb = _check_scales(a_scale, b_scale, M, N, K, "gemm_mxfp8_gfx1250")
     cfg, slack = _tail_safe(cfg, K, (a, b, a_scale, b_scale), b_preshuffled, packed, "gemm_mxfp8_gfx1250")
     k_tail = K % (WMMA_K * cfg.kpair) != 0
