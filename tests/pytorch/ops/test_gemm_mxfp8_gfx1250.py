@@ -4,21 +4,26 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""The gfx1250 MXFP8 GEMMs (``primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250``) against the recipe reference:
-dense, grouped-M and variable-K, bitwise on integer-valued operands (exact in fp32) for every config, M / N / K tails
-and ragged / empty experts (outputs pre-filled with NaN, so a missed or stray store shows); fp32 out and beta = 1
-(``out = round(out + fp32 result)``, with and without the early old-C fetch); SNR on random data; determinism; and
-operands that end exactly on a 2 MiB allocation boundary (K tails must not read past them)."""
+"""The gfx1250 MXFP8 GEMMs (``primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250``) against the recipe reference,
+bitwise on integer-valued operands (exact in fp32): dense, grouped-M and variable-K; each config feature once (tile
+shapes, pipeline depths, multicast clusters, packed / raw scales, preshuffled / row-major B, M / N / K tails, fp32
+out, beta = 1 with and without the early old-C fetch, persistent workgroups), the entry points' default configs
+(``config=None``: the production paths), operands without storage slack, SNR on random data and determinism.
+Outputs sit between NaN guard rows: a missed store leaves NaN, a stray one past ``out`` hits a guard."""
+
+import math
 
 import pytest
 import torch
 
+from primus_turbo.flydsl.gemm.gemm_mxfp8_gfx1250_configs import MXGemmConfig as C
 from primus_turbo.pytorch.core.utils import is_gfx1250
 from tests.pytorch.ref.mxfp8_ref import (
     PAD_SCALE,
     gemm_ref,
     int_valued_operands,
     pack_scales,
+    preshuffle_b16,
     quant_rows,
     snr_db,
 )
@@ -27,314 +32,320 @@ pytestmark = pytest.mark.skipif(not is_gfx1250(), reason="gfx1250 kernel")
 
 if is_gfx1250():
     import primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 as KM
-    from primus_turbo.flydsl.gemm.gemm_mxfp8_gfx1250_configs import MXGemmConfig as C
     from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 import (
         gemm_mxfp8_gfx1250,
         grouped_gemm_mxfp8_gfx1250,
         grouped_gemm_mxfp8_variable_k_gfx1250,
     )
 
-    # 7th / 8th fields: scales passed packed (the fast layout) or raw; B passed 16x16-preshuffled
-    CONFIGS = [
-        C(256, 256, 2, 2, 1, 1, True),
-        C(256, 256, 2, 2, 1, 4, True),
-        C(256, 256, 2, 2, 2, 2, True),
-        C(256, 256, 4, 1, 1, 1, True),
-        C(256, 256, 3, 1, 1, 2, True),
-        C(128, 256, 3, 2, 1, 4, True),
-        C(256, 128, 4, 1, 4, 1, True),
-        C(128, 128, 4, 2, 1, 1, True),
-        C(256, 256, 2, 2, 1, 4),
-        C(128, 128, 4, 1, 1, 1),
-        C(256, 256, 4, 1, 2, 2, True, True),
-        C(128, 256, 3, 2, 1, 4, True, True),
-    ]
-else:
-    CONFIGS = [None]
-
 DEV = "cuda"
+BF16, F32 = torch.bfloat16, torch.float32
+
+# The production configs (gemm_mxfp8_gfx1250_configs) that tests below run by name
+DEFAULT = C(256, 256, 2, 2, 2, 2)  # the dense default
+KP1_C2X4 = C(256, 256, 4, 1, 2, 4)  # dense o_proj fwd; the routed experts' grouped-M (c2x4)
+KP1_C4X4 = C(256, 256, 4, 1, 4, 4)  # dense o_proj dgrad
+PERSIST_C4X1 = C(256, 256, 2, 2, 4, 1, persist=True)  # dense q_up / kv_up fwd
 
 
 def _slack(t, extra=4096):
-    """``t`` in a storage with ``extra`` bytes after it: a partial last K step reads the last row up to a step past its
-    data (the MX quantizers allocate that slack); without it the kernels use kpair 1 or refuse K % 128 != 0."""
+    """``t`` in a storage with ``extra`` bytes after it (the MX quantizers allocate that slack after their outputs)."""
     n = t.numel() * t.element_size()
     v = torch.empty(n + extra, dtype=torch.uint8, device=t.device)[:n].view(t.dtype).view(t.shape)
     return v.copy_(t)
 
 
-def _shuf(b):
-    """The 16x16 preshuffle of the last two dims (``[.., N/16][K/16][16][16]``)."""
-    *lead, N, Kd = b.shape
-    return b.reshape(*lead, N // 16, 16, Kd // 16, 16).transpose(-3, -2).contiguous().reshape(b.shape)
-
-
 def _exact(t):
-    """``t`` in a fresh allocation of exactly its size (a multiple of 2 MiB >= 10 MiB: a segment of its own, so the
-    tensor ends where the mapping ends)."""
+    """``t`` in a fresh allocation of exactly its size. At 10 MiB or more that is a segment of its own, so the tensor
+    likely ends where the mapping does (best effort: the address range after it may still be mapped)."""
     torch.cuda.empty_cache()
     x = torch.empty(t.numel() * t.element_size(), dtype=torch.uint8, device=t.device).view(t.dtype).view(t.shape)
     return x.copy_(t)
 
 
-def _run(a, sa, b, sb, cfg, out=None):
-    sa, sb = (pack_scales(sa), pack_scales(sb)) if cfg.scale_4d else (_slack(sa), _slack(sb))
-    if cfg.b_preshuffle:
-        b = _shuf(b)
-    return gemm_mxfp8_gfx1250(_slack(a), sa, _slack(b), sb, out=out, config=cfg, b_preshuffled=cfg.b_preshuffle)
+def _guarded(shape, dtype, init=None):
+    """An output of ``shape`` between two NaN guard rows (of its last dim), NaN itself unless ``init`` is given:
+    (out, check), where check() asserts the guards are untouched."""
+    buf = torch.full((math.prod(shape[:-1]) + 2, shape[-1]), float("nan"), dtype=dtype, device=DEV)
+    out = buf[1:-1].view(shape)
+    if init is not None:
+        out.copy_(init)
+
+    def check():
+        assert torch.isnan(buf[0]).all() and torch.isnan(buf[-1]).all(), "a store past out"
+
+    return out, check
 
 
-@pytest.mark.parametrize("cfg", CONFIGS, ids=lambda c: "-".join(map(str, c)) if c else "none")
+def _dense(M, N, K, packed, bsh, seed):
+    """Integer-valued dense operands as the kernel takes them (with storage slack) and the exact result."""
+    a, sa, b, sb = int_valued_operands(M, N, K, seed=seed)
+    ref = gemm_ref(a, sa, b, sb).float()
+    sa, sb = (pack_scales(sa), pack_scales(sb)) if packed else (_slack(sa), _slack(sb))
+    return _slack(a), sa, _slack(preshuffle_b16(b) if bsh else b), sb, ref
+
+
+def _eq(out, ref):
+    torch.testing.assert_close(out, ref.to(out.dtype), rtol=0, atol=0)
+
+
+# (config, packed scales, preshuffled B, (M, N, K)): every tile shape, pipeline depth and cluster of the tables once
+DENSE_CASES = [
+    (C(256, 256, 2, 2, 1, 1), False, False, (300, 264, 576)),  # raw / row-major; M, N tails; a half last K step
+    (C(128, 128, 4, 1, 1, 1), False, False, (257, 136, 1008)),  # K % 32 != 0: the last scale block half data
+    (C(128, 256, 3, 2, 1, 4), True, True, (640, 1024, 2048)),
+    (C(256, 128, 4, 1, 4, 1), True, True, (1024, 512, 7168)),
+    (C(128, 128, 4, 2, 1, 1), True, True, (384, 512, 640)),  # a half last K step at kpair 2
+    (C(256, 256, 3, 1, 1, 2), True, False, (512, 1024, 1152)),  # row-major B at kpair 1
+    (KP1_C2X4, True, True, (1024, 1024, 2048)),
+    (KP1_C4X4, True, True, (1024, 2048, 1088)),  # a partial K step at kpair 1
+    (DEFAULT, True, True, (512, 1024, 1024)),
+]
+
+
+@pytest.mark.parametrize("cfg, packed, bsh, shape", DENSE_CASES, ids=lambda x: str(tuple(x)) if isinstance(x, tuple) else str(x))
+def test_gemm_mxfp8_int_exact(cfg, packed, bsh, shape):
+    M, N, K = shape
+    a, sa, b, sb, ref = _dense(M, N, K, packed, bsh, seed=M + N + K)
+    out, check = _guarded((M, N), BF16)
+    gemm_mxfp8_gfx1250(a, sa, b, sb, out=out, config=cfg, b_preshuffled=bsh)
+    _eq(out, ref)
+    check()
+
+
 @pytest.mark.parametrize(
-    "M, N, K",
-    [
-        (512, 1024, 1024),
-        (300, 264, 576),  # every tail: M, N past the tile, K = 4.5 WMMA steps
-        (257, 136, 1008),  # K not a multiple of 32: the last scale block is half data
-        (1024, 512, 7168),
-        (384, 512, 640),  # a half last K step at kpair 2
-    ],
+    "cfg, shape",
+    [(DEFAULT, (300, 512, 640)), (C(256, 256, 4, 1, 1, 4), (512, 1024, 1152))],
+    ids=["kpair2-early-C", "kpair1"],
 )
-def test_gemm_mxfp8_int_exact(cfg, M, N, K):
-    if cfg.b_preshuffle and N % 16:
-        pytest.skip("a preshuffled B needs N % 16 == 0")
-    a, sa, b, sb = int_valued_operands(M, N, K, seed=M + N + K)
-    out = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device=DEV)
-    _run(a, sa, b, sb, cfg, out)
-    torch.testing.assert_close(out, gemm_ref(a, sa, b, sb).to(torch.bfloat16), rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("cfg", [C(256, 256, 2, 2, 1, 1), C(256, 256, 2, 2, 2, 2), C(128, 256, 3, 2, 1, 1),
-                                 C(256, 256, 4, 1, 1, 4)] if is_gfx1250() else [None], ids=str)
-@pytest.mark.parametrize("M, N, K", [(512, 1024, 1152), (300, 512, 640), (256, 768, 2048)])
-@pytest.mark.parametrize("c_early", [True, False])
-def test_gemm_mxfp8_fp32_out_and_accumulate(cfg, M, N, K, c_early, monkeypatch):
-    """fp32 out == the exact result; beta = 1 into bf16 / fp32 == round(fp32 result + C), rounded once."""
-    monkeypatch.setattr(KM, "C_EARLY_ON", c_early)
-    a, sa, b, sb = int_valued_operands(M, N, K, seed=M + K)
-    ref = gemm_ref(a, sa, b, sb).float()
-    sa, sb, a, b = pack_scales(sa), pack_scales(sb), _slack(a), _slack(_shuf(b))
-    out = torch.full((M, N), float("nan"), device=DEV)
-    gemm_mxfp8_gfx1250(a, sa, b, sb, out_dtype=torch.float32, out=out, config=cfg, b_preshuffled=True)
-    torch.testing.assert_close(out, ref, rtol=0, atol=0)
-    for dt in (torch.bfloat16, torch.float32):
+def test_gemm_mxfp8_fp32_out_and_accumulate(cfg, shape):
+    """fp32 out == the exact result; beta = 1 into bf16 (kpair 2: the old C fetched during the last K step; kpair 1:
+    read at the stores) and into fp32 == round(fp32 result + C), rounded once."""
+    M, N, K = shape
+    a, sa, b, sb, ref = _dense(M, N, K, True, True, seed=M + K)
+    kinds = ((F32, False), (BF16, True)) if cfg.kpair == 2 else ((BF16, True), (F32, True))
+    for dt, acc in kinds:
         c0 = (torch.randn(M, N, device=DEV) * 64).to(dt)
-        out = c0.clone()
-        gemm_mxfp8_gfx1250(a, sa, b, sb, out_dtype=dt, out=out, config=cfg, b_preshuffled=True, accumulate=True)
-        torch.testing.assert_close(out, (ref + c0.float()).to(dt), rtol=0, atol=0)
+        out, check = _guarded((M, N), dt, c0 if acc else None)
+        gemm_mxfp8_gfx1250(a, sa, b, sb, out_dtype=dt, out=out, config=cfg, b_preshuffled=True, accumulate=acc)
+        _eq(out, (ref + c0.float()) if acc else ref)
+        check()
 
 
-@pytest.mark.parametrize("cfg", [C(256, 256, 2, 2, 1, 1), C(256, 256, 2, 2, 2, 2)] if is_gfx1250() else [None], ids=str)
-@pytest.mark.parametrize("c_pre", [False, True])
-def test_gemm_mxfp8_persistent(cfg, c_pre, monkeypatch):
-    """Persistent dense (272 tiles on <= 256 workgroups, a half last K step): bf16 out and beta = 1 into bf16 (c_pre:
-    the old C's first rows fetched during the previous tile's epilogue)."""
-    M, N, Kd = 4352, 4096, 640
-    a, sa, b, sb = int_valued_operands(M, N, Kd, seed=3)
-    ref = gemm_ref(a, sa, b, sb).float()
-    sa, sb, a, b = pack_scales(sa), pack_scales(sb), _slack(a), _slack(_shuf(b))
-    monkeypatch.setattr(KM, "PERSIST_ON", True)
-    monkeypatch.setattr(KM, "C_PRE_ON", c_pre)
-    out = torch.full((M, N), float("nan"), device=DEV, dtype=torch.bfloat16)
-    gemm_mxfp8_gfx1250(a, sa, b, sb, out=out, config=cfg, b_preshuffled=True)
-    torch.testing.assert_close(out, ref.to(torch.bfloat16), rtol=0, atol=0)
-    c0 = (torch.randn(M, N, device=DEV) * 64).to(torch.bfloat16)
-    out = c0.clone()
-    gemm_mxfp8_gfx1250(a, sa, b, sb, out=out, config=cfg, b_preshuffled=True, accumulate=True)
-    torch.testing.assert_close(out, (ref + c0.float()).to(torch.bfloat16), rtol=0, atol=0)
+def test_gemm_mxfp8_persistent():
+    """Persistent dense, M past 32 m tiles so both the head chunks and the short last chunk of the schedule run:
+    bf16 out on c4x1 (q_up / kv_up fwd), and the default config of beta = 1 into bf16 (a kpair-1 pick there becomes
+    the persistent c2x2 with c_pre: the old C's first rows fetched during the previous tile's epilogue)."""
+    M, N, K = 9216, 512, 640
+    a, sa, b, sb, ref = _dense(M, N, K, True, True, seed=3)
+    out, check = _guarded((M, N), BF16)
+    gemm_mxfp8_gfx1250(a, sa, b, sb, out=out, config=PERSIST_C4X1, b_preshuffled=True)
+    _eq(out, ref)
+    check()
+    M, N, K = 8704, 1536, 4096
+    a, sa, b, sb, ref = _dense(M, N, K, True, True, seed=4)
+    c0 = (torch.randn(M, N, device=DEV) * 64).to(BF16)
+    out, check = _guarded((M, N), BF16, c0)
+    gemm_mxfp8_gfx1250(a, sa, b, sb, out=out, b_preshuffled=True, accumulate=True)
+    _eq(out, ref + c0.float())
+    check()
 
 
 def test_gemm_mxfp8_random_snr():
-    M, N, K = 1024, 2048, 4096
+    M, N, K = 1024, 2048, 4224
     g = torch.Generator(device=DEV).manual_seed(5)
     a, sa = quant_rows(torch.randn(M, K, device=DEV, generator=g) * torch.logspace(-2, 2, K, device=DEV))
     b, sb = quant_rows(torch.randn(N, K, device=DEV, generator=g))
     ref = gemm_ref(a, sa, b, sb)
-    floor = snr_db(ref.to(torch.bfloat16), ref)  # the bf16 output rounding alone: ~55.6 dB
-    for cfg in (CONFIGS[1], CONFIGS[8], CONFIGS[10]):  # packed, raw, preshuffled B
-        # the WMMA accumulation error is invisible next to the bf16 output rounding
-        assert snr_db(_run(a, sa, b, sb, cfg), ref) > floor - 0.05
-    out = gemm_mxfp8_gfx1250(a, pack_scales(sa), b, pack_scales(sb), out_dtype=torch.float32)
+    floor = snr_db(ref.to(BF16), ref)  # the bf16 output rounding alone: ~55.6 dB
+    a, sa, b, sb = _slack(a), pack_scales(sa), _slack(preshuffle_b16(b)), pack_scales(sb)
+    # the WMMA accumulation error is invisible next to the bf16 output rounding
+    assert snr_db(gemm_mxfp8_gfx1250(a, sa, b, sb, config=KP1_C2X4, b_preshuffled=True), ref) > floor - 0.05
+    out = gemm_mxfp8_gfx1250(a, sa, b, sb, out_dtype=F32, config=DEFAULT, b_preshuffled=True)
     assert snr_db(out, ref) > 60
 
 
-def test_gemm_mxfp8_deterministic():
-    M, N, K = 1000, 2048, 7168
-    g = torch.Generator(device=DEV).manual_seed(7)
-    a, sa = quant_rows(torch.randn(M, K, device=DEV, generator=g))
-    b, sb = quant_rows(torch.randn(N, K, device=DEV, generator=g))
-    for cfg in (CONFIGS[1], CONFIGS[3], CONFIGS[10]):
-        first = _run(a, sa, b, sb, cfg).clone()
-        out = torch.empty_like(first)
-        same = 0
-        for _ in range(1000):
-            _run(a, sa, b, sb, cfg, out)
-            same += int(torch.equal(out, first))
-        assert same == 1000
-
-
-def _grouped_operands(lens, N, Kd, seed):
-    """A row copy padded to 32 rows per expert (zero rows, scale 127), b [G, N, K], int-valued."""
+def _grouped(lens, N, K, seed):
+    """A row copy padded to 32 rows per expert (zero rows, scale 127), b [G, N, K], int-valued; the exact result."""
     pads = [-(-n // 32) * 32 for n in lens]
-    a, sa, _, _ = int_valued_operands(max(sum(pads), 1), 16, Kd, seed=seed)
+    a, sa, _, _ = int_valued_operands(max(sum(pads), 1), 16, K, seed=seed)
     a, sa = a[: sum(pads)].clone(), sa[: sum(pads)].clone()
     offs = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), dtype=torch.int64, device=DEV)
     offs_p = torch.tensor([0] + torch.tensor(pads).cumsum(0).tolist(), dtype=torch.int64, device=DEV)
     for g, n in enumerate(lens):
-        a[int(offs_p[g]) + n: int(offs_p[g + 1])] = 0
-        sa[int(offs_p[g]) + n: int(offs_p[g + 1])] = 127
-    bb = [int_valued_operands(N, 16, Kd, seed=seed + 1 + g)[:2] for g in range(len(lens))]
+        a[int(offs_p[g]) + n : int(offs_p[g + 1])] = 0
+        sa[int(offs_p[g]) + n : int(offs_p[g + 1])] = 127
+    bb = [int_valued_operands(N, 16, K, seed=seed + 1 + g)[:2] for g in range(len(lens))]
     b, sb = torch.stack([x[0] for x in bb]), torch.stack([x[1] for x in bb])
     ref = torch.zeros(sum(lens), N, dtype=torch.float64, device=DEV)
     for g, n in enumerate(lens):
         r0, rp = int(offs[g]), int(offs_p[g])
-        ref[r0: r0 + n] = gemm_ref(a[rp: rp + n], sa[rp: rp + n], b[g], sb[g])
-    return a, sa, b, sb, offs, offs_p, ref
+        ref[r0 : r0 + n] = gemm_ref(a[rp : rp + n], sa[rp : rp + n], b[g], sb[g])
+    return a, sa, b, sb, offs, offs_p, ref.float()
 
 
-@pytest.mark.parametrize(
-    "lens, N, Kd, cfg",
-    [
-        ([100, 0, 300, 37], 512, 1024, C(256, 256, 2, 2, 1, 4)),
-        ([1, 513, 0, 0, 64, 255], 1024, 2048, C(256, 256, 4, 1, 1, 4)),
-        ([256] * 8, 768, 576, C(128, 256, 3, 2, 1, 2)),
-        ([77, 300, 0, 129], 512, 640, C(256, 256, 2, 2, 1, 2)),
-        ([(37 * i) % 300 for i in range(40)], 256, 1024, C(256, 256, 2, 2, 1, 1)),  # > 32 experts
-        ([(53 * i) % 900 for i in range(48)], 1024, 512, C(256, 256, 2, 2, 1, 4)),  # persistent: ~2 tiles each
-    ]
-    if is_gfx1250()
-    else [],
-)
-def test_grouped_gemm_mxfp8(lens, N, Kd, cfg, monkeypatch):
-    """Routed experts fwd / dgrad: skewed, empty and one-row experts, K tails; packed scales + preshuffled B and the
-    raw / row-major fallback; fp32 out; the XCD-grouped m tile order; persistent (+ staggered) workgroups."""
-    a, sa, b, sb, offs, offs_p, ref = _grouped_operands(lens, N, Kd, seed=len(lens) + Kd)
+# m tiles of 256 rows per expert: 1 3 0 0 1 1 3 (9). In 2x4 clusters (two consecutive m tiles share B): pairs that
+# straddle two experts load B per workgroup, (6, 7) shares expert 6's, and (8, 9) has a dead second tile.
+RAGGED = [1, 513, 0, 0, 64, 255, 700]
+
+
+def test_grouped_gemm_mxfp8():
+    """Routed experts fwd / dgrad with ragged, one-row and empty experts: the default config (the production c2x4),
+    the raw-scale / row-major-B fallback with fp32 out, and no expert with rows (out untouched)."""
+    N, K = 1024, 2048
+    a, sa, b, sb, offs, offs_p, ref = _grouped(RAGGED, N, K, seed=7)
+    m = sum(RAGGED)
+    sb4 = torch.stack([pack_scales(sb[g]) for g in range(len(RAGGED))])
+    out, check = _guarded((m, N), BF16)
+    grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(preshuffle_b16(b)), sb4, offs, offs_p, m, out=out)
+    _eq(out, ref)
+    check()
+    out, check = _guarded((m, N), F32)
+    grouped_gemm_mxfp8_gfx1250(
+        _slack(a), _slack(sa), _slack(b), _slack(sb), offs, offs_p, m, F32, out, C(256, 256, 2, 2, 1, 2), False
+    )
+    _eq(out, ref)
+    check()
+    zero = torch.zeros_like(offs)
+    out, check = _guarded((64, N), BF16)
+    grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(preshuffle_b16(b)), sb4, zero, zero, 64, out=out)
+    assert torch.isnan(out).all()
+    check()
+
+
+def test_grouped_gemm_mxfp8_many_experts():
+    """48 experts (two 32-lane lookup chunks), ~2 m tiles each, K below 2048: the default config is persistent
+    kpair 2 (a half last K step)."""
+    lens = [(53 * i) % 900 for i in range(48)]
+    N, K = 1024, 640
+    a, sa, b, sb, offs, offs_p, ref = _grouped(lens, N, K, seed=11)
     m = sum(lens)
     sb4 = torch.stack([pack_scales(sb[g]) for g in range(len(lens))])
-    for odt in (torch.bfloat16, torch.float32):
-        out = torch.full((m, N), float("nan"), device=DEV, dtype=odt)
-        grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(_shuf(b)), sb4, offs, offs_p, m, out_dtype=odt,
-                                   out=out, config=cfg)
-        torch.testing.assert_close(out, ref.to(odt), rtol=0, atol=0)
-    out = torch.full((m, N), float("nan"), device=DEV, dtype=torch.bfloat16)
-    grouped_gemm_mxfp8_gfx1250(_slack(a), _slack(sa), _slack(b), _slack(sb), offs, offs_p, m, out=out, config=cfg,
-                               b_preshuffled=False)
-    torch.testing.assert_close(out, ref.to(torch.bfloat16), rtol=0, atol=0)
-    monkeypatch.setattr(KM, "XCD_REMAP_ON", True)
-    out = torch.full((m, N), float("nan"), device=DEV, dtype=torch.bfloat16)
-    grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(_shuf(b)), sb4, offs, offs_p, m, out=out, config=cfg)
-    torch.testing.assert_close(out, ref.to(torch.bfloat16), rtol=0, atol=0)
-    monkeypatch.setattr(KM, "XCD_REMAP_ON", False)
-    if cfg.num_buffers == 2 and cfg.kpair == 2:
-        monkeypatch.setattr(KM, "PERSIST_ON", True)
-        for c, sg in ((cfg, 0), (cfg._replace(cluster_n=1), 8)):
-            monkeypatch.setattr(KM, "STAGGER_ON", sg)
-            out = torch.full((m, N), float("nan"), device=DEV, dtype=torch.bfloat16)
-            grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(_shuf(b)), sb4, offs, offs_p, m, out=out,
-                                       config=c)
-            torch.testing.assert_close(out, ref.to(torch.bfloat16), rtol=0, atol=0)
+    out, check = _guarded((m, N), BF16)
+    grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(preshuffle_b16(b)), sb4, offs, offs_p, m, out=out)
+    _eq(out, ref)
+    check()
 
 
-@pytest.mark.parametrize(
-    "lens, M, N, cfg",
-    [
-        ([130, 0, 256, 1], 512, 768, C(256, 256, 2, 2, 2, 2)),
-        ([0, 0], 256, 256, C(256, 256, 2, 2, 1, 1)),
-        ([300, 77, 0, 1000, 1], 320, 512, C(256, 256, 2, 2, 1, 1)),
-        ([2048, 128, 129, 640], 512, 768, C(128, 256, 3, 2, 1, 1)),
-        ([5, 384, 1], 256, 256, C(128, 128, 4, 2, 1, 1)),
-        ([2048, 2048], 256, 512, C(256, 256, 4, 1, 1, 2)),
-    ]
-    if is_gfx1250()
-    else [],
-)
-def test_grouped_gemm_mxfp8_variable_k(lens, M, N, cfg, monkeypatch):
-    """Routed experts wgrad over each expert's 128-padded tokens: empty experts (0, or out untouched with
-    ``accumulate``), odd counts of 128 (a half last K step), M tails; bf16 / fp32 out, beta = 1 with and without the
-    early old-C fetch."""
+def _vk(lens, M, N, seed):
+    """Variable-K operands over each expert's 128-padded tokens (padding: zero codes, PAD_SCALE for the 32-blocks
+    with no token), packed scales, a preshuffled b; the exact per-expert results [G, M, N] and the offsets."""
     pads = [-(-n // 128) * 128 for n in lens]
     T = max(sum(pads), 128)
-    a, sa, b, sb = int_valued_operands(M, N, T, seed=T + M)
-    offs = torch.tensor([0] + torch.tensor(pads).cumsum(0).tolist(), dtype=torch.int64, device=DEV)
-    for g, n in enumerate(lens):  # padding tokens: zero codes, PAD_SCALE for the blocks with no token
-        t0, t1 = int(offs[g]) + n, int(offs[g + 1])
-        a[:, t0:t1], b[:, t0:t1] = 0, 0
-        sa[:, -(-t0 // 32): t1 // 32], sb[:, -(-t0 // 32): t1 // 32] = PAD_SCALE, PAD_SCALE
-    o = [int(x) for x in offs]
-    ref = torch.stack(
-        [gemm_ref(a[:, o[g]: o[g + 1]], sa[:, o[g] // 32: o[g + 1] // 32], b[:, o[g]: o[g + 1]],
-                  sb[:, o[g] // 32: o[g + 1] // 32]) for g in range(len(lens))]
-    ).float()
-    sa, sb, b = pack_scales(sa), pack_scales(sb), _slack(_shuf(b))
-    for dt, acc, ce, pe in ((torch.bfloat16, False, True, False), (torch.float32, False, True, False),
-                            (torch.float32, True, True, False), (torch.bfloat16, True, True, False),
-                            (torch.bfloat16, True, False, False), (torch.bfloat16, True, True, True)):
-        monkeypatch.setattr(KM, "C_EARLY_ON", ce)
-        monkeypatch.setattr(KM, "PERSIST_ON", pe)
-        c0 = (torch.randn(len(lens), M, N, device=DEV) * 64).to(dt)
-        out = c0.clone() if acc else torch.full(c0.shape, float("nan"), device=DEV, dtype=dt)
-        grouped_gemm_mxfp8_variable_k_gfx1250(a, sa, b, sb, offs, out_dtype=dt, out=out, accumulate=acc, config=cfg)
-        torch.testing.assert_close(out, ((ref + c0.float()) if acc else ref).to(dt), rtol=0, atol=0)
-
-
-def test_grouped_gemm_mxfp8_variable_k_persistent(monkeypatch):
-    """Persistent variable-K (beta = 1 into bf16, early old-C fetch): 768 output tiles on <= 256 workgroups, so each
-    runs several tiles whose last K steps end in either slot (also with staggered starts, with c_pre, and the entry's
-    default config); == the one-tile-per-workgroup launch bitwise and the reference."""
-    lens = [128 * (i % 5) + (0 if i % 7 == 3 else 37 * (i % 3)) for i in range(24)]
-    M, N = 1024, 2048
-    pads = [-(-n // 128) * 128 for n in lens]
-    T = sum(pads)
-    a, sa, b, sb = int_valued_operands(M, N, T, seed=11)
+    a, sa, b, sb = int_valued_operands(M, N, T, seed=seed)
     offs = torch.tensor([0] + torch.tensor(pads).cumsum(0).tolist(), dtype=torch.int64, device=DEV)
     o = [int(x) for x in offs]
     for g, n in enumerate(lens):
-        a[:, o[g] + n: o[g + 1]], b[:, o[g] + n: o[g + 1]] = 0, 0
-        sa[:, -(-(o[g] + n) // 32): o[g + 1] // 32], sb[:, -(-(o[g] + n) // 32): o[g + 1] // 32] = PAD_SCALE, PAD_SCALE
-    ref = torch.stack([gemm_ref(a[:, o[g]: o[g + 1]], sa[:, o[g] // 32: o[g + 1] // 32], b[:, o[g]: o[g + 1]],
-                                sb[:, o[g] // 32: o[g + 1] // 32]) for g in range(len(lens))]).float()
-    sa, sb, b = pack_scales(sa), pack_scales(sb), _slack(_shuf(b))
-    c0 = (torch.randn(len(lens), M, N, device=DEV) * 64).to(torch.bfloat16)
-    outs = []
-    for pe, sg, pre, cfg in ((True, 0, False, C(256, 256, 2, 2, 1, 1)), (False, 0, False, C(256, 256, 2, 2, 1, 1)),
-                             (True, 8, False, C(256, 256, 2, 2, 1, 1)), (True, 0, True, C(256, 256, 2, 2, 1, 1)),
-                             (True, 8, True, C(256, 256, 2, 2, 2, 2)), (None, None, None, None)):
-        monkeypatch.setattr(KM, "PERSIST_ON", pe)
-        monkeypatch.setattr(KM, "STAGGER_ON", sg)
-        monkeypatch.setattr(KM, "C_PRE_ON", pre)
-        out = c0.clone()
-        grouped_gemm_mxfp8_variable_k_gfx1250(a, sa, b, sb, offs, out=out, accumulate=True, config=cfg)
-        outs.append(out)
-    torch.testing.assert_close(outs[0], (ref + c0.float()).to(torch.bfloat16), rtol=0, atol=0)
-    assert all(torch.equal(outs[0], o) for o in outs[1:])
+        t0, t1 = o[g] + n, o[g + 1]
+        a[:, t0:t1], b[:, t0:t1] = 0, 0
+        sa[:, -(-t0 // 32) : t1 // 32], sb[:, -(-t0 // 32) : t1 // 32] = PAD_SCALE, PAD_SCALE
+    ref = torch.stack(
+        [
+            gemm_ref(a[:, o[g] : o[g + 1]], sa[:, o[g] // 32 : o[g + 1] // 32], b[:, o[g] : o[g + 1]],
+                     sb[:, o[g] // 32 : o[g + 1] // 32])
+            for g in range(len(lens))
+        ]
+    ).float()
+    return a, pack_scales(sa), b, pack_scales(sb), offs, ref
+
+
+def test_grouped_gemm_mxfp8_variable_k():
+    """Routed experts wgrad, 40 experts (offsets read per tile, not from a lane table): empty experts, odd counts of
+    128 tokens (a half last K step), an M tail. The default config, as production runs it: beta = 1 into a bf16
+    main_grad, persistent with c_pre (2x2 clusters); and bf16 out without beta = 1 (persistent), fp32 out with beta = 1
+    (not persistent, no early fetch); an empty expert leaves its slice unchanged (or zero)."""
+    lens = [128 * (i % 5) + (0 if i % 7 == 3 else 37 * (i % 3)) for i in range(40)]
+    M, N = 320, 2560
+    a, sa, b, sb, offs, ref = _vk(lens, M, N, seed=13)
+    a, b = _slack(a), _slack(preshuffle_b16(b))
+    for dt, acc in ((BF16, True), (BF16, False), (F32, True)):
+        c0 = (torch.randn(len(lens), M, N, device=DEV) * 64).to(dt)
+        out, check = _guarded((len(lens), M, N), dt, c0 if acc else None)
+        grouped_gemm_mxfp8_variable_k_gfx1250(a, sa, b, sb, offs, out_dtype=dt, out=out, accumulate=acc)
+        _eq(out, (ref + c0.float()) if acc else ref)
+        check()
+
+
+def test_grouped_gemm_mxfp8_variable_k_narrow():
+    """The default config of a narrow N into a bf16 main_grad (N <= 2048: persistent 1x1 with c_pre)."""
+    lens = [300, 77, 0, 1000, 1]
+    M, N = 512, 768
+    a, sa, b, sb, offs, ref = _vk(lens, M, N, seed=17)
+    c0 = (torch.randn(len(lens), M, N, device=DEV) * 64).to(BF16)
+    out, check = _guarded((len(lens), M, N), BF16, c0)
+    grouped_gemm_mxfp8_variable_k_gfx1250(_slack(a), sa, _slack(preshuffle_b16(b)), sb, offs, out=out, accumulate=True)
+    _eq(out, ref + c0.float())
+    check()
+
+
+def test_gemm_mxfp8_deterministic():
+    """The production configs repeat bit for bit (operands prepared once): dense c2x4, grouped-M c2x4 and the
+    persistent variable-K wgrad into bf16."""
+    g = torch.Generator(device=DEV).manual_seed(7)
+    a, sa = quant_rows(torch.randn(1000, 7168, device=DEV, generator=g))
+    b, sb = quant_rows(torch.randn(2048, 7168, device=DEV, generator=g))
+    a, sa, b, sb = _slack(a), pack_scales(sa), _slack(preshuffle_b16(b)), pack_scales(sb)
+    calls = [lambda out: gemm_mxfp8_gfx1250(a, sa, b, sb, out=out, config=KP1_C2X4, b_preshuffled=True)]
+    ga, gsa, gb, gsb, offs, offs_p, _ = _grouped(RAGGED, 1024, 2048, seed=7)
+    gsa, gsb4 = pack_scales(gsa), torch.stack([pack_scales(gsb[e]) for e in range(len(RAGGED))])
+    ga, gb = _slack(ga), _slack(preshuffle_b16(gb))
+    calls.append(lambda out: grouped_gemm_mxfp8_gfx1250(ga, gsa, gb, gsb4, offs, offs_p, sum(RAGGED), out=out))
+    lens = [128 * (i % 5) + (0 if i % 7 == 3 else 37 * (i % 3)) for i in range(40)]
+    va, vsa, vb, vsb, voffs, _ = _vk(lens, 320, 2560, seed=13)
+    va, vb = _slack(va), _slack(preshuffle_b16(vb))
+    c0 = torch.randn(len(lens), 320, 2560, device=DEV).to(BF16)
+
+    def vk(out):
+        out.copy_(c0)
+        grouped_gemm_mxfp8_variable_k_gfx1250(va, vsa, vb, vsb, voffs, out=out, accumulate=True)
+
+    calls.append(vk)
+    for call, shape in zip(calls, ((1000, 2048), (sum(RAGGED), 1024), (len(lens), 320, 2560))):
+        first = torch.empty(shape, dtype=BF16, device=DEV)
+        call(first)
+        out = torch.empty_like(first)
+        for _ in range(100):
+            call(out)
+            assert torch.equal(out, first)
 
 
 def test_gemm_mxfp8_tail_at_allocation_end():
-    """K tails with an operand that ends exactly where its 10 MiB allocation does (no slack): the half last K step at
-    kpair 2 reads only its first half of a row-major A, so nothing past it; a preshuffled b or raw scales without
-    their slack make the entry use kpair 1; K % 128 != 0 without slack is refused."""
-    M, N, Kd = 16384, 256, 640
-    a, sa, b, sb = int_valued_operands(M, N, Kd, seed=1)
-    ref = gemm_ref(a, sa, b, sb).to(torch.bfloat16)
+    """Operands that end exactly where their (10 MiB or more) allocation does, so a read past them could fault
+    (best effort). With the default configs: a K tail at kpair 2 reads half rows of a row-major A, nothing past
+    it; a preshuffled b or raw scales without their slack make the entry fall back to kpair 1 (never persistent);
+    the variable-K wgrad's empty last expert reads inside the operands; K % 128 != 0 without slack is refused."""
+    M, N, K = 16384, 256, 640  # dense default: 128x128, kpair 2 (a half last K step)
+    a, sa, b, sb = int_valued_operands(M, N, K, seed=1)
+    ref = gemm_ref(a, sa, b, sb).float()
     a = _exact(a)
     assert a.numel() == 10 << 20 and KM._slack(a) == 0
-    for cfg in (C(256, 256, 2, 2, 1, 1), C(256, 256, 2, 2, 2, 2)):
-        out = gemm_mxfp8_gfx1250(a, pack_scales(sa), _slack(_shuf(b)), pack_scales(sb), config=cfg, b_preshuffled=True)
-        torch.testing.assert_close(out, ref, rtol=0, atol=0)
-        out = gemm_mxfp8_gfx1250(a, sa, _shuf(b), sb, config=cfg, b_preshuffled=True)  # no slack: kpair 1
-        torch.testing.assert_close(out, ref, rtol=0, atol=0)
-    # variable-K over experts with odd counts of 128 tokens: a [2048, T] and a preshuffled b [2048, T] of 10 MiB
-    lens = [384, 128, 1408, 2048, 1152]
-    Mv, Nv, T = 2048, 2048, sum(lens)
-    a, sa, b, sb = int_valued_operands(Mv, Nv, T, seed=2)
-    offs = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), dtype=torch.int64, device=DEV)
-    o = [int(x) for x in offs]
-    ref = torch.stack([gemm_ref(a[:, o[g]: o[g + 1]], sa[:, o[g] // 32: o[g + 1] // 32], b[:, o[g]: o[g + 1]],
-                                sb[:, o[g] // 32: o[g + 1] // 32]) for g in range(len(lens))]).to(torch.bfloat16)
-    sa, sb, a = pack_scales(sa), pack_scales(sb), _exact(a)
-    for bs in (_slack(_shuf(b)), _exact(_shuf(b))):  # kpair 2 with half steps; b without slack: kpair 1
-        out = grouped_gemm_mxfp8_variable_k_gfx1250(a, sa, bs, sb, offs, config=C(256, 256, 2, 2, 1, 1))
-        torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    sa, sb, bs = pack_scales(sa), pack_scales(sb), preshuffle_b16(b)
+    _eq(gemm_mxfp8_gfx1250(a, sa, _slack(bs), sb, b_preshuffled=True), ref)
+    _eq(gemm_mxfp8_gfx1250(a, sa, _exact(bs), sb, b_preshuffled=True), ref)  # no slack: kpair 1
+    # beta = 1 into bf16, K % 256 == 128: the persistent c2x2 default needs b's slack; without it kpair 1
+    M, N, K = 4096, 3072, 4224
+    a, sa, b, sb = int_valued_operands(M, N, K, seed=2)
+    ref = gemm_ref(a, sa, b, sb).float()
+    c0 = (torch.randn(M, N, device=DEV) * 64).to(BF16)
+    out = c0.clone()
+    gemm_mxfp8_gfx1250(
+        _slack(a), pack_scales(sa), _exact(preshuffle_b16(b)), pack_scales(sb), out=out, b_preshuffled=True,
+        accumulate=True,
+    )
+    _eq(out, ref + c0.float())
+    # grouped-M, K < 2048 (the persistent kpair-2 default), K % 256 == 128, b without its slack: kpair 1
+    lens = [5000, 0, 6000, 4000]
+    a, sa, b, sb, offs, offs_p, ref = _grouped(lens, 512, 640, seed=3)
+    sb4 = torch.stack([pack_scales(sb[g]) for g in range(len(lens))])
+    out = grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _exact(preshuffle_b16(b)), sb4, offs, offs_p, 15000)
+    _eq(out, ref)
+    # variable-K, odd counts of 128 tokens and an empty last expert (its K step starts at T, the end of a and b)
+    lens = [384, 128, 1408, 2048, 1152, 0]
+    M, N = 2048, 2048
+    a, sa, b, sb, offs, ref = _vk(lens, M, N, seed=4)
+    a = _exact(a)
+    for bs in (_slack(preshuffle_b16(b)), _exact(preshuffle_b16(b))):  # kpair 2 with half steps; no slack: kpair 1
+        _eq(grouped_gemm_mxfp8_variable_k_gfx1250(a, sa, bs, sb, offs), ref)
     a, sa, b, sb = int_valued_operands(256, 256, 576)
     with pytest.raises(ValueError, match="pad K"):
         gemm_mxfp8_gfx1250(a, pack_scales(sa), b, pack_scales(sb), config=C(256, 256, 2, 2, 1, 1))
@@ -347,3 +358,10 @@ def test_gemm_mxfp8_rejects():
     a, sa, b, sb = int_valued_operands(256, 256, 256)
     with pytest.raises(ValueError, match="E8M0"):
         gemm_mxfp8_gfx1250(a, sa.float(), b, sb)
+    with pytest.raises(ValueError, match="persist=True needs"):
+        gemm_mxfp8_gfx1250(a, sa, b, sb, config=C(256, 256, 4, 1, 1, 1, persist=True))
+    with pytest.raises(ValueError, match="row stride"):  # overlapping output rows
+        gemm_mxfp8_gfx1250(a, sa, b, sb, out=torch.empty(256 * 128 + 128, dtype=BF16, device=DEV).as_strided((256, 256), (128, 1)))
+    offs = torch.tensor([0, 128, 256, 256], dtype=torch.int64, device=DEV)
+    with pytest.raises(ValueError, match="contiguous int64"):
+        grouped_gemm_mxfp8_gfx1250(a, sa, b.view(1, 256, 256), sb.view(1, 256, 8), offs[::2], offs[::2], 256)
