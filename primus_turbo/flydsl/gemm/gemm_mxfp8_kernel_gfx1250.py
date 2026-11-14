@@ -264,7 +264,9 @@ def _launch_gemm_mxfp8(
                 o2 = Vec(buffer_load(rsrc, e * 2, vec_width=4, is_scalar=True))
                 k0, klen = fx.Int32(o2[0]), fx.Int32(o2[2]) - fx.Int32(o2[0])
             supers = (klen + (SUPER_K - 1)) // SUPER_K
-            supers = (supers > zero).select(supers, fx.Int32(1))  # an empty expert: one zero K step
+            # an empty expert: one zero-extent K step, from the operands' first column (offs[e] may be T, the end)
+            k0 = (klen > zero).select(k0, zero)
+            supers = (supers > zero).select(supers, fx.Int32(1))
             # (a_row0, out_row0, m_valid, blk_n, n_valid, expert, k0, klen, supers)
             return blk_m, blk_m, i32_m - blk_m, blk_n, i32_n - blk_n, e, k0, klen, supers
 
@@ -1111,7 +1113,7 @@ def _tail_safe(cfg: MXGemmConfig, v: int, tensors, b_preshuffled: bool, packed: 
     if all(_slack(t) >= n for t, n in zip(tensors, need)):
         return cfg, tuple((i, n) for i, n in enumerate(need) if n)
     if v % WMMA_K == 0:  # kpair 2 with a half step: kpair 1 has none
-        return cfg._replace(kpair=1, num_buffers=min(4, 2 * cfg.num_buffers)), None
+        return cfg._replace(kpair=1, num_buffers=min(4, 2 * cfg.num_buffers), persist=False, c_pre=False), None
     raise ValueError(f"{who}: K % 128 = {v % WMMA_K} would read up to {max(need)} B past the last row of a / b / the "
                      f"scales, more than their storages hold: pad K to a multiple of 128 or give them that slack")
 
