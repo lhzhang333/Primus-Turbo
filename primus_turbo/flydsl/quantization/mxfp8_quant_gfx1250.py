@@ -22,7 +22,8 @@ inputs of the gfx1250 MX GEMM. Batched inputs put the batch dim first. One kerne
 tile per workgroup (8 waves):
 
 * the tile comes in by one TDM load into LDS rows padded by 16 bytes; rows and columns past the
-  tensor (or past an expert's tokens) are zero-filled by the descriptor's bounds;
+  tensor (or past an expert's tokens) are zero-filled by the descriptor's bounds (the input's last row in a
+  partial last k-tile: masked 16-byte loads, which address nothing past the data; see ``TAIL``);
 * rows phase: a lane takes half a 32-block of a row (two ``ds_load_b128``), |x| max on the bf16
   bits, the other half's max by DPP, the E8M0 byte by the scale rule, codes by
   ``v_cvt_scalef32_pk8_fp8_bf16``, one 16-byte store (8 lanes fill a 128-byte line);
@@ -195,6 +196,19 @@ def _tdm_load(lds, gaddr, cols, rows, stride):
     rocdl.tensor_load_to_lds(vec[0], vec[1], z4, z4, z8)
 
 
+def _masked_tile(lds, gaddr, stride, rows, cols, zero, t):
+    """``_tdm_load``'s tile by masked 16-byte async loads, one per lane and pass: the 8 columns from ``c`` of row
+    ``r`` at ``gaddr + (r * stride + c) * 2`` when r < ``rows`` and c < ``cols`` (a multiple of 8), else 16 bytes of
+    the zero buffer ``zero``. Nothing past the data is addressed. The caller waits for them (asynccnt)."""
+    for i in range_constexpr(BM * BK // 8 // NT):
+        q = t + I32(i * NT)
+        r, c = q // I32(16), (q % I32(16)) * I32(8)
+        ok = (r < rows) & (c < cols)
+        ga = ok.select(gaddr + (I64(r) * I64(stride) + I64(c)) * I64(2), zero)
+        gp = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(ga))
+        _rocdl.global_load_async_to_lds_b128(gp, _lds_ptr(lds + r * I32(PITCH) + c * I32(2)), 0)
+
+
 def _group_scan(arg_go, mc0, G, lane):
     """Expert of the column-copy tile at padded token ``mc0``, lane-parallel: lane l of chunk c takes
     expert 32 c + l, DPP prefix sums give the offsets of the column copy (experts padded to 128 tokens)
@@ -294,6 +308,11 @@ def _launch(
     NOP: Constexpr[int],
 ):
     NKT = (K + BK - 1) // BK
+    # A TDM load addresses whole BK-column tile rows (its inner extent bounds the data, not the addressing): in a
+    # partial last k-tile each row is read up to 254 bytes past its data. That stays inside the input except on its
+    # last row, so the tile holding the last row of the partial k-tile is loaded by masked 16-byte loads instead
+    # (rows % 16 bytes: K % 8 == 0; the entries give narrower inputs storage past their end instead).
+    TAIL = K % BK != 0 and K % 8 == 0
     # expert-padded copies: the MoE producers; GLU / dGLU without group offsets (G = 0) are dense
     EXP = PROD in (P_GROUPED, P_GATHER) or (PROD in (P_GLU, P_DGLU) and G > 0)
     HALVES = 2 if PROD == P_DGLU else 1  # dGLU quantizes dgate (columns [0, K)) and dup ([K, 2K))
@@ -362,12 +381,33 @@ def _launch(
             # ---- producer: the bf16 tile(s) into LDS, rows / columns past the data zero
             if const_expr(PROD in (P_DENSE, P_GROUPED, P_NORM)):
                 xs = i32_t if PROD == P_NORM else I32(K)  # row stride of x (elements)
-                if wave == I32(0):
+                if const_expr(TAIL):
+                    if (kt == I32(NKT - 1)) & (in0 + nreal == i32_m):  # see TAIL
+                        src = _addr(arg_x) + (row0 * I64(xs) + I64(k0)) * I64(2)
+                        _masked_tile(base, src, xs, nreal, cols, _addr(arg_z), t)
+                        rocdl.s_wait_asynccnt(0)
+                    elif wave == I32(0):
+                        _tdm_load(base, _addr(arg_x) + (row0 * I64(xs) + I64(k0)) * I64(2), cols, nreal, xs)
+                        rocdl.s_wait_tensorcnt(0)
+                elif wave == I32(0):
                     _tdm_load(base, _addr(arg_x) + (row0 * I64(xs) + I64(k0)) * I64(2), cols, nreal, xs)
                     rocdl.s_wait_tensorcnt(0)
             elif const_expr(PROD in (P_GLU, P_DGLU)):  # gate / up halves of l1, then dact
                 l1 = _addr(arg_x2 if PROD == P_DGLU else arg_x) + (row0 * I64(2 * K) + I64(k0)) * I64(2)
-                if wave < I32(NTILE):
+                if const_expr(TAIL):
+                    if (kt == I32(NKT - 1)) & (in0 + nreal == i32_m):  # see TAIL
+                        src = [l1, l1 + I64(2 * K), _addr(arg_x) + (row0 * I64(K) + I64(k0)) * I64(2)]
+                        for w in range_constexpr(NTILE):
+                            _masked_tile(base + I32(w * TILE), src[w], K if w == 2 else 2 * K, nreal, cols,
+                                         _addr(arg_z), t)
+                        rocdl.s_wait_asynccnt(0)
+                    elif wave < I32(NTILE):
+                        src = [l1, l1 + I64(2 * K), _addr(arg_x) + (row0 * I64(K) + I64(k0)) * I64(2)]
+                        for w in range_constexpr(NTILE):
+                            if wave == I32(w):
+                                _tdm_load(base + I32(w * TILE), src[w], cols, nreal, K if w == 2 else 2 * K)
+                        rocdl.s_wait_tensorcnt(0)
+                elif wave < I32(NTILE):
                     src = [l1, l1 + I64(2 * K), _addr(arg_x) + (row0 * I64(K) + I64(k0)) * I64(2)]
                     for w in range_constexpr(NTILE):
                         if wave == I32(w):
@@ -618,15 +658,29 @@ def _run(prod, out, rule, x, outs, m, mc, m_tiles, k, ko=0, b2d=0, padm=0, go=No
         _COMPILED[tail] = fn
 
 
+def _slack(t):
+    """Bytes of ``t``'s storage past its last element (``t`` contiguous)."""
+    return t.untyped_storage().nbytes() - (t.storage_offset() + t.numel()) * t.element_size()
+
+
 def _check(x, out_dtype, rule, ndims):
+    """``x`` as the kernels read it: contiguous, 16-byte aligned and, when its width K is neither a multiple of 128
+    nor of 8, with 256 bytes of storage past its end (a copy otherwise): the TDM load of its last row's partial
+    k-tile addresses up to 254 bytes past the data (``TAIL`` in ``_launch``)."""
     assert x.ndim in ndims and x.is_cuda and x.dtype == torch.bfloat16, f"bf16 {ndims}-D CUDA input, got {x.dtype}"
     assert out_dtype == torch.float8_e4m3fn, f"E4M3 codes only, got {out_dtype}"
     assert rule in RULES, f"rule must be one of {tuple(RULES)}, got {rule!r}"
-    return x if x.is_contiguous() else x.contiguous()
+    K = x.shape[-1]
+    room = BK if K % 8 and K % BK else 0  # elements
+    if x.is_contiguous() and x.data_ptr() % 16 == 0 and (not room or _slack(x) >= 2 * room):
+        return x
+    buf = torch.empty(x.numel() + room, dtype=x.dtype, device=x.device)
+    return buf[: x.numel()].view(x.shape).copy_(x)
 
 
 # Storage past every GEMM operand the quantizers write: a TDM load's inner extent clamps the data, not the
-# addressing, so the gfx1250 MX GEMM's last K step may address up to ~2 KiB past an operand's end.
+# addressing, so the gfx1250 MX GEMM's partial last K step may address up to 3840 bytes past an operand's end (a
+# 16x16-preshuffled B; ``_tail_safe`` of gemm_mxfp8_kernel_gfx1250).
 GEMM_SLACK = 4096
 _ALIGN = 256  # every carved tensor starts 256-byte aligned
 _ESIZE = {torch.float8_e4m3fn: 1, _E8: 1, torch.uint8: 1, torch.int64: 8}
@@ -761,7 +815,7 @@ def grouped_glu_quant_mxfp8(l1, probs, group_lens, group_offs, activation="silu"
     (tests): also receives act."""
     l1 = _check(l1, out_dtype, rule, (2,))
     M, I = l1.shape[0], l1.shape[1] // 2
-    assert l1.shape[1] == 2 * I and probs.shape == (M,) and probs.dtype == torch.float32
+    assert l1.shape[1] == 2 * I and I % 16 == 0 and probs.shape == (M,) and probs.dtype == torch.float32
     return _grouped(P_GLU, l1, group_lens, group_offs, out_dtype, rule, I, M, p=probs.contiguous(), dbg=act_out,
                     act=_check_activation(activation), clamp=_check_clamp_limit(clamp_limit), layout=layout)
 
@@ -805,7 +859,7 @@ def glu_quant_mxfp8(l1, probs=None, activation="silu", clamp_limit=None, out_dty
     ``probs`` None: no row weights (bit-identical to all ones). ``act_out`` [M, I] bf16 (tests): also receives act."""
     l1 = _check(l1, out_dtype, rule, (2,))
     I = l1.shape[1] // 2
-    assert l1.shape[1] == 2 * I
+    assert l1.shape[1] == 2 * I and I % 16 == 0, f"l1 [M, 2I] with I % 16 == 0, got {tuple(l1.shape)}"
     return _dense_glu(P_GLU, l1, l1, probs, I, out_dtype, rule, pad, layout, dbg=act_out,
                       act=_check_activation(activation), clamp=_check_clamp_limit(clamp_limit))
 
