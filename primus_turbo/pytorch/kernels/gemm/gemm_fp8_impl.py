@@ -342,7 +342,6 @@ class GEMMFP8TritonBackend(KernelBackend):
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.ROWWISE,
         ScalingGranularity.BLOCKWISE,
-        ScalingGranularity.MX_BLOCKWISE,
     }
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
@@ -362,7 +361,8 @@ class GEMMFP8TritonBackend(KernelBackend):
         out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
-        if granularity == ScalingGranularity.MX_BLOCKWISE:  # gfx1250 only: other archs keep their MX backends
+        # MX_BLOCKWISE (not in SUPPORTED_GRANULARITIES): gfx1250 only, other archs keep their MX backends
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
             ok = is_gfx1250() and not trans_a and trans_b and not trans_c and a.dim() == b.dim() == 2
             ok = ok and b.shape[1] == a.shape[1] and a.shape[1] % 128 == 0
             ok = ok and out_dtype in (torch.bfloat16, torch.float16) and not kwargs.get("b_preshuffled")
