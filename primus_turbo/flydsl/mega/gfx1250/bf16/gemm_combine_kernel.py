@@ -25,6 +25,11 @@ The three roles of the gfx950 ``grouped_gemm_combine_bf16_kernel``, in one launc
   second counter, waits for each token's primary-route rows to land and sums them into ``out``
   (``topk_reduce_bf16_tile``); it also tops up the flags of the pool blocks this call left empty.
 
+``COMBINE_ONLY`` (``combine_only_gfx1250``) is the combine and the reduce over an L2 output computed
+elsewhere: no GEMM role, every workgroup combines, and the combine takes its chunks pipelined
+(``combine_bf16_tile(pipelined=True)``, the segment table read once into LDS) and the reduce packs a
+token's primary routes (``topk_reduce_tile_packed``). The fused launch keeps the roles above.
+
 Workgroup order: the GEMM tiles, then the tail combine workgroups (one per CU; they start as the
 GEMM drains), so nothing that spins can keep a GEMM tile from a CU. ``num_lead_combine`` > 0 moves
 that many combine workgroups to after ``lead_gemm_percent`` of the tiles, to push while the GEMM
@@ -58,14 +63,17 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
 )
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
 from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
+    block_exclusive_scan_lds,
     combine_bf16_tile,
     spin_until_flag_reaches,
     topk_reduce_bf16_tile,
+    topk_reduce_tile_packed,
 )
 from primus_turbo.flydsl.mega.gfx1250.prims import (
     CPOL_DEVICE_STREAM,
     atomic_add,
     cast,
+    ceildiv,
     ld,
     st,
     wait_mem_all,
@@ -84,6 +92,21 @@ from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource_from_add
 _FOLD_CHUNK_ROWS = 16
 # reduce work item: this many workgroup-sized token groups per counter take
 _REDUCE_GROUPS_PER_TAKE = 4
+# reduce loads a warp keeps in flight per column-step batch (route slots x steps)
+_REDUCE_LOADS_PER_BATCH = 32
+# combine-role LDS (i32 words): two slots each for the taken combine chunk and reduce take, the segment
+# scan's scratch (one word per wave), then per segment its first chunk (+ the total), start row, fold count
+_LDS_COMBINE_SLOT = 0
+_LDS_REDUCE_SLOT = 2
+_LDS_SCAN = 4
+
+
+def _combine_lds_layout(num_experts: int, block: int):
+    """(first-chunk word (num_experts + 1 words with the total), start-row word, fold-count word, total words)."""
+    first_chunk = _LDS_SCAN + block // WAVE
+    start_row = first_chunk + num_experts + 1
+    fold_count = start_row + num_experts
+    return first_chunk, start_row, fold_count, fold_count + num_experts
 
 
 def _addr(p):
@@ -141,13 +164,22 @@ def _launch_gemm_combine_nt(
     issue_first: Constexpr[int],
     wmma_b2b: Constexpr[int],
     lds_cosched: Constexpr[int],
+    COMBINE_ONLY: Constexpr[bool],
 ):
     block = m_warp * n_warp * WAVE
-    arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
+    # COMBINE_ONLY: the L2 output comes in through ``arg_l2``, computed elsewhere (the MXFP8 Mega's grouped
+    # GEMM); every workgroup combines, and the LDS holds only the combine's tables
+    _LDS_FIRST_CHUNK, _LDS_START_ROW, _LDS_FOLD_COUNT, combine_words = _combine_lds_layout(NUM_EXPERTS, block)
+    arena_bytes = max(
+        combine_words * 4, 0 if COMBINE_ONLY else tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
+    )
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
     NUM_COMBINE = NUM_LEAD_COMBINE + NUM_TAIL_COMBINE
     num_experts_per_rank = NUM_EXPERTS // NUM_RANKS
+    # a token's primary routes, one per rank its experts sit on, fill at most this many reduce slots
+    num_route_slots = min(NUM_TOPK, NUM_RANKS)
+    reduce_vec_unroll = max(1, min(ceildiv(N // 8, 64), _REDUCE_LOADS_PER_BATCH // num_route_slots))
 
     @flyc.kernel(name="mega_gfx1250_combine_epoch_bump", known_block_size=[64, 1, 1])
     def epoch_bump(
@@ -251,6 +283,9 @@ def _launch_gemm_combine_nt(
         l2_base = _addr(fx.recast_iter(fx.Int8, arg_l2))
 
         num_tiles_m = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tile_blocks)[fx.Int32(0)])
+        if const_expr(COMBINE_ONLY):
+            # no GEMM tile: no combine waits, and the flags of every pool block topped up
+            num_tiles_m = fx.Int32(0)
         combine_start = num_tiles_m * fx.Int32(N_BLOCKS_N * LEAD_GEMM_PERCENT // 100)
         tail_combine_start = num_tiles_m * fx.Int32(N_BLOCKS_N) + fx.Int32(NUM_LEAD_COMBINE)
         is_lead_combine = (bid >= combine_start) & (bid < combine_start + fx.Int32(NUM_LEAD_COMBINE))
@@ -271,203 +306,393 @@ def _launch_gemm_combine_nt(
         expert = live.select(expert, fx.Int32(0))
         blk_n = block_n * fx.Int32(tile_n)
         m_row = block_m * fx.Int32(tile_m)
-        nt_gemm_tile(
-            base_ptr,
-            gA_base=fx.recast_iter(fx.Int8, arg_act),
-            lda=K,
-            a_row0=m_row,
-            a_rows=fx.Int32(0),
-            row_idx_table=_i32_table(arg_tile_to_expert),
-            row_idx_base=fx.Int32(0),
-            gB_base=fx.recast_iter(fx.Int8, arg_w),
-            ldb=N if B_NN else K,
-            b_slab=fx.Int64(expert) * fx.Int64(N * K * EB),
-            blk_n=blk_n,
-            c_addr=l2_base + (fx.Int64(m_row) * fx.Int64(N) + fx.Int64(blk_n)) * fx.Int64(EB),
-            ldc=N,
-            m_rows=fx.Int32(tile_m),
-            n_valid=fx.Int32(N) - blk_n,
-            i32_k=fx.Int32(K),
-            live=live,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            m_warp=m_warp,
-            n_warp=n_warp,
-            gather=False,
-            c_cache_modifier=CPOL_DEVICE_STREAM,  # read by combine workgroups on other CUs
-            b_nn=B_NN,
-            issue_first=bool(issue_first),
-            lds_cosched=bool(lds_cosched),
-            i32_n=fx.Int32(N),
-        )
-        # every wave's C stores retire before the flag; two rendezvous, which LLVM would fold
-        wait_mem_all()
-        fx.gpu.barrier()
-        wait_mem_all()
-        fx.gpu.barrier()
-        if live:
-            if fx.Int32(tid) == fx.Int32(0):
-                atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1))
+        if const_expr(not COMBINE_ONLY):
+            nt_gemm_tile(
+                base_ptr,
+                gA_base=fx.recast_iter(fx.Int8, arg_act),
+                lda=K,
+                a_row0=m_row,
+                a_rows=fx.Int32(0),
+                row_idx_table=_i32_table(arg_tile_to_expert),
+                row_idx_base=fx.Int32(0),
+                gB_base=fx.recast_iter(fx.Int8, arg_w),
+                ldb=N if B_NN else K,
+                b_slab=fx.Int64(expert) * fx.Int64(N * K * EB),
+                blk_n=blk_n,
+                c_addr=l2_base + (fx.Int64(m_row) * fx.Int64(N) + fx.Int64(blk_n)) * fx.Int64(EB),
+                ldc=N,
+                m_rows=fx.Int32(tile_m),
+                n_valid=fx.Int32(N) - blk_n,
+                i32_k=fx.Int32(K),
+                live=live,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                m_warp=m_warp,
+                n_warp=n_warp,
+                gather=False,
+                c_cache_modifier=CPOL_DEVICE_STREAM,  # read by combine workgroups on other CUs
+                b_nn=B_NN,
+                issue_first=bool(issue_first),
+                lds_cosched=bool(lds_cosched),
+                i32_n=fx.Int32(N),
+            )
+            # every wave's C stores retire before the flag; two rendezvous, which LLVM would fold
+            wait_mem_all()
+            fx.gpu.barrier()
+            wait_mem_all()
+            fx.gpu.barrier()
+            if live:
+                if fx.Int32(tid) == fx.Int32(0):
+                    atomic_add(combine_flag_base, combine_bank + block_m, fx.Int64(1))
 
         if is_combine:
-            # Work items are _FOLD_CHUNK_ROWS-row chunks of the fold rows of all segments, in pool
-            # order, taken from one counter: a segment can hold most of the fold rows (a token's
-            # fold row sits in its highest local expert's segment), and the lead workgroups, if
-            # any, get the early chunks while the tail ones, which start once the GEMM has drained,
-            # take what is left. LDS: [0] the taken chunk, [2 + s] segment s's first
-            # chunk, [2 + NUM_EXPERTS] the chunk count.
-            lds = _addr(base_ptr)
-            seg = fx.Int32(tid)
-            while seg < fx.Int32(NUM_EXPERTS):
-                fold_count = _i32_table(arg_recv_fold_count)[seg]
-                num_chunks = (fold_count + fx.Int32(_FOLD_CHUNK_ROWS - 1)) // fx.Int32(_FOLD_CHUNK_ROWS)
-                st(lds, fx.Int32(2) + seg, num_chunks, scope="workgroup", space=3)
-                seg = seg + fx.Int32(block)
-            fx.gpu.barrier()
-            if fx.Int32(tid) == fx.Int32(0):
-                running = fx.Int32(0)
-                for s_idx in range(fx.Int32(NUM_EXPERTS)):
-                    num_chunks = ld(lds, fx.Int32(2) + s_idx, scope="workgroup", space=3)
-                    st(lds, fx.Int32(2) + s_idx, running, scope="workgroup", space=3)
-                    running = running + num_chunks
-                st(lds, fx.Int32(2 + NUM_EXPERTS), running, scope="workgroup", space=3)
-                taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(1))
-                st(lds, fx.Int32(0), taken, scope="workgroup", space=3)
-            fx.gpu.barrier()
-            total_chunks = rocdl.readfirstlane(
-                T.i32, ld(lds, fx.Int32(2 + NUM_EXPERTS), scope="workgroup", space=3)
-            )
-            chunk = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(0), scope="workgroup", space=3))
-            # every pool block below next_tile_m is already confirmed, so each is polled once
-            next_tile_m = fx.Int32(0)
-            segment_idx = fx.Int32(0)
-            while chunk < total_chunks:
-                # taken chunks only grow, so the segment cursor only moves forward
-                while ld(lds, fx.Int32(3) + segment_idx, scope="workgroup", space=3) <= chunk:
-                    segment_idx = segment_idx + fx.Int32(1)
-                segment_idx = rocdl.readfirstlane(T.i32, segment_idx)
-                first_chunk = ld(lds, fx.Int32(2) + segment_idx, scope="workgroup", space=3)
-                start_row = rocdl.readfirstlane(T.i32, _i32_table(arg_recv_start_row)[segment_idx])
-                fold_count = rocdl.readfirstlane(T.i32, _i32_table(arg_recv_fold_count)[segment_idx])
-                part_offset = (chunk - first_chunk) * fx.Int32(_FOLD_CHUNK_ROWS)
-                num_part_rows = arith.select(
-                    fold_count - part_offset < fx.Int32(_FOLD_CHUNK_ROWS),
-                    fold_count - part_offset,
-                    fx.Int32(_FOLD_CHUNK_ROWS),
-                )
-                # a fold row's other pool rows lie in lower blocks, so wait for the whole prefix
-                last_tile_m = (start_row + part_offset + num_part_rows - fx.Int32(1)) // fx.Int32(BLOCK_M)
-                if fx.Int32(tid) == fx.Int32(0):
-                    polled_tile_m = next_tile_m
-                    while polled_tile_m <= last_tile_m:
-                        spin_until_flag_reaches(
-                            combine_flag_base,
-                            combine_bank + polled_tile_m,
-                            expected_combine,
-                            "agent",
-                            RANK,
-                            "combine",
-                        )
-                        polled_tile_m = polled_tile_m + fx.Int32(1)
-                    # take the next chunk now, so its counter round trip overlaps this one's push
-                    taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(1))
-                    st(lds, fx.Int32(1), taken, scope="workgroup", space=3)
-                next_tile_m = arith.select(last_tile_m < next_tile_m, next_tile_m, last_tile_m + fx.Int32(1))
-                wait_mem_all()
-                fx.gpu.barrier()
-                combine_bf16_tile(
-                    sym_buffer,
-                    workspace,
-                    thread_index=tid,
-                    segment_idx=segment_idx,
-                    first_fold_row=start_row + part_offset,
-                    num_fold_rows=num_part_rows,
-                    recv_dst_rank_res=create_buffer_resource_from_addr(_addr(arg_recv_dst_rank)),
-                    pool_row_to_route_res=create_buffer_resource_from_addr(_addr(arg_pool_row_to_route)),
-                    pool_row_to_recv_token_res=create_buffer_resource_from_addr(
-                        _addr(arg_pool_row_to_recv_token)
-                    ),
-                    recv_token_to_pool_rows_res=create_buffer_resource_from_addr(
-                        _addr(arg_recv_token_to_pool_rows)
-                    ),
-                    l2_ptr=l2_base,
-                    epoch=expected_reduce,
-                    reduce_bank=reduce_bank,
-                    grad_gate_res=(
-                        create_buffer_resource_from_addr(_addr(arg_grad_gate)) if HAS_GRAD_GATE else None
-                    ),
-                    has_grad_gate=HAS_GRAD_GATE,
-                    bias=(
-                        (
-                            _addr(arg_bias),
-                            create_buffer_resource_from_addr(_addr(arg_tile_to_expert)),
-                            create_buffer_resource_from_addr(_addr(arg_bias_scale)),
-                        )
-                        if HAS_BIAS
-                        else None
-                    ),
-                    block_threads=block,
-                )
-                chunk = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(1), scope="workgroup", space=3))
-                fx.gpu.barrier()  # every wave has the chunk before thread 0 takes the next one
+            # the combine-only launch (no GEMM tile to share the GPU with) takes its chunks pipelined and packs
+            # the reduce's routes; the fused launch keeps its combine as it was
+            if const_expr(COMBINE_ONLY):
+                # its own scope: the fused branch below assigns many of the same names, which the AST
+                # rewriter would otherwise carry into that branch's dynamic ifs and loops
+                def combine_only_role():
+                    # Work items are _FOLD_CHUNK_ROWS-row chunks of the fold rows of all segments, in pool
+                    # order, taken from one counter by every workgroup of the launch (no GEMM tile: the L2
+                    # rows are there already). LDS: _combine_lds_layout; the segment table (each segment's
+                    # first chunk, start row and fold count, and the chunk total) is read once, lane-parallel.
+                    lds = _addr(base_ptr)
+                    # the first chunk's counter round trip overlaps the segment table's loads
+                    taken = fx.Int32(0)
+                    if fx.Int32(tid) == fx.Int32(0):
+                        taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(1))
 
-            # ---- reduce: every chunk is taken by a running workgroup, so the flags waited on come ----
-            # pool blocks this call left empty still have to reach the never-reset expected
-            num_empty_tiles_m = fx.Int32(MAX_TILES) - num_tiles_m
-            num_local_empty_tiles_m = (
-                num_empty_tiles_m - combine_idx + fx.Int32(NUM_COMBINE - 1)
-            ) // fx.Int32(NUM_COMBINE)
-            for empty_iter in range(num_local_empty_tiles_m):
-                empty_tile_m = num_tiles_m + combine_idx + empty_iter * fx.Int32(NUM_COMBINE)
+                    def load_segment(seg, is_seg):
+                        seg = arith.select(is_seg, seg, fx.Int32(0))
+                        fold_count = _i32_table(arg_recv_fold_count)[seg]
+                        start_row = _i32_table(arg_recv_start_row)[seg]
+                        num_chunks = (fold_count + fx.Int32(_FOLD_CHUNK_ROWS - 1)) // fx.Int32(
+                            _FOLD_CHUNK_ROWS
+                        )
+                        return num_chunks, [(_LDS_START_ROW, start_row), (_LDS_FOLD_COUNT, fold_count)]
+
+                    block_exclusive_scan_lds(
+                        fx.Int32(tid), block, lds, _LDS_SCAN, _LDS_FIRST_CHUNK, NUM_EXPERTS, load_segment
+                    )
+                    if fx.Int32(tid) == fx.Int32(0):
+                        st(lds, fx.Int32(_LDS_COMBINE_SLOT), taken, scope="workgroup", space=3)
+                    fx.gpu.barrier()
+                    total_chunks = rocdl.readfirstlane(
+                        T.i32, ld(lds, fx.Int32(_LDS_FIRST_CHUNK + NUM_EXPERTS), scope="workgroup", space=3)
+                    )
+                    chunk = rocdl.readfirstlane(
+                        T.i32, ld(lds, fx.Int32(_LDS_COMBINE_SLOT), scope="workgroup", space=3)
+                    )
+                    segment_idx = fx.Int32(0)
+                    slot = fx.Int32(0)
+                    while chunk < total_chunks:
+                        # taken chunks only grow, so the segment cursor only moves forward
+                        while (
+                            ld(lds, fx.Int32(_LDS_FIRST_CHUNK + 1) + segment_idx, scope="workgroup", space=3)
+                            <= chunk
+                        ):
+                            segment_idx = segment_idx + fx.Int32(1)
+                        segment_idx = rocdl.readfirstlane(T.i32, segment_idx)
+                        first_chunk = ld(
+                            lds, fx.Int32(_LDS_FIRST_CHUNK) + segment_idx, scope="workgroup", space=3
+                        )
+                        start_row = rocdl.readfirstlane(
+                            T.i32, ld(lds, fx.Int32(_LDS_START_ROW) + segment_idx, scope="workgroup", space=3)
+                        )
+                        fold_count = rocdl.readfirstlane(
+                            T.i32,
+                            ld(lds, fx.Int32(_LDS_FOLD_COUNT) + segment_idx, scope="workgroup", space=3),
+                        )
+                        part_offset = (chunk - first_chunk) * fx.Int32(_FOLD_CHUNK_ROWS)
+                        num_part_rows = arith.select(
+                            fold_count - part_offset < fx.Int32(_FOLD_CHUNK_ROWS),
+                            fold_count - part_offset,
+                            fx.Int32(_FOLD_CHUNK_ROWS),
+                        )
+                        # take the next chunk now: its counter round trip overlaps this one's push
+                        taken = fx.Int32(0)
+                        if fx.Int32(tid) == fx.Int32(0):
+                            taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(1))
+                        combine_bf16_tile(
+                            sym_buffer,
+                            workspace,
+                            thread_index=tid,
+                            segment_idx=segment_idx,
+                            first_fold_row=start_row + part_offset,
+                            num_fold_rows=num_part_rows,
+                            recv_dst_rank_res=create_buffer_resource_from_addr(_addr(arg_recv_dst_rank)),
+                            pool_row_to_route_res=create_buffer_resource_from_addr(
+                                _addr(arg_pool_row_to_route)
+                            ),
+                            pool_row_to_recv_token_res=create_buffer_resource_from_addr(
+                                _addr(arg_pool_row_to_recv_token)
+                            ),
+                            recv_token_to_pool_rows_res=create_buffer_resource_from_addr(
+                                _addr(arg_recv_token_to_pool_rows)
+                            ),
+                            l2_ptr=l2_base,
+                            epoch=expected_reduce,
+                            reduce_bank=reduce_bank,
+                            grad_gate_res=(
+                                create_buffer_resource_from_addr(_addr(arg_grad_gate))
+                                if HAS_GRAD_GATE
+                                else None
+                            ),
+                            has_grad_gate=HAS_GRAD_GATE,
+                            bias=(
+                                (
+                                    _addr(arg_bias),
+                                    create_buffer_resource_from_addr(_addr(arg_tile_to_expert)),
+                                    create_buffer_resource_from_addr(_addr(arg_bias_scale)),
+                                )
+                                if HAS_BIAS
+                                else None
+                            ),
+                            block_threads=block,
+                            pipelined=True,
+                        )
+                        # two slots: a slot is rewritten two chunks later, after every wave passed the barrier below
+                        slot = fx.Int32(1) - slot
+                        if fx.Int32(tid) == fx.Int32(0):
+                            st(lds, fx.Int32(_LDS_COMBINE_SLOT) + slot, taken, scope="workgroup", space=3)
+                        fx.gpu.barrier()
+                        chunk = rocdl.readfirstlane(
+                            T.i32, ld(lds, fx.Int32(_LDS_COMBINE_SLOT) + slot, scope="workgroup", space=3)
+                        )
+
+                    # ---- reduce: every chunk is taken by a running workgroup, so the flags waited on come ----
+                    # pool blocks this call left empty still have to reach the never-reset expected
+                    num_empty_tiles_m = fx.Int32(MAX_TILES) - num_tiles_m
+                    num_local_empty_tiles_m = (
+                        num_empty_tiles_m - combine_idx + fx.Int32(NUM_COMBINE - 1)
+                    ) // fx.Int32(NUM_COMBINE)
+                    for empty_iter in range(num_local_empty_tiles_m):
+                        empty_tile_m = num_tiles_m + combine_idx + empty_iter * fx.Int32(NUM_COMBINE)
+                        if fx.Int32(tid) == fx.Int32(0):
+                            atomic_add(combine_flag_base, combine_bank + empty_tile_m, fx.Int64(N_BLOCKS_N))
+                    # tokens are taken from a counter too: the workgroups do not all become resident at
+                    # once (blocks are spread over the XCDs unevenly), and a late one must not hold a
+                    # static share of the tokens
+                    group_tokens = block // 64
+                    take_tokens = _REDUCE_GROUPS_PER_TAKE * group_tokens
+                    num_tokens = rocdl.readfirstlane(
+                        T.i32, _i32_table(arg_num_tokens_per_rank)[fx.Int32(RANK)]
+                    )
+                    # the reduce's slots are not the combine's: a wave may still read the combine's last one
+                    if fx.Int32(tid) == fx.Int32(0):
+                        taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(1), fx.Int32(1))
+                        st(lds, fx.Int32(_LDS_REDUCE_SLOT), taken, scope="workgroup", space=3)
+                    fx.gpu.barrier()
+                    take = rocdl.readfirstlane(
+                        T.i32, ld(lds, fx.Int32(_LDS_REDUCE_SLOT), scope="workgroup", space=3)
+                    )
+                    slot = fx.Int32(0)
+                    while take * fx.Int32(take_tokens) < num_tokens:
+                        # take the next token group now: its counter round trip overlaps this one's reduce
+                        taken = fx.Int32(0)
+                        if fx.Int32(tid) == fx.Int32(0):
+                            taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(1), fx.Int32(1))
+                        for group in range(fx.Int32(_REDUCE_GROUPS_PER_TAKE)):
+                            topk_reduce_tile_packed(
+                                thread_index=tid,
+                                reduce_block_idx=take * fx.Int32(_REDUCE_GROUPS_PER_TAKE) + group,
+                                num_reduce_warps=NUM_MAX_TOKENS_PER_RANK,  # one token per warp per group
+                                num_topk=NUM_TOPK,
+                                hidden=N,
+                                num_experts=NUM_EXPERTS,
+                                num_experts_per_rank=num_experts_per_rank,
+                                num_max_routes=num_max_routes,
+                                rank=RANK,
+                                combine_token_res=combine_token_res,
+                                output_res=create_buffer_resource_from_addr(_addr(arg_out)),
+                                topk_indices_res=create_buffer_resource_from_addr(_addr(arg_topk_idx)),
+                                num_tokens_res=create_buffer_resource_from_addr(
+                                    _addr(arg_num_tokens_per_rank)
+                                ),
+                                reduce_flag_base=reduce_flag_base,
+                                reduce_bank=reduce_bank,
+                                epoch=expected_reduce,
+                                combine_gate_res=combine_gate_res,
+                                grad_topk_weights_res=(
+                                    create_buffer_resource_from_addr(_addr(arg_grad_topk_weights))
+                                    if HAS_GRAD_GATE
+                                    else None
+                                ),
+                                has_grad_gate=HAS_GRAD_GATE,
+                                block_threads=block,
+                                vec_unroll=reduce_vec_unroll,
+                                num_route_slots=num_route_slots,
+                            )
+                        slot = fx.Int32(1) - slot
+                        if fx.Int32(tid) == fx.Int32(0):
+                            st(lds, fx.Int32(_LDS_REDUCE_SLOT) + slot, taken, scope="workgroup", space=3)
+                        fx.gpu.barrier()
+                        take = rocdl.readfirstlane(
+                            T.i32, ld(lds, fx.Int32(_LDS_REDUCE_SLOT) + slot, scope="workgroup", space=3)
+                        )
+
+                combine_only_role()
+            else:
+                # Work items are _FOLD_CHUNK_ROWS-row chunks of the fold rows of all segments, in pool
+                # order, taken from one counter: a segment can hold most of the fold rows (a token's
+                # fold row sits in its highest local expert's segment), and the lead workgroups, if
+                # any, get the early chunks while the tail ones, which start once the GEMM has drained,
+                # take what is left. LDS: [0] the taken chunk, [2 + s] segment s's first
+                # chunk, [2 + NUM_EXPERTS] the chunk count.
+                lds = _addr(base_ptr)
+                seg = fx.Int32(tid)
+                while seg < fx.Int32(NUM_EXPERTS):
+                    fold_count = _i32_table(arg_recv_fold_count)[seg]
+                    num_chunks = (fold_count + fx.Int32(_FOLD_CHUNK_ROWS - 1)) // fx.Int32(_FOLD_CHUNK_ROWS)
+                    st(lds, fx.Int32(2) + seg, num_chunks, scope="workgroup", space=3)
+                    seg = seg + fx.Int32(block)
+                fx.gpu.barrier()
                 if fx.Int32(tid) == fx.Int32(0):
-                    atomic_add(combine_flag_base, combine_bank + empty_tile_m, fx.Int64(N_BLOCKS_N))
-            # tokens are taken from a counter too: the workgroups do not all become resident at
-            # once (blocks are spread over the XCDs unevenly), and a late one must not hold a
-            # static share of the tokens
-            group_tokens = block // 64
-            take_tokens = _REDUCE_GROUPS_PER_TAKE * group_tokens
-            num_tokens = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tokens_per_rank)[fx.Int32(RANK)])
-            if fx.Int32(tid) == fx.Int32(0):
-                taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(1), fx.Int32(1))
-                st(lds, fx.Int32(0), taken, scope="workgroup", space=3)
-            fx.gpu.barrier()
-            take = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(0), scope="workgroup", space=3))
-            while take * fx.Int32(take_tokens) < num_tokens:
-                if fx.Int32(tid) == fx.Int32(0):
-                    taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(1), fx.Int32(1))
-                    st(lds, fx.Int32(1), taken, scope="workgroup", space=3)
-                for group in range(fx.Int32(_REDUCE_GROUPS_PER_TAKE)):
-                    topk_reduce_bf16_tile(
+                    running = fx.Int32(0)
+                    for s_idx in range(fx.Int32(NUM_EXPERTS)):
+                        num_chunks = ld(lds, fx.Int32(2) + s_idx, scope="workgroup", space=3)
+                        st(lds, fx.Int32(2) + s_idx, running, scope="workgroup", space=3)
+                        running = running + num_chunks
+                    st(lds, fx.Int32(2 + NUM_EXPERTS), running, scope="workgroup", space=3)
+                    taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(1))
+                    st(lds, fx.Int32(0), taken, scope="workgroup", space=3)
+                fx.gpu.barrier()
+                total_chunks = rocdl.readfirstlane(
+                    T.i32, ld(lds, fx.Int32(2 + NUM_EXPERTS), scope="workgroup", space=3)
+                )
+                chunk = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(0), scope="workgroup", space=3))
+                # every pool block below next_tile_m is already confirmed, so each is polled once
+                next_tile_m = fx.Int32(0)
+                segment_idx = fx.Int32(0)
+                while chunk < total_chunks:
+                    # taken chunks only grow, so the segment cursor only moves forward
+                    while ld(lds, fx.Int32(3) + segment_idx, scope="workgroup", space=3) <= chunk:
+                        segment_idx = segment_idx + fx.Int32(1)
+                    segment_idx = rocdl.readfirstlane(T.i32, segment_idx)
+                    first_chunk = ld(lds, fx.Int32(2) + segment_idx, scope="workgroup", space=3)
+                    start_row = rocdl.readfirstlane(T.i32, _i32_table(arg_recv_start_row)[segment_idx])
+                    fold_count = rocdl.readfirstlane(T.i32, _i32_table(arg_recv_fold_count)[segment_idx])
+                    part_offset = (chunk - first_chunk) * fx.Int32(_FOLD_CHUNK_ROWS)
+                    num_part_rows = arith.select(
+                        fold_count - part_offset < fx.Int32(_FOLD_CHUNK_ROWS),
+                        fold_count - part_offset,
+                        fx.Int32(_FOLD_CHUNK_ROWS),
+                    )
+                    # a fold row's other pool rows lie in lower blocks, so wait for the whole prefix
+                    last_tile_m = (start_row + part_offset + num_part_rows - fx.Int32(1)) // fx.Int32(BLOCK_M)
+                    if fx.Int32(tid) == fx.Int32(0):
+                        polled_tile_m = next_tile_m
+                        while polled_tile_m <= last_tile_m:
+                            spin_until_flag_reaches(
+                                combine_flag_base,
+                                combine_bank + polled_tile_m,
+                                expected_combine,
+                                "agent",
+                                RANK,
+                                "combine",
+                            )
+                            polled_tile_m = polled_tile_m + fx.Int32(1)
+                        # take the next chunk now, so its counter round trip overlaps this one's push
+                        taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(1))
+                        st(lds, fx.Int32(1), taken, scope="workgroup", space=3)
+                    next_tile_m = arith.select(
+                        last_tile_m < next_tile_m, next_tile_m, last_tile_m + fx.Int32(1)
+                    )
+                    wait_mem_all()
+                    fx.gpu.barrier()
+                    combine_bf16_tile(
+                        sym_buffer,
+                        workspace,
                         thread_index=tid,
-                        reduce_block_idx=take * fx.Int32(_REDUCE_GROUPS_PER_TAKE) + group,
-                        num_reduce_warps=NUM_MAX_TOKENS_PER_RANK,  # one token per warp per group
-                        num_topk=NUM_TOPK,
-                        hidden=N,
-                        num_experts=NUM_EXPERTS,
-                        num_experts_per_rank=num_experts_per_rank,
-                        num_max_routes=num_max_routes,
-                        rank=RANK,
-                        combine_token_res=combine_token_res,
-                        output_res=create_buffer_resource_from_addr(_addr(arg_out)),
-                        topk_indices_res=create_buffer_resource_from_addr(_addr(arg_topk_idx)),
-                        num_tokens_res=create_buffer_resource_from_addr(_addr(arg_num_tokens_per_rank)),
-                        reduce_flag_base=reduce_flag_base,
-                        reduce_bank=reduce_bank,
+                        segment_idx=segment_idx,
+                        first_fold_row=start_row + part_offset,
+                        num_fold_rows=num_part_rows,
+                        recv_dst_rank_res=create_buffer_resource_from_addr(_addr(arg_recv_dst_rank)),
+                        pool_row_to_route_res=create_buffer_resource_from_addr(_addr(arg_pool_row_to_route)),
+                        pool_row_to_recv_token_res=create_buffer_resource_from_addr(
+                            _addr(arg_pool_row_to_recv_token)
+                        ),
+                        recv_token_to_pool_rows_res=create_buffer_resource_from_addr(
+                            _addr(arg_recv_token_to_pool_rows)
+                        ),
+                        l2_ptr=l2_base,
                         epoch=expected_reduce,
-                        combine_gate_res=combine_gate_res,
-                        grad_topk_weights_res=(
-                            create_buffer_resource_from_addr(_addr(arg_grad_topk_weights))
-                            if HAS_GRAD_GATE
-                            else None
+                        reduce_bank=reduce_bank,
+                        grad_gate_res=(
+                            create_buffer_resource_from_addr(_addr(arg_grad_gate)) if HAS_GRAD_GATE else None
                         ),
                         has_grad_gate=HAS_GRAD_GATE,
+                        bias=(
+                            (
+                                _addr(arg_bias),
+                                create_buffer_resource_from_addr(_addr(arg_tile_to_expert)),
+                                create_buffer_resource_from_addr(_addr(arg_bias_scale)),
+                            )
+                            if HAS_BIAS
+                            else None
+                        ),
                         block_threads=block,
-                        vec_unroll=4,
                     )
+                    chunk = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(1), scope="workgroup", space=3))
+                    fx.gpu.barrier()  # every wave has the chunk before thread 0 takes the next one
+
+                # ---- reduce: every chunk is taken by a running workgroup, so the flags waited on come ----
+                # pool blocks this call left empty still have to reach the never-reset expected
+                num_empty_tiles_m = fx.Int32(MAX_TILES) - num_tiles_m
+                num_local_empty_tiles_m = (
+                    num_empty_tiles_m - combine_idx + fx.Int32(NUM_COMBINE - 1)
+                ) // fx.Int32(NUM_COMBINE)
+                for empty_iter in range(num_local_empty_tiles_m):
+                    empty_tile_m = num_tiles_m + combine_idx + empty_iter * fx.Int32(NUM_COMBINE)
+                    if fx.Int32(tid) == fx.Int32(0):
+                        atomic_add(combine_flag_base, combine_bank + empty_tile_m, fx.Int64(N_BLOCKS_N))
+                # tokens are taken from a counter too: the workgroups do not all become resident at
+                # once (blocks are spread over the XCDs unevenly), and a late one must not hold a
+                # static share of the tokens
+                group_tokens = block // 64
+                take_tokens = _REDUCE_GROUPS_PER_TAKE * group_tokens
+                num_tokens = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tokens_per_rank)[fx.Int32(RANK)])
+                if fx.Int32(tid) == fx.Int32(0):
+                    taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(1), fx.Int32(1))
+                    st(lds, fx.Int32(0), taken, scope="workgroup", space=3)
                 fx.gpu.barrier()
-                take = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(1), scope="workgroup", space=3))
-                fx.gpu.barrier()  # every wave has the take before thread 0 takes the next one
+                take = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(0), scope="workgroup", space=3))
+                while take * fx.Int32(take_tokens) < num_tokens:
+                    if fx.Int32(tid) == fx.Int32(0):
+                        taken = atomic_add(_addr(arg_chunk_counter), fx.Int32(1), fx.Int32(1))
+                        st(lds, fx.Int32(1), taken, scope="workgroup", space=3)
+                    for group in range(fx.Int32(_REDUCE_GROUPS_PER_TAKE)):
+                        topk_reduce_bf16_tile(
+                            thread_index=tid,
+                            reduce_block_idx=take * fx.Int32(_REDUCE_GROUPS_PER_TAKE) + group,
+                            num_reduce_warps=NUM_MAX_TOKENS_PER_RANK,  # one token per warp per group
+                            num_topk=NUM_TOPK,
+                            hidden=N,
+                            num_experts=NUM_EXPERTS,
+                            num_experts_per_rank=num_experts_per_rank,
+                            num_max_routes=num_max_routes,
+                            rank=RANK,
+                            combine_token_res=combine_token_res,
+                            output_res=create_buffer_resource_from_addr(_addr(arg_out)),
+                            topk_indices_res=create_buffer_resource_from_addr(_addr(arg_topk_idx)),
+                            num_tokens_res=create_buffer_resource_from_addr(_addr(arg_num_tokens_per_rank)),
+                            reduce_flag_base=reduce_flag_base,
+                            reduce_bank=reduce_bank,
+                            epoch=expected_reduce,
+                            combine_gate_res=combine_gate_res,
+                            grad_topk_weights_res=(
+                                create_buffer_resource_from_addr(_addr(arg_grad_topk_weights))
+                                if HAS_GRAD_GATE
+                                else None
+                            ),
+                            has_grad_gate=HAS_GRAD_GATE,
+                            block_threads=block,
+                            vec_unroll=4,
+                        )
+                    fx.gpu.barrier()
+                    take = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(1), scope="workgroup", space=3))
+                    fx.gpu.barrier()  # every wave has the take before thread 0 takes the next one
 
     epoch_bump(arg_parity, arg_combine_expected, arg_reduce_expected, arg_epoch, arg_chunk_counter).launch(
         grid=(1, 1, 1), block=(64, 1, 1), stream=stream
@@ -551,22 +776,81 @@ def gemm_combine_nt_gfx1250(
     interleaves the fragment reads with the matrix ops (``nt_gemm_tile``; -1: wherever the tile and
     ``issue_first`` allow it) and ``wmma_b2b`` turns the WMMA arbitration stall off (None: on for NT,
     off with ``b_nn``)."""
+    return _launch(
+        act,
+        w2,
+        None,
+        handle,
+        topk_idx,
+        num_lead_combine=num_lead_combine,
+        num_tail_combine=num_tail_combine,
+        lead_gemm_percent=lead_gemm_percent,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        m_warp=m_warp,
+        n_warp=n_warp,
+        grad_gate=grad_gate,
+        b_nn=b_nn,
+        bias=bias,
+        bias_scale=bias_scale,
+        issue_first=issue_first,
+        wmma_b2b=wmma_b2b,
+        lds_cosched=lds_cosched,
+    )
+
+
+def _launch(
+    act: torch.Tensor | None,
+    w2: torch.Tensor | None,
+    l2: torch.Tensor | None,
+    handle: DispatchHandle,
+    topk_idx: torch.Tensor,
+    *,
+    num_lead_combine: int = 0,
+    num_tail_combine: int = 0,
+    lead_gemm_percent: int = 25,
+    tile_m: int = 256,
+    tile_n: int = 256,
+    tile_k: int = 0,
+    m_warp: int = 4,
+    n_warp: int = 2,
+    grad_gate: torch.Tensor | None = None,
+    b_nn: bool = False,
+    bias: torch.Tensor | None = None,
+    bias_scale: torch.Tensor | None = None,
+    issue_first: int = 1,
+    wmma_b2b: int | None = None,
+    lds_cosched: int = -1,
+):
+    """The launch behind ``gemm_combine_nt_gfx1250`` (``act``, ``w2``) and ``combine_only_gfx1250`` (``l2``
+    [pool rows, N] bf16, the L2 output computed elsewhere: the combine and reduce alone)."""
     if wmma_b2b is None:
         wmma_b2b = 0 if b_nn else 1
     lds_cosched = resolve_lds_cosched(lds_cosched, issue_first, tile_m, tile_n, m_warp, n_warp)
-    _require_gfx1250(act.device)
     symm = get_symm_buffer_for_mega_moe()
-    G, N, K = w2.shape
-    if b_nn:
-        K, N = N, K
-        assert N >= tile_n, "an NN block backs its B read off into the row, so N >= tile_n"
-    rows = act.shape[0]
-    tile_k = tile_k or (128 if K % 128 == 0 else 64)
-    assert act.dtype == w2.dtype == torch.bfloat16 and act.is_contiguous() and w2.is_contiguous()
-    assert act.shape[1] == K and N == int(symm.hidden), "w2's output dim is the model hidden"
-    assert rows == handle.pool_row_to_route.numel(), "act holds the rows dispatched to this rank"
+    combine_only = l2 is not None
+    if combine_only:
+        _require_gfx1250(l2.device)
+        assert act is None and w2 is None and num_lead_combine == 0 and bias is None
+        assert l2.dtype == torch.bfloat16 and l2.is_contiguous()
+        rows, N = l2.shape
+        G, K, tile_k = int(symm.num_experts) // int(symm.num_ranks), 128, 128
+        act = w2 = l2  # traced out
+    else:
+        _require_gfx1250(act.device)
+        G, N, K = w2.shape
+        if b_nn:
+            K, N = N, K
+            assert N >= tile_n, "an NN block backs its B read off into the row, so N >= tile_n"
+        rows = act.shape[0]
+        tile_k = tile_k or (128 if K % 128 == 0 else 64)
+        assert act.dtype == w2.dtype == torch.bfloat16 and act.is_contiguous() and w2.is_contiguous()
+        assert act.shape[1] == K, "act's K is w2's"
+        assert K % tile_k == 0 and K // tile_k >= NUM_BUFFERS, "K must be a whole number of >= 2 k-tiles"
+    assert N == int(symm.hidden), "the combined rows are the model hidden"
+    assert rows == handle.pool_row_to_route.numel(), "the pool holds the rows dispatched to this rank"
     assert tile_m == BLOCK_M, "a GEMM tile is one Mega pool block"
-    assert K % tile_k == 0 and K // tile_k >= NUM_BUFFERS, "K must be a whole number of >= 2 k-tiles"
     assert topk_idx.dim() == 2 and topk_idx.shape[1] == int(symm.num_topk)
     num_tokens = topk_idx.shape[0]
     # the reduce walks num_max_tokens_per_rank tokens; the rows past this call's read as unrouted
@@ -593,7 +877,8 @@ def gemm_combine_nt_gfx1250(
         assert bias_scale is not None and bias_scale.dtype == torch.float32 and bias_scale.numel() == rows
         bias, bias_scale = bias.contiguous(), bias_scale.contiguous()
     # local stage of the L2 output: only this rank's combine workgroups read it
-    l2 = torch.empty(rows, N, dtype=torch.bfloat16, device=act.device)
+    if not combine_only:
+        l2 = torch.empty(rows, N, dtype=torch.bfloat16, device=act.device)
     args = (
         _as_ptr(out),
         _as_ptr(act),
@@ -623,7 +908,9 @@ def gemm_combine_nt_gfx1250(
         torch.cuda.current_stream(),
         # GEMM tiles of this call's pool (the prologue's num_tile_blocks), then the combine
         # workgroups: a worst-case grid would queue idle tiles ahead of the tail combine
-        rows // BLOCK_M * ((N + tile_n - 1) // tile_n) + num_lead_combine + num_tail_combine,
+        (0 if combine_only else rows // BLOCK_M * ((N + tile_n - 1) // tile_n))
+        + num_lead_combine
+        + num_tail_combine,
         N,
         K,
         int(symm.num_max_pool_tokens) // BLOCK_M,
@@ -647,6 +934,7 @@ def gemm_combine_nt_gfx1250(
         issue_first,
         wmma_b2b,
         lds_cosched,
+        combine_only,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)
@@ -659,3 +947,10 @@ def gemm_combine_nt_gfx1250(
     if has_grad_gate:
         return out[:num_tokens], grad_topk_weights[: num_tokens * topk_idx.shape[1]].view(num_tokens, -1)
     return out[:num_tokens]
+
+
+def combine_only_gfx1250(l2: torch.Tensor, handle: DispatchHandle, topk_idx: torch.Tensor, *, grad_gate=None):
+    """The combine and reduce of ``gemm_combine_nt_gfx1250`` over an L2 output computed elsewhere: ``l2`` [pool rows,
+    hidden] bf16 in pool order (padding rows unread) -> ``out [tokens, hidden]``, and with ``grad_gate`` (f32 per
+    pool row) also ``grad_topk_weights [tokens, topk]``, as that call returns them."""
+    return _launch(None, None, l2, handle, topk_idx, grad_gate=grad_gate)
