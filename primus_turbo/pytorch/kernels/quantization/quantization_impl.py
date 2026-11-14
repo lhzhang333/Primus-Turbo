@@ -82,7 +82,9 @@ def _gfx1250_mxfp8(
             f"FlyDSL quantizers support, got {x.dtype} -> {out_dtype}, {row}, {col}"
         )
     mx_strict(
-        f"MXFP8 quantization of {x.dtype} -> {out_dtype} ({row}, {col}) runs the HIP kernels on gfx1250",
+        lambda: (
+            f"MXFP8 quantization of {x.dtype} -> {out_dtype} ({row}, {col}) runs the HIP kernels on gfx1250"
+        ),
         level=2,
     )
     return None
