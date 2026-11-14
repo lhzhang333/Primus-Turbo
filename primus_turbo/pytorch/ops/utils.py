@@ -126,16 +126,22 @@ def mx_gemm_layout(w, grouped: bool = False, a=None, config=None, out_dtype=None
     return ok and mx_weight_layout_recipe(grouped, w.shape) == MX_W
 
 
-def mx_check_operand_recipe(who: str, name: str, t, want: ScalingRecipe, lay: bool) -> None:
-    """Raise (not assert) when a pre-quantized MX operand ``t`` (e.g. ``rmsnorm_mxfp8``'s pair) was written in
-    another layout than the consumer reads: ``want`` = ``MX_A`` / ``MX_B`` (gfx1250 GEMM layout, ``lay``) or raw."""
-    got = t.scaling_recipe
-    if got != want:
-        raise ValueError(
-            f"{who}: {name} was quantized with {got}, but this GEMM reads the "
-            f"{'gfx1250 MX GEMM layout' if lay else 'raw MX layout'} and expects {want}; quantize it with the "
-            f"recipes the consumer uses (row MX_A / column MX_B where mx_gemm_layout holds, raw ScalingRecipe() else)"
-        )
+def mx_check_operand_recipes(who: str, lay: bool, **copies) -> None:
+    """gfx1250: raise ValueError when a pre-quantized MX operand copy (``name=(tensor or None, the recipe it must
+    carry)``, e.g. ``a`` / ``a_t`` / ``b`` / ``b_t``) was written in another layout than the GEMMs of ``who`` read
+    (``lay``: gfx1250's MX GEMM layout, else the raw one). Elsewhere a no-op: the ops keep their assertions there."""
+    if not is_gfx1250():
+        return
+    from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
+
+    for name, (t, want) in copies.items():
+        if isinstance(t, QuantizedTensor) and t.scaling_recipe != want:
+            raise ValueError(
+                f"{who}: {name} was quantized with {t.scaling_recipe}, but this GEMM reads the "
+                f"{'gfx1250 MX GEMM layout' if lay else 'raw MX layout'} and expects {want}; quantize it with the "
+                f"recipes the op uses (MX_A rows / MX_B columns / MX_W weights where mx_gemm_layout holds, the "
+                f"raw ones else)"
+            )
 
 
 def _get_fp8_dtype(format: Format, is_fwd_stage: bool):

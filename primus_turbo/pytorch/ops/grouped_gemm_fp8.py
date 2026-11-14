@@ -48,6 +48,7 @@ from primus_turbo.pytorch.ops.utils import (
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx_check_operand_recipes,
     mx_gemm_layout,
     mx_wgrad_accum_backend,
 )
@@ -669,6 +670,15 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
         lay = mx_gemm_layout(b, grouped=True, a=a, config=config, out_dtype=out_dtype)
         a_scaling_recipe, a_t_recipe = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
+        b_scaling_recipe = MX_W if lay else ScalingRecipe(use_2d_block=True)
+        mx_check_operand_recipes(
+            "grouped_gemm_fp8 (MXFP8)",
+            lay,
+            a=(a, a_scaling_recipe),
+            a_t=(a_t, a_t_recipe),
+            b=(b, b_scaling_recipe),
+            b_t=(b_t, b_scaling_recipe),
+        )
         if not isinstance(a, QuantizedTensor):
             # NOTE: If a is not a QuantizedTensor use grouped_quantize_fp8_with_trans to avoid call dequantize.
             (
@@ -716,7 +726,6 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
             group_offs_padded_rowwise = quantized_a.group_offs
 
-        b_scaling_recipe = MX_W if lay else ScalingRecipe(use_2d_block=True)
         if not isinstance(b, QuantizedTensor):
             # NOTE: If b is not a QuantizedTensor use quantize_fp8_with_trans to avoid call dequantize.
 

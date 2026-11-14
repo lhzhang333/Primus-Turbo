@@ -54,6 +54,7 @@ from primus_turbo.pytorch.ops.utils import (
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx_check_operand_recipes,
     mx_gemm_layout,
 )
 
@@ -573,6 +574,17 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
         lay2 = mx_gemm_layout(w2, grouped=True, a=x, config=config, out_dtype=out_dtype)
         assert lay2 == lay, "w1 and w2 must be quantized in the same layout"
         x_rec, x_t_rec = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
+        w_rec = MX_W if lay else ScalingRecipe(use_2d_block=True)
+        mx_check_operand_recipes(
+            "grouped_mlp_fp8 (MXFP8)",
+            lay,
+            x=(x, x_rec),
+            x_t=(x_t, x_t_rec),
+            w1=(w1, w_rec),
+            w1_t=(w1_t, w_rec),
+            w2=(w2, w_rec),
+            w2_t=(w2_t, w_rec),
+        )
         # x may be a lazy permute placeholder (Primus' moe_permute_quant_fusion, ops/moe_gather.py): quantize
         # straight from the un-permuted source through dest2src, and keep the plan that lets the unpermute's
         # backward hand grad_out over the same way.
@@ -596,7 +608,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             )
         else:
             assert x._is_grouped_tensor, "a QuantizedTensor input must be a grouped tensor"
-            check_quantized_tensor(x, config, axis=-1, scaling_recipe=x_rec if lay else None)
+            check_quantized_tensor(x, config, axis=-1)
             x_row, x_row_scale = x.qdata, x.scale_inv
             offs_row = x.group_offs
             if x_t is None:

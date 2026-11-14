@@ -198,6 +198,36 @@ def test_gemm_layout_gfx950(monkeypatch):
         gemm_fp8(a, QuantizedTensorPair(w, w_t), trans_b=True, out_dtype=torch.bfloat16, config=MX)
 
 
+def test_operand_recipe_checks(monkeypatch):
+    """gfx1250: every pre-quantized copy (a, a_t, b, b_t) must carry the recipe its GEMM reads (ValueError);
+    elsewhere main's checks: a and b asserted, the transposed copies taken as given."""
+    import importlib
+
+    gemm_fp8_mod = importlib.import_module("primus_turbo.pytorch.ops.gemm_fp8")
+    reached = []
+
+    def gemm(*args, **kw):
+        reached.append(1)
+        return torch.empty(32, 64)
+
+    monkeypatch.setattr(gemm_fp8_mod, "check_mxfp8_support", lambda: (True, ""))
+    monkeypatch.setattr(gemm_fp8_mod, "mx1250_gemm_direct", lambda *args, **kw: None)
+    monkeypatch.setattr(gemm_fp8_mod, "gemm_fp8_impl", gemm)
+    raw_a, raw_w, mx_w = ScalingRecipe(), ScalingRecipe(use_2d_block=True), ops_utils.MX_W
+    a = QuantizedTensorPair(_qt((32, 64), raw_a), _qt((32, 64), raw_w, axis=-2))  # a_t: 2-D blocks
+    w = QuantizedTensorPair(_qt((64, 64), raw_w), _qt((64, 64), mx_w, axis=-2))  # b_t: another layout
+    kw = dict(trans_b=True, out_dtype=torch.bfloat16, config=MX)
+    _fake_arch(monkeypatch, "gfx950")
+    gemm_fp8(a, w, **kw)
+    assert reached
+    _fake_arch(monkeypatch, "gfx1250")
+    with pytest.raises(ValueError, match="a_t was quantized with .* raw MX layout"):
+        gemm_fp8(a, w, **kw)
+    a = QuantizedTensorPair(a.data, _qt((32, 64), raw_a, axis=-2))
+    with pytest.raises(ValueError, match="b_t was quantized with"):
+        gemm_fp8(a, w, **kw)
+
+
 def test_fused_glu_e4m3_only_on_gfx1250(monkeypatch):
     """gfx1250's fused MXFP8 GLU / dGLU quantize to E4M3 both ways: HYBRID is refused before any GEMM runs."""
     import primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl as gimpl
