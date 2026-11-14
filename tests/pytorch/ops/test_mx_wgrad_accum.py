@@ -34,7 +34,6 @@ from primus_turbo.pytorch.ops import (
     gemm_fp8,
     grouped_gemm_fp8,
     mx_weight_layout_recipe,
-    mx_wgrad_accum_backend,
     mx_wgrad_accum_supported,
 )
 
@@ -301,7 +300,17 @@ def test_no_mx_on_gfx942(monkeypatch):
     monkeypatch.setattr(ops_utils, "is_gfx1250", lambda: False)
     assert not mx_wgrad_accum_supported(False, torch.bfloat16)
     assert not mx_wgrad_accum_supported(True, torch.bfloat16)
-    assert mx_wgrad_accum_backend(True) == BackendType.TRITON
+    assert ops_utils.mx_wgrad_accum_backend(True) == BackendType.TRITON
+
+
+def test_supported_dense_flydsl_gfx950_needs_the_op_dtype(monkeypatch):
+    """gfx950's dense FlyDSL wgrad adds only into a main_grad of the op's output dtype, where the caller says it."""
+    _fake_arch(monkeypatch, "gfx950")
+    choice = BackendChoice(backend=BackendType.FLYDSL)
+    monkeypatch.setattr(GlobalBackendManager, "get_gemm_backend", classmethod(lambda cls, precision: choice))
+    assert mx_wgrad_accum_supported(False, torch.bfloat16, out_dtype=torch.bfloat16)
+    assert not mx_wgrad_accum_supported(False, torch.float16, out_dtype=torch.bfloat16)
+    assert mx_wgrad_accum_supported(False, torch.float16)  # the op dtype not given: the table's answer
 
 
 def _accumulate(op, weight, inputs, grad_outputs, main_grad0, fused):

@@ -47,16 +47,22 @@ def mx_wgrad_accum_backend(grouped: bool) -> BackendType:
     return BackendType.TRITON if grouped else BackendType.HIPBLASLT
 
 
-def mx_wgrad_accum_supported(grouped: bool, main_grad_dtype: torch.dtype) -> bool:
+def mx_wgrad_accum_supported(
+    grouped: bool, main_grad_dtype: torch.dtype, out_dtype: Optional[torch.dtype] = None
+) -> bool:
     """Whether the MXFP8 wgrad of ``grouped_gemm_fp8`` (``grouped``) / ``gemm_fp8`` can add into a ``main_grad`` of
     ``main_grad_dtype`` with the backend it would run (pinned through GlobalBackendManager or its env variable, else
     ``mx_wgrad_accum_backend``). Frameworks ask before passing fuse_bgrad_accum_pattern; where it is False they add
-    the wgrad themselves."""
+    the wgrad themselves. ``out_dtype``: the op's output dtype, where known (gfx950's dense FlyDSL wgrad adds only
+    into a main_grad of that dtype)."""
     if is_gfx942():
         return False
     get = GlobalBackendManager.get_grouped_gemm_backend if grouped else GlobalBackendManager.get_gemm_backend
     backend = getattr(get(PrecisionType.FP8), "backend", None) or mx_wgrad_accum_backend(grouped)
     arch = "gfx1250" if is_gfx1250() else "gfx950" if is_gfx950() else None
+    same_dtype = out_dtype in (None, main_grad_dtype)
+    if (arch, grouped, backend) == ("gfx950", False, BackendType.FLYDSL) and not same_dtype:
+        return False
     return main_grad_dtype in _MX_WGRAD_ACCUM.get((arch, grouped, backend), ())
 
 
