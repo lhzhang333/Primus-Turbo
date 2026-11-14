@@ -26,27 +26,17 @@ from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950, is_gfx1250
 _ALL, _BF16_FP32 = (torch.bfloat16, torch.float16, torch.float32), (torch.bfloat16, torch.float32)
 # main_grad dtypes an MXFP8 wgrad with a beta=1 epilogue (fuse_bgrad_accum_pattern) adds into, per (arch, grouped,
 # backend); dense = gemm_fp8's wgrad, grouped = grouped_gemm_fp8's variable-K one. gfx950 FlyDSL: 16-bit only.
+# gfx1250: FlyDSL, and Triton as its fallback (no hipBLASLt MX GEMM there).
 _MX_WGRAD_ACCUM = {
     ("gfx950", False, BackendType.HIPBLASLT): _ALL,
     ("gfx950", False, BackendType.FLYDSL): _ALL[:2],
     ("gfx950", True, BackendType.TRITON): _ALL,
     ("gfx950", True, BackendType.FLYDSL): _ALL[:2],
-    ("gfx1250", False, BackendType.FLYDSL): _BF16_FP32,  # once the kernels have it (_mx1250_flydsl_accum)
+    ("gfx1250", False, BackendType.FLYDSL): _BF16_FP32,
     ("gfx1250", True, BackendType.FLYDSL): _BF16_FP32,
-    ("gfx1250", False, BackendType.TRITON): _ALL,  # the fallback (hipBLASLt's MX GEMM is wrong there)
+    ("gfx1250", False, BackendType.TRITON): _ALL,
     ("gfx1250", True, BackendType.TRITON): _ALL,
 }
-
-
-def _mx1250_flydsl_accum(grouped: bool) -> bool:
-    """Whether gfx1250's FlyDSL MX wgrad has its beta=1 epilogue yet (``accumulate=`` / the variable-K mode)."""
-    if grouped:
-        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import mx1250_grouped
-
-        return mx1250_grouped()[1] is not None
-    from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import mx1250_gemm
-
-    return mx1250_gemm()[1]
 
 
 def mx_wgrad_accum_backend(grouped: bool) -> BackendType:
@@ -57,73 +47,107 @@ def mx_wgrad_accum_backend(grouped: bool) -> BackendType:
     return BackendType.TRITON if grouped else BackendType.HIPBLASLT
 
 
-def mx_wgrad_accum_supported(grouped: bool, main_grad_dtype: torch.dtype) -> bool:
+def mx_wgrad_accum_supported(
+    grouped: bool, main_grad_dtype: torch.dtype, out_dtype: Optional[torch.dtype] = None
+) -> bool:
     """Whether the MXFP8 wgrad of ``grouped_gemm_fp8`` (``grouped``) / ``gemm_fp8`` can add into a ``main_grad`` of
     ``main_grad_dtype`` with the backend it would run (pinned through GlobalBackendManager or its env variable, else
-    ``mx_wgrad_accum_backend``). Frameworks ask before passing fuse_bgrad_accum_pattern; on gfx1250 it is False
-    until the FlyDSL kernels have the beta=1 epilogue (the framework adds the wgrad itself)."""
+    ``mx_wgrad_accum_backend``). Frameworks ask before passing fuse_bgrad_accum_pattern; where it is False they add
+    the wgrad themselves. ``out_dtype``: the op's output dtype, where known (gfx950's dense FlyDSL wgrad adds only
+    into a main_grad of that dtype)."""
     if is_gfx942():
         return False
     get = GlobalBackendManager.get_grouped_gemm_backend if grouped else GlobalBackendManager.get_gemm_backend
     backend = getattr(get(PrecisionType.FP8), "backend", None) or mx_wgrad_accum_backend(grouped)
     arch = "gfx1250" if is_gfx1250() else "gfx950" if is_gfx950() else None
-    if arch == "gfx1250" and backend == BackendType.FLYDSL and not _mx1250_flydsl_accum(grouped):
+    same_dtype = out_dtype in (None, main_grad_dtype)
+    if (arch, grouped, backend) == ("gfx950", False, BackendType.FLYDSL) and not same_dtype:
         return False
     return main_grad_dtype in _MX_WGRAD_ACCUM.get((arch, grouped, backend), ())
 
 
-# gfx1250's MX GEMM layouts, written by the quantizers when a recipe's shuffle flags ask for them: packed E8M0 scales
-# for every operand (A: shuffle_scale), 16x16 blocks for the B operands too (W, Wᵀ, wgrad's activation columns)
+# gfx1250's MX GEMM layouts, written by its quantizers when a recipe's shuffle flags ask for them: packed E8M0 scales
+# for every operand (A: shuffle_scale), 16x16 blocks for the B operands too (W, Wᵀ, wgrad's activation columns). On
+# other archs the same flags mean other layouts (gfx950: the CDNA4 shuffles), so only gfx1250 reads them as these.
 MX_A, MX_B = ScalingRecipe(shuffle_scale=True), ScalingRecipe(shuffle_scale=True, shuffle_out=True)
 MX_W = ScalingRecipe(use_2d_block=True, shuffle_scale=True, shuffle_out=True)
 
 
 def _mx1250_layout_ok(grouped: bool) -> bool:
-    """Whether gfx1250's FlyDSL MX GEMMs of this op kind run here and read the GEMM layouts: on gfx1250 with no
-    other FP8 backend pinned, and (``grouped``) the grouped-M / variable-K entry points present."""
+    """Whether gfx1250's FlyDSL MX GEMMs of this op kind (dense / ``grouped``) run here: on gfx1250, with no other
+    FP8 GEMM backend pinned."""
     if not is_gfx1250():
         return False
     get = GlobalBackendManager.get_grouped_gemm_backend if grouped else GlobalBackendManager.get_gemm_backend
-    if getattr(get(PrecisionType.FP8), "backend", None) not in (None, BackendType.FLYDSL):
-        return False
-    if grouped:
-        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import mx1250_grouped
-
-        return None not in mx1250_grouped()
-    return True
+    return getattr(get(PrecisionType.FP8), "backend", None) in (None, BackendType.FLYDSL)
 
 
-def mx_weight_layout_recipe(grouped: bool, shape=None) -> ScalingRecipe:
-    """Scaling recipe of a cached MXFP8 weight (both copies, ``create_quantized_weight(scaling_recipe=)``) of
-    ``gemm_fp8`` / (``grouped``) the grouped ops: gfx1250's MX GEMM layout ``MX_W`` when its FlyDSL MX GEMMs of that
-    kind take it here (and ``shape``'s last two dims are % 16, if given), else the raw 2-D block recipe. The op layer
-    decides the same way (``mx_gemm_layout``), so a cache made with this recipe is what the op expects."""
-    ok = _mx1250_layout_ok(grouped) and (shape is None or (shape[-1] % 16 == 0 and shape[-2] % 16 == 0))
+def _mx1250_layout_dtypes_ok(config=None, out_dtype=None) -> bool:
+    """The formats the gfx1250 MX GEMM layouts are written in (its quantizers take bf16 -> E4M3 only): E4M3 forward
+    and backward (not E5M2 / HYBRID) and a bf16 output, each where given."""
+    return (config is None or config.format == Format.E4M3) and out_dtype in (None, torch.bfloat16)
+
+
+def mx_weight_layout_recipe(grouped: bool, shape, *, config=None, dtype=None) -> ScalingRecipe:
+    """Scaling recipe for the cached MXFP8 copies of a weight of ``shape`` (both copies,
+    ``create_quantized_weight(scaling_recipe=)``) of ``gemm_fp8`` / (``grouped``) the grouped ops: gfx1250's MX GEMM
+    layout ``MX_W`` where its FlyDSL MX GEMMs of that kind run (gfx1250, no other FP8 GEMM backend pinned) and take
+    the shape (N and K % 16; grouped: % 32), for an E4M3 ``config`` and a bf16 weight ``dtype`` where given; else the
+    raw 2-D block recipe. ``mx_gemm_layout`` decides the same way, so the op reads such a cache in the layout it
+    expects."""
+    align = 32 if grouped else 16
+    ok = _mx1250_layout_ok(grouped) and shape[-1] % align == 0 and shape[-2] % align == 0
+    ok = ok and _mx1250_layout_dtypes_ok(config) and dtype in (None, torch.bfloat16)
     return MX_W if ok else ScalingRecipe(use_2d_block=True)
 
 
-def mx_gemm_layout(w, grouped: bool = False, a=None) -> bool:
-    """Whether the MX GEMMs of a ``gemm_fp8`` / (``grouped``) grouped op with weight ``w`` and input ``a`` run on
-    gfx1250's GEMM layouts: a cached ``w``'s recipe says, else a quantized ``a``'s, else a plain ``w`` takes them when
+def mx_gemm_layout(w, grouped: bool = False, a=None, config=None, out_dtype=None) -> bool:
+    """Whether the MX GEMMs of a ``gemm_fp8`` / (``grouped``) grouped op with weight ``w``, input ``a``, ``config``
+    and ``out_dtype`` run on gfx1250's MX GEMM layouts (``MX_A`` / ``MX_B`` / ``MX_W``) rather than the raw ones.
+    Never off gfx1250. A cached ``w``'s recipe decides, else a quantized ``a``'s; ValueError when the layout they
+    force cannot run here (another FP8 GEMM backend pinned, a format other than E4M3, a non-bf16 output, or a
+    non-bf16 operand to quantize into it). Else a plain bf16 ``w`` (and ``a``) takes the layout where
     ``mx_weight_layout_recipe`` would cache it so."""
+    if not is_gfx1250():
+        return False
     from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 
-    for t, flag in ((w, "shuffle_out"), (a, "shuffle_scale")):
+    def bf16(t):  # an operand the op quantizes itself: gfx1250's quantizers write the layouts from bf16 only
+        return t is None or isinstance(t, QuantizedTensor) or t.dtype == torch.bfloat16
+
+    ok = _mx1250_layout_ok(grouped) and _mx1250_layout_dtypes_ok(config, out_dtype) and bf16(w) and bf16(a)
+    for t, flag, what in ((w, "shuffle_out", "cached weight"), (a, "shuffle_scale", "quantized input")):
         if isinstance(t, QuantizedTensor):
-            return bool(t.scaling_recipe is not None and getattr(t.scaling_recipe, flag))
-    return mx_weight_layout_recipe(grouped, w.shape) == MX_W
+            if t.scaling_recipe is None or not getattr(t.scaling_recipe, flag):
+                return False
+            if not ok:
+                raise ValueError(
+                    f"MXFP8 {'grouped ' if grouped else ''}GEMM: the {what} is in gfx1250's MX GEMM layout "
+                    f"({t.scaling_recipe}), which only gfx1250's FlyDSL MX GEMMs read (no other FP8 GEMM backend "
+                    f"pinned), for E4M3 data and bf16 activations and output; got format "
+                    f"{getattr(config, 'format', None)}, input {getattr(a, 'dtype', None)}, weight {w.dtype}, "
+                    f"out_dtype {out_dtype}. Quantize it with the raw recipe (mx_weight_layout_recipe says which)."
+                )
+            return True
+    return ok and mx_weight_layout_recipe(grouped, w.shape) == MX_W
 
 
-def mx_check_operand_recipe(who: str, name: str, t, want: ScalingRecipe, lay: bool) -> None:
-    """Raise (not assert) when a pre-quantized MX operand ``t`` (e.g. ``rmsnorm_mxfp8``'s pair) was written in
-    another layout than the consumer reads: ``want`` = ``MX_A`` / ``MX_B`` (gfx1250 GEMM layout, ``lay``) or raw."""
-    got = t.scaling_recipe
-    if got != want:
-        raise ValueError(
-            f"{who}: {name} was quantized with {got}, but this GEMM reads the "
-            f"{'gfx1250 MX GEMM layout' if lay else 'raw MX layout'} and expects {want}; quantize it with the "
-            f"recipes the consumer uses (row MX_A / column MX_B where mx_gemm_layout holds, raw ScalingRecipe() else)"
-        )
+def mx_check_operand_recipes(who: str, lay: bool, **copies) -> None:
+    """gfx1250: raise ValueError when a pre-quantized MX operand copy (``name=(tensor or None, the recipe it must
+    carry)``, e.g. ``a`` / ``a_t`` / ``b`` / ``b_t``) was written in another layout than the GEMMs of ``who`` read
+    (``lay``: gfx1250's MX GEMM layout, else the raw one). Elsewhere a no-op: the ops keep their assertions there."""
+    if not is_gfx1250():
+        return
+    from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
+
+    for name, (t, want) in copies.items():
+        if isinstance(t, QuantizedTensor) and t.scaling_recipe != want:
+            raise ValueError(
+                f"{who}: {name} was quantized with {t.scaling_recipe}, but this GEMM reads the "
+                f"{'gfx1250 MX GEMM layout' if lay else 'raw MX layout'} and expects {want}; quantize it with the "
+                f"recipes the op uses (MX_A rows / MX_B columns / MX_W weights where mx_gemm_layout holds, the "
+                f"raw ones else)"
+            )
 
 
 def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
@@ -173,34 +197,35 @@ def _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern: Optional[str]):
     return True, b.main_grad
 
 
+DUMMY_WGRAD_FLAT_POOL = True  # get_dummy_wgrad hands out views of one flat buffer per (dtype, device)
 _dummy_wgrads = {}
 
 
-def _get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tensor:
-    """Returns a dummy tensor of given shape.
+def get_dummy_wgrad(shape, dtype: torch.dtype, device, zero: bool = False) -> torch.Tensor:
+    """A placeholder gradient of ``shape`` / ``dtype`` on ``device`` for a weight whose gradient went elsewhere (a
+    fused wgrad accumulated it into ``main_grad``): a contiguous view of the first ``numel`` elements of one flat
+    buffer per (dtype, device), so the placeholders of all weights cost the largest one once.
 
-    Supports arbitrary rank (2D for plain Linear weights, 3D for stacked
-    grouped-linear weights ``(num_gemms, out_features, in_features)``, etc.).
-    One flat buffer per dtype serves every shape: the dummy is a contiguous view of
-    its first ``numel`` elements, so the dummies cost the largest weight once instead
-    of one persistent buffer per distinct weight shape (DeepSeek-V3 with MXFP8 experts
-    and dense linears: 1.75 GiB instead of 3.1 GiB). The buffer only grows; views
-    handed out earlier keep the old one alive until autograd drops them (the
-    framework's hook sets ``param.grad = None`` right after). The contents are never
-    read (``zero=True``: zeroed for frameworks that add the dummy, e.g. Megatron's
-    ``zero_out_wgrad``); views of one buffer may alias each other, which is harmless
-    for the same reason. A contiguous view keeps the gradient layout contract, so
-    AccumulateGrad still takes it without a copy.
-    """
-    global _dummy_wgrads
+    Never written: views of the buffer alias each other, so their contents are undefined and nobody may write or
+    read them; the fused-wgrad ops only hand them to autograd, which takes one over as the weight's ``.grad``.
+    ``zero=True`` zeroes this view for a framework that adds the placeholder (Megatron's ``zero_out_wgrad``). The
+    buffer only grows; views handed out earlier keep the old one alive until they are dropped."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     numel = 1
     for d in shape:
         numel *= int(d)
-    key = (dtype, torch.cuda.current_device())
+    key = (dtype, device)
     buf = _dummy_wgrads.get(key)
     if buf is None or buf.numel() < numel:
-        buf = _dummy_wgrads[key] = torch.empty(numel, dtype=dtype, device="cuda", requires_grad=False)
+        buf = _dummy_wgrads[key] = torch.empty(numel, dtype=dtype, device=device)
     view = buf[:numel].view(*shape)
     if zero:
         view.fill_(0)
     return view.detach()
+
+
+def _get_dummy_wgrad(shape, dtype: torch.dtype, zero=False) -> torch.Tensor:
+    """``get_dummy_wgrad`` on the current CUDA device: the fused-wgrad ops' placeholder gradient."""
+    return get_dummy_wgrad(shape, dtype, torch.cuda.current_device(), zero)

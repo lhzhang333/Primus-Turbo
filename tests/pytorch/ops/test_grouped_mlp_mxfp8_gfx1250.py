@@ -6,10 +6,11 @@
 
 """MXFP8 routed experts on gfx1250, strict mode (a fallback raises): grouped_gemm_fp8, and grouped_mlp_fp8 with its
 GLU / dGLU in two phases (the grouped MX GEMM, then the FlyDSL GLU / dGLU + dual-quant kernel), against BF16, at a
-toy shape and the DSv3 expert shape (32 experts x 2048 tokens, H 7168, I 2048), balanced and skewed (empty experts),
-and as Primus runs them (cached weights, wgrads fused into main_grad).
-The grouped GEMMs run on gfx1250's FlyDSL MX kernels ("default"; skipped while they are missing) or on Triton, pinned
-(the fallback)."""
+toy shape (and once per test at the DSv3 expert shape: 32 experts x 2048 tokens, H 7168, I 2048), balanced and skewed
+(empty experts), and as Primus runs them (cached weights, wgrads fused into main_grad).
+The grouped GEMMs run on gfx1250's FlyDSL MX kernels ("default") or on Triton, pinned (the fallback)."""
+
+import itertools
 
 import pytest
 import torch
@@ -50,10 +51,22 @@ MX = Float8QuantConfig(
     block_size=32,
 )
 # (G, tokens, H, I): toy, DSv3 routed experts at T = 8192 (top-8)
-SHAPES = [(4, 1000, 512, 256), (32, 65536, 7168, 2048)]
+TOY, DSV3 = (4, 1000, 512, 256), (32, 65536, 7168, 2048)
 
 
-@pytest.fixture(params=["default", "triton"])
+def _cases(*axes, dsv3, toy=TOY, big=DSV3):
+    """(backend, shape, *axes): both backends x every value of ``axes`` at the toy shape, plus one case at DSv3 scale
+    (FlyDSL, the ``dsv3`` values): those hold about 20 GB and run per-expert BF16 references."""
+
+    def case(b, shape, rest, name):
+        ids = [b, name, *(str(v).replace("torch.", "") for v in rest)]
+        return pytest.param(b, shape, *rest, id="-".join(ids))
+
+    toys = [case(b, toy, rest, "toy") for b in ("default", "triton") for rest in itertools.product(*axes)]
+    return toys + [case("default", big, dsv3, "dsv3")]
+
+
+@pytest.fixture
 def backend(request, monkeypatch):
     monkeypatch.setenv("PRIMUS_TURBO_MX_STRICT", "2")
     monkeypatch.delenv("PRIMUS_TURBO_MXFP8_SCALE_RULE", raising=False)
@@ -61,11 +74,6 @@ def backend(request, monkeypatch):
     GlobalBackendManager.reset()
     if request.param == "triton":
         GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON, PrecisionType.FP8)
-    else:
-        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import mx1250_grouped
-
-        if None in mx1250_grouped():
-            pytest.skip("gemm_mxfp8_kernel_gfx1250 has no grouped mode yet")
     yield request.param
     GlobalBackendManager.reset()
 
@@ -92,10 +100,10 @@ def _check(name, got, ref, snr_min):
     assert s >= snr_min and cos >= 0.995, f"{name}: SNR {s:.2f} dB, cos {cos:.5f}"
 
 
-@pytest.mark.parametrize("skew", [False, True])
-@pytest.mark.parametrize("G, M, H, I", SHAPES)
-def test_grouped_gemm(backend, G, M, H, I, skew):
+@pytest.mark.parametrize("backend, shape, skew", _cases([False, True], dsv3=(True,)), indirect=["backend"])
+def test_grouped_gemm(backend, shape, skew):
     """fc1-shaped grouped_gemm_fp8: y / dx / dw vs per-expert BF16 GEMMs (SNR >= 25 dB)."""
+    G, M, H, I = shape
     lens = _group_lens(G, M, skew)
     x, w, dy = _randn(M, H, seed=1), _randn(G, 2 * I, H, scale=H**-0.5, seed=2), _randn(M, 2 * I, seed=3)
     xg, wg = x.clone().requires_grad_(), w.clone().requires_grad_()
@@ -123,10 +131,11 @@ def _mlp_bf16(x, w1, w2, lens, probs):
     return torch.cat(out)
 
 
-@pytest.mark.parametrize("G, M, H, I", SHAPES)
-def test_grouped_chain(backend, G, M, H, I):
+@pytest.mark.parametrize("backend, shape", _cases(dsv3=()), indirect=["backend"])
+def test_grouped_chain(backend, shape):
     """The unfused experts (``turbo_fused_grouped_gemm`` off): fc1 and fc2 by grouped_gemm_fp8 around a torch SwiGLU
     with probs, plain bf16 leaves (no cached weights): every leaf's gradient vs BF16 (SNR >= 20 dB)."""
+    G, M, H, I = shape
     lens = _group_lens(G, M, True)
     x, dy = _randn(M, H, seed=1), _randn(M, H, seed=4)
     w1, w2 = _randn(G, 2 * I, H, scale=H**-0.5, seed=2), _randn(G, H, I, scale=I**-0.5, seed=3)
@@ -142,10 +151,10 @@ def test_grouped_chain(backend, G, M, H, I):
         _check(name, got.grad, ref.grad, 20)
 
 
-@pytest.mark.parametrize("skew", [False, True])
-@pytest.mark.parametrize("G, M, H, I", SHAPES)
-def test_grouped_mlp(backend, G, M, H, I, skew):
+@pytest.mark.parametrize("backend, shape, skew", _cases([False, True], dsv3=(True,)), indirect=["backend"])
+def test_grouped_mlp(backend, shape, skew):
     """grouped_mlp_fp8 (fused GLU with probs): y / dx / dprobs / dw1 / dw2 vs BF16 (SNR >= 20 dB, cos >= 0.995)."""
+    G, M, H, I = shape
     lens = _group_lens(G, M, skew)
     x, dy = _randn(M, H, seed=1), _randn(M, H, seed=4)
     w1, w2 = _randn(G, 2 * I, H, scale=H**-0.5, seed=2), _randn(G, H, I, scale=I**-0.5, seed=3)
@@ -162,15 +171,19 @@ def test_grouped_mlp(backend, G, M, H, I, skew):
         _check(name, got.grad, ref.grad, 20)
 
 
-@pytest.mark.parametrize("main_grad_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("G, M, H, I", SHAPES)
-def test_grouped_mlp_primus(backend, G, M, H, I, main_grad_dtype):
+@pytest.mark.parametrize(
+    "backend, shape, main_grad_dtype",
+    _cases([torch.bfloat16, torch.float32], dsv3=(torch.float32,)),
+    indirect=["backend"],
+)
+def test_grouped_mlp_primus(backend, shape, main_grad_dtype):
     """Primus' routed experts (fused grouped MLP, several micro-batches): w1 / w2 cached by create_quantized_weight
-    in the recipe ``mx_weight_layout_recipe`` asks for (gfx1250's GEMM layout once its FlyDSL grouped kernels run),
+    in its default recipe (gfx1250's GEMM layout; raw with Triton pinned),
     wgrads accumulated into main_grad (beta=1): y / dx / dprobs bitwise those of plain bf16 weights (the same
     operands), each main_grad increment vs the plain run's dw (>= 40 dB: one rounding against two) and BF16."""
     if not mx_wgrad_accum_supported(True, main_grad_dtype):
         pytest.skip(f"no grouped MXFP8 beta=1 wgrad into {main_grad_dtype} here")
+    G, M, H, I = shape
     lens = _group_lens(G, M, True)
     x, dy = _randn(M, H, seed=1), _randn(M, H, seed=4)
     w1, w2 = _randn(G, 2 * I, H, scale=H**-0.5, seed=2), _randn(G, H, I, scale=I**-0.5, seed=3)
@@ -187,8 +200,8 @@ def test_grouped_mlp_primus(backend, G, M, H, I, main_grad_dtype):
     ref = run(*plain, False)
     cached = []
     for w in (w1, w2):
-        q, q_t = create_quantized_weight(w, float8_e4m3, MX, need_weight_transpose_cache=True,
-                                         scaling_recipe=mx_weight_layout_recipe(True, w.shape))  # fmt: skip
+        q, q_t = create_quantized_weight(w, float8_e4m3, MX, need_weight_transpose_cache=True)
+        assert q.scaling_recipe == mx_weight_layout_recipe(True, w.shape)
         q.main_grad = (_randn(*w.shape, scale=1e-3, seed=6)).to(main_grad_dtype)
         q.grad_added_to_main_grad = False
         cached.append(QuantizedTensorPair(q, q_t))
@@ -250,16 +263,20 @@ def _combine(rows, order, k):
     return rows.float().index_select(0, order).view(-1, k, rows.shape[1]).sum(1).to(rows.dtype)
 
 
-@pytest.mark.parametrize("skew", [False, True])
-@pytest.mark.parametrize("T, H, I", [(257, 512, 256), (8192, 7168, 2048)])
-def test_grouped_mlp_permute_fusion(backend, T, H, I, skew, monkeypatch):
+@pytest.mark.parametrize(
+    "backend, shape, skew",
+    _cases([False, True], dsv3=(True,), toy=(257, 512, 256), big=(8192, 7168, 2048)),
+    indirect=["backend"],
+)
+def test_grouped_mlp_permute_fusion(backend, shape, skew, monkeypatch):
     """Primus' MoE permute -> fused grouped MLP -> unpermute with moe_permute_quant_fusion and its backward twin
     (32 experts, top-8): x and dOut are quantized straight from the token rows through dest2src (no bf16 permuted
     copy), and y / dx / dw1 / dw2 / dprobs are bitwise those of the materialized permute."""
     from primus_turbo.pytorch.ops import grouped_mlp_fp8 as op
     from primus_turbo.pytorch.ops import moe_gather
 
-    E, k = 32, 8
+    assert op.CONSUMES_PERMUTE_SEAM_MXFP8  # what Primus probes before it hands over a placeholder
+    (T, H, I), E, k = shape, 32, 8
     g = torch.Generator(device="cuda").manual_seed(T + H)
     if skew:  # hot experts, empty ones
         w = torch.rand(E, generator=g, device="cuda") ** 4
@@ -304,13 +321,14 @@ def test_grouped_mlp_permute_fusion(backend, T, H, I, skew, monkeypatch):
         assert torch.equal(a, b), name
 
 
-@pytest.mark.parametrize("G, M, H, I", SHAPES[:1])
-def test_grouped_mlp_custom_op_path(backend, G, M, H, I, monkeypatch):
-    """The fused GLU / dGLU through their torch.library custom ops (torch.compile's path; eager calls run the bodies,
-    whose outputs may share an allocation): unaliased outputs, bitwise the eager results."""
+@pytest.mark.parametrize("backend", ["default", "triton"], indirect=True)
+def test_grouped_mlp_custom_op_path(backend, monkeypatch):
+    """The fused GLU / dGLU through their torch.library custom ops (torch.compile's path; eager calls run the plain
+    functions, whose outputs may share an allocation): unaliased outputs, bitwise the eager results."""
     import importlib
 
     op = importlib.import_module("primus_turbo.pytorch.ops.grouped_mlp_fp8")
+    G, M, H, I = TOY
     lens = _group_lens(G, M, True)
     x, dy = _randn(M, H, seed=1), _randn(M, H, seed=4)
     w1, w2 = _randn(G, 2 * I, H, scale=H**-0.5, seed=2), _randn(G, H, I, scale=I**-0.5, seed=3)
@@ -324,6 +342,6 @@ def test_grouped_mlp_custom_op_path(backend, G, M, H, I, monkeypatch):
         return [y] + [t.grad for t in leaves]
 
     eager = run()
-    monkeypatch.setattr(op, "_mx_glu_op", lambda f: f)  # the custom ops themselves
+    monkeypatch.setattr(op, "_mx_glu", lambda custom_op, fn, a: custom_op)  # the custom ops themselves
     for name, a, b in zip(("y", "dx", "dw1", "dw2", "dprobs"), run(), eager):
         assert torch.equal(a, b), name

@@ -4,7 +4,6 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import functools
 from typing import Optional, Union
 
 import torch
@@ -23,15 +22,16 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.core.utils import is_gfx950, is_gfx1250
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_dglu_impl,
     grouped_gemm_fp8_glu_impl,
     grouped_gemm_fp8_impl,
     grouped_gemm_fp8_variable_k_accum_impl,
     grouped_gemm_fp8_variable_k_impl,
-    eager_body,
+    grouped_gemm_mxfp8_dglu,
     grouped_gemm_mxfp8_dglu_impl,
+    grouped_gemm_mxfp8_glu,
     grouped_gemm_mxfp8_glu_impl,
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
@@ -54,12 +54,20 @@ from primus_turbo.pytorch.ops.utils import (
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx_check_operand_recipes,
     mx_gemm_layout,
 )
 
 __all__ = [
+    "CONSUMES_PERMUTE_SEAM_MXFP8",
     "grouped_mlp_fp8",
 ]
+
+# The MXFP8 path takes the MoE permute -> MXFP8 handoff of ops/moe_gather.py: an ``x`` registered as a lazy permute
+# placeholder (no values) is quantized from the un-permuted rows through ``dest2src``, and the unpermute's backward
+# gather is deferred into the quantization of ``grad_out``. Frameworks check this before handing over a placeholder.
+# The TENSORWISE path does not take it.
+CONSUMES_PERMUTE_SEAM_MXFP8 = True
 
 
 _SUPPORTED_ACTIVATIONS = ("silu", "gelu")
@@ -462,12 +470,13 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
         )
 
 
-def _mx_glu_op(op):
-    """The fused MXFP8 GLU / dGLU: the custom op's Python body in eager mode (no torch.library dispatch, and its
-    outputs may share allocations, as gfx1250's quantizers carve a copy's codes and scales from one buffer), else
-    the custom op itself (which then hands back unaliased outputs)."""
-    body = eager_body(op)
-    return op if body is None else functools.partial(body, share_storage=True)
+def _mx_glu(op, fn, a):
+    """The fused MXFP8 GLU / dGLU to call for operand ``a``: on gfx1250, in eager mode on plain tensors, the plain
+    function ``fn`` (no torch.library dispatch per call; its outputs may share an allocation); else the custom op
+    ``op`` (torch.compile, fake / subclass tensors, other archs)."""
+    if is_gfx1250() and type(a) is torch.Tensor and not torch.compiler.is_compiling():
+        return fn
+    return op
 
 
 def _quantize_weight(
@@ -569,9 +578,21 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
 
         M = int(probs.shape[0])
         x_dtype = _get_fp8_dtype(config.format, True)
-        lay = mx_gemm_layout(w1, grouped=True, a=x)
-        assert mx_gemm_layout(w2, grouped=True, a=x) == lay, "w1 and w2 must be quantized in the same layout"
+        lay = mx_gemm_layout(w1, grouped=True, a=x, config=config, out_dtype=out_dtype)
+        lay2 = mx_gemm_layout(w2, grouped=True, a=x, config=config, out_dtype=out_dtype)
+        assert lay2 == lay, "w1 and w2 must be quantized in the same layout"
         x_rec, x_t_rec = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
+        w_rec = MX_W if lay else ScalingRecipe(use_2d_block=True)
+        mx_check_operand_recipes(
+            "grouped_mlp_fp8 (MXFP8)",
+            lay,
+            x=(x, x_rec),
+            x_t=(x_t, x_t_rec),
+            w1=(w1, w_rec),
+            w1_t=(w1_t, w_rec),
+            w2=(w2, w_rec),
+            w2_t=(w2_t, w_rec),
+        )
         # x may be a lazy permute placeholder (Primus' moe_permute_quant_fusion, ops/moe_gather.py): quantize
         # straight from the un-permuted source through dest2src, and keep the plan that lets the unpermute's
         # backward hand grad_out over the same way.
@@ -595,7 +616,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             )
         else:
             assert x._is_grouped_tensor, "a QuantizedTensor input must be a grouped tensor"
-            check_quantized_tensor(x, config, axis=-1, scaling_recipe=x_rec if lay else None)
+            check_quantized_tensor(x, config, axis=-1)
             x_row, x_row_scale = x.qdata, x.scale_inv
             offs_row = x.group_offs
             if x_t is None:
@@ -618,7 +639,8 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
 
         # The activation is quantised inside the epilogue: it feeds nothing but the
         # quantiser, so staging it in out_dtype would be an [M, I] round trip through HBM.
-        l1, act_row, act_row_scale, act_col, act_col_scale = _mx_glu_op(grouped_gemm_mxfp8_glu_impl)(
+        glu = _mx_glu(grouped_gemm_mxfp8_glu_impl, grouped_gemm_mxfp8_glu, x_row)
+        l1, act_row, act_row_scale, act_col, act_col_scale = glu(
             x_row,
             w1_row,
             x_row_scale,
@@ -635,6 +657,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             out_col_scaling_recipe=x_t_rec,
             activation=activation,
             clamp_limit=clamp_limit,
+            b_preshuffled=lay,
         )
 
         # act_row shares x_row's padded rows, so it reads under ``offs_row`` and writes
@@ -752,7 +775,8 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
 
         # dgrad against w2_col, contracting K_out; the epilogue turns it into the
         # pre-activation gradient and quantises that, so neither reaches HBM.
-        grad_probs, gl_row, gl_row_scale, gl_col, gl_col_scale = _mx_glu_op(grouped_gemm_mxfp8_dglu_impl)(
+        dglu = _mx_glu(grouped_gemm_mxfp8_dglu_impl, grouped_gemm_mxfp8_dglu, go_row)
+        grad_probs, gl_row, gl_row_scale, gl_col, gl_col_scale = dglu(
             go_row,
             w2_col,
             go_row_scale,
@@ -770,6 +794,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             out_col_scaling_recipe=g_rec,
             activation=ctx.activation,
             clamp_limit=ctx.clamp_limit,
+            b_preshuffled=ctx.lay,
         )
         # grad_x = grad_l1 @ w1_col^T, contracting 2I. grad_l1 reuses gradO's tables --
         # the two have the same M and group_lens.

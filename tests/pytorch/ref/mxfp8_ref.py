@@ -1,5 +1,5 @@
 ###############################################################################
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # See LICENSE for license information.
 ###############################################################################
@@ -116,7 +116,9 @@ def quant_2d(w: torch.Tensor, rule: str = "nosat"):
 PAD_SCALE = 127  # E8M0 byte of a column block that holds no token (padding only): 1.0
 
 
-def quant_grouped(x: torch.Tensor, group_lens: torch.Tensor, rule: str = "nosat", align: int = 128, row_align: int = 32):
+def quant_grouped(
+    x: torch.Tensor, group_lens: torch.Tensor, rule: str = "nosat", align: int = 128, row_align: int = 32
+):
     """MoE activation / gradient ``x [M, C]`` in expert order, ``group_lens [G]`` tokens per expert.
 
     Rows: ``quant_rows(x)`` with each expert's rows zero-padded to a multiple of ``row_align`` (32: Turbo's
@@ -174,8 +176,10 @@ def glu_ref(l1, probs, activation="silu", clamp_limit=None):
     g * sigmoid(2 sqrt(2/pi) g (1 + 0.044715 g^2)). The kernels' exp2 / reciprocal are the hardware's, so
     their bf16 values may be an ulp off this; their quantization is checked on their own values."""
     g, u, _, _ = _glu_in(l1, clamp_limit)
-    gate = g / (1 + torch.exp2(g * -1.4426950408889634)) if activation == "silu" else g * torch.sigmoid(
-        g * _GELU_A2 * (1 + g * g * _GELU_B)
+    gate = (
+        g / (1 + torch.exp2(g * -1.4426950408889634))
+        if activation == "silu"
+        else g * torch.sigmoid(g * _GELU_A2 * (1 + g * g * _GELU_B))
     )
     return ((gate * u) * probs.float()[:, None]).to(torch.bfloat16)
 
@@ -216,7 +220,8 @@ def gather_mx_rows(q, s, row_map):
     ok = ((idx >= 0) & (idx < q.shape[0]))[:, None]
     i = idx.clamp(0, q.shape[0] - 1)
     zero = torch.zeros((), dtype=torch.uint8)
-    return torch.where(ok, q.view(torch.uint8)[i], zero).view(torch.float8_e4m3fn), torch.where(ok, s.view(torch.uint8)[i], zero)
+    qg = torch.where(ok, q.view(torch.uint8)[i], zero).view(torch.float8_e4m3fn)
+    return qg, torch.where(ok, s.view(torch.uint8)[i], zero)
 
 
 def quant_grouped_fp8(q, s, row_map, group_lens, rule="nosat"):
@@ -232,7 +237,10 @@ def quant_grouped_fp8(q, s, row_map, group_lens, rule="nosat"):
 
 
 def pack_scales(s: torch.Tensor) -> torch.Tensor:
-    """Raw E8M0 [R, ceil(K/32)] -> the GEMM layout [ceil(R/32), ceil(K/128), 32, 4], pad bytes 0x00."""
+    """Raw E8M0 [.., R, ceil(K/32)] -> the GEMM layout [.., ceil(R/32), ceil(K/128), 32, 4], pad bytes 0x00."""
+    if s.ndim > 2:
+        return torch.stack([pack_scales(t) for t in s])
+    s = s.view(torch.uint8)
     R, KB = s.shape
     Rp, KBp = -(-R // 32) * 32, -(-KB // 4) * 4
     sp = torch.zeros(Rp, KBp, dtype=torch.uint8, device=s.device)
@@ -253,12 +261,6 @@ def unpreshuffle_b16(q: torch.Tensor) -> torch.Tensor:
     *b, N, K = q.shape
     u = q.contiguous().view(torch.uint8).view(*b, N // 16, K // 16, 16, 16)
     return u.transpose(-3, -2).contiguous().view(*b, N, K).view(q.dtype)
-
-
-def unpack_scales(s4: torch.Tensor, R: int, K: int) -> torch.Tensor:
-    """The GEMM layout -> raw E8M0 [R, ceil(K/32)]."""
-    G, T = s4.shape[:2]
-    return s4.permute(0, 2, 1, 3).reshape(G * 32, T * 4)[:R, : -(-K // MX)].contiguous()
 
 
 def dequant(q: torch.Tensor, s: torch.Tensor, dtype=torch.float32) -> torch.Tensor:
@@ -289,3 +291,89 @@ def int_valued_operands(M: int, N: int, K: int, device="cuda", seed: int = 0):
     sa = torch.randint(126, 129, (M, kb), generator=g, device=device).to(torch.uint8)
     sb = torch.randint(126, 129, (N, kb), generator=g, device=device).to(torch.uint8)
     return a, sa, b, sb
+
+
+# ---- test helpers: inputs, byte comparisons, the layouts of the quantizers' outputs
+
+
+def mx_input(*shape, seed=0, special=True, device="cuda"):
+    """bf16 data over a wide range, per-row scaled, with all-zero blocks, denormal blocks, the scale rules'
+    boundary values (+-448 * 2^k, mantissas 1.75 / 1.7578125 / 1.875 / 1.9375) and +-Inf / NaN (``special``)."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    rows = shape[-2]
+    x = torch.randn(*shape, generator=g, device=device)
+    x = x * torch.exp2(torch.randint(-24, 24, (*shape[:-1], 1), generator=g, device=device).float())
+    if special and x.numel() >= 64:
+        x[..., ::7, :32] = 0
+        x[..., 1::5, :] *= 2.0**-128  # rows of denormals / tiny normals
+        f = x.view(-1)
+        n = f.numel()
+
+        def at(k):
+            return torch.randint(0, n, (k,), generator=g, device=device)
+
+        k = max(1, n // 64)
+        mant = torch.tensor([1.75, 1.7578125, 1.875, 1.9375, 1.0, 1.9921875], device=device)
+        v = mant[torch.randint(0, 6, (k,), generator=g, device=device)] * 256
+        e = torch.randint(-40, 40, (k,), generator=g, device=device).float()
+        sgn = torch.randint(0, 2, (k,), generator=g, device=device).float() * 2 - 1
+        f[at(k)] = v * torch.exp2(e) * sgn
+        if rows > 2:
+            f[at(3)] = torch.tensor([float("inf"), -float("inf"), float("nan")], device=device)
+    return x.to(torch.bfloat16)
+
+
+def assert_bytes_equal(a: torch.Tensor, b: torch.Tensor, what: str):
+    """``a`` and ``b`` hold the same bytes (and shape); the message names the first difference."""
+    a, b = a.contiguous().view(torch.uint8).cpu(), b.contiguous().view(torch.uint8).cpu()
+    assert a.shape == b.shape, f"{what}: shape {tuple(a.shape)} vs {tuple(b.shape)}"
+    bad = (a != b).nonzero()
+    assert bad.numel() == 0, (
+        f"{what}: {bad.shape[0]} bytes differ, first at {bad[0].tolist()}: {a[tuple(bad[0])]} vs {b[tuple(bad[0])]}"
+    )
+
+
+def padded(t: torch.Tensor, shape) -> torch.Tensor:
+    """``t``'s bytes (uint8, CPU) in the top-left corner of zeros of ``shape``: the quantizers' 128-padding."""
+    out = torch.zeros(shape, dtype=torch.uint8)
+    out[tuple(slice(0, d) for d in t.shape)] = t.cpu().view(torch.uint8)
+    return out
+
+
+def to_layout(copies, pack_row=False, shuf_row=False, pack_col=False, shuf_col=False):
+    """Reference (q_row, s_row, q_col, s_col) in the gfx1250 GEMM layouts: packed scales (``pack_scales``) and / or
+    16x16-preshuffled codes (``preshuffle_b16``), per copy."""
+    qr, sr, qc, sc = (t.cpu() for t in copies)
+    return (
+        preshuffle_b16(qr) if shuf_row else qr,
+        pack_scales(sr) if pack_row else sr,
+        preshuffle_b16(qc) if shuf_col else qc,
+        pack_scales(sc) if pack_col else sc,
+    )
+
+
+def check_grouped(out, vals, lens, rule, pack_row=False, shuf_row=False, pack_col=False, shuf_col=False):
+    """A grouped quantizer's 8-tuple against ``quant_grouped`` of the bf16 values it quantized (see
+    ``check_grouped_ref``)."""
+    ref = quant_grouped(vals.cpu(), lens, rule)
+    check_grouped_ref(out, ref, lens, pack_row, shuf_row, pack_col, shuf_col)
+
+
+def check_grouped_ref(out, ref, lens, pack_row=False, shuf_row=False, pack_col=False, shuf_col=False):
+    """A grouped quantizer's 8-tuple against a reference 8-tuple (``quant_grouped``'s order): the allocation bounds
+    (rows ceil32(M + 32 G), tokens ceil128(M + 128 G)), the 32-row / 128-token padded lens and offsets of both
+    copies, and the rows / columns up to them in the given layout."""
+    q_row, s_row, q_col, s_col, lens_c, offs_c, lens_r, offs_r = ref
+    M, G, Mr, Mc = int(lens.sum()), len(lens), int(offs_r[-1]), int(offs_c[-1])
+    assert (
+        out[0].shape[0] == -(-(M + 32 * G) // 32) * 32 and out[2].shape[1] == -(-(M + 128 * G) // 128) * 128
+    )
+    for got, ref, what in zip(
+        out[4:], (lens_r, offs_r, lens_c, offs_c), ("lens_row", "offs_row", "lens_col", "offs_col")
+    ):
+        assert torch.equal(got.cpu(), ref.cpu()), f"{what}: {got.tolist()} vs {ref.tolist()}"
+    qr, sr, _, sc = to_layout((q_row, s_row, q_col, s_col), pack_row, shuf_row, pack_col, False)
+    assert_bytes_equal(out[0][:Mr], qr, "q_row")
+    assert_bytes_equal(out[1][: Mr // 32] if pack_row else out[1][:Mr], sr, "s_row")
+    assert_bytes_equal((unpreshuffle_b16(out[2].cpu()) if shuf_col else out[2])[:, :Mc], q_col, "q_col")
+    assert_bytes_equal(out[3][:, : Mc // 128] if pack_col else out[3][:, : Mc // 32], sc, "s_col")

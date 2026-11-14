@@ -58,12 +58,12 @@ def _gfx1250_mxfp8(
     a shuffled recipe they cannot take raises, and so does any HIP fallback under PRIMUS_TURBO_MX_STRICT=2.
     The E8M0 rule is PRIMUS_TURBO_MXFP8_SCALE_RULE (nosat by default). Calls the kernels take are memoized
     (the rule is part of the key); the others go through the checks every time."""
+    if not is_gfx1250():
+        return None
     key = (x.dtype, out_dtype, row, col, same_blocks, envs.PRIMUS_TURBO_MXFP8_SCALE_RULE)
     hit = _MX1250.get(key)
     if hit is not None:
         return hit
-    if not is_gfx1250():
-        return None
     if (
         x.dtype == torch.bfloat16
         and out_dtype == torch.float8_e4m3fn
@@ -82,7 +82,9 @@ def _gfx1250_mxfp8(
             f"FlyDSL quantizers support, got {x.dtype} -> {out_dtype}, {row}, {col}"
         )
     mx_strict(
-        f"MXFP8 quantization of {x.dtype} -> {out_dtype} ({row}, {col}) runs the HIP kernels on gfx1250",
+        lambda: (
+            f"MXFP8 quantization of {x.dtype} -> {out_dtype} ({row}, {col}) runs the HIP kernels on gfx1250"
+        ),
         level=2,
     )
     return None
@@ -736,7 +738,9 @@ def grouped_quantize_mxfp8_impl(
                 layout=lay,
             )
         rows, cols = with_trans or axis == 1, with_trans or axis == 0
-        out = Q.grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype, rule, True, rows, cols, layout=lay)
+        out = Q.grouped_quant_mxfp8_raw(
+            x, group_lens, group_offs, out_dtype, rule, True, rows, cols, layout=lay
+        )
         if with_trans:
             return out
         return (out[0], out[1], out[4], out[5]) if rows else (out[2], out[3], out[6], out[7])

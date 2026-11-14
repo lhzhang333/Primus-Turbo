@@ -4,10 +4,17 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import json
+import os
+import subprocess
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
 
+import primus_turbo
+from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.pytorch.ops.normalization import rmsnorm, rmsnorm_residual
 from tests.pytorch.test_utils import get_tolerances
 
@@ -21,7 +28,7 @@ def _dgamma_tolerances(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("outer_shape", [(1,), (511,), (4096,), (8192,)])
-@pytest.mark.parametrize("inner_shape", [33, 128, 512, 513, 1536, 4096, 5120, 7168, 8192])
+@pytest.mark.parametrize("inner_shape", [33, 128, 512, 513, 1536, 4096, 5120, 7168, 8192, 12288, 16384])
 def test_rmsnorm_ops(dtype, outer_shape, inner_shape):
     torch.manual_seed(1)
     device = "cuda:0"
@@ -50,7 +57,7 @@ def test_rmsnorm_ops(dtype, outer_shape, inner_shape):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("outer_shape", [(1,), (511,), (4096,)])
-@pytest.mark.parametrize("inner_shape", [128, 4096, 8192])
+@pytest.mark.parametrize("inner_shape", [128, 4096, 8192, 16384])
 def test_rmsnorm_zero_centered_ops(dtype, outer_shape, inner_shape):
     # zero_centered=True applies a (1 + gamma) gain. Reference folds the +1 into the weight.
     torch.manual_seed(3)
@@ -81,7 +88,7 @@ def test_rmsnorm_zero_centered_ops(dtype, outer_shape, inner_shape):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("outer_shape", [(1,), (511,), (4096,)])
-@pytest.mark.parametrize("inner_shape", [128, 4096, 8192])
+@pytest.mark.parametrize("inner_shape", [128, 4096, 8192, 12288, 16384])
 def test_rmsnorm_residual_ops(dtype, outer_shape, inner_shape):
     torch.manual_seed(2)
     device = "cuda:0"
@@ -122,11 +129,11 @@ def test_rmsnorm_residual_ops(dtype, outer_shape, inner_shape):
 
 
 @pytest.mark.parametrize("residual", [False, True])
-@pytest.mark.parametrize("B,H", [(8192, 512), (8192, 1536), (4096, 7168), (300, 2880)])
-def test_rmsnorm_bwd_tiled(B, H, residual):
-    """The tiled backward at the DSv3 norm widths (kv / q / hidden) and a ragged shape: dx / dgamma vs torch
-    (bf16), the residual variant with gradients through both outputs, and bitwise the same on a rerun (fixed
-    launch configs, no autotune)."""
+@pytest.mark.parametrize("B,H", [(8192, 512), (8192, 1536), (4096, 7168), (300, 2880), (1024, 16384)])
+def test_rmsnorm_bwd_bf16(B, H, residual):
+    """The backward at the DSv3 norm widths (kv / q / hidden), a ragged shape (gfx1250: the tiled kernel) and a
+    wide one (grid-stride kernel): dx / dgamma vs torch (bf16), the residual variant with gradients through both
+    outputs."""
     torch.manual_seed(B + H)
     eps = 1e-6
     x = torch.randn(B, H, dtype=torch.bfloat16, device="cuda")
@@ -152,5 +159,59 @@ def test_rmsnorm_bwd_tiled(B, H, residual):
     for a, b in zip(got[:-1], ref[:-1]):
         torch.testing.assert_close(a, b, **get_tolerances(torch.bfloat16))
     torch.testing.assert_close(got[-1], ref[-1], rtol=3e-2, atol=3e-2)
-    for a, b in zip(got, run(False)):
-        assert torch.equal(a, b), "the backward is not bitwise the same on a rerun"
+
+
+# Prints {case: sha256 of each input's grad} for the bf16 backward of the [B, H, residual] cases in argv[1].
+_BWD_DIGESTS = r"""
+import hashlib, json, sys
+import torch
+from primus_turbo.pytorch.ops.normalization import rmsnorm, rmsnorm_residual
+
+out = {}
+for B, H, residual in json.loads(sys.argv[1]):
+    g = torch.Generator(device="cuda").manual_seed(B * 7 + H)
+    x, r, gy, gr = (torch.randn(B, H, generator=g, device="cuda").to(torch.bfloat16) for _ in range(4))
+    gamma = torch.randn(H, generator=g, device="cuda").to(torch.bfloat16)
+    leaves = [t.requires_grad_() for t in ((x, r, gamma) if residual else (x, gamma))]
+    if residual:
+        torch.autograd.backward(rmsnorm_residual(x, r, gamma, 1e-6), (gy, gr))
+    else:
+        rmsnorm(x, gamma, 1e-6).backward(gy)
+    out[f"{B}x{H}{'r' if residual else ''}"] = [
+        hashlib.sha256(t.grad.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest() for t in leaves
+    ]
+print(json.dumps(out))
+"""
+
+
+def _bwd_digests_in_new_process(cases):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(primus_turbo.__file__)))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in (root, os.environ.get("PYTHONPATH")) if p))
+    proc = subprocess.run(
+        [sys.executable, "-c", _BWD_DIGESTS, json.dumps(cases)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.skipif(not is_gfx1250(), reason="fixed launch configs on gfx1250 only (autotuned elsewhere)")
+def test_rmsnorm_bwd_bitwise_across_processes():
+    """dx / dgamma (/ dresidual) bit for bit the same in two processes, for each backward kernel (multi-row,
+    tiled, grid-stride). An autotune per process could pick different num_warps, i.e. a different reduction
+    order, in each of them."""
+    cases = [
+        [8192, 128, False],
+        [8192, 512, False],
+        [8192, 1536, True],
+        [4096, 7168, False],
+        [300, 2880, True],
+        [2048, 12288, False],
+        [1024, 16384, True],
+    ]
+    first, second = (_bwd_digests_in_new_process(cases) for _ in range(2))
+    assert len(first) == len(cases)
+    assert first == second, {k: (first[k], second[k]) for k in first if first[k] != second[k]}

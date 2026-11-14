@@ -957,16 +957,23 @@ def create_quantized_weight(
 ) -> Tuple[QuantizedTensor, Optional[QuantizedTensor]]:
     """Quantize ``weight`` ([N, K] or [G, N, K]) into (W, Wᵀ or None).
 
-    ``scaling_recipe`` overrides the recipe ``quant_config`` implies, for both copies. gfx1250 MXFP8 weight
-    caches ask for the MX GEMM layouts with ``ScalingRecipe(use_2d_block=True, shuffle_scale=True,
-    shuffle_out=True)``: packed scales ``[.., ceil(R/32), ceil(C/128), 32, 4]`` and 16x16-preshuffled codes
-    ``[R/16][C/16][16][16]`` (same shape), N and K % 16 == 0, bf16 weights; the copies carry the recipe, so
-    their consumers and ``dequantize`` know the layout. With the transpose cache, gfx1250 writes both
-    copies in one pass."""
+    ``scaling_recipe`` overrides the recipe ``quant_config`` implies, for both copies. Without it, an MXFP8 weight on
+    gfx1250 takes the layout gemm_fp8 / the grouped ops read there (``ops.utils.mx_weight_layout_recipe``: gfx1250's
+    MX GEMM layout where it applies, else the raw 2-D blocks). The copies carry their recipe, so their consumers and
+    ``dequantize`` know the layout. With the transpose cache, gfx1250 writes both MXFP8 copies in one pass."""
 
     def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
         if scaling_recipe is not None:
             return scaling_recipe
+        if (
+            is_gfx1250()
+            and isinstance(quant_config, Float8QuantConfig)
+            and quant_config.granularity == ScalingGranularity.MX_BLOCKWISE
+        ):
+            from primus_turbo.pytorch.ops.utils import mx_weight_layout_recipe
+
+            grouped = weight.dim() == 3
+            return mx_weight_layout_recipe(grouped, weight.shape, config=quant_config, dtype=weight.dtype)
         if isinstance(quant_config, Float4QuantConfig):
             weight_scaling_recipe = ScalingRecipe(
                 use_2d_block=True,

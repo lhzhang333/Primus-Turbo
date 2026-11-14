@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.triton.normalization.rmsnorm_kernel import (
     rmsnorm_bwd_finalize_kernel,
     rmsnorm_bwd_kernel_grid_stride,
@@ -77,7 +78,7 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
         ns = 3 if BLOCK_H <= 128 else 2
         return "multi", BLOCK_H, ROWS, 4, ns
 
-    if BLOCK_H <= 8192:
+    if BLOCK_H <= 8192 and is_gfx1250():
         # Tiled grid-stride: ~16K-element tiles (ROWS rows), one program per CU at most (the dgamma partials stay
         # in the Triton finalize), loads pipelined over 2 stages. Fixed per width -- no autotune: num_warps and
         # ROWS set the order of each row's sum, i.e. dx's last bits, which must not depend on the process.
@@ -88,9 +89,12 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
     wide_row = H >= 16384 or (BLOCK_H == 8192 and H <= 8192)
     half_wave = rows_per_program <= 13 and wide_row
     grid = min(B, _num_cus() // 2 if half_wave else _num_cus())
-    # Fixed launch config, no autotune: the num_warps x num_stages candidates time within ~1% of each other, so a
-    # per-process autotune winner was decided by noise, and num_warps changes the tl.sum order, i.e. dx's last bits.
-    return "grid", BLOCK_H, grid, (8 if BLOCK_H >= 4096 else 4), 1
+    if is_gfx1250():
+        # BLOCK_H > 8192 here. A fixed launch config instead of the autotune: each process picks its own winner (the
+        # candidates time within ~1% of each other), and num_warps sets the order of tl.sum, so dx's last bits could
+        # differ across ranks.
+        return "grid", BLOCK_H, grid, 8, 1
+    return "grid", BLOCK_H, grid, 0, 0
 
 
 # Above this many partials the Triton finalize loses badly to a torch
@@ -242,10 +246,10 @@ def rmsnorm_bwd_impl(
             0,
             0,
             B=B,
+            num_programs=num_programs,
             H=H,
             BLOCK_H=BLOCK_H,
             ROWS=GR,
-            NUM_PROGRAMS=num_programs,
             NUM_STAGES=num_stages,
             ZERO_CENTERED=zero_centered,
             num_warps=num_warps,
@@ -254,7 +258,10 @@ def rmsnorm_bwd_impl(
     else:  # "grid": persistent grid-stride
         num_programs = GR
         dg_partial = torch.empty(num_programs, H, device=x2.device, dtype=torch.float32)
-        rmsnorm_bwd_kernel_grid_stride[(num_programs,)](
+        kernel, launch = rmsnorm_bwd_kernel_grid_stride, {}
+        if num_warps:  # a fixed launch config (gfx1250): the kernel without its autotuner
+            kernel, launch = kernel.fn, dict(num_warps=num_warps, num_stages=num_stages)
+        kernel[(num_programs,)](
             dy2,
             x2,
             gamma,
@@ -273,8 +280,7 @@ def rmsnorm_bwd_impl(
             BLOCK_H=BLOCK_H,
             num_programs=num_programs,
             ZERO_CENTERED=zero_centered,
-            num_warps=num_warps,
-            num_stages=num_stages,
+            **launch,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
@@ -456,10 +462,10 @@ def rmsnorm_bwd_residual_impl(
             dxpr2.stride(0),
             dxpr2.stride(1),
             B=B,
+            num_programs=num_programs,
             H=H,
             BLOCK_H=BLOCK_H,
             ROWS=GR,
-            NUM_PROGRAMS=num_programs,
             NUM_STAGES=num_stages,
             HAS_RESIDUAL=True,
             num_warps=num_warps,
@@ -468,7 +474,10 @@ def rmsnorm_bwd_residual_impl(
     else:  # "grid": persistent grid-stride
         num_programs = GR
         dg_partial = torch.empty(num_programs, H, device=x_plus_r.device, dtype=torch.float32)
-        rmsnorm_bwd_residual_kernel_grid_stride[(num_programs,)](
+        kernel, launch = rmsnorm_bwd_residual_kernel_grid_stride, {}
+        if num_warps:  # a fixed launch config (gfx1250): the kernel without its autotuner
+            kernel, launch = kernel.fn, dict(num_warps=num_warps, num_stages=num_stages)
+        kernel[(num_programs,)](
             dy2,
             dxpr2,
             x_plus_r,
@@ -489,8 +498,7 @@ def rmsnorm_bwd_residual_impl(
             H=H,
             BLOCK_H=BLOCK_H,
             num_programs=num_programs,
-            num_warps=num_warps,
-            num_stages=num_stages,
+            **launch,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
