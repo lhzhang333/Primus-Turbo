@@ -404,28 +404,26 @@ def rmsnorm_mxfp8(
     row_recipe: Union[ScalingRecipe, None] = None,
     col_recipe: Union[ScalingRecipe, None] = None,
 ) -> Tuple[Union[torch.Tensor, None], QuantizedTensorPair]:
-    """RMSNorm (``(x * rstd) * gamma``, fp32 math, bf16 out) whose output also comes back MXFP8-quantized.
+    """RMSNorm (``(x * rstd) * gamma``, fp32 math) whose output also comes back MXFP8-quantized.
 
-    Returns ``(y, QuantizedTensorPair(data=row, data_t=col))``: E4M3, one E8M0 scale per 32 elements, K (= H)
-    and M padded to 128 as the HIP quantizer pads them. ``row`` (``quantized_axis=-1``) is a consumer GEMM's A
-    operand (fwd / dgrad), ``col`` (``-2``, the transposed copy) its wgrad operand; pass the pair as ``a`` to
-    ``gemm_fp8``: nothing is quantized again. Gradients flow back through both ``y`` and ``row``.
+    Returns ``(y, QuantizedTensorPair(data=row, data_t=col))``: E4M3, one E8M0 scale per 32 elements, K (= H) and M
+    padded to 128 as the HIP quantizer pads them. ``row`` (``quantized_axis=-1``) is a consumer GEMM's A operand,
+    ``col`` (``-2``) its wgrad operand: pass the pair as ``a`` to ``gemm_fp8`` and nothing is quantized again.
+    Gradients flow back through both ``y`` and ``row``.
 
-    ``row_recipe`` / ``col_recipe`` must be what the consumer expects for its A / A^T copies: on gfx1250 the MX
-    GEMM layouts by default (``ScalingRecipe(shuffle_scale=True)``: packed scales; ``ScalingRecipe(shuffle_scale
-    =True, shuffle_out=True)``: + 16x16 codes, a B operand), raw ``ScalingRecipe()`` elsewhere.
+    ``row_recipe`` / ``col_recipe``: the layouts the consumer reads. Default: gfx1250's MX GEMM layouts for bf16 x
+    there (``ScalingRecipe(shuffle_scale=True)`` rows, ``ScalingRecipe(shuffle_scale=True, shuffle_out=True)``
+    columns), raw ``ScalingRecipe()`` otherwise.
 
-    gfx1250 (bf16 x and gamma, H % 8 == 0 and H > 512, 16-byte aligned rows; x may be a strided row
-    view): one read of x for the statistics, one tile pass that normalizes, stores ``y`` and quantizes it,
-    so the codes are exactly the MXFP8 cast of the returned ``y`` -- and y, rstd and the gradients are bit for bit
-    those of Turbo's ``rmsnorm`` followed by the quantization. ``write_y=False`` skips the bf16 store
-    and returns ``None`` for ``y`` (every consumer must read the pair). Elsewhere: Turbo's RMSNorm, then
-    ``quantize_fp8_with_trans`` (same outputs).
+    The outputs are those of Turbo's ``rmsnorm`` followed by ``quantize_fp8_with_trans``, bit for bit: one fused pass
+    on gfx1250 (bf16 x and gamma, H % 8 == 0 and H > 512, 16-byte aligned rows; x may be a strided row view), those
+    two ops otherwise. ``write_y=False`` returns ``None`` for ``y`` (every consumer must read the pair).
     """
     from primus_turbo.pytorch.core.utils import is_gfx1250
 
     if row_recipe is None or col_recipe is None:
-        mx = is_gfx1250()
+        # gfx1250's GEMM layouts where its quantizers write them (bf16 x), raw ones otherwise
+        mx = is_gfx1250() and x.dtype == torch.bfloat16
         row_recipe = row_recipe or ScalingRecipe(shuffle_scale=mx)
         col_recipe = col_recipe or ScalingRecipe(shuffle_scale=mx, shuffle_out=mx)
     y, row, col = _RMSNormMXFP8Function.apply(x, gamma, eps, write_y, row_recipe, col_recipe)
