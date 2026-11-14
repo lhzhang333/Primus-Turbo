@@ -84,6 +84,61 @@ def test_dispatch_gemm_nt_ep1(ep1_group, num_tokens, hidden, inter, num_experts,
             torch.testing.assert_close(out[rows].float(), ref, rtol=1.6e-2, atol=1e-2, msg=f"expert {e}")
 
 
+@pytest.mark.parametrize(
+    "num_tokens, num_experts, num_topk, num_empty",
+    [(1024, 32, 8, 0), (333, 8, 4, 2), (8192, 32, 8, 0)],
+)
+def test_dispatch_prologue_pool_order_ep1(ep1_group, num_tokens, num_experts, num_topk, num_empty):
+    """Each part of an expert's pool segment (the rows the combine folds a token's routes into, then the others)
+    lists its tokens in increasing order, and so does each send list: the tables depend on the routing alone, not
+    on the grid the prologue was tuned to or on the order its workgroups ran in, so the wgrads, which contract over
+    the pool rows, are the same in every run."""
+    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+        run_dispatch_prologue,
+    )
+
+    torch.manual_seed(num_tokens + num_empty)
+    x = torch.randn(num_tokens, 1024, device="cuda", dtype=torch.bfloat16)
+    w1 = torch.empty(num_experts, 512, 1024, device="cuda", dtype=torch.bfloat16)  # only its shape is read
+    scores = torch.randn(num_tokens, num_experts, device="cuda")
+    scores[:, num_experts - num_empty :] = float("-inf")
+    topk_w, topk_idx = scores.softmax(-1).topk(num_topk, dim=-1)
+    tables = []
+    for _ in range(2):
+        handle, weights = run_dispatch_prologue(x, w1, ep1_group, topk_idx, topk_w)
+        start = handle.combine_recv_start_row.tolist()
+        fold = handle.combine_recv_fold_count.tolist()
+        counts = handle.num_tokens_per_expert.tolist()
+        token = handle.pool_row_to_recv_token.tolist()
+        for e in range(num_experts):
+            for lo, hi in ((start[e], start[e] + fold[e]), (start[e] + fold[e], start[e] + counts[e])):
+                assert token[lo:hi] == sorted(set(token[lo:hi])), (
+                    f"expert {e}: pool rows {lo}..{hi} out of order"
+                )
+        send_offset = handle.expert_send_offset.tolist()
+        send_count = handle.expert_send_count.tolist()
+        sent = handle.dispatched_token_idx.tolist()
+        for e in range(num_experts):
+            part = sent[send_offset[e] : send_offset[e] + send_count[e]]
+            assert part == sorted(set(part)), f"expert {e}: send list out of order"
+        num_sent = sum(send_count)
+        tables.append(
+            [handle.pool_row_to_recv_token, handle.pool_row_to_route, handle.recv_token_to_pool_rows, weights]
+            + [handle.dispatched_token_idx[:num_sent]]
+        )
+    for a, b, what in zip(
+        *tables,
+        (
+            "pool_row_to_recv_token",
+            "pool_row_to_route",
+            "recv_token_to_pool_rows",
+            "dispatch weights",
+            "dispatched_token_idx",
+        ),
+    ):
+        assert torch.equal(a, b), f"{what} differs between two calls"
+
+
 # the plain schedule first, then issue_first alone, then every option on (lds_cosched needs issue_first)
 _SCHEDULES = [
     dict(issue_first=0, lds_cosched=0, wmma_b2b=0),
