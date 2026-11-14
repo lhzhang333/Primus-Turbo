@@ -298,6 +298,21 @@ def copy_warp(
         buffer_store(v, dst, dst_off + o, cache_modifier=store_cache_modifier)
 
 
+def wave_match_rank(key: ArithValue):
+    """``(rank, is_last)`` of this lane's i32 ``key`` within its hardware wave: how many lower lanes hold the same
+    key, and whether no higher lane does. A negative key is no key (``is_last`` false). It goes by lane number, so
+    unlike the values an atomic add returns it is the same in every run. Call it with every lane of the wave
+    active: it reads the other lanes' keys."""
+    lane = fx.Int32(fx.thread_idx.x) % fx.Int32(WAVE)
+    rank = fx.Int32(0)
+    num_after = fx.Int32(0)
+    for other_lane in range(WAVE):
+        same = _readlane_i32(key, fx.Int32(other_lane)) == key
+        rank = rank + arith.select(same & (lane > fx.Int32(other_lane)), fx.Int32(1), fx.Int32(0))
+        num_after = num_after + arith.select(same & (lane < fx.Int32(other_lane)), fx.Int32(1), fx.Int32(0))
+    return rank, (key >= fx.Int32(0)) & (num_after == fx.Int32(0))
+
+
 def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -309,4 +324,10 @@ def _readfirstlane_i32(v):
     buffer descriptor built from one puts every store behind a readfirstlane/saveexec
     waterfall. Pinning the value collapses the SRD to scalar regs and drops the waterfall."""
     op = rocdl.readfirstlane(res=_raw(v).type, src=_raw(v))
+    return ArithValue(op.result if hasattr(op, "result") else op)
+
+
+def _readlane_i32(v, lane):
+    """Lane ``lane`` (a wave-uniform i32; its low bits pick the lane) of the i32 ``v``, as an SGPR value."""
+    op = rocdl.readlane(_raw(v).type, _raw(v), _raw(lane))
     return ArithValue(op.result if hasattr(op, "result") else op)
