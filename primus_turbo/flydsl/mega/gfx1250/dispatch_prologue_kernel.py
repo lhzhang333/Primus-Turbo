@@ -231,6 +231,10 @@ def _make_dispatch_prologue(
         pool_row_to_recv_token_resource = create_buffer_resource_from_addr(
             pool_row_to_recv_token_base, num_records_bytes=pool_row_to_recv_token_bytes
         )
+        # exact size: the sentinel rows past the last expert's pool fall out of range here
+        weight_recv_resource = create_buffer_resource_from_addr(
+            weight_recv_base, num_records_bytes=pool_rows_bytes
+        )
         # combine recv-segment table: one (local_expert, source_rank) entry each
         combine_recv_dst_rank_resource = create_buffer_resource(COMBINE_RECV_DST_RANK, max_size=True)
         combine_recv_start_row_resource = create_buffer_resource(COMBINE_RECV_START_ROW, max_size=True)
@@ -422,7 +426,9 @@ def _make_dispatch_prologue(
                     )
                     within_expert_offset = within_expert_offset + count_value
                 is_last_expert = local_expert_idx == fx.Int32(num_experts_per_rank - 1)
-                # padding rows, plus BLOCK_M rows past the last expert, gather out of bounds and read 0
+                # padding rows, plus BLOCK_M rows past the last expert, gather out of bounds and read 0; their
+                # routing weight is 0, not a value left by an earlier call (a NaN there poisoned whole MX
+                # wgrad column blocks, which contract over the padding rows)
                 sentinel_end = (
                     expert_pool_base
                     + padded_count
@@ -431,6 +437,7 @@ def _make_dispatch_prologue(
                 sentinel_row = expert_pool_base + expert_total_count
                 while sentinel_row < sentinel_end:
                     buffer_store(fx.Int32(num_max_recv_tokens), pool_row_to_recv_token_resource, sentinel_row)
+                    buffer_store(fx.Float32(0.0), weight_recv_resource, sentinel_row)
                     sentinel_row = sentinel_row + fx.Int32(1)
                 if is_last_expert:
                     total_rows = expert_pool_base + padded_count
