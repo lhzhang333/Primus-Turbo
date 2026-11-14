@@ -41,7 +41,9 @@ def make_lds_copy_ops(bits: int):
         raise ValueError(f"bits must be 32/64/128, got {bits}")
     layout = fx.make_layout(bits // fx.Int32.width, 1)
     atom = fx.make_copy_atom(fx.UniversalCopy(bits), fx.Int32)
-    ptr_ty = fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Shared, alignment=bits // 8)
+    ptr_ty = fx.PointerType.get(
+        elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Shared, alignment=bits // 8
+    )
 
     def _view(lds_base_idx, byte_offset):
         addr_i32 = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
