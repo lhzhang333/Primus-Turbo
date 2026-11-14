@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     PRIMUS_TURBO_GROUPED_GEMM_BACKEND: str | None = None
     PRIMUS_TURBO_ATTN_BACKEND: str | None = None
     PRIMUS_TURBO_SPARSE_ATTN_BACKEND: str | None = None
+    PRIMUS_TURBO_MLA_FWD_IMPL: str = "flydsl"
     PRIMUS_TURBO_MLA_BWD_IMPL: str = "flydsl"
     PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND: str | None = None
     PRIMUS_TURBO_AUTO_TUNE: bool = False
@@ -134,13 +135,21 @@ def env_clamped_int(name: str, default: int, lo: int, hi: int) -> Callable[[], i
     return _get
 
 
-def _mla_bwd_impl() -> str:
-    """PRIMUS_TURBO_MLA_BWD_IMPL: "flydsl" (also unset or blank) or "hk", any case."""
-    raw = os.getenv("PRIMUS_TURBO_MLA_BWD_IMPL", "")
-    value = raw.strip().lower() or "flydsl"
-    if value not in ("flydsl", "hk"):
-        raise ValueError(f"PRIMUS_TURBO_MLA_BWD_IMPL={raw!r}: expected flydsl or hk")
-    return value
+def _mla_impl(name: str):
+    """The reader of an MLA kernel setting: "flydsl" (also unset or blank) or "hk", any case."""
+
+    def read() -> str:
+        raw = os.getenv(name, "")
+        value = raw.strip().lower() or "flydsl"
+        if value not in ("flydsl", "hk"):
+            raise ValueError(f"{name}={raw!r}: expected flydsl or hk")
+        return value
+
+    return read
+
+
+_mla_fwd_impl = _mla_impl("PRIMUS_TURBO_MLA_FWD_IMPL")
+_mla_bwd_impl = _mla_impl("PRIMUS_TURBO_MLA_BWD_IMPL")
 
 
 def _deepep_cpu_timeout() -> int:
@@ -176,6 +185,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "PRIMUS_TURBO_ATTN_BACKEND": backend_spec("PRIMUS_TURBO_ATTN_BACKEND"),
     # Sparse-attention (DeepSeek-V4 sparse-MLA) backend, e.g. FLYDSL, TRITON, or "autotune".
     "PRIMUS_TURBO_SPARSE_ATTN_BACKEND": backend_spec("PRIMUS_TURBO_SPARSE_ATTN_BACKEND"),
+    # Kernel of the gfx1250 DeepSeek-V3 MLA attention forward (qk 192 / v 128) under the FLYDSL
+    # backend: "flydsl" (unset or blank) or "hk", the HipKittens kernel, which hands a call it cannot
+    # take to FlyDSL (see its README). Read at the first MLA forward
+    # (attention_flydsl_gfx1250_mla_impl.mla_fwd_impl); another value raises ValueError.
+    "PRIMUS_TURBO_MLA_FWD_IMPL": _mla_fwd_impl,
     # Kernels of the gfx1250 DeepSeek-V3 MLA attention backward (qk 192 / v 128) under the FLYDSL
     # backend: "flydsl" (unset or blank) or "hk", the HipKittens kernels, which hand a call they
     # cannot take to FlyDSL (e.g. seqlen_q % 384 not 0 or 256, see their README). Read at the first

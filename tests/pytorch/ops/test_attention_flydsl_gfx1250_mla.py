@@ -64,10 +64,11 @@ def _meta(b=1, sq=256, skv=256, h=2, hkv=None, d_qk=D_QK, d_v=D_V, dtype=torch.b
 
 @pytest.fixture(autouse=True)
 def _flydsl_backward(monkeypatch):
-    """These tests cover the FlyDSL kernels: an exported PRIMUS_TURBO_MLA_BWD_IMPL=hk must not route the backward to
-    the HipKittens kernels (test_attention_hipkittens_gfx1250_mla covers those)."""
-    monkeypatch.delenv("PRIMUS_TURBO_MLA_BWD_IMPL", raising=False)
-    envs.reset_cache("PRIMUS_TURBO_MLA_BWD_IMPL")
+    """These tests cover the FlyDSL kernels: an exported PRIMUS_TURBO_MLA_FWD_IMPL=hk or PRIMUS_TURBO_MLA_BWD_IMPL=hk
+    must not route a pass to the HipKittens kernels (test_attention_hipkittens_gfx1250_mla covers those)."""
+    for name in ("PRIMUS_TURBO_MLA_FWD_IMPL", "PRIMUS_TURBO_MLA_BWD_IMPL"):
+        monkeypatch.delenv(name, raising=False)
+        envs.reset_cache(name)
 
 
 def _on_gfx1250(monkeypatch):

@@ -13,6 +13,16 @@
     "-Iinclude"
   ],
   "kernels": {
+    "k_mla_fwd": {
+      "src": "src/k_mla_fwd.hip",
+      "extra_flags": [
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode",
+        "-mllvm",
+        "-greedy-regclass-priority-trumps-globalness"
+      ],
+      "hsaco_sha256": "5d9d5ce4ccccbd028353fd04bc1c3435c1b483e6aec5ec6e2d1a044ad5b570df"
+    },
     "k_delta": {
       "src": "src/k_delta.hip",
       "extra_flags": [],

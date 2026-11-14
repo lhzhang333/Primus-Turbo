@@ -1,33 +1,36 @@
-# gfx1250 MLA attention backward on HipKittens kernels
+# gfx1250 MLA attention on HipKittens kernels
 
-DeepSeek-V3 MLA attention (head dims qk 192 / v 128, bf16, MHA, bottom-right causal) backward on HIP kernels for
-gfx1250 (MI455X): a drop-in for the FlyDSL MLA backward (`primus_turbo/flydsl/attention/gfx1250_mla`) with the same
-tensors, whose gradients it reproduces bit for bit. The forward stays on FlyDSL. The Python side is
-`primus_turbo/pytorch/kernels/attention/attention_hipkittens_gfx1250_mla_impl.py` (`hk_mla_bwd`).
+DeepSeek-V3 MLA attention (head dims qk 192 / v 128, bf16, MHA, bottom-right causal) forward and backward on HIP
+kernels for gfx1250 (MI455X): drop-ins for the FlyDSL MLA forward and backward
+(`primus_turbo/flydsl/attention/gfx1250_mla`) with the same tensors, whose outputs and gradients they reproduce bit for
+bit. The Python side is `primus_turbo/pytorch/kernels/attention/attention_hipkittens_gfx1250_mla_impl.py`
+(`hk_mla_fwd`, `hk_mla_bwd`).
 
 ## Use
 
-`PRIMUS_TURBO_MLA_BWD_IMPL=hk` (default `flydsl`) runs the backward of the FlyDSL MLA attention on these kernels. It
-is read through `primus_turbo.common.envs` at the first MLA backward (`envs.set_env()` changes it for later eager
-backwards); `torch.compile` reads it while tracing, and a compiled graph keeps that setting. A call the kernels cannot
-take runs on FlyDSL, with one warning per reason. It must pass, in order:
+`PRIMUS_TURBO_MLA_FWD_IMPL=hk` (default `flydsl`) runs the forward of the FlyDSL MLA attention on `k_mla_fwd`,
+`PRIMUS_TURBO_MLA_BWD_IMPL=hk` (default `flydsl`) its backward on the backward kernels; the two are independent. They
+are read through `primus_turbo.common.envs` at the first MLA forward / backward (`envs.set_env()` changes them for
+later eager calls); `torch.compile` reads them while tracing, and a compiled graph keeps those settings. A call the
+kernels cannot take runs on FlyDSL, with one warning per reason. It must pass, in order:
 
 1. the FlyDSL MLA rules (bf16, 4-D, qk 192 / v 128, MHA, causal, seqlen_q and seqlen_kv multiples of 64,
    seqlen_q <= seqlen_kv, 32-bit descriptor extents);
-2. the HipKittens rules (`hk_mla_unsupported_reason`): seqlen_q % 384 in {0, 256} and
-   batch * heads * seqlen_kv <= 512 * 4096;
-3. the code objects are built (`primus_turbo/lib/hk_gfx1250_mla`).
+2. the HipKittens rules: none more for the forward (`hk_mla_fwd_unsupported_reason`); for the backward
+   (`hk_mla_unsupported_reason`) seqlen_q % 384 in {0, 256} and batch * heads * seqlen_kv <= 512 * 4096;
+3. the pass's code objects are built (`primus_turbo/lib/hk_gfx1250_mla`).
 
 ## Kernels
 
 | kernel | work |
 |---|---|
+| `k_mla_fwd` | O and lse: 256-query blocks of eight waves (two 16-row q tiles each, 128 rows apart) over 64-row K / V tiles in two LDS slots; persistent workgroups on a static block schedule where it covers the grid (seqlen_q == seqlen_kv, full blocks; see `_mla_fwd_grid`), else one workgroup per block |
 | `k_delta` | the row constants NL = -log2(e) * lse and ND = -scale * delta, delta = rowsum(dO * O) |
 | `k_dkdv96ds` | dK, dV over 96-row kv blocks (two 48-row waves on a 3-stage Q / dO TDM ring), then 64-row tail blocks; stores every bf16 dS^T tile it feeds the dK WMMA into the dS scratch |
 | `k_dqds_c` | dQ = dS K from that scratch: 384-query workgroups (4 waves sharing one K ring) plus one merged 256-query head tile |
 
-**Numerics.** The kernels run the FlyDSL backward's operations in its order, so dQ, dK and dV are bitwise those of
-the FlyDSL backward. Every output element is written by exactly one workgroup, so the backward is deterministic.
+**Numerics.** The kernels run the FlyDSL forward's / backward's operations in its order, so out / lse and dQ, dK,
+dV are bitwise FlyDSL's. Every output element is written by exactly one workgroup, so both passes are deterministic.
 
 **dS scratch.** One block per backward call from the torch caching allocator, on the current stream: the layout of
 `include/dslayout.h`, about batch * heads * seqlen_q * seqlen_kv bytes under the causal mask: 4.33 GB at b2 s4096

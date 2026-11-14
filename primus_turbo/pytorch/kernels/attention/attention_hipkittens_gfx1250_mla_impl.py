@@ -4,18 +4,21 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""HipKittens kernels of the gfx1250 (MI455X) DeepSeek-V3 MLA attention backward: ``hk_mla_bwd``.
+"""HipKittens kernels of the gfx1250 (MI455X) DeepSeek-V3 MLA attention: ``hk_mla_fwd`` and ``hk_mla_bwd``.
 
 q / k head dim 192, v head dim 128, bf16, MHA, bottom-right causal; the tensors of the FlyDSL MLA kernels
-(``attention_flydsl_gfx1250_mla_impl``, which runs this backward when PRIMUS_TURBO_MLA_BWD_IMPL is ``hk``).
-The kernels are code objects built from ``csrc/kernels/attention/hipkittens/gfx1250_mla`` into
-``primus_turbo/lib/hk_gfx1250_mla`` (see the README there), launched through the HIP runtime torch loaded:
+(``attention_flydsl_gfx1250_mla_impl``, which runs this forward when PRIMUS_TURBO_MLA_FWD_IMPL is ``hk`` and this
+backward when PRIMUS_TURBO_MLA_BWD_IMPL is ``hk``). The kernels are code objects built from
+``csrc/kernels/attention/hipkittens/gfx1250_mla`` into ``primus_turbo/lib/hk_gfx1250_mla`` (see the README there),
+launched through the HIP runtime torch loaded:
+  k_mla_fwd   O and the natural-log LSE: 256-query blocks of eight waves on two K / V tile slots, on persistent
+              workgroups (a static block schedule) where the grid allows them
   k_delta     NL = -log2(e) * lse and ND = -scale * delta, delta = rowsum(dO * O)
   k_dkdv96ds  dK, dV over 96-row kv blocks, then 64-row tail blocks; stores every bf16 dS^T tile it feeds the dK
               WMMA into a scratch
   k_dqds_c    dQ = dS K from that scratch: 384-query workgroups plus one merged 256-query head tile
-They run the FlyDSL backward's arithmetic in its order, so the gradients are bitwise FlyDSL's, and every output
-element is written by one workgroup, so the backward is deterministic.
+They run the FlyDSL forward's / backward's arithmetic in its order, so out / lse and the gradients are bitwise
+FlyDSL's, and every output element is written by one workgroup, so both passes are deterministic.
 """
 
 import ctypes
@@ -32,7 +35,7 @@ import torch
 
 from primus_turbo.common.logger import logger
 
-__all__ = ["hk_mla_unsupported_reason", "hk_mla_bwd"]
+__all__ = ["hk_mla_fwd_unsupported_reason", "hk_mla_fwd", "hk_mla_unsupported_reason", "hk_mla_bwd"]
 
 MLA_D_QK, MLA_D_V = 192, 128
 _MLA_DKDV_ROWS = 96  # k_dkdv96ds kv rows per workgroup
@@ -41,14 +44,20 @@ _MLA_HEAD_GROUP = 32  # head-group target of the k_dkdv96ds / k_dqds_c grids
 _MLA_MAX_BH_S = 512 * 4096  # largest batch * heads * seqlen the kernels' index arithmetic is verified for
 # kernel: (workgroup size, packed arguments, sha256 of the code object), the signatures and pins of
 # csrc/.../gfx1250_mla/manifest.json (a test keeps them equal); only a code object with its pin is loaded:
+#   k_mla_fwd   Q K V O LSE, scale, Sq Skv H B nqb npw pstep
 #   k_delta     DO O LSE NL ND, scale, S H
 #   k_dkdv96ds  Q K V DO NL ND DV DK DS, scale, Sq Skv Hq Hkv G nqt cshift causal B HG ds_mode
 #   k_dqds_c    DS K DQ, Sq Skv Hq Hkv G nkvt cshift causal q_off ntile HG
 _MLA_KERNELS = {
+    "k_mla_fwd": (256, "<5Qf7i", "5d9d5ce4ccccbd028353fd04bc1c3435c1b483e6aec5ec6e2d1a044ad5b570df"),
     "k_delta": (256, "<5Qf2i", "cc6c67a7c5475ddaab90f23e75eee07fc3e24fdf0dc3e1483c9128dc3cda2aa8"),
     "k_dkdv96ds": (64, "<9Qf11i", "620c95a97780f4dec86b8ffd135e9efec7e3c5195bb98cf4eba8f187356dd2c0"),
     "k_dqds_c": (128, "<3Q11i", "ccd6c8e68afd30e588477bf2fae710cd0cd50b03555238ac2cb4040106fbbd60"),
 }
+_MLA_FWD_KERNELS = ("k_mla_fwd",)
+_MLA_BWD_KERNELS = ("k_delta", "k_dkdv96ds", "k_dqds_c")
+_MLA_FWD_ROWS = 256  # k_mla_fwd queries per block (8 waves x 32)
+_MLA_FWD_XCDS = 8  # the persistent schedule keeps a head's blocks on one XCD: workgroups w and w + 8 share it
 _MLA_HSACO_DIR = Path(__file__).resolve().parents[3] / "lib" / "hk_gfx1250_mla"
 
 
@@ -179,27 +188,39 @@ def _mla_kernel(name: str) -> _HipKernel:
     return kernel
 
 
-_MLA_UNAVAILABLE = {}  # device index -> why the kernels cannot run there, or None
+_MLA_UNAVAILABLE = {}  # (device index, pass) -> why the pass's kernels cannot run there, or None
 
 
-@torch.compiler.assume_constant_result  # the gate runs in compiled regions; the answer is fixed per device
-def hk_mla_unavailable_reason(device: Optional[int] = None) -> Optional[str]:
-    """None when the code objects are the pinned ones and load on ``device`` (default: the current one), else why
-    not."""
+def _mla_unavailable(device: Optional[int], which: str) -> Optional[str]:
+    names = _MLA_FWD_KERNELS if which == "forward" else _MLA_BWD_KERNELS
     if device is None:
         try:
             device = torch.cuda.current_device()
         except RuntimeError as e:  # no usable GPU
-            return f"the HipKittens MLA backward kernels are unavailable: {e}"
-    if device not in _MLA_UNAVAILABLE:
+            return f"the HipKittens MLA {which} kernels are unavailable: {e}"
+    if (device, which) not in _MLA_UNAVAILABLE:
         reason = None
         try:
-            for name in _MLA_KERNELS:
+            for name in names:
                 _mla_kernel(name).load(device)
         except (OSError, RuntimeError) as e:
-            reason = f"the HipKittens MLA backward kernels are unavailable: {e}"
-        _MLA_UNAVAILABLE[device] = reason
-    return _MLA_UNAVAILABLE[device]
+            reason = f"the HipKittens MLA {which} kernels are unavailable: {e}"
+        _MLA_UNAVAILABLE[(device, which)] = reason
+    return _MLA_UNAVAILABLE[(device, which)]
+
+
+@torch.compiler.assume_constant_result  # the gate runs in compiled regions; the answer is fixed per device
+def hk_mla_unavailable_reason(device: Optional[int] = None) -> Optional[str]:
+    """None when the backward's code objects are the pinned ones and load on ``device`` (default: the current one),
+    else why not."""
+    return _mla_unavailable(device, "backward")
+
+
+@torch.compiler.assume_constant_result
+def hk_mla_fwd_unavailable_reason(device: Optional[int] = None) -> Optional[str]:
+    """None when the forward's code object is the pinned one and loads on ``device`` (default: the current one),
+    else why not."""
+    return _mla_unavailable(device, "forward")
 
 
 def hk_mla_unsupported_reason(
@@ -211,6 +232,101 @@ def hk_mla_unsupported_reason(
     _, skv, hkv, _ = k.shape
     reason = _mla_shape_reason(b, sq, skv, h, hkv, bool(causal))
     return reason if reason is not None else hk_mla_unavailable_reason(q.device.index)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Forward
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _mla_fwd_shape_reason(b: int, sq: int, skv: int, h: int, hkv: int, causal: bool) -> Optional[str]:
+    """Why k_mla_fwd cannot take this problem, beyond the FlyDSL MLA gate's rules (seqlen_q a multiple of 64, its
+    32-bit lse offsets), or None. Like _mla_shape_reason, the reasons name no sizes."""
+    if h != hkv:
+        return "MHA only (heads_q == heads_kv)"
+    if not causal:
+        return "causal only"
+    if skv < sq:
+        return "seqlen_kv < seqlen_q"
+    if sq % 64:
+        return "seqlen_q must be a multiple of 64"
+    return None
+
+
+def hk_mla_fwd_unsupported_reason(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool
+) -> Optional[str]:
+    """Why ``hk_mla_fwd`` cannot take kernel-layout q / k / v that pass the FlyDSL MLA gate
+    (``flydsl_gfx1250_mla_unsupported_reason``), or None."""
+    b, sq, h, _ = q.shape
+    _, skv, hkv, _ = k.shape
+    reason = _mla_fwd_shape_reason(b, sq, skv, h, hkv, bool(causal))
+    return reason if reason is not None else hk_mla_fwd_unavailable_reason(q.device.index)
+
+
+_MLA_CUS = {}  # device index -> compute units
+
+
+def _mla_cus(device: torch.device) -> int:
+    if device.type != "cuda":  # meta tensors: a CU count with the persistent schedule (MI455X)
+        return 256
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    if idx not in _MLA_CUS:
+        _MLA_CUS[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return _MLA_CUS[idx]
+
+
+def _mla_fwd_grid(b: int, sq: int, skv: int, h: int, cus: int) -> Tuple[Tuple[int, int, int], int, int, int]:
+    """(grid, nqb, npw, pstep) of k_mla_fwd. Persistent (npw = cus workgroups, one per CU) when the static schedule
+    covers the grid exactly: workgroup w runs head-batch 8 (R s + r) + w % 8 at step s (w / 8 = r nqb + i,
+    R = cus / 8 / nqb, pstep = 8 R) and q block i on even steps, nqb - 1 - i on odd ones, so needs full blocks,
+    seqlen_q == seqlen_kv (a block's tile count is its q block's), cus / 8 a multiple of the q blocks, batch * heads a
+    multiple of 8 and an even number of steps (pairs of complementary q blocks). Else one workgroup per block."""
+    nqb = -(-sq // _MLA_FWD_ROWS)
+    per_xcd, hb = cus // _MLA_FWD_XCDS, b * h
+    if sq == skv and sq % _MLA_FWD_ROWS == 0 and cus % _MLA_FWD_XCDS == 0 and per_xcd % nqb == 0:
+        rounds = per_xcd // nqb
+        if hb % _MLA_FWD_XCDS == 0 and (hb // _MLA_FWD_XCDS) % rounds == 0:
+            steps = hb // _MLA_FWD_XCDS // rounds
+            if steps % 2 == 0:
+                return (cus, 1, 1), nqb, cus, _MLA_FWD_XCDS * rounds
+    return (nqb, h, b), nqb, 0, 0
+
+
+def hk_mla_fwd(q, k, v, softmax_scale=None, causal=True):
+    """MLA forward: q [B, Sq, H, 192], k [B, Skv, H, 192], v [B, Skv, H, 128] contiguous bf16 on one device. Returns
+    out [B, Sq, H, 128] bf16 and lse [B, H, Sq] fp32 (natural log), bitwise the FlyDSL forward's."""
+    b, sq, h, _ = q.shape
+    skv, hkv = k.shape[1], k.shape[2]
+    for name, t, shape in (
+        ("q", q, (b, sq, h, MLA_D_QK)),
+        ("k", k, (b, skv, hkv, MLA_D_QK)),
+        ("v", v, (b, skv, hkv, MLA_D_V)),
+    ):
+        if t.shape != shape or t.dtype != torch.bfloat16 or t.device != q.device or not t.is_contiguous():
+            raise ValueError(
+                f"{name}: expected a contiguous torch.bfloat16 {shape} tensor on {q.device}, got {t.dtype} "
+                f"{tuple(t.shape)} on {t.device}{'' if t.is_contiguous() else ' (strided)'}"
+            )
+    if min(b, sq, skv, h) <= 0:
+        raise ValueError(f"empty problem: q {tuple(q.shape)}, k {tuple(k.shape)}")
+    reason = _mla_fwd_shape_reason(b, sq, skv, h, hkv, bool(causal))
+    if reason is not None:
+        raise NotImplementedError(f"hk_mla_fwd: {reason}: q {tuple(q.shape)}, k {tuple(k.shape)}")
+    if b * h * sq * 4 >= 2**31:
+        raise NotImplementedError("hk_mla_fwd: lse is too large for the kernel's 32-bit offsets")
+    out = torch.empty((b, sq, h, MLA_D_V), dtype=q.dtype, device=q.device)
+    lse = torch.empty((b, h, sq), dtype=torch.float32, device=q.device)
+    grid, nqb, npw, pstep = _mla_fwd_grid(b, sq, skv, h, _mla_cus(q.device))
+    with torch.cuda.device(q.device):
+        values = (q, k, v, out, lse, _mla_scale(softmax_scale), sq, skv, h, b, nqb, npw, pstep)
+        _mla_kernel("k_mla_fwd")(grid, values, torch.cuda.current_stream())
+    return out, lse
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Backward
+# ---------------------------------------------------------------------------------------------------------------
 
 
 def _mla_check(q, k, v, o, do, lse) -> Tuple[int, int, int, int, int]:
