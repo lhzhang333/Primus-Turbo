@@ -3,20 +3,22 @@
 #
 # See LICENSE for license information.
 ###############################################################################
-"""Static per-shape configs of the gfx1250 MXFP8 dense GEMM (``gemm_mxfp8_kernel_gfx1250``). No runtime autotune."""
+"""Static configs of the gfx1250 MXFP8 GEMMs (``gemm_mxfp8_kernel_gfx1250``): dense per (M, N, K), the routed
+experts' grouped-M and variable-K modes per shape class. Measured on MI455X (DSv3 shapes); no runtime autotune."""
 
 from typing import NamedTuple
+
+DENSE, GROUPED_M, VARIABLE_K = 0, 1, 2  # the GEMM modes
+_GRID_CUS = 256  # MI455X: the CU count of pick_config's grid-fill rule
 
 
 class MXGemmConfig(NamedTuple):
     """One kernel instance: a ``tile_m x tile_n`` block per workgroup of 2x2 waves, ``num_buffers`` LDS slots of
-    ``kpair`` 128-wide K steps each, and a ``cluster_m x cluster_n`` workgroup cluster that multicasts the shared
-    A (along N) and B (along M) tiles; 1x1 is the no-multicast config. ``scale_4d`` / ``b_preshuffle`` describe the
-    inputs (the entry point sets them from the scale tensors' rank and its ``b_preshuffled`` flag). ``persist``:
-    persistent workgroups (bf16 out, kpair 2 x 2 slots; the next tile loads during the stores); ``stagger``: the (first wave of) workgroups start in that many phases; ``xcd_remap``: grouped-M m tiles
-    grouped per XCD; ``c_pre`` (persistent beta = 1 into bf16 with the early old-C fetch): the old C's first rows (as
-    many as the LDS past the slots holds, 80 at 256x256) come during the previous tile's epilogue, only the rest
-    during the last K step. They are dropped where they do not apply."""
+    ``kpair`` 128-wide K steps each, and a ``cluster_m x cluster_n`` workgroup cluster that multicasts the shared A
+    (along N) and B (along M) tiles (1x1: none). ``persist``: persistent workgroups, which load the next tile during
+    the stores; it needs 2 slots of kpair 2 (else the call raises), and a call with fp32 out, or beta = 1 where the
+    early old-C fetch does not fit, runs non-persistent. ``c_pre`` (persistent beta = 1 into bf16): the old C's first
+    rows come during the previous tile's epilogue; ignored elsewhere."""
 
     tile_m: int = 256
     tile_n: int = 256
@@ -24,11 +26,7 @@ class MXGemmConfig(NamedTuple):
     kpair: int = 2
     cluster_m: int = 2
     cluster_n: int = 2
-    scale_4d: bool = False
-    b_preshuffle: bool = False
     persist: bool = False
-    stagger: int = 0
-    xcd_remap: bool = False
     c_pre: bool = False
 
 
@@ -105,8 +103,7 @@ _TABLE_ACC: dict = {
 }
 
 
-def pick_config(M: int, N: int, K: int, b_preshuffled: bool = False, num_cus: int = 256,
-                beta1: bool = False) -> MXGemmConfig:
+def pick_config(M: int, N: int, K: int, b_preshuffled: bool = False, beta1: bool = False) -> MXGemmConfig:
     """The measured config of (M, N, K), else by grid fill: 256x256 while it gives at least ~3/4 of a wave, then
     128x256, then 128x128 (two workgroups per CU). The entry point shrinks the cluster to what the grid divides.
     ``beta1``: accumulating into a bf16 out (the old C fetched early wants kpair 2: a kpair-1 pick becomes the
@@ -114,42 +111,35 @@ def pick_config(M: int, N: int, K: int, b_preshuffled: bool = False, num_cus: in
     cfg = beta1 and _TABLE_ACC.get((M, N, K))
     if cfg:
         return cfg
-    cfg = _pick(M, N, K, b_preshuffled, num_cus)
+    cfg = _pick(M, N, K, b_preshuffled)
     if beta1 and cfg.kpair == 1:
         return MXGemmConfig(256, 256, 2, 2, 2, 2, persist=True, c_pre=True)
     return cfg
 
 
-def _pick(M: int, N: int, K: int, b_preshuffled: bool, num_cus: int) -> MXGemmConfig:
+def _pick(M: int, N: int, K: int, b_preshuffled: bool) -> MXGemmConfig:
     cfg = (b_preshuffled and _TABLE_BSH.get((M, N, K))) or _TABLE.get((M, N, K))
     if cfg is not None:
         return cfg
     tiles = lambda tm, tn: -(-M // tm) * -(-N // tn)  # noqa: E731
-    if tiles(256, 256) >= 3 * num_cus // 4:
+    if tiles(256, 256) >= 3 * _GRID_CUS // 4:
         # long K with a preshuffled B: the deep kpair-1 pipeline (2-4% on the 32-expert-as-one-GEMM shapes)
         return MXGemmConfig(256, 256, 4, 1, 2, 2) if b_preshuffled and K >= 4096 else DEFAULT
-    if tiles(128, 256) >= 3 * num_cus // 4:
+    if tiles(128, 256) >= 3 * _GRID_CUS // 4:
         return MXGemmConfig(128, 256, 3, 2, 1, 4)
     return MXGemmConfig(128, 128, 2, 2, 1, 1)
 
 
-def pick_grouped_config(mode: int, M: int, N: int, K: int, b_preshuffled: bool = True,
-                        bf16_out: bool = True) -> MXGemmConfig:
-    """Routed experts. ``mode`` 1 (grouped-M fwd / dgrad: M = rows per expert, multicast along N only) or 2
-    (variable-K wgrad: K = tokens per expert). In-job A/B on the DSv3 experts, 32 x 2048 rows balanced and skewed
-    (scratch_mxd/results/kg3c_*.json, 11-12; kg5_*.json, 11-13): grouped-M with a preshuffled B runs best as the deep
-    kpair-1 pipeline, K = 7168 (fc1 fwd, fc2 dgrad) and the shorter K too (fc1 dgrad 4096: 0.913 / 0.921 balanced /
-    skewed, fc2 fwd 2048: 0.923 / 0.952 vs persistent nb2 kp2 c1x4; below K 2048 unmeasured, persistent kept), in
-    clusters of 2 m x 4 n tiles (B multicast inside an expert; kgm1 / kgm3, 11-13, vs c1x4: balanced fc1 fwd 0.896 /
-    0.917, fc1 dgrad 0.937 / 0.940, fc2 fwd 0.963 / 0.957, fc2 dgrad 0.926 / 0.935, skewed 0.964-0.997, never slower;
-    c4x4 straddles experts more and is 7-15% slower skewed);
-    variable-K into a bf16 main_grad persistent (6-10%: the next tile loads while a tile stores) with the old C's first
-    rows fetched during the previous tile's epilogue (c_pre: 2.5-3.2% balanced, 2-8% skewed; 11-13
-    results/kw1_vk_*.json), c2x2 except for a narrow N into bf16 (fc2 wgrad, N = 2048: c1x1, 8% faster skewed; fp32
-    out is not persistent, where c2x2 stays 8% faster)."""
-    if mode == 1:
+def pick_grouped_config(mode: int, N: int, K: int, b_preshuffled: bool = True, bf16_out: bool = True) -> MXGemmConfig:
+    """Routed experts. ``GROUPED_M`` (fwd / dgrad, ``N`` x ``K`` per expert): with a preshuffled B and K >= 2048 the
+    deep kpair-1 pipeline in clusters of 2 m x 4 n tiles (B multicast inside an expert), else persistent kpair 2.
+    ``VARIABLE_K`` (wgrad, ``K`` = tokens per expert): persistent with the early old-C rows (c_pre), in 2x2 clusters
+    except a narrow N into bf16 (N <= 2048: 1x1)."""
+    if mode == GROUPED_M:
         if b_preshuffled and K >= 2048:
             return MXGemmConfig(256, 256, 4, 1, 2, 4)
         return MXGemmConfig(256, 256, 2, 2, 1, 4, persist=True)
+    if mode != VARIABLE_K:
+        raise ValueError(f"pick_grouped_config: mode {mode} is not GROUPED_M or VARIABLE_K")
     c = 1 if N <= 2048 and bf16_out else 2
     return MXGemmConfig(256, 256, 2, 2, c, c, persist=True, c_pre=True)
