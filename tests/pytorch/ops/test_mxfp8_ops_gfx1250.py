@@ -454,12 +454,14 @@ def test_rmsnorm_mxfp8_fp16_falls_back():
     from primus_turbo.pytorch.ops.normalization import rmsnorm, rmsnorm_mxfp8
     from primus_turbo.pytorch.ops.quantization import quantize_fp8_with_trans
 
-    x0, gamma0 = (t.half() for t in _rms_inputs(256, 1536, 0, seed=9))
+    g = torch.Generator(device="cuda").manual_seed(9)
+    x0 = torch.randn(256, 1536, generator=g, device="cuda").half()
+    gamma0 = (1 + 0.25 * torch.randn(1536, generator=g, device="cuda")).half()
     x, gamma = x0.clone().requires_grad_(), gamma0.clone().requires_grad_()
     y, pair = rmsnorm_mxfp8(x, gamma, 1e-6)
     assert pair.data.scaling_recipe == pair.data_t.scaling_recipe == ScalingRecipe()
     y_ref = rmsnorm(x0, gamma0, 1e-6)
-    assert torch.equal(y, y_ref)
+    _eq(y, y_ref, "y")
     ref = quantize_fp8_with_trans(y_ref, float8_e4m3, ScalingGranularity.MX_BLOCKWISE, block_size=32)
     for got, exp, what in zip((pair.data.qdata, pair.data.scale_inv, pair.data_t.qdata, pair.data_t.scale_inv), ref,
                               ("q_row", "s_row", "q_col", "s_col")):  # fmt: skip
