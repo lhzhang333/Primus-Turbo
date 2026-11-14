@@ -31,7 +31,9 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor, QuantizedTensorPair
 from primus_turbo.pytorch.ops import (
+    DUMMY_WGRAD_FLAT_POOL,
     gemm_fp8,
+    get_dummy_wgrad,
     grouped_gemm_fp8,
     mx_weight_layout_recipe,
     mx_wgrad_accum_supported,
@@ -382,9 +384,8 @@ def test_fused_matches_unfused(grouped, main_grad_dtype, pinned):
 @pytest.mark.parametrize("main_grad_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("grouped", [False, True])
 def test_dummy_wgrad_is_a_view_of_one_buffer(grouped, main_grad_dtype):
-    """With the wgrad fused into main_grad, autograd gets a dummy: a view of one flat buffer per dtype (whatever the
-    weight's shape), which AccumulateGrad takes over as the weight's .grad without a copy; ``zero=True`` zeroes
-    just that view."""
+    """With the wgrad fused into main_grad, autograd gets a dummy: a view of the flat buffer of its dtype (whatever
+    the weight's shape), which AccumulateGrad takes over as the weight's .grad without a copy."""
     if not mx_wgrad_accum_supported(grouped, main_grad_dtype):
         pytest.skip(f"no MXFP8 beta=1 wgrad into {main_grad_dtype} here")
     torch.manual_seed(0)
@@ -394,14 +395,44 @@ def test_dummy_wgrad_is_a_view_of_one_buffer(grouped, main_grad_dtype):
     w.main_grad = torch.zeros(shape, device="cuda", dtype=main_grad_dtype)
     w.grad_added_to_main_grad = False
     x = torch.randn(rows, shape[-1], device="cuda", dtype=torch.bfloat16)
+    kw = dict(trans_b=True, config=MX, fuse_bgrad_accum_pattern="megatron")
     if grouped:
-        lens = torch.full((4,), 256, device="cuda", dtype=torch.int64)
-        out = grouped_gemm_fp8(x, w, lens, trans_b=True, config=MX, fuse_bgrad_accum_pattern="megatron")
+        out = grouped_gemm_fp8(x, w, torch.full((4,), 256, device="cuda", dtype=torch.int64), **kw)
     else:
-        out = gemm_fp8(x, w, trans_b=True, out_dtype=torch.bfloat16, config=MX, fuse_bgrad_accum_pattern="megatron")
+        out = gemm_fp8(x, w, out_dtype=torch.bfloat16, **kw)
     out.backward(torch.randn_like(out))
-    buf = ops_utils._dummy_wgrads[(torch.bfloat16, torch.cuda.current_device())]
     assert w.grad_added_to_main_grad and w.main_grad.abs().sum() > 0
-    assert w.grad.shape == w.shape and w.grad.data_ptr() == buf.data_ptr(), "the dummy was copied, not taken over"
-    small = ops_utils._get_dummy_wgrad([3, 5], torch.bfloat16, zero=True)
-    assert small.data_ptr() == buf.data_ptr() and not small.any()
+    pool = get_dummy_wgrad([1], torch.bfloat16, "cuda")
+    assert w.grad.shape == w.shape and w.grad.data_ptr() == pool.data_ptr(), (
+        "the dummy was copied, not taken over"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_dummy_wgrad_pool():
+    """get_dummy_wgrad: views of one flat buffer per (dtype, device) that grows for a larger shape (earlier views
+    stay valid), zero=True zeroes just the view; the bf16 grouped GEMM's fused wgrad hands autograd such a view."""
+    from primus_turbo.pytorch.ops import grouped_gemm
+
+    assert DUMMY_WGRAD_FLAT_POOL
+    fp16, dev = torch.float16, torch.device("cuda", torch.cuda.current_device())
+    small = get_dummy_wgrad([3, 5], fp16, "cuda")
+    assert (
+        get_dummy_wgrad([2, 2], fp16, dev).data_ptr()
+        == small.data_ptr()
+        == ops_utils._get_dummy_wgrad([1], fp16).data_ptr()
+    )
+    big = get_dummy_wgrad([small.numel() + (1 << 20)], fp16, dev.index)  # grows the buffer
+    assert get_dummy_wgrad([3], fp16, "cuda").data_ptr() == big.data_ptr() and small.shape == (3, 5)
+    big.fill_(1)
+    zeroed = get_dummy_wgrad([4, 4], fp16, "cuda", zero=True)
+    assert not zeroed.any() and big[16:].eq(1).all()
+
+    G, M, N, K = 2, 128, 256, 128
+    w = torch.nn.Parameter(torch.randn(G, N, K, device="cuda", dtype=torch.bfloat16))
+    w.main_grad, w.grad_added_to_main_grad = torch.zeros(G, N, K, device="cuda"), False
+    x = torch.randn(G * M, K, device="cuda", dtype=torch.bfloat16)
+    lens = torch.full((G,), M, device="cuda", dtype=torch.int64)
+    grouped_gemm(x, w, lens, trans_b=True, fuse_bgrad_accum_pattern="megatron").sum().backward()
+    assert w.grad_added_to_main_grad and w.main_grad.abs().sum() > 0
+    assert w.grad.data_ptr() == get_dummy_wgrad([1], torch.bfloat16, "cuda").data_ptr()

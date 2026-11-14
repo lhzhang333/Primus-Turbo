@@ -197,34 +197,35 @@ def _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern: Optional[str]):
     return True, b.main_grad
 
 
+DUMMY_WGRAD_FLAT_POOL = True  # get_dummy_wgrad hands out views of one flat buffer per (dtype, device)
 _dummy_wgrads = {}
 
 
-def _get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tensor:
-    """Returns a dummy tensor of given shape.
+def get_dummy_wgrad(shape, dtype: torch.dtype, device, zero: bool = False) -> torch.Tensor:
+    """A placeholder gradient of ``shape`` / ``dtype`` on ``device`` for a weight whose gradient went elsewhere (a
+    fused wgrad accumulated it into ``main_grad``): a contiguous view of the first ``numel`` elements of one flat
+    buffer per (dtype, device), so the placeholders of all weights cost the largest one once.
 
-    Supports arbitrary rank (2D for plain Linear weights, 3D for stacked
-    grouped-linear weights ``(num_gemms, out_features, in_features)``, etc.).
-    One flat buffer per dtype serves every shape: the dummy is a contiguous view of
-    its first ``numel`` elements, so the dummies cost the largest weight once instead
-    of one persistent buffer per distinct weight shape (DeepSeek-V3 with MXFP8 experts
-    and dense linears: 1.75 GiB instead of 3.1 GiB). The buffer only grows; views
-    handed out earlier keep the old one alive until autograd drops them (the
-    framework's hook sets ``param.grad = None`` right after). The contents are never
-    read (``zero=True``: zeroed for frameworks that add the dummy, e.g. Megatron's
-    ``zero_out_wgrad``); views of one buffer may alias each other, which is harmless
-    for the same reason. A contiguous view keeps the gradient layout contract, so
-    AccumulateGrad still takes it without a copy.
-    """
-    global _dummy_wgrads
+    Never written: views of the buffer alias each other, so their contents are undefined and nobody may write or
+    read them; the fused-wgrad ops only hand them to autograd, which takes one over as the weight's ``.grad``.
+    ``zero=True`` zeroes this view for a framework that adds the placeholder (Megatron's ``zero_out_wgrad``). The
+    buffer only grows; views handed out earlier keep the old one alive until they are dropped."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     numel = 1
     for d in shape:
         numel *= int(d)
-    key = (dtype, torch.cuda.current_device())
+    key = (dtype, device)
     buf = _dummy_wgrads.get(key)
     if buf is None or buf.numel() < numel:
-        buf = _dummy_wgrads[key] = torch.empty(numel, dtype=dtype, device="cuda", requires_grad=False)
+        buf = _dummy_wgrads[key] = torch.empty(numel, dtype=dtype, device=device)
     view = buf[:numel].view(*shape)
     if zero:
         view.fill_(0)
     return view.detach()
+
+
+def _get_dummy_wgrad(shape, dtype: torch.dtype, zero=False) -> torch.Tensor:
+    """``get_dummy_wgrad`` on the current CUDA device: the fused-wgrad ops' placeholder gradient."""
+    return get_dummy_wgrad(shape, dtype, torch.cuda.current_device(), zero)
