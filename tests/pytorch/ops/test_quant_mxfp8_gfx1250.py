@@ -210,6 +210,29 @@ def test_glu(Q, case, I, act, clamp, rule):
     _check_grouped(out, act_v, lens, rule)
 
 
+@pytest.mark.parametrize("lay", [0, PACK_ROW])
+def test_glu_rows_only(Q, lay):
+    """``cols=False`` (the MX Mega's forward when no backward follows): the row copy and its lens / offsets of the
+    ``cols=True`` call bit for bit, and no column copy."""
+    I = 2048
+    lens = _moe_lens("skew", I)
+    M = int(lens.sum())
+    g = torch.Generator(device="cuda").manual_seed(M + I)
+    l1 = (torch.randn(M, 2 * I, generator=g, device="cuda") * 3).to(torch.bfloat16)
+    probs = torch.rand(M, generator=g, device="cuda")
+    lens_d = lens.cuda()
+    offs = torch.nn.functional.pad(torch.cumsum(lens_d, 0), (1, 0))
+    both = Q.grouped_glu_quant_mxfp8(l1, probs, lens_d, offs, layout=lay | PACK_COL | SHUF_COL)
+    rows = Q.grouped_glu_quant_mxfp8(l1, probs, lens_d, offs, layout=lay, cols=False)
+    assert rows[2] is None and rows[3] is None, "cols=False: no column copy"
+    Mr = int(both[5][-1])
+    _eq(rows[0][:Mr], both[0][:Mr], "q_row")
+    _eq(rows[1][: Mr // 32] if lay & PACK_ROW else rows[1][:Mr], both[1][: Mr // 32] if lay & PACK_ROW else both[1][:Mr],
+        "s_row")
+    for i, what in ((4, "lens_row"), (5, "offs_row")):
+        assert torch.equal(rows[i], both[i]), what
+
+
 @pytest.mark.parametrize("rule", RULES)
 @pytest.mark.parametrize("act,clamp", [("silu", None), ("silu", 7.0), ("gelu", None), ("gelu", 7.0)])
 @pytest.mark.parametrize("I", [96, 2048])
@@ -253,7 +276,17 @@ def test_gather(Q, case, H, with_probs, rule):
     _check_grouped(out, R.gather_rows(x.cpu(), d2s.cpu(), None if pp is None else pp.cpu()), lens, rule)
 
 
-@pytest.mark.parametrize("lay", [0, PACK_ROW | PACK_COL | SHUF_COL])
+# raw; the MX Mega's dy (MX_A columns) and x (MX_B columns); 16x16 row codes alone and with both copies shuffled
+@pytest.mark.parametrize(
+    "lay",
+    [
+        0,
+        PACK_ROW | PACK_COL,
+        PACK_ROW | PACK_COL | SHUF_COL,
+        PACK_ROW | SHUF_ROW,
+        PACK_ROW | SHUF_ROW | PACK_COL | SHUF_COL,
+    ],
+)
 @pytest.mark.parametrize("H", [512, 7168])
 @pytest.mark.parametrize("case", [[0, 5, 0], [31, 32, 33, 1, 0, 127, 128, 129], "skew"])
 def test_gather_fp8(Q, case, H, lay):

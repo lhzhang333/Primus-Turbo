@@ -791,16 +791,17 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype=torch.float8_e4
 
 
 def grouped_glu_quant_mxfp8(l1, probs, group_lens, group_offs, activation="silu", clamp_limit=None,
-                            out_dtype=torch.float8_e4m3fn, rule="nosat", act_out=None, layout=0):
+                            out_dtype=torch.float8_e4m3fn, rule="nosat", act_out=None, layout=0, cols=True):
     """GLU forward + MoE dual cast: act = bf16(f(min(gate, L)) * clamp(up, -L, L) * probs[row]) from
     l1 [M, 2I] bf16 (gate | up, Turbo's fc1 layout; probs [M] fp32), quantized as
     ``grouped_quant_mxfp8_raw`` would quantize it (the 8-tuple, act [M, I]). ``act_out`` [M, I] bf16
-    (tests): also receives act."""
+    (tests): also receives act. ``cols`` False leaves the column copy out (None)."""
     l1 = _check(l1, out_dtype, rule, (2,))
     M, I = l1.shape[0], l1.shape[1] // 2
     assert l1.shape[1] == 2 * I and probs.shape == (M,) and probs.dtype == torch.float32
-    return _grouped(P_GLU, l1, group_lens, group_offs, out_dtype, rule, I, M, p=probs.contiguous(), dbg=act_out,
-                    act=_check_activation(activation), clamp=_check_clamp_limit(clamp_limit), layout=layout)
+    return _grouped(P_GLU, l1, group_lens, group_offs, out_dtype, rule, I, M, cols=cols, p=probs.contiguous(),
+                    dbg=act_out, act=_check_activation(activation), clamp=_check_clamp_limit(clamp_limit),
+                    layout=layout)
 
 
 def grouped_dglu_quant_mxfp8(grad_act, l1, probs, group_lens, group_offs, activation="silu", clamp_limit=None,
