@@ -28,7 +28,7 @@ def _dgamma_tolerances(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("outer_shape", [(1,), (511,), (4096,), (8192,)])
-@pytest.mark.parametrize("inner_shape", [33, 128, 513, 4096, 5120, 7168, 8192, 12288, 16384])
+@pytest.mark.parametrize("inner_shape", [33, 128, 512, 513, 1536, 4096, 5120, 7168, 8192, 12288, 16384])
 def test_rmsnorm_ops(dtype, outer_shape, inner_shape):
     torch.manual_seed(1)
     device = "cuda:0"
@@ -128,6 +128,39 @@ def test_rmsnorm_residual_ops(dtype, outer_shape, inner_shape):
     torch.testing.assert_close(gamma.grad, gamma_ref.grad, **dg_tol)
 
 
+@pytest.mark.parametrize("residual", [False, True])
+@pytest.mark.parametrize("B,H", [(8192, 512), (8192, 1536), (4096, 7168), (300, 2880), (1024, 16384)])
+def test_rmsnorm_bwd_bf16(B, H, residual):
+    """The backward at the DSv3 norm widths (kv / q / hidden), a ragged shape (gfx1250: the tiled kernel) and a
+    wide one (grid-stride kernel): dx / dgamma vs torch (bf16), the residual variant with gradients through both
+    outputs."""
+    torch.manual_seed(B + H)
+    eps = 1e-6
+    x = torch.randn(B, H, dtype=torch.bfloat16, device="cuda")
+    r = torch.randn_like(x)
+    gamma = torch.randn(H, dtype=torch.bfloat16, device="cuda")
+    gy, gr = torch.randn_like(x), torch.randn_like(x)
+
+    def run(ref):
+        leaves = [t.clone().requires_grad_() for t in ((x, r, gamma) if residual else (x, gamma))]
+        if residual:
+            if ref:
+                h = leaves[0] + leaves[1]
+                outs = (F.rms_norm(h, [H], leaves[2], eps), h)
+            else:
+                outs = rmsnorm_residual(leaves[0], leaves[1], leaves[2], eps)
+            torch.autograd.backward(outs, (gy, gr))
+        else:
+            y = F.rms_norm(leaves[0], [H], leaves[1], eps) if ref else rmsnorm(leaves[0], leaves[1], eps)
+            y.backward(gy)
+        return [t.grad for t in leaves]
+
+    got, ref = run(False), run(True)
+    for a, b in zip(got[:-1], ref[:-1]):
+        torch.testing.assert_close(a, b, **get_tolerances(torch.bfloat16))
+    torch.testing.assert_close(got[-1], ref[-1], rtol=3e-2, atol=3e-2)
+
+
 # Prints {case: sha256 of each input's grad} for the bf16 backward of the [B, H, residual] cases in argv[1].
 _BWD_DIGESTS = r"""
 import hashlib, json, sys
@@ -168,8 +201,8 @@ def _bwd_digests_in_new_process(cases):
 @pytest.mark.skipif(not is_gfx1250(), reason="fixed launch configs on gfx1250 only (autotuned elsewhere)")
 def test_rmsnorm_bwd_bitwise_across_processes():
     """dx / dgamma (/ dresidual) bit for bit the same in two processes, for each backward kernel (multi-row,
-    grid-stride). An autotune per process could pick different num_warps, i.e. a different reduction order, in
-    each of them."""
+    tiled, grid-stride). An autotune per process could pick different num_warps, i.e. a different reduction
+    order, in each of them."""
     cases = [
         [8192, 128, False],
         [8192, 512, False],
