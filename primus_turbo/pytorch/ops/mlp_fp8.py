@@ -67,7 +67,7 @@ class FP8MLPMXFunc(torch.autograd.Function):
         M, I = l1.shape[0], l1.shape[1] // 2
         assert l1.shape[1] == 2 * I and I % 128 == 0, f"mlp_fp8: fc1 width 2I, I % 128 == 0: {l1.shape[1]}"
         # the activation is fc2's A operand: its two copies in the layout fc2 reads
-        lay2 = mx_gemm_layout(w2)
+        lay2 = mx_gemm_layout(w2, config=config, out_dtype=out_dtype)
         recipes = (MX_A, MX_B) if lay2 else (ScalingRecipe(), ScalingRecipe())
         qdtype = _get_fp8_dtype(config.format, True)
         Q, rule, bits = _glu_quantizer(l1, qdtype, *recipes)

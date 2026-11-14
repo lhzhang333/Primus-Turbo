@@ -6,8 +6,9 @@
 
 """MXFP8 wgrad accumulated into main_grad (fuse_bgrad_accum_pattern="megatron", beta=1) against the unfused wgrad
 added by the framework, for gemm_fp8 and grouped_gemm_fp8, over two micro-batches on top of an existing gradient;
-which backends / main_grad dtypes ``mx_wgrad_accum_supported`` reports; and which weight-cache layout
-``mx_weight_layout_recipe`` asks for (the op layer's ``mx_gemm_layout`` agreeing)."""
+which backends / main_grad dtypes ``mx_wgrad_accum_supported`` reports; and which MX layouts the op layer picks per
+arch, format and dtype (``mx_weight_layout_recipe`` for weight caches, ``mx_gemm_layout`` in the ops; host-only, on a
+faked arch)."""
 
 import pytest
 import torch
@@ -26,7 +27,9 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp8_support,
+    float8_e4m3,
 )
+from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor, QuantizedTensorPair
 from primus_turbo.pytorch.ops import (
     gemm_fp8,
     grouped_gemm_fp8,
@@ -85,7 +88,9 @@ def test_supported(monkeypatch, grouped, pinned, arch, dtype, want):
     "arch, grouped, pinned, shape, want",
     [
         ("gfx1250", False, None, (64, 64), True),  # the FlyDSL MX GEMMs read it
+        ("gfx1250", False, None, (48, 80), True),
         ("gfx1250", True, None, (4, 64, 64), True),
+        ("gfx1250", True, None, (4, 48, 64), False),  # grouped packed scales: N and K % 32
         ("gfx1250", False, BackendType.TRITON, (64, 64), False),  # another FP8 backend pinned
         ("gfx1250", True, BackendType.TRITON, (4, 64, 64), False),
         ("gfx1250", False, None, (64, 72), False),  # no 16x16 blocks
@@ -100,7 +105,107 @@ def test_weight_layout_recipe(monkeypatch, arch, grouped, pinned, shape, want):
     assert mx_weight_layout_recipe(grouped, shape) == (
         ops_utils.MX_W if want else ScalingRecipe(use_2d_block=True)
     )
-    assert ops_utils.mx_gemm_layout(torch.empty(shape), grouped) is want  # the op layer agrees
+    w = torch.empty(shape, dtype=torch.bfloat16)
+    assert ops_utils.mx_gemm_layout(w, grouped, config=MX, out_dtype=torch.bfloat16) is want  # the op agrees
+
+
+def _fake_arch(monkeypatch, arch):
+    for name in ("gfx942", "gfx950", "gfx1250"):
+        monkeypatch.setattr(ops_utils, f"is_{name}", lambda name=name: arch == name)
+
+
+def _cfg(fmt):
+    return Float8QuantConfig(
+        format=fmt, granularity=ScalingGranularity.MX_BLOCKWISE, scale_dtype=ScaleDtype.E8M0, block_size=32
+    )
+
+
+def _qt(shape, recipe, axis=-1):
+    """A host-side MXFP8 QuantizedTensor carrying ``recipe`` (the layout decisions read its recipe only)."""
+    scale = torch.zeros(*shape[:-1], shape[-1] // 32, dtype=torch.uint8)
+    return QuantizedTensor(
+        torch.zeros(shape, dtype=float8_e4m3),
+        scale,
+        shape=torch.Size(shape),
+        orig_dtype=torch.bfloat16,
+        dest_dtype=float8_e4m3,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        block_size=32,
+        scaling_recipe=recipe,
+        quantized_axis=axis,
+    )
+
+
+@pytest.mark.parametrize(
+    "fmt, w_dtype, a_dtype, out_dtype, want",
+    [
+        (Format.E4M3, torch.bfloat16, torch.bfloat16, torch.bfloat16, True),
+        (Format.E4M3, torch.float16, torch.float16, torch.float16, False),  # fp16: raw layouts
+        (Format.E4M3, torch.bfloat16, torch.float16, torch.bfloat16, False),
+        (Format.E4M3, torch.bfloat16, torch.bfloat16, torch.float16, False),
+        (Format.HYBRID, torch.bfloat16, torch.bfloat16, torch.bfloat16, False),  # E5M2 gradients
+        (Format.E5M2, torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
+    ],
+)
+def test_gemm_layout_dtypes(monkeypatch, fmt, w_dtype, a_dtype, out_dtype, want):
+    """gfx1250 lays out only what its quantizers write (bf16 -> E4M3 both ways, bf16 out); else the raw layouts."""
+    _fake_arch(monkeypatch, "gfx1250")
+    cfg, w, a = _cfg(fmt), torch.empty(64, 64, dtype=w_dtype), torch.empty(32, 64, dtype=a_dtype)
+    for grouped in (False, True):
+        wg = w.expand(2, 64, 64) if grouped else w
+        assert ops_utils.mx_gemm_layout(wg, grouped, a=a, config=cfg, out_dtype=out_dtype) is want
+        cached = mx_weight_layout_recipe(grouped, wg.shape, config=cfg, dtype=w_dtype) == ops_utils.MX_W
+        assert cached is (fmt == Format.E4M3 and w_dtype == torch.bfloat16)
+
+
+def test_gemm_layout_forced(monkeypatch):
+    """A cached MX_W weight or a quantized MX_A input forces the layout, and raises where it cannot run; a raw
+    cache keeps the raw layouts."""
+    _fake_arch(monkeypatch, "gfx1250")
+    bf16, w = torch.bfloat16, _qt((64, 64), ops_utils.MX_W)
+    assert ops_utils.mx_gemm_layout(w, a=torch.empty(32, 64, dtype=bf16), config=MX, out_dtype=bf16)
+    raw = _qt((64, 64), ScalingRecipe(use_2d_block=True))
+    assert not ops_utils.mx_gemm_layout(raw, a=torch.empty(32, 64, dtype=bf16), config=MX, out_dtype=bf16)
+    hybrid, fp16 = _cfg(Format.HYBRID), torch.float16
+    for cfg, a_dtype, out_dtype in ((hybrid, bf16, bf16), (MX, fp16, bf16), (MX, bf16, fp16)):
+        with pytest.raises(ValueError, match="cached weight is in gfx1250's MX GEMM layout"):
+            ops_utils.mx_gemm_layout(w, a=torch.empty(32, 64, dtype=a_dtype), config=cfg, out_dtype=out_dtype)
+    with pytest.raises(ValueError, match="quantized input is in gfx1250's MX GEMM layout"):
+        ops_utils.mx_gemm_layout(
+            torch.empty(64, 64, dtype=bf16), a=_qt((32, 64), ops_utils.MX_A), config=_cfg(Format.HYBRID)
+        )
+    choice = BackendChoice(backend=BackendType.TRITON)
+    monkeypatch.setattr(GlobalBackendManager, "get_gemm_backend", classmethod(lambda cls, precision: choice))
+    with pytest.raises(ValueError, match="no other FP8 GEMM backend pinned"):
+        ops_utils.mx_gemm_layout(w, config=MX, out_dtype=bf16)
+
+
+def test_gemm_layout_gfx950(monkeypatch):
+    """gfx950 reads the shuffle flags as the CDNA4 layouts: a cache whose recipe equals MX_W does not switch the op
+    to gfx1250's layouts, and gemm_fp8 refuses it as the raw-recipe check always did."""
+    import importlib
+
+    gemm_fp8_mod = importlib.import_module("primus_turbo.pytorch.ops.gemm_fp8")
+
+    _fake_arch(monkeypatch, "gfx950")
+    w, w_t = _qt((64, 64), ops_utils.MX_W), _qt((64, 64), ops_utils.MX_W, axis=-2)
+    assert not ops_utils.mx_gemm_layout(w, a=torch.empty(32, 64, dtype=torch.bfloat16), config=MX)
+    assert not ops_utils.mx_gemm_layout(torch.empty(64, 64, dtype=torch.bfloat16))
+    assert mx_weight_layout_recipe(False, (64, 64)) == ScalingRecipe(use_2d_block=True)
+    monkeypatch.setattr(gemm_fp8_mod, "check_mxfp8_support", lambda: (True, ""))
+    a = QuantizedTensorPair(_qt((32, 64), ScalingRecipe()), _qt((32, 64), ScalingRecipe(), axis=-2))
+    with pytest.raises(AssertionError, match="scaling_recipe"):
+        gemm_fp8(a, QuantizedTensorPair(w, w_t), trans_b=True, out_dtype=torch.bfloat16, config=MX)
+
+
+def test_fused_glu_e4m3_only_on_gfx1250(monkeypatch):
+    """gfx1250's fused MXFP8 GLU / dGLU quantize to E4M3 both ways: HYBRID is refused before any GEMM runs."""
+    import primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl as gimpl
+
+    monkeypatch.setattr(gimpl, "is_gfx1250", lambda: True)
+    gimpl._check_mx_glu_dispatch(MX, False, True)
+    with pytest.raises(AssertionError, match="E4M3 only"):
+        gimpl._check_mx_glu_dispatch(_cfg(Format.HYBRID), False, True)
 
 
 def test_no_mx_on_gfx942(monkeypatch):

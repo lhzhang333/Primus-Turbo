@@ -60,8 +60,9 @@ def mx_wgrad_accum_supported(grouped: bool, main_grad_dtype: torch.dtype) -> boo
     return main_grad_dtype in _MX_WGRAD_ACCUM.get((arch, grouped, backend), ())
 
 
-# gfx1250's MX GEMM layouts, written by the quantizers when a recipe's shuffle flags ask for them: packed E8M0 scales
-# for every operand (A: shuffle_scale), 16x16 blocks for the B operands too (W, Wᵀ, wgrad's activation columns)
+# gfx1250's MX GEMM layouts, written by its quantizers when a recipe's shuffle flags ask for them: packed E8M0 scales
+# for every operand (A: shuffle_scale), 16x16 blocks for the B operands too (W, Wᵀ, wgrad's activation columns). On
+# other archs the same flags mean other layouts (gfx950: the CDNA4 shuffles), so only gfx1250 reads them as these.
 MX_A, MX_B = ScalingRecipe(shuffle_scale=True), ScalingRecipe(shuffle_scale=True, shuffle_out=True)
 MX_W = ScalingRecipe(use_2d_block=True, shuffle_scale=True, shuffle_out=True)
 
@@ -75,25 +76,54 @@ def _mx1250_layout_ok(grouped: bool) -> bool:
     return getattr(get(PrecisionType.FP8), "backend", None) in (None, BackendType.FLYDSL)
 
 
-def mx_weight_layout_recipe(grouped: bool, shape=None) -> ScalingRecipe:
-    """Scaling recipe of a cached MXFP8 weight (both copies, ``create_quantized_weight(scaling_recipe=)``) of
-    ``gemm_fp8`` / (``grouped``) the grouped ops: gfx1250's MX GEMM layout ``MX_W`` when its FlyDSL MX GEMMs of that
-    kind take it here (and ``shape``'s last two dims are % 16, if given), else the raw 2-D block recipe. The op layer
-    decides the same way (``mx_gemm_layout``), so a cache made with this recipe is what the op expects."""
-    ok = _mx1250_layout_ok(grouped) and (shape is None or (shape[-1] % 16 == 0 and shape[-2] % 16 == 0))
+def _mx1250_layout_dtypes_ok(config=None, out_dtype=None) -> bool:
+    """The formats the gfx1250 MX GEMM layouts are written in (its quantizers take bf16 -> E4M3 only): E4M3 forward
+    and backward (not E5M2 / HYBRID) and a bf16 output, each where given."""
+    return (config is None or config.format == Format.E4M3) and out_dtype in (None, torch.bfloat16)
+
+
+def mx_weight_layout_recipe(grouped: bool, shape, *, config=None, dtype=None) -> ScalingRecipe:
+    """Scaling recipe for the cached MXFP8 copies of a weight of ``shape`` (both copies,
+    ``create_quantized_weight(scaling_recipe=)``) of ``gemm_fp8`` / (``grouped``) the grouped ops: gfx1250's MX GEMM
+    layout ``MX_W`` where its FlyDSL MX GEMMs of that kind run (gfx1250, no other FP8 GEMM backend pinned) and take
+    the shape (N and K % 16; grouped: % 32), for an E4M3 ``config`` and a bf16 weight ``dtype`` where given; else the
+    raw 2-D block recipe. ``mx_gemm_layout`` decides the same way, so the op reads such a cache in the layout it
+    expects."""
+    align = 32 if grouped else 16
+    ok = _mx1250_layout_ok(grouped) and shape[-1] % align == 0 and shape[-2] % align == 0
+    ok = ok and _mx1250_layout_dtypes_ok(config) and dtype in (None, torch.bfloat16)
     return MX_W if ok else ScalingRecipe(use_2d_block=True)
 
 
-def mx_gemm_layout(w, grouped: bool = False, a=None) -> bool:
-    """Whether the MX GEMMs of a ``gemm_fp8`` / (``grouped``) grouped op with weight ``w`` and input ``a`` run on
-    gfx1250's GEMM layouts: a cached ``w``'s recipe says, else a quantized ``a``'s, else a plain ``w`` takes them when
+def mx_gemm_layout(w, grouped: bool = False, a=None, config=None, out_dtype=None) -> bool:
+    """Whether the MX GEMMs of a ``gemm_fp8`` / (``grouped``) grouped op with weight ``w``, input ``a``, ``config``
+    and ``out_dtype`` run on gfx1250's MX GEMM layouts (``MX_A`` / ``MX_B`` / ``MX_W``) rather than the raw ones.
+    Never off gfx1250. A cached ``w``'s recipe decides, else a quantized ``a``'s; ValueError when the layout they
+    force cannot run here (another FP8 GEMM backend pinned, a format other than E4M3, a non-bf16 output, or a
+    non-bf16 operand to quantize into it). Else a plain bf16 ``w`` (and ``a``) takes the layout where
     ``mx_weight_layout_recipe`` would cache it so."""
+    if not is_gfx1250():
+        return False
     from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 
-    for t, flag in ((w, "shuffle_out"), (a, "shuffle_scale")):
+    def bf16(t):  # an operand the op quantizes itself: gfx1250's quantizers write the layouts from bf16 only
+        return t is None or isinstance(t, QuantizedTensor) or t.dtype == torch.bfloat16
+
+    ok = _mx1250_layout_ok(grouped) and _mx1250_layout_dtypes_ok(config, out_dtype) and bf16(w) and bf16(a)
+    for t, flag, what in ((w, "shuffle_out", "cached weight"), (a, "shuffle_scale", "quantized input")):
         if isinstance(t, QuantizedTensor):
-            return bool(t.scaling_recipe is not None and getattr(t.scaling_recipe, flag))
-    return mx_weight_layout_recipe(grouped, w.shape) == MX_W
+            if t.scaling_recipe is None or not getattr(t.scaling_recipe, flag):
+                return False
+            if not ok:
+                raise ValueError(
+                    f"MXFP8 {'grouped ' if grouped else ''}GEMM: the {what} is in gfx1250's MX GEMM layout "
+                    f"({t.scaling_recipe}), which only gfx1250's FlyDSL MX GEMMs read (no other FP8 GEMM backend "
+                    f"pinned), for E4M3 data and bf16 activations and output; got format "
+                    f"{getattr(config, 'format', None)}, input {getattr(a, 'dtype', None)}, weight {w.dtype}, "
+                    f"out_dtype {out_dtype}. Quantize it with the raw recipe (mx_weight_layout_recipe says which)."
+                )
+            return True
+    return ok and mx_weight_layout_recipe(grouped, w.shape) == MX_W
 
 
 def mx_check_operand_recipe(who: str, name: str, t, want: ScalingRecipe, lay: bool) -> None:

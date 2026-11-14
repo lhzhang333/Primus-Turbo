@@ -20,6 +20,7 @@ from primus_turbo.pytorch.core.backend import (
 from primus_turbo.pytorch.core.low_precision import (
     MXFP8_BLOCK_SIZE,
     Float8QuantConfig,
+    Format,
     ScalingGranularity,
     ScalingRecipe,
     float8_e4m3,
@@ -1317,6 +1318,9 @@ def _check_mx_glu_dispatch(config: Float8QuantConfig, trans_a: bool, trans_b: bo
     assert config.mxfp8_scaling(), f"Fused GLU grouped MXFP8 GEMM is MX_BLOCKWISE-only, got {config}"
     assert is_gfx950() or is_gfx1250(), "Fused GLU grouped MXFP8 GEMM is only supported on gfx950 and gfx1250"
     assert not trans_a and trans_b, "Fused GLU grouped MXFP8 GEMM is NT only"
+    assert not is_gfx1250() or config.format == Format.E4M3, (
+        f"gfx1250's fused MXFP8 GLU / dGLU quantize to E4M3 only (forward and backward), got {config.format}"
+    )
 
 
 def _check_mx_out_recipes(row: ScalingRecipe, col: ScalingRecipe) -> None:

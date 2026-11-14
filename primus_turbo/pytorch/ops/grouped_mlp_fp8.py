@@ -569,8 +569,9 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
 
         M = int(probs.shape[0])
         x_dtype = _get_fp8_dtype(config.format, True)
-        lay = mx_gemm_layout(w1, grouped=True, a=x)
-        assert mx_gemm_layout(w2, grouped=True, a=x) == lay, "w1 and w2 must be quantized in the same layout"
+        lay = mx_gemm_layout(w1, grouped=True, a=x, config=config, out_dtype=out_dtype)
+        lay2 = mx_gemm_layout(w2, grouped=True, a=x, config=config, out_dtype=out_dtype)
+        assert lay2 == lay, "w1 and w2 must be quantized in the same layout"
         x_rec, x_t_rec = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
         # x may be a lazy permute placeholder (Primus' moe_permute_quant_fusion, ops/moe_gather.py): quantize
         # straight from the un-permuted source through dest2src, and keep the plan that lets the unpermute's

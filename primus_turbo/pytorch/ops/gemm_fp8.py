@@ -571,7 +571,7 @@ def _mx_linear_fwd(a, b, a_t, b_t, out_dtype, config):
     granularity = config.granularity
     block_size = config.block_size
 
-    lay = mx_gemm_layout(b, a=a)
+    lay = mx_gemm_layout(b, a=a, config=config, out_dtype=out_dtype)
     a_scaling_recipe, a_t_recipe = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
     if isinstance(a, QuantizedTensor):
         mx_check_operand_recipe("gemm_fp8 (MXFP8)", "a", a, a_scaling_recipe, lay)
