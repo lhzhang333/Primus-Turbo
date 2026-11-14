@@ -74,6 +74,8 @@ from primus_turbo.flydsl.mega.gfx1250.prims import (
 )
 from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
     BLOCK_M,
+    EPOCH_SLOT_WORDS,
+    EPOCH_SLOTS,
     TOKEN_DTYPE,
     Workspace,
     get_symm_buffer_for_mega_moe,
@@ -124,6 +126,7 @@ def _launch_gemm_combine_nt(
     arg_parity: fx.Pointer,
     arg_combine_expected: fx.Pointer,
     arg_reduce_expected: fx.Pointer,
+    arg_epoch: fx.Pointer,
     arg_chunk_counter: fx.Pointer,
     arg_grad_gate: fx.Pointer,
     arg_grad_topk_weights: fx.Pointer,
@@ -175,21 +178,33 @@ def _launch_gemm_combine_nt(
         arg_parity: fx.Pointer,
         arg_combine_expected: fx.Pointer,
         arg_reduce_expected: fx.Pointer,
+        arg_epoch: fx.Pointer,
         arg_chunk_counter: fx.Pointer,
     ):
         """Flip the parity; the new bank expects N_BLOCKS_N more per pool block and one more per route.
 
-        Also rearms the combine and reduce work counters for this launch."""
-        if fx.Int32(fx.thread_idx.x) == fx.Int32(0):
+        Also rearms the combine and reduce work counters for this launch, and copies the epoch into every
+        workgroup's slot."""
+        tid = fx.Int32(fx.thread_idx.x)
+        parity_addr = _addr(arg_parity)
+        combine_addr, reduce_addr = _addr(arg_combine_expected), _addr(arg_reduce_expected)
+        new_parity = ld(parity_addr, fx.Int32(0), dtype=fx.T.i64) ^ fx.Int64(1)
+        bank = cast(new_parity, fx.T.i32)
+        new_combine = ld(combine_addr, bank, dtype=fx.T.i64) + fx.Int64(N_BLOCKS_N)
+        new_reduce = ld(reduce_addr, bank, dtype=fx.T.i64) + fx.Int64(1)
+        fx.gpu.barrier()  # every lane read the old epoch before lane 0 replaces it
+        if tid == fx.Int32(0):
             st(_addr(arg_chunk_counter), fx.Int32(0), fx.Int32(0))
             st(_addr(arg_chunk_counter), fx.Int32(1), fx.Int32(0))
-            parity_addr = _addr(arg_parity)
-            new_parity = ld(parity_addr, fx.Int32(0), dtype=fx.T.i64) ^ fx.Int64(1)
             st(parity_addr, fx.Int32(0), new_parity)
-            bank = cast(new_parity, fx.T.i32)
-            combine_addr, reduce_addr = _addr(arg_combine_expected), _addr(arg_reduce_expected)
-            st(combine_addr, bank, ld(combine_addr, bank, dtype=fx.T.i64) + fx.Int64(N_BLOCKS_N))
-            st(reduce_addr, bank, ld(reduce_addr, bank, dtype=fx.T.i64) + fx.Int64(1))
+            st(combine_addr, bank, new_combine)
+            st(reduce_addr, bank, new_reduce)
+        slot = tid
+        while slot < fx.Int32(EPOCH_SLOTS):
+            st(_addr(arg_epoch), slot * fx.Int32(EPOCH_SLOT_WORDS), new_parity)
+            st(_addr(arg_epoch), slot * fx.Int32(EPOCH_SLOT_WORDS) + fx.Int32(1), new_combine)
+            st(_addr(arg_epoch), slot * fx.Int32(EPOCH_SLOT_WORDS) + fx.Int32(2), new_reduce)
+            slot = slot + fx.Int32(64)
 
     @flyc.kernel(name="gemm_combine_nt", known_block_size=[block, 1, 1])
     def gemm_combine_nt(
@@ -210,6 +225,7 @@ def _launch_gemm_combine_nt(
         arg_parity: fx.Pointer,
         arg_combine_expected: fx.Pointer,
         arg_reduce_expected: fx.Pointer,
+        arg_epoch: fx.Pointer,
         arg_chunk_counter: fx.Pointer,
         arg_grad_gate: fx.Pointer,
         arg_grad_topk_weights: fx.Pointer,
@@ -249,12 +265,13 @@ def _launch_gemm_combine_nt(
             if HAS_GRAD_GATE
             else None
         )
-        # this launch's epoch, already bumped
-        parity = cast(ld(_addr(arg_parity), fx.Int32(0), dtype=fx.T.i64), fx.T.i32)
+        # this launch's epoch, already bumped, from this workgroup's own slot
+        epoch_slot = _addr(arg_epoch) + fx.Int64(bid % fx.Int32(EPOCH_SLOTS)) * fx.Int64(EPOCH_SLOT_WORDS * 8)
+        parity = cast(ld(epoch_slot, fx.Int32(0), dtype=fx.T.i64), fx.T.i32)
         combine_bank = parity * fx.Int32(MAX_TILES)
         reduce_bank = parity * fx.Int32(num_max_routes)
-        expected_combine = ld(_addr(arg_combine_expected), parity, dtype=fx.T.i64)
-        expected_reduce = ld(_addr(arg_reduce_expected), parity, dtype=fx.T.i64)
+        expected_combine = ld(epoch_slot, fx.Int32(1), dtype=fx.T.i64)
+        expected_reduce = ld(epoch_slot, fx.Int32(2), dtype=fx.T.i64)
         l2_base = _addr(fx.recast_iter(fx.Int8, arg_l2))
 
         num_tiles_m = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tile_blocks)[fx.Int32(0)])
@@ -502,7 +519,7 @@ def _launch_gemm_combine_nt(
                     T.i32, ld(lds, fx.Int32(_LDS_REDUCE_SLOT) + slot, scope="workgroup", space=3)
                 )
 
-    epoch_bump(arg_parity, arg_combine_expected, arg_reduce_expected, arg_chunk_counter).launch(
+    epoch_bump(arg_parity, arg_combine_expected, arg_reduce_expected, arg_epoch, arg_chunk_counter).launch(
         grid=(1, 1, 1), block=(64, 1, 1), stream=stream
     )
     gemm_combine_nt(
@@ -523,6 +540,7 @@ def _launch_gemm_combine_nt(
         arg_parity,
         arg_combine_expected,
         arg_reduce_expected,
+        arg_epoch,
         arg_chunk_counter,
         arg_grad_gate,
         arg_grad_topk_weights,
@@ -543,7 +561,7 @@ def _chunk_counter(device: torch.device) -> torch.Tensor:
     return torch.zeros(2, dtype=torch.int32, device=device)
 
 
-_CONSTEXPR0 = 25
+_CONSTEXPR0 = 26
 
 
 def gemm_combine_nt_gfx1250(
@@ -659,6 +677,7 @@ def gemm_combine_nt_gfx1250(
         _as_ptr(symm._combine_parity),
         _as_ptr(symm._combine_expected),
         _as_ptr(symm._reduce_expected),
+        _as_ptr(symm._combine_epoch),
         _as_ptr(_chunk_counter(act.device)),
         # traced out without a grad gate; any device tensor fills them
         _as_ptr(grad_gate if has_grad_gate else out),

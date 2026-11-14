@@ -33,6 +33,11 @@ BLOCK_M = 256  # pool-block granularity + pool alignment
 
 # default dispatched-token dtype; override via ``token_dtype`` to target fp8, etc.
 TOKEN_DTYPE = torch.bfloat16
+# A launch's epoch (flag-bank parity + that bank's expected values), copied by its bump kernel into one 128-byte
+# slot per workgroup (block index modulo EPOCH_SLOTS): read at device scope by every wave, one shared word was
+# served one request at a time -- some 2048 waves took ~0.25 ms to start a comm launch.
+EPOCH_SLOTS = 1024
+EPOCH_SLOT_WORDS = 16  # i64 words, one cache line
 TOKEN_ALIGNMENT = 128  # get_token_alignment_for_mega_moe
 
 
@@ -393,6 +398,10 @@ class SymmBuffer:
         self._combine_parity = torch.zeros(1, dtype=torch.int64, device="cuda")
         self._combine_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
         self._reduce_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        # per-workgroup copies of the current epoch (EPOCH_SLOTS): dispatch (parity, expected), combine (parity,
+        # combine expected, reduce expected)
+        self._dispatch_epoch = torch.zeros(EPOCH_SLOTS * EPOCH_SLOT_WORDS, dtype=torch.int64, device="cuda")
+        self._combine_epoch = torch.zeros(EPOCH_SLOTS * EPOCH_SLOT_WORDS, dtype=torch.int64, device="cuda")
         self._sym_buffer = None  # cached so its peer-delta table stays alive with this heap
 
     def dispatch_fp8_views(self) -> Tuple[torch.Tensor, torch.Tensor]:
