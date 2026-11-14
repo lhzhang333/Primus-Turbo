@@ -389,6 +389,18 @@ def test_layout_moe(kind, dim, case):
     _check_grouped(out, vals, lens, rule, lay)
 
 
+def _written(out):
+    """What a quantizer call writes: every output of a dense one; of a grouped 8-tuple (after dGLU's grad_probs) the
+    rows / tokens up to the padded totals offs_row[G] / offs_col[G] (raw layout) and the lens / offsets, not the rest of
+    the bounds-sized allocations."""
+    out = [t for t in out if t is not None]
+    if len(out) < 8:
+        return out
+    head, (qr, sr, qc, sc, *lo) = out[:-8], out[-8:]
+    Mr, Mc = int(lo[1][-1]), int(lo[3][-1])
+    return [*head, qr[:Mr], sr[:Mr], qc[:, :Mc], sc[:, : Mc // 32], *lo]
+
+
 def test_tail_at_mapping_end():
     """Inputs whose last byte ends their GPU mapping (a read past them faults), with K % 128 != 0: the tile load
     addresses whole 128-column rows, so the last row's partial k-tile must not come in by TDM. Every producer that
@@ -417,10 +429,11 @@ def test_tail_at_mapping_end():
         "gather": (lambda a: Q.grouped_gather_quant_mxfp8(a, d2s, lens, offs), [x]),
     }
     for name, (fn, inputs) in cases.items():
-        ref = [t for t in fn(*inputs) if t is not None]
+        ref = _written(fn(*inputs))
         for i, t in enumerate(inputs):  # each input in turn at the end of its mapping
             with tensor_at_mapping_end(t.shape, t.dtype) as e:
                 e.copy_(t)
-                got = [u for u in fn(*[e if j == i else u for j, u in enumerate(inputs)]) if u is not None]
+                got = _written(fn(*[e if j == i else u for j, u in enumerate(inputs)]))
+                assert len(got) == len(ref)
                 for k, (a, b) in enumerate(zip(got, ref)):
                     _eq(a, b, f"{name}, input {i} at the mapping end: output {k}")

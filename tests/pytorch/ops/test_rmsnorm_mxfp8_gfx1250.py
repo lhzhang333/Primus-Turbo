@@ -100,9 +100,9 @@ def test_skip_y():
 
 
 def test_tail_at_mapping_end():
-    """x [M, 200] (H % 128 != 0) ending where its GPU mapping does: the last row's partial k-tile must not be read
+    """x [M, 208] (H % 128 != 0) ending where its GPU mapping does: the last row's partial k-tile must not be read
     by the TDM (it addresses whole 128-column rows). Same outputs as x in ordinary storage."""
-    x, gamma = _inputs(257, 200, 0, seed=5)
+    x, gamma = _inputs(257, 208, 0, seed=5)
     ref = N.rmsnorm_quant_mxfp8(x, gamma, EPS, pad=True, layout=LAYOUTS["mx_ab"])
     with tensor_at_mapping_end(x.shape, x.dtype) as e:
         e.copy_(x)
