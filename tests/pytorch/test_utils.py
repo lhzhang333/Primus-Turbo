@@ -4,6 +4,9 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import contextlib
+import ctypes
+
 import pytest
 import torch
 
@@ -95,3 +98,80 @@ def pinned_backend_takes(backend, varlen=False, **kwargs) -> bool:
     with pytest.raises(ValueError, match="cannot handle the given inputs"):
         resolve_flash_attn_backend(varlen=varlen, user_backend=backend, **kwargs)
     return False
+
+
+class _HipMemLocation(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+
+class _HipMemAllocationProp(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("requestedHandleType", ctypes.c_int),
+        ("location", _HipMemLocation),
+        ("win32HandleMetaData", ctypes.c_void_p),
+        ("allocFlags", ctypes.c_uint32),
+    ]
+
+
+class _HipMemAccessDesc(ctypes.Structure):
+    _fields_ = [("location", _HipMemLocation), ("flags", ctypes.c_int)]
+
+
+class _CudaArray:
+    def __init__(self, ptr, nbytes):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (ptr, False),
+            "version": 3,
+        }
+
+
+@contextlib.contextmanager
+def tensor_at_mapping_end(shape, dtype):
+    """A CUDA tensor whose last byte is the last mapped byte of its virtual address range: HIP's virtual memory API
+    reserves a page more than it maps, so a kernel that reads past the tensor faults instead of reading a neighbour
+    (for tests of out-of-bounds addressing). Skips the test where the API is not available. Unmapped on exit, after
+    a device synchronize; the tensor must not be used afterwards."""
+    torch.zeros(1, device="cuda")  # the runtime is up, so its library is loaded
+    if not torch.version.hip:
+        pytest.skip("HIP virtual memory API")
+    path = next((line.split()[-1] for line in open("/proc/self/maps") if "libamdhip64" in line), None)
+    if path is None:
+        pytest.skip("libamdhip64 not loaded")
+    hip = ctypes.CDLL(path)
+    dev = torch.cuda.current_device()
+    loc = _HipMemLocation(type=1, id=dev)  # hipMemLocationTypeDevice
+    prop = _HipMemAllocationProp(type=1, requestedHandleType=0, location=loc)  # pinned, no export handle
+    gran = ctypes.c_size_t()
+    if hip.hipMemGetAllocationGranularity(ctypes.byref(gran), ctypes.byref(prop), 0):
+        pytest.skip("hipMemGetAllocationGranularity failed")
+    nbytes = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
+    page = gran.value
+    size = max(1, -(-nbytes // page)) * page
+    va, handle = ctypes.c_void_p(), ctypes.c_void_p()
+    no_flags = ctypes.c_ulonglong(0)
+    if hip.hipMemAddressReserve(
+        ctypes.byref(va), ctypes.c_size_t(size + page), ctypes.c_size_t(page), None, no_flags
+    ):
+        pytest.skip("hipMemAddressReserve failed")
+    mapped = False
+    try:
+        if hip.hipMemCreate(ctypes.byref(handle), ctypes.c_size_t(size), ctypes.byref(prop), no_flags):
+            pytest.skip("hipMemCreate failed")
+        if hip.hipMemMap(va, ctypes.c_size_t(size), ctypes.c_size_t(0), handle, no_flags):
+            pytest.skip("hipMemMap failed")
+        mapped = True
+        access = _HipMemAccessDesc(location=loc, flags=3)  # read-write
+        if hip.hipMemSetAccess(va, ctypes.c_size_t(size), ctypes.byref(access), ctypes.c_size_t(1)):
+            pytest.skip("hipMemSetAccess failed")
+        raw = torch.as_tensor(_CudaArray(va.value + size - nbytes, nbytes), device="cuda")
+        yield raw.view(dtype).view(shape)
+    finally:
+        torch.cuda.synchronize()  # nothing may still use the range
+        if mapped:
+            hip.hipMemUnmap(va, ctypes.c_size_t(size))
+        if handle.value:
+            hip.hipMemRelease(handle)
+        hip.hipMemAddressFree(va, ctypes.c_size_t(size + page))
