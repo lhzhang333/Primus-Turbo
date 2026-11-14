@@ -16,6 +16,7 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp8_support,
+    mx_strict,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
@@ -40,10 +41,16 @@ from primus_turbo.pytorch.ops.quantization import (
     quantize_fp8_with_trans,
 )
 from primus_turbo.pytorch.ops.utils import (
+    MX_A,
+    MX_B,
+    MX_W,
     _ensure_contiguous_grad_out,
     _get_dummy_wgrad,
     _get_fp8_dtype,
     _setup_fused_grad_accum,
+    mx_check_operand_recipes,
+    mx_gemm_layout,
+    mx_wgrad_accum_backend,
 )
 
 __all__ = [
@@ -69,6 +76,7 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
     out: Optional[torch.Tensor] = None,
     m_real: Optional[int] = None,
     n_real: Optional[int] = None,
+    b_preshuffled: bool = False,
 ) -> Optional[torch.Tensor]:
     """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked. Returns the
     weight grad, or a dummy buffer (weight dtype, never read) when it accumulated in
@@ -83,6 +91,7 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
         granularity=granularity,
         num_cu=num_cu,
         default_backend=default_backend,
+        b_preshuffled=b_preshuffled,
     )
 
     if not inplace_add_to_out:
@@ -659,7 +668,17 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
         a_dtype = b_dtype = _get_fp8_dtype(config.format, True)
 
-        a_scaling_recipe = ScalingRecipe()
+        lay = mx_gemm_layout(b, grouped=True, a=a, config=config, out_dtype=out_dtype)
+        a_scaling_recipe, a_t_recipe = (MX_A, MX_B) if lay else (ScalingRecipe(), ScalingRecipe())
+        b_scaling_recipe = MX_W if lay else ScalingRecipe(use_2d_block=True)
+        mx_check_operand_recipes(
+            "grouped_gemm_fp8 (MXFP8)",
+            lay,
+            a=(a, a_scaling_recipe),
+            a_t=(a_t, a_t_recipe),
+            b=(b, b_scaling_recipe),
+            b_t=(b_t, b_scaling_recipe),
+        )
         if not isinstance(a, QuantizedTensor):
             # NOTE: If a is not a QuantizedTensor use grouped_quantize_fp8_with_trans to avoid call dequantize.
             (
@@ -679,20 +698,21 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                 group_offs,
                 block_size=config.block_size,
                 scaling_recipe=a_scaling_recipe,
-                scaling_recipe_for_trans=a_scaling_recipe,
+                scaling_recipe_for_trans=a_t_recipe,
             )
         else:
             quantized_a = a
             check_quantized_tensor(quantized_a, config, axis=-1, scaling_recipe=a_scaling_recipe)
 
             if a_t is None:
+                mx_strict("grouped_gemm_fp8 (MXFP8): no a_t, re-quantizing a from its dequantized values")
                 quantized_a_t = QuantizedTensor.quantize(
                     quantized_a.dequantize(),
                     quantized_a.real_dtype,
                     config.granularity,
                     axis=-2,
                     block_size=config.block_size,
-                    scaling_recipe=a_scaling_recipe,
+                    scaling_recipe=a_t_recipe,
                     group_lens=group_lens,
                 )
             else:
@@ -706,7 +726,6 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
 
             group_offs_padded_rowwise = quantized_a.group_offs
 
-        b_scaling_recipe = ScalingRecipe(use_2d_block=True)
         if not isinstance(b, QuantizedTensor):
             # NOTE: If b is not a QuantizedTensor use quantize_fp8_with_trans to avoid call dequantize.
 
@@ -715,14 +734,15 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                 b_dtype,
                 config.granularity,
                 block_size=config.block_size,
-                scaling_recipe=ScalingRecipe(use_2d_block=True),
-                scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
+                scaling_recipe=b_scaling_recipe,
+                scaling_recipe_for_trans=b_scaling_recipe,
             )
         else:
             quantized_b = b
             check_quantized_tensor(quantized_b, config, axis=-1, scaling_recipe=b_scaling_recipe)
 
             if b_t is None:
+                mx_strict("grouped_gemm_fp8 (MXFP8): no b_t, re-quantizing b from its dequantized values")
                 quantized_b_t = QuantizedTensor.quantize(
                     quantized_b.dequantize(),
                     quantized_b.real_dtype,
@@ -758,6 +778,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             num_cu=num_cu,
             default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
+            b_preshuffled=lay,
         )
         out = out[:total_m]
 
@@ -770,6 +791,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             group_offs,
         )
         ctx.config = config
+        ctx.lay = lay
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
         ctx.total_m = total_m
@@ -799,8 +821,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             group_lens,
             group_offs,
             block_size=ctx.config.block_size,
-            scaling_recipe=ScalingRecipe(),
-            scaling_recipe_for_trans=ScalingRecipe(),
+            scaling_recipe=MX_A if ctx.lay else ScalingRecipe(),
+            scaling_recipe_for_trans=MX_A if ctx.lay else ScalingRecipe(),
         )
 
         # dgrad: grad_a = grad_out @ b_col^T  (same single NT op as fwd)
@@ -818,14 +840,14 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             num_cu=ctx.num_cu,
             default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
+            b_preshuffled=ctx.lay,
         )
         grad_a = grad_a[: ctx.total_m]
 
         # wgrad: grad_b[g] = grad_out_col[g] @ a_col[g]^T  (variable-K over colwise-128 M_g)
-        # FlyDSL is the default for the ordinary path, where it is faster. Its beta=1
-        # epilogue only writes 16-bit, so the fused path defaults to Triton, which also
-        # covers the fp32 main_grad Megatron allocates by default; pin FlyDSL through
-        # GlobalBackendManager when main_grad matches the weight's own bf16/fp16 dtype.
+        # FlyDSL is the default for the ordinary path, where it is faster; the fused (beta=1)
+        # path takes mx_wgrad_accum_backend (FlyDSL's gfx950 epilogue writes only 16-bit).
+        wgrad_backend = mx_wgrad_accum_backend(grouped=True) if ctx.fuse_bgrad_accum else BackendType.FLYDSL
         grad_b = _grouped_gemm_fp8_variable_k_impl_wrapper(
             grad_out_t_fp8,
             a_fp8_col,
@@ -839,9 +861,10 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=(BackendType.TRITON.value if ctx.fuse_bgrad_accum else BackendType.FLYDSL.value),
+            default_backend=wgrad_backend.value,
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
+            b_preshuffled=ctx.lay,
         )
         # NT-only: wgrad already produces grad_b as (G, N, K) matching b.
         return (

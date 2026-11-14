@@ -25,6 +25,7 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
+from primus_turbo.pytorch.core.utils import is_gfx1250
 
 _SUPPORTED_QUANTIZED_DTYPES = [float8_e4m3, float8_e5m2, float4_e2m1fn_x2]
 _SUPPORTED_QUANTIZED_GRANS = [
@@ -752,6 +753,12 @@ class QuantizedTensor(torch.Tensor):
 
         if out_shape == wrapper_shape:
             return tensor._data, tensor._scale_inv, out_shape
+        recipe = tensor._scaling_recipe
+        if tensor._dest_dtype != float4_e2m1fn_x2 and recipe is not None and is_gfx1250():
+            if recipe.shuffle_scale or recipe.shuffle_out:
+                raise NotImplementedError(
+                    f"view / reshape of a gfx1250 MXFP8 QuantizedTensor in the GEMM layouts ({recipe})"
+                )
 
         align = _get_padding_align_size(tensor)
         padded_target_shape = _pad_inner_dim(target_shape, align)
@@ -946,8 +953,27 @@ def create_quantized_weight(
     dest_dtype: torch.dtype,
     quant_config: Union[Float4QuantConfig, Float8QuantConfig],
     need_weight_transpose_cache: bool = False,
+    scaling_recipe: Optional[ScalingRecipe] = None,
 ) -> Tuple[QuantizedTensor, Optional[QuantizedTensor]]:
+    """Quantize ``weight`` ([N, K] or [G, N, K]) into (W, Wᵀ or None).
+
+    ``scaling_recipe`` overrides the recipe ``quant_config`` implies, for both copies. Without it, an MXFP8 weight on
+    gfx1250 takes the layout gemm_fp8 / the grouped ops read there (``ops.utils.mx_weight_layout_recipe``: gfx1250's
+    MX GEMM layout where it applies, else the raw 2-D blocks). The copies carry their recipe, so their consumers and
+    ``dequantize`` know the layout. With the transpose cache, gfx1250 writes both MXFP8 copies in one pass."""
+
     def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
+        if scaling_recipe is not None:
+            return scaling_recipe
+        if (
+            is_gfx1250()
+            and isinstance(quant_config, Float8QuantConfig)
+            and quant_config.granularity == ScalingGranularity.MX_BLOCKWISE
+        ):
+            from primus_turbo.pytorch.ops.utils import mx_weight_layout_recipe
+
+            grouped = weight.dim() == 3
+            return mx_weight_layout_recipe(grouped, weight.shape, config=quant_config, dtype=weight.dtype)
         if isinstance(quant_config, Float4QuantConfig):
             weight_scaling_recipe = ScalingRecipe(
                 use_2d_block=True,
@@ -966,6 +992,40 @@ def create_quantized_weight(
     scale_rounding_mode = (
         quant_config.scale_rounding_mode if isinstance(quant_config, Float4QuantConfig) else 0
     )
+    if (
+        need_weight_transpose_cache
+        and is_gfx1250()
+        and isinstance(quant_config, Float8QuantConfig)
+        and quant_config.granularity == ScalingGranularity.MX_BLOCKWISE
+    ):
+        # gfx1250: both copies from one read (32x32 blocks: one scale per block, q_t == q.T).
+        from primus_turbo.pytorch.ops.quantization import quantize_fp8_with_trans
+
+        recipe = _weight_scaling_recipe(quant_config)
+        q, s, q_t, s_t = quantize_fp8_with_trans(
+            weight,
+            dest_dtype,
+            quant_config.granularity,
+            block_size=quant_config.block_size,
+            scaling_recipe=recipe,
+            scaling_recipe_for_trans=recipe,
+        )
+        return tuple(
+            QuantizedTensor(
+                data,
+                scale,
+                shape=weight.size(),
+                orig_dtype=weight.dtype,
+                dest_dtype=dest_dtype,
+                granularity=quant_config.granularity,
+                block_size=quant_config.block_size,
+                scaling_recipe=recipe,
+                quantized_axis=axis,
+                requires_grad=weight.requires_grad,
+            )
+            for data, scale, axis in ((q, s, -1), (q_t, s_t, -2))
+        )
+
     quantized_weight = QuantizedTensor.quantize(
         weight,
         dest_dtype=dest_dtype,

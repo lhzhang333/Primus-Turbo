@@ -27,8 +27,14 @@ from .grouped_gemm_fp4 import *
 from .grouped_gemm_fp8 import *
 from .grouped_mlp_fp4 import grouped_mlp_fp4
 from .mlp_fp4 import mlp_fp4
+from .mlp_fp8 import mlp_fp8
 from .moe import *
 from .normalization import *
 from .quantization import *
 from .rope import *
-from .utils import DUMMY_WGRAD_FLAT_POOL, get_dummy_wgrad
+from .utils import (
+    DUMMY_WGRAD_FLAT_POOL,
+    get_dummy_wgrad,
+    mx_weight_layout_recipe,
+    mx_wgrad_accum_supported,
+)

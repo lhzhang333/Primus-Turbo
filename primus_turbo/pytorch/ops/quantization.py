@@ -135,6 +135,10 @@ def quantize_fp8_with_trans(
                ``axis`` argument is taken (it is implied by the dual direction).
             3. The block size must be 32.
             4. The return value is x_rowwise, x_scale_inv_rowwise, x_colwise and x_scale_inv_colwise.
+            5. gfx1250: ``shuffle_scale`` / ``shuffle_out`` of ``scaling_recipe`` (row copy) and
+               ``scaling_recipe_for_trans`` (column copy) select the MX GEMM layouts, packed scales
+               ``[.., ceil(R/32), ceil(C/128), 32, 4]`` and 16x16-preshuffled codes (see
+               ``quantization_impl._gfx1250_mxfp8``); ``dequantize_fp8`` with the same recipe undoes them.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MXFP8_BLOCK_SIZE, (
@@ -215,6 +219,9 @@ def grouped_quantize_fp8_with_trans(
 ]:
     """
     FP8 Grouped Quantize with trans
+
+    Returns (q_row, s_row, q_col, s_col, lens_row, offs_row, lens_col, offs_col): rows padded
+    to 32 per group, columns to 128; gfx1250 layouts as in :func:`quantize_fp8_with_trans`.
     """
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MXFP8_BLOCK_SIZE, (
@@ -257,6 +264,7 @@ def dequantize_fp8(
             1. The x must be 2D tensor.
             2. The axis means direction of de-quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
+            4. ``scaling_recipe``: the one ``x`` was quantized with (gfx1250 GEMM layouts are undone first).
     """
     if granularity == ScalingGranularity.TENSORWISE:
         return dequantize_fp8_tensorwise_impl(x, out_dtype, scale_inv)
@@ -278,7 +286,7 @@ def dequantize_fp8(
             f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
         )
 
-        return dequantize_mxfp8_impl(x, out_dtype, axis, block_size, scale_inv)
+        return dequantize_mxfp8_impl(x, out_dtype, axis, block_size, scale_inv, scaling_recipe)
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
 
@@ -304,7 +312,7 @@ def grouped_dequantize_fp8(
             f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
         )
         return grouped_dequantize_mxfp8_impl(
-            x, out_dtype, axis, block_size, scale_inv, group_offs, group_offs_padded, total_M
+            x, out_dtype, axis, block_size, scale_inv, group_offs, group_offs_padded, total_M, scaling_recipe
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")

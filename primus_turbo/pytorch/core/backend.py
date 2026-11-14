@@ -486,6 +486,28 @@ def _format_kwargs(kwargs: Dict[str, Any]) -> str:
     return ", ".join(f"{k}={_format_value(v)}" for k, v in kwargs.items())
 
 
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
+
+
+def _mx_strict_fallback(
+    dispatcher: str, default: Optional[BackendType], fallback: BackendType, kw: dict
+) -> None:
+    """MXFP8 strict mode (``low_precision.mx_strict``): an MXFP8 call (MX_BLOCKWISE on FP8 operands; not MXFP4) may
+    not fall back from its default backend."""
+    if getattr(kw.get("granularity"), "name", None) != "MX_BLOCKWISE":
+        return
+    if getattr(kw.get("a"), "dtype", None) not in _FP8_DTYPES:
+        return
+    from primus_turbo.pytorch.core.low_precision import mx_strict
+
+    mx_strict(
+        lambda: (
+            f"{dispatcher}: the default backend {getattr(default, 'name', None)} cannot take "
+            f"{_format_kwargs(kw)}; would fall back to {fallback.name}"
+        )
+    )
+
+
 def _warn_fallback(backend_enum: BackendType, kwargs: dict) -> None:
     """Say once that the default backend was not eligible and we fell back.
 
@@ -666,6 +688,9 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         # 4. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
+                _mx_strict_fallback(
+                    cls.__name__, default_backend_choice.backend, fallback_backend_enum, kwargs
+                )
                 _warn_fallback(fallback_backend_enum, kwargs)
                 return fallback_backend_entry.impl.execute(**kwargs)
 
@@ -722,6 +747,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         # 4. Fallback: try all backends
         for fallback_backend_enum, fallback_backend_entry in cls._backends.items():
             if fallback_backend_entry.impl.can_handle(**kwargs):
+                _mx_strict_fallback(cls.__name__, default_backend_enum, fallback_backend_enum, kwargs)
                 _warn_fallback(fallback_backend_enum, kwargs)
                 return fallback_backend_enum
 

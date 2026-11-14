@@ -11,6 +11,7 @@ from typing import NamedTuple, Optional, Tuple
 import torch
 from torch._library.opaque_object import register_opaque_type
 
+import primus_turbo.common.envs as envs
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 
 try:
@@ -78,6 +79,15 @@ def check_mxfp8_support() -> Tuple[bool, str]:
         False,
         "Device compute capability gfx950 or higher required for MXFP8 execution.",
     )
+
+
+def mx_strict(what, level: int = 1) -> None:
+    """Raise RuntimeError for ``what``, a silent MXFP8 fallback (a message, or a callable that builds it only then),
+    when PRIMUS_TURBO_MX_STRICT >= ``level`` (1: GEMM backend fallback, re-quantizing a dequantized operand; 2: also
+    the HIP MXFP8 quantization on gfx1250)."""
+    strict = envs.PRIMUS_TURBO_MX_STRICT
+    if strict >= level:
+        raise RuntimeError(f"PRIMUS_TURBO_MX_STRICT={strict}: {what() if callable(what) else what}")
 
 
 ###################################################

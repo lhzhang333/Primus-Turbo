@@ -55,6 +55,14 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_kwargs_keys.py",
     # The fused-wgrad ops' placeholder gradients: views of one flat buffer per dtype (ops.get_dummy_wgrad).
     "tests/pytorch/ops/test_dummy_wgrad.py",
+    # MXFP8 strict mode (PRIMUS_TURBO_MX_STRICT): dispatcher fallbacks and re-quantization refused.
+    "tests/pytorch/core/test_mx_strict.py",
+    # MXFP8 wgrad into main_grad (beta=1) vs the unfused add, dense and grouped; mx_wgrad_accum_supported.
+    "tests/pytorch/ops/test_mx_wgrad_accum.py",
+    # gemm_fp8 (MXFP8) on the FlyDSL gfx1250 MX GEMM vs BF16 and the emulated recipe, strict mode.
+    "tests/pytorch/ops/test_gemm_fp8_mx_gfx1250.py",
+    # grouped_gemm_fp8 / grouped_mlp_fp8 (MXFP8, two-phase fused GLU) at the DSv3 expert shape vs BF16, strict mode.
+    "tests/pytorch/ops/test_grouped_mlp_mxfp8_gfx1250.py",
     # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250_mla).
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
     # HipKittens kernels of its backward (csrc/kernels/attention/hipkittens/gfx1250_mla).
@@ -63,6 +71,12 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
     # MXFP8 quantization (primus_turbo/flydsl/quantization/mxfp8_quant_gfx1250.py), bitwise vs the reference.
     "tests/pytorch/ops/test_quant_mxfp8_gfx1250.py",
+    # The op layer on those quantizers: dispatch and layouts, strict mode, operand slack.
+    "tests/pytorch/ops/test_mxfp8_ops_gfx1250.py",
+    # The MXFP8 quantization ops, which dispatch bf16 / E4M3 to those kernels on gfx1250 (HIP layouts). Not
+    # test_quantize_mxfp8_shuffle: on gfx1250 the shuffle flags mean the gfx1250 GEMM layouts, not HIP's.
+    "tests/pytorch/ops/test_quantization.py::test_quantize_mxfp8[",
+    "tests/pytorch/ops/test_quantization.py::test_quantize_mxfp8_with_trans",
     # Sparse MLA (primus_turbo/flydsl/attention/gfx1250_sparse_mla); every backend it can pick
     # runs here.
     "tests/pytorch/ops/test_attention.py::test_sparse_mla_op",
