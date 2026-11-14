@@ -7,7 +7,9 @@
 """MegaMoE in MXFP8 on gfx1250, one GPU (EP1): the MX rows on the wire, the combine-only launch, and the stages
 bit for bit against the routed experts' grouped-path kernels run in the Mega pool order on the same quantized
 operands (the rows from bf16 by the grouped path's gather-quant, the columns by mxfp8_ref from the dispatched fp8
-rows); the staged ops against an fp32 reference."""
+rows; ``check_stages``, which the EP2+ suite runs on every rank); the staged ops against an fp32 reference; a bf16
+combine after a combine-only launch on one heap, two layers interleaved, the zero routing weight of the pool's
+padding rows, and the contract violations the stages refuse."""
 
 import os
 import sys
@@ -24,16 +26,16 @@ import mxfp8_ref as R  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not is_gfx1250(), reason="gfx1250 kernels")
 
-from tests.pytorch.ops.test_mega_bf16_gfx1250_fused_moe import (  # noqa: E402,F401
-    _reference,
-    _snr,
-    ep1_group,
-)
+from tests.pytorch.ops import test_mega_bf16_gfx1250_fused_moe as _bf16  # noqa: E402
+
+_reference, _snr = _bf16._reference, _bf16._snr
+ep1_group = _bf16.ep1_group  # the one-rank group fixture
 
 SWIGLU = GLUActivation.swiglu()  # DeepSeek-V3's activation: plain SiLU-SwiGLU
 
 
-def _inputs(T, H, I, E, topk, seed, skew=False):
+def _inputs(T, H, I, E, topk, seed, skew=False, local=None):
+    """Tokens routed over ``E`` experts, and the weights of ``local`` (default all) of them."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(T, H, generator=g, device="cuda").to(torch.bfloat16)
     scores = torch.randn(T, E, generator=g, device="cuda")
@@ -41,10 +43,24 @@ def _inputs(T, H, I, E, topk, seed, skew=False):
         scores[:, : E // 4] += 2.0
         scores[:, -2:] -= 100.0
     topk_w, topk_idx = scores.softmax(-1).topk(topk, dim=-1)
-    w1 = (torch.randn(E, 2 * I, H, generator=g, device="cuda") * 2 / H**0.5).to(torch.bfloat16)
-    w2 = (torch.randn(E, H, I, generator=g, device="cuda") * 2 / I**0.5).to(torch.bfloat16)
+    local = local or E
+    w1 = (torch.randn(local, 2 * I, H, generator=g, device="cuda") * 2 / H**0.5).to(torch.bfloat16)
+    w2 = (torch.randn(local, H, I, generator=g, device="cuda") * 2 / I**0.5).to(torch.bfloat16)
     dy = torch.randn(T, H, generator=g, device="cuda").to(torch.bfloat16)
     return x, topk_idx, topk_w, w1, w2, dy
+
+
+def _recv_rows(t, group):
+    """Every rank's ``t`` at the receive rows ``src_rank * T_max + i`` that ``pool_row_to_recv_token`` numbers (zero
+    past each rank's own count): what the dispatch delivers to any rank."""
+    from primus_turbo.flydsl.mega.gfx1250.symm_buffer import get_symm_buffer_for_mega_moe
+
+    t_max = int(get_symm_buffer_for_mega_moe().num_max_tokens_per_rank)
+    buf = t.new_zeros((t_max,) + t.shape[1:])
+    buf[: t.shape[0]] = t
+    out = t.new_empty((group.size() * t_max,) + t.shape[1:])
+    torch.distributed.all_gather_into_tensor(out, buf, group=group)
+    return out
 
 
 def _eq(got, want, what):
@@ -89,14 +105,12 @@ def _cols(c, P, shuffled):
     return codes[:, :P], c[1].cpu()[:, : P // 128]
 
 
-@pytest.mark.parametrize(
-    "T, H, I, E, topk, skew",
-    [
-        (512, 1024, 512, 8, 4, False),
-        (1024, 7168, 2048, 32, 8, True),  # DeepSeek-V3's experts (EP1 slice), hot and empty experts
-    ],
-)
-def test_stages_vs_grouped_path_bitwise_ep1(ep1_group, T, H, I, E, topk, skew):
+def check_stages(group, T, H, I, E, topk, seed, skew=False):
+    """The MX stages on this rank bit for bit against the grouped path's kernels run in this rank's pool order on
+    the same quantized operands: the delivered x rows, l1, the activation's column copy, the x / dy column copies,
+    grad_gate, grad_l1's copies, dW1, dW2 (also into a filled bf16 main_grad). Each is per pool row (dW: per local
+    expert), so it holds on every rank at any EP size; y, dx and d topk_w fold rows of several ranks and are
+    checked bit for bit at EP1 only. ``E`` experts in all, ``E / group.size()`` per rank; a collective."""
     from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 import (
         grouped_gemm_mxfp8_gfx1250,
         grouped_gemm_mxfp8_variable_k_gfx1250,
@@ -105,14 +119,16 @@ def test_stages_vs_grouped_path_bitwise_ep1(ep1_group, T, H, I, E, topk, skew):
     from primus_turbo.flydsl.quantization import mxfp8_quant_gfx1250 as Q
     from primus_turbo.pytorch.kernels.fused_mega_moe import fused_mega_moe_gfx1250_fp8_impl as MX
 
-    x, topk_idx, topk_w, w1, w2, dy = _inputs(T, H, I, E, topk, T + H, skew)
-    l1, dw, handle, x_col, _ = MX.stage1_forward(x, w1, ep1_group, topk_idx, topk_w)
+    world = group.size()
+    x, topk_idx, topk_w, w1, w2, dy = _inputs(T, H, I, E, topk, seed + 101 * group.rank(), skew, E // world)
+    l1, dw, handle, x_col, _ = MX.stage1_forward(x, w1, group, topk_idx, topk_w)
     y, act_col = MX.stage2_forward(l1, w2, handle, topk_idx, dw, SWIGLU)
     gl_row, gl_col, grad_gate, dW2 = MX.stage2_backward(dy, l1, dw, w2, handle, act_col, SWIGLU)
     dx, gtw, dW1 = MX.stage1_backward(gl_row, gl_col, grad_gate, x_col, w1, handle, topk_idx)
     h = DispatchHandle(*handle)
     P, lens, offs = h.pool_row_to_route.numel(), h.num_tokens_per_expert, h.num_tokens_per_expert_prefix
     rmap = h.pool_row_to_recv_token[:P]  # padding rows: out of range -> zero rows, as the pool's
+    x_recv, dy_recv = _recv_rows(x, group), _recv_rows(dy, group)
 
     def gemm(a, w):
         return grouped_gemm_mxfp8_gfx1250(a[0], a[1], w[0], w[1], offs, offs, P)
@@ -123,32 +139,40 @@ def test_stages_vs_grouped_path_bitwise_ep1(ep1_group, T, H, I, E, topk, skew):
     W1, W1t = MX._weights(w1)[:2], MX._weights(w1)[2:]
     W2, W2t = MX._weights(w2)[:2], MX._weights(w2)[2:]
     # forward: rows quantized from bf16 x by the grouped path's gather-quant
-    xr = Q.grouped_gather_quant_mxfp8(x, rmap, lens, offs, total_m=P, layout=Q.PACK_ROW)
+    xr = Q.grouped_gather_quant_mxfp8(x_recv, rmap, lens, offs, total_m=P, layout=Q.PACK_ROW)
     xr_mega = MX._send(x, h, 0, cols=False)  # the forward's rows once more: what the dispatch delivered
     _eq(xr_mega[0][:P], xr[0][:P], "x rows")
     _eq(xr_mega[1].view(-1)[: P * H // 32], xr[1].view(-1)[: P * H // 32], "x row scales")
     r_l1 = gemm(xr, W1)
     _eq(l1, r_l1, "l1")
-    act = Q.grouped_glu_quant_mxfp8(r_l1, dw, lens, offs, "silu", None, layout=Q.PACK_ROW | Q.PACK_COL | Q.SHUF_COL)
+    act = Q.grouped_glu_quant_mxfp8(
+        r_l1, dw, lens, offs, "silu", None, layout=Q.PACK_ROW | Q.PACK_COL | Q.SHUF_COL
+    )
     for got, want, what in zip(_cols(act_col, P, True), _cols(act[2:4], P, True), ("act columns", "scales")):
         _eq(got, want, what)
-    _eq(y, _fold(gemm(act, W2), h, T), "y")
     # the column copy of x for dW1, from the dispatched fp8 rows
-    for got, want, what in zip(_cols(x_col, P, True), _ref_cols(x, h), ("x columns", "x column scales")):
+    for got, want, what in zip(_cols(x_col, P, True), _ref_cols(x_recv, h), ("x columns", "x column scales")):
         _eq(got, want, what)
     # backward
-    dyr = Q.grouped_gather_quant_mxfp8(dy, rmap, lens, offs, total_m=P, layout=Q.PACK_ROW)
-    gp, *g = Q.grouped_dglu_quant_mxfp8(gemm(dyr, W2t), r_l1, dw, lens, offs, "silu", None,
-                                        layout=Q.PACK_ROW | Q.PACK_COL)
+    dyr = Q.grouped_gather_quant_mxfp8(dy_recv, rmap, lens, offs, total_m=P, layout=Q.PACK_ROW)
+    gp, *g = Q.grouped_dglu_quant_mxfp8(
+        gemm(dyr, W2t), r_l1, dw, lens, offs, "silu", None, layout=Q.PACK_ROW | Q.PACK_COL
+    )
     _eq(grad_gate, gp, "grad_gate")
     _eq(gl_row[0][:P], g[0][:P], "grad_l1 rows")
     _eq(gl_row[1].view(-1)[: P * 2 * I // 32], g[1].view(-1)[: P * 2 * I // 32], "grad_l1 row scales")
-    for got, want, what in zip(_cols(gl_col, P, False), _cols(g[2:4], P, False), ("grad_l1 columns", "scales")):
+    for got, want, what in zip(
+        _cols(gl_col, P, False), _cols(g[2:4], P, False), ("grad_l1 columns", "scales")
+    ):
         _eq(got, want, what)
-    _eq(dx, _fold(gemm(g, W1t), h, T), "dx")
-    _eq(gtw, _gate_scatter(gp, h, T, topk), "grad_topk_weights")
+    if world == 1:
+        _eq(y, _fold(gemm(act, W2), h, T), "y")
+        _eq(dx, _fold(gemm(g, W1t), h, T), "dx")
+        _eq(gtw, _gate_scatter(gp, h, T, topk), "grad_topk_weights")
     dy_col = MX._send(dy, h, MX._COLS_A)[2:]  # the backward's own dispatch of dy, again (same pool)
-    for got, want, what in zip(_cols(dy_col, P, False), _ref_cols(dy, h), ("dy columns", "dy column scales")):
+    for got, want, what in zip(
+        _cols(dy_col, P, False), _ref_cols(dy_recv, h), ("dy columns", "dy column scales")
+    ):
         _eq(got, want, what)
     _eq(dW2, wgrad(dy_col, (act[2], act[3])), "dW2")
     _eq(dW1, wgrad((g[2], g[3]), x_col), "dW1")
@@ -159,10 +183,24 @@ def test_stages_vs_grouped_path_bitwise_ep1(ep1_group, T, H, I, E, topk, skew):
     _eq(main_grad, want, "dW2 into main_grad")
 
 
+@pytest.mark.parametrize(
+    "T, H, I, E, topk, skew",
+    [
+        (512, 1024, 512, 8, 4, False),
+        (1024, 7168, 2048, 32, 8, True),  # DeepSeek-V3's experts (EP1 slice), hot and empty experts
+    ],
+)
+def test_stages_vs_grouped_path_bitwise_ep1(ep1_group, T, H, I, E, topk, skew):
+    check_stages(ep1_group, T, H, I, E, topk, T + H, skew)
+
+
 def test_combine_only_ep1(ep1_group):
     """The combine-only launch reads only real pool rows (padding rows NaN here) and folds them in route order."""
     from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import combine_only_gfx1250
-    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle, run_dispatch_prologue
+    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+        DispatchHandle,
+        run_dispatch_prologue,
+    )
 
     T, H, E, topk = 333, 1024, 8, 4
     x, topk_idx, topk_w, w1, _, _ = _inputs(T, H, 256, E, topk, 7, skew=True)
@@ -199,9 +237,20 @@ def test_staged_op_ep1(ep1_group, fuse):
             w.main_grad = torch.zeros_like(w)
             w.grad_added_to_main_grad = False
     advance_weight_generation()
-    l1, dw, handle, state = fused_mega_moe_fp8_stage1(leaves[0], topk_idx, leaves[1], leaves[2], ep1_group, pattern)
+    l1, dw, handle, state = fused_mega_moe_fp8_stage1(
+        leaves[0], topk_idx, leaves[1], leaves[2], ep1_group, pattern
+    )
     y = fused_mega_moe_fp8_stage2(
-        l1, dw, handle, state, topk_idx, leaves[1], leaves[3], ep1_group, SWIGLU, fuse_wgrad_accum_pattern=pattern
+        l1,
+        dw,
+        handle,
+        state,
+        topk_idx,
+        leaves[1],
+        leaves[3],
+        ep1_group,
+        SWIGLU,
+        fuse_wgrad_accum_pattern=pattern,
     )
     y.backward(dy)
     refs = [t.detach().float().requires_grad_() for t in (x, topk_w, w1, w2)]
@@ -209,9 +258,158 @@ def test_staged_op_ep1(ep1_group, fuse):
     ref_y.backward(dy.float())
     grads = [leaves[0].grad, leaves[1].grad] + [w.main_grad if fuse else w.grad for w in leaves[2:]]
     snrs = {"y": _snr(y, ref_y.detach())}
-    snrs.update({name: _snr(got, want.grad) for name, got, want in zip(("dx", "d topk_w", "dW1", "dW2"), grads, refs)})
-    print(f"\n[MX Mega vs fp32, fuse={fuse}] " + ", ".join(f"{k} {v:.1f} dB" for k, v in snrs.items()))
+    snrs.update(
+        {name: _snr(got, want.grad) for name, got, want in zip(("dx", "d topk_w", "dW1", "dW2"), grads, refs)}
+    )
     for name, snr in snrs.items():
         assert snr > 20, f"{name} SNR {snr:.1f} dB"
     if fuse:
         assert all(w.grad_added_to_main_grad for w in leaves[2:])
+
+
+def _op_step(group, x, topk_idx, topk_w, w1, w2, dy, activation=SWIGLU):
+    """One staged MX op forward + backward on fresh leaves: ``(y, dx, d topk_w, dW1, dW2)``."""
+    from primus_turbo.pytorch.kernels.fused_mega_moe import advance_weight_generation
+    from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (
+        fused_mega_moe_fp8_stage1,
+        fused_mega_moe_fp8_stage2,
+    )
+
+    advance_weight_generation()
+    leaves = [t.clone().requires_grad_() for t in (x, topk_w, w1, w2)]
+    l1, dw, handle, state = fused_mega_moe_fp8_stage1(leaves[0], topk_idx, leaves[1], leaves[2], group)
+    y = fused_mega_moe_fp8_stage2(l1, dw, handle, state, topk_idx, leaves[1], leaves[3], group, activation)
+    y.backward(dy)
+    return [y.detach()] + [t.grad for t in leaves]
+
+
+def test_repeat_bitwise_ep1(ep1_group):
+    """Every output, the wgrads included, bit for bit across calls on the same inputs, with another call between
+    them: the prologue puts each pool segment's rows in receive-token order, so the wgrads' contraction order and
+    their 32-row MX column blocks do not depend on the run."""
+    first = _inputs(1024, 7168, 2048, 32, 8, 21, skew=True)
+    other = _inputs(1024, 7168, 2048, 32, 8, 22)
+    a = _op_step(ep1_group, *first)
+    _op_step(ep1_group, *other)
+    b = _op_step(ep1_group, *first)
+    for got, want, what in zip(b, a, ("y", "dx", "d topk_w", "dW1", "dW2")):
+        _eq(got, want, what)
+
+
+def test_interleaved_layers_ep1(ep1_group):
+    """Two layers on one heap, forward A, forward B, backward B, backward A (A's backward after B's prologue and
+    dispatches): each layer bit for bit as it is alone."""
+    from primus_turbo.pytorch.kernels.fused_mega_moe import advance_weight_generation
+    from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (
+        fused_mega_moe_fp8_stage1,
+        fused_mega_moe_fp8_stage2,
+    )
+
+    layers = [_inputs(512, 1024, 512, 8, 4, seed, skew=seed % 2 == 0) for seed in (31, 32)]
+    alone = [_op_step(ep1_group, *inputs) for inputs in layers]
+    advance_weight_generation()
+    runs = []
+    for x, topk_idx, topk_w, w1, w2, _ in layers:
+        leaves = [t.clone().requires_grad_() for t in (x, topk_w, w1, w2)]
+        l1, dw, handle, state = fused_mega_moe_fp8_stage1(
+            leaves[0], topk_idx, leaves[1], leaves[2], ep1_group
+        )
+        y = fused_mega_moe_fp8_stage2(
+            l1, dw, handle, state, topk_idx, leaves[1], leaves[3], ep1_group, SWIGLU
+        )
+        runs.append((y, leaves))
+    for (y, _), (*_, dy) in zip(reversed(runs), reversed(layers)):
+        y.backward(dy)
+    for (y, leaves), want, layer in zip(runs, alone, "AB"):
+        for got, w, what in zip(
+            [y.detach()] + [t.grad for t in leaves], want, ("y", "dx", "d topk_w", "dW1", "dW2")
+        ):
+            _eq(got, w, f"layer {layer} {what}")
+
+
+def test_bf16_combine_after_combine_only_ep1(ep1_group):
+    """A bf16 ``gemm_combine_nt_gfx1250`` on the heap a combine-only launch just used completes and is right: the
+    combine-only launch tops every pool block's flag up to its epoch."""
+    from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import (
+        combine_only_gfx1250,
+        gemm_combine_nt_gfx1250,
+    )
+    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+        DispatchHandle,
+        run_dispatch_prologue,
+    )
+
+    T, H, I, E, topk = 333, 1024, 256, 8, 4
+    x, topk_idx, topk_w, w1, w2, _ = _inputs(T, H, I, E, topk, 41, skew=True)
+    topk_idx = topk_idx.to(torch.int64)
+    h, _ = run_dispatch_prologue(x, w1, ep1_group, topk_idx, topk_w)
+    h = DispatchHandle(*h)
+    P = h.pool_row_to_route.numel()
+    pool = torch.randn(P, H, device="cuda").to(torch.bfloat16)
+    act = torch.randn(P, I, device="cuda").to(torch.bfloat16)
+    expert = h.tile_to_expert.long().repeat_interleave(256)[:P]
+    l2 = torch.zeros(P, H, dtype=torch.bfloat16, device="cuda")
+    for e in range(E):
+        rows = expert == e
+        l2[rows] = (act[rows].float() @ w2[e].float().T).to(torch.bfloat16)
+    for _ in range(2):
+        _eq(combine_only_gfx1250(pool, h, topk_idx), _fold(pool, h, T), "combine-only y")
+        y = gemm_combine_nt_gfx1250(act, w2, h, topk_idx)
+        torch.testing.assert_close(y.float(), _fold(l2, h, T).float(), rtol=2e-2, atol=2e-2)
+
+
+def test_padding_rows_zero_weight_ep1(ep1_group):
+    """The prologue writes routing weight 0 at the pool's padding rows, whatever an earlier call left there (a NaN
+    there once reached the MX wgrads, which contract over whole 256-row segments); the real rows keep theirs."""
+    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+        DispatchHandle,
+        run_dispatch_prologue,
+    )
+    from primus_turbo.flydsl.mega.gfx1250.symm_buffer import get_symm_buffer_for_mega_moe
+
+    T, H, I, E, topk = 333, 1024, 256, 8, 4
+    x, topk_idx, topk_w, w1, _, _ = _inputs(T, H, I, E, topk, 51, skew=True)
+    run_dispatch_prologue(x, w1, ep1_group, topk_idx, topk_w)
+    get_symm_buffer_for_mega_moe().weight_recv_buf.fill_(float("nan"))
+    h, dw = run_dispatch_prologue(x, w1, ep1_group, topk_idx, topk_w)
+    h = DispatchHandle(*h)
+    token = h.pool_row_to_recv_token[: dw.numel()].long()
+    real = token < T
+    assert bool(torch.isfinite(dw).all()) and not bool(dw[~real].any()), "padding rows: weight 0"
+    _eq(dw[real], topk_w.reshape(-1)[h.pool_row_to_route[real].long()], "real rows: their routing weight")
+
+
+def test_contract_rejected_ep1(ep1_group, monkeypatch):
+    """What the gfx1250 MX stages cannot compute raises before any cross-rank work: a shape off the grid (no
+    padding fallback), an fc1 bias, the bf16 kernels' default activation (``None``), the EVEN scale rule."""
+    import primus_turbo.common.envs as envs
+    from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (
+        fused_mega_moe_fp8_stage1,
+        fused_mega_moe_fp8_stage2,
+    )
+
+    x, topk_idx, topk_w, w1, w2, _ = _inputs(64, 1024, 256, 8, 4, 61)
+    fc1_bias = torch.zeros(w1.shape[:2], dtype=torch.bfloat16, device="cuda")
+    for bad_w1 in (w1[:, :, :640].contiguous(), w1[:, :192].contiguous()):  # hidden % 512, intermediate % 128
+        with pytest.raises(ValueError, match="hidden % 512"):
+            fused_mega_moe_fp8_stage1(
+                x[:, : bad_w1.shape[2]].contiguous(), topk_idx, topk_w, bad_w1, ep1_group
+            )
+    with pytest.raises(NotImplementedError, match="SiLU-SwiGLU"):
+        fused_mega_moe_fp8_stage1(x, topk_idx, topk_w, w1, ep1_group, activation=None)
+    with pytest.raises(NotImplementedError, match="SiLU-SwiGLU"):
+        fused_mega_moe_fp8_stage1(x, topk_idx, topk_w, w1, ep1_group, activation=GLUActivation.swigluoai())
+    l1, dw, handle, state = fused_mega_moe_fp8_stage1(x, topk_idx, topk_w, w1, ep1_group, activation=SWIGLU)
+    with pytest.raises(NotImplementedError, match="fc1 bias"):
+        fused_mega_moe_fp8_stage2(
+            l1, dw, handle, state, topk_idx, topk_w, w2, ep1_group, SWIGLU, fc1_bias=fc1_bias
+        )
+    with pytest.raises(NotImplementedError, match="SiLU-SwiGLU"):
+        fused_mega_moe_fp8_stage2(l1, dw, handle, state, topk_idx, topk_w, w2, ep1_group, None)
+    monkeypatch.setenv("PRIMUS_TURBO_MXFP8_SCALE_RULE", "even")
+    envs.reset_cache()
+    try:
+        with pytest.raises(NotImplementedError, match="nosat"):
+            fused_mega_moe_fp8_stage1(x, topk_idx, topk_w, w1, ep1_group, activation=SWIGLU)
+    finally:
+        envs.reset_cache()  # the next read sees the variable as monkeypatch restores it
