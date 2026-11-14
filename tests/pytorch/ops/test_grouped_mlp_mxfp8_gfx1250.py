@@ -160,7 +160,7 @@ def test_grouped_mlp(backend, G, M, H, I, skew):
 @pytest.mark.parametrize("G, M, H, I", SHAPES)
 def test_grouped_mlp_primus(backend, G, M, H, I, main_grad_dtype):
     """Primus' routed experts (fused grouped MLP, several micro-batches): w1 / w2 cached by create_quantized_weight
-    in the recipe ``mx_weight_layout_recipe`` asks for (gfx1250's GEMM layout; raw with Triton pinned),
+    in its default recipe (gfx1250's GEMM layout; raw with Triton pinned),
     wgrads accumulated into main_grad (beta=1): y / dx / dprobs bitwise those of plain bf16 weights (the same
     operands), each main_grad increment vs the plain run's dw (>= 40 dB: one rounding against two) and BF16."""
     if not mx_wgrad_accum_supported(True, main_grad_dtype):
@@ -181,8 +181,8 @@ def test_grouped_mlp_primus(backend, G, M, H, I, main_grad_dtype):
     ref = run(*plain, False)
     cached = []
     for w in (w1, w2):
-        q, q_t = create_quantized_weight(w, float8_e4m3, MX, need_weight_transpose_cache=True,
-                                         scaling_recipe=mx_weight_layout_recipe(True, w.shape))  # fmt: skip
+        q, q_t = create_quantized_weight(w, float8_e4m3, MX, need_weight_transpose_cache=True)
+        assert q.scaling_recipe == mx_weight_layout_recipe(True, w.shape)
         q.main_grad = (_randn(*w.shape, scale=1e-3, seed=6)).to(main_grad_dtype)
         q.grad_added_to_main_grad = False
         cached.append(QuantizedTensorPair(q, q_t))

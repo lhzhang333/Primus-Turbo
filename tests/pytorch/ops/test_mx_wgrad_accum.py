@@ -138,6 +138,29 @@ def _qt(shape, recipe, axis=-1):
 
 
 @pytest.mark.parametrize(
+    "arch, shape, dtype, want",
+    [
+        ("gfx1250", (64, 64), torch.bfloat16, ops_utils.MX_W),
+        ("gfx1250", (64, 72), torch.bfloat16, ScalingRecipe(use_2d_block=True)),
+        ("gfx1250", (64, 64), torch.float16, ScalingRecipe(use_2d_block=True)),
+        ("gfx1250", (2, 64, 64), torch.bfloat16, ops_utils.MX_W),
+        ("gfx950", (64, 64), torch.bfloat16, ScalingRecipe(use_2d_block=True)),  # main's default
+    ],
+)
+def test_weight_cache_default_recipe(monkeypatch, arch, shape, dtype, want):
+    """create_quantized_weight without a recipe: on gfx1250 the layout the ops read (mx_weight_layout_recipe),
+    elsewhere main's raw 2-D blocks."""
+    import primus_turbo.pytorch.core.quantized_tensor as qt
+
+    _fake_arch(monkeypatch, arch)
+    monkeypatch.setattr(qt, "is_gfx1250", lambda: arch == "gfx1250")
+    seen = []
+    monkeypatch.setattr(qt.QuantizedTensor, "quantize", lambda *a, **kw: seen.append(kw["scaling_recipe"]))
+    qt.create_quantized_weight(torch.empty(shape, dtype=dtype), float8_e4m3, MX)
+    assert seen == [want]
+
+
+@pytest.mark.parametrize(
     "fmt, w_dtype, a_dtype, out_dtype, want",
     [
         (Format.E4M3, torch.bfloat16, torch.bfloat16, torch.bfloat16, True),
