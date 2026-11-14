@@ -47,6 +47,8 @@ SPIN_TIMEOUT_CYCLES = 3_000_000_000
 _TH_NT = 1
 _SCOPE_DEV = 2 << 3
 _SCOPE_SYS = 3 << 3
+# coherent across the device (no stale line of this CU's caches), regular temporal hint
+CPOL_DEVICE = _SCOPE_DEV
 # non-temporal, coherent across the device: data another CU of this GPU produced
 CPOL_DEVICE_STREAM = _SCOPE_DEV | _TH_NT
 # non-temporal, coherent at system scope: a store a peer GPU reads, or a peer's store read here
