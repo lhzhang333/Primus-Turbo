@@ -266,6 +266,26 @@ def test_scale_rule_read_on_gfx1250_only(monkeypatch):
         qimpl._gfx1250_mxfp8(x, torch.float8_e4m3fn, raw, raw)
 
 
+def test_mlp_fp8_checks_its_inputs(monkeypatch):
+    """mlp_fp8 refuses up front what its fused gfx1250 kernels cannot run: other archs, non-E4M3 formats, 3-D
+    inputs, a non-bf16 output."""
+    import importlib
+
+    mlp_mod = importlib.import_module("primus_turbo.pytorch.ops.mlp_fp8")
+    x, w1, w2 = torch.empty(8, 64), torch.empty(256, 64), torch.empty(64, 128)
+    bf16 = torch.bfloat16
+    monkeypatch.setattr(mlp_mod, "is_gfx1250", lambda: False)
+    with pytest.raises(NotImplementedError, match="gfx1250 only"):
+        mlp_mod.mlp_fp8(x.to(bf16), w1.to(bf16), w2.to(bf16), config=MX)
+    monkeypatch.setattr(mlp_mod, "is_gfx1250", lambda: True)
+    with pytest.raises(ValueError, match="format E4M3 only"):
+        mlp_mod.mlp_fp8(x.to(bf16), w1.to(bf16), w2.to(bf16), config=_cfg(Format.HYBRID))
+    with pytest.raises(ValueError, match="2-D x"):
+        mlp_mod.mlp_fp8(x.to(bf16).view(2, 4, 64), w1.to(bf16), w2.to(bf16), config=MX)
+    with pytest.raises(ValueError, match="bfloat16 output only"):
+        mlp_mod.mlp_fp8(x.half(), w1.half(), w2.half(), config=MX)
+
+
 def test_fused_glu_e4m3_only_on_gfx1250(monkeypatch):
     """gfx1250's fused MXFP8 GLU / dGLU quantize to E4M3 both ways: HYBRID is refused before any GEMM runs."""
     import primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl as gimpl

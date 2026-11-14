@@ -4,19 +4,11 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Dense SwiGLU MLP in MXFP8 on gfx1250 (the shared expert, a dense FFN): ``fc2(f(gate) * up)``.
+"""Dense GLU MLP in MXFP8 on gfx1250 (e.g. a shared expert): ``fc2(f(gate) * up)`` in one autograd Function.
 
-    fwd  fc1 : l1 (bf16)                    = gemm(x, w1)                        (gemm_fp8's linear)
-         glu : act_row, act_col             = glu_quant_mxfp8(l1)                (one pass: act never in bf16)
-         fc2 : out                          = gemm(act_row, w2)
-    bwd  fc2 : d_act (bf16), dw2            = fc2's dgrad / wgrad
-         dglu: dl1_row, dl1_col             = dglu_quant_mxfp8(d_act, l1)        (grad_l1 never in bf16)
-         fc1 : dx, dw1                      = fc1's dgrad / wgrad on the dGLU's copies
-
-One autograd Function owns both linears, so neither fc2's activation nor fc1's output gradient is quantized
-twice or kept in bf16; ``l1`` is the one bf16 tensor saved. The linears are gemm_fp8's (``_mx_linear_fwd`` /
-``_mx_linear_bwd``): the same quantization, GEMMs, cached-weight and fused-wgrad handling, so the op equals
-``gemm_fp8 -> SwiGLU -> gemm_fp8`` bit for bit when that SwiGLU computes the kernels' bf16 values.
+fc1 and fc2 are gemm_fp8's MXFP8 linears (``_mx_linear_fwd`` / ``_mx_linear_bwd``); the GLU and its gradient are
+fused with the MXFP8 dual cast of their outputs, so the activation and fc1's output gradient are never written in
+bf16. The results equal ``gemm_fp8 -> GLU -> gemm_fp8`` bit for bit when that GLU computes the kernels' bf16 values.
 """
 
 from typing import Union
@@ -25,6 +17,7 @@ import torch
 
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
+    Format,
     ScalingGranularity,
     ScalingRecipe,
 )
@@ -74,8 +67,13 @@ class FP8MLPMXFunc(torch.autograd.Function):
         qr, sr, qc, sc = Q.glu_quant_mxfp8(
             l1, None, activation, clamp_limit, qdtype, rule, pad=True, layout=bits
         )
-        common = dict(shape=(M, I), orig_dtype=l1.dtype, dest_dtype=qdtype,
-                      granularity=ScalingGranularity.MX_BLOCKWISE, block_size=config.block_size)  # fmt: skip
+        common = dict(
+            shape=(M, I),
+            orig_dtype=l1.dtype,
+            dest_dtype=qdtype,
+            granularity=ScalingGranularity.MX_BLOCKWISE,
+            block_size=config.block_size,
+        )
         act = QuantizedTensor(qr, sr, scaling_recipe=recipes[0], quantized_axis=-1, **common)
         act_t = QuantizedTensor(qc, sc, scaling_recipe=recipes[1], quantized_axis=-2, **common)
         out, saved2, lay2 = _mx_linear_fwd(act, w2, act_t, w2_t, out_dtype, config)
@@ -111,28 +109,31 @@ def mlp_fp8(
     trans_w2: bool = True,
     out_dtype: Union[None, torch.dtype] = None,
     config: Union[Float8QuantConfig, None] = None,
-    num_cu: int | None = None,
     fuse_wgrad_accum_pattern: Union[None, str] = None,
     activation: Union[None, str] = None,
     clamp_limit: Union[None, float] = None,
 ) -> torch.Tensor:
-    """Dense SwiGLU MLP in MXFP8 (gfx1250): ``fc2(f(gate) * up)``, the API of ``mlp_fp4``.
+    """Dense GLU MLP in MXFP8: ``fc2(f(gate) * up)``. gfx1250 only (NotImplementedError elsewhere): the fused GLU /
+    dGLU + MXFP8 dual-cast kernels are that arch's.
 
     Args:
-        x: [M, K] bf16 activations, or a pre-quantized pair (``rmsnorm_mxfp8``'s; ``data_t`` the column
-            copy) in the recipes fc1 reads (gemm_fp8's rule: MX_A / MX_B on gfx1250's GEMM layout).
-        w1: [2I, K] fc1 weight (gate rows, then up), I % 128 == 0; w2: [K_out, I] fc2 weight. bf16, or
-            cached pairs (``create_quantized_weight(..., need_weight_transpose_cache=True,
-            scaling_recipe=mx_weight_layout_recipe(False, w.shape))``). NT only: ``trans_w1`` / ``trans_w2``.
-        config: MX_BLOCKWISE Float8QuantConfig (block 32).
-        num_cu: signature parity with ``mlp_fp4``; unused.
+        x: [M, K] activations, or a pre-quantized pair (e.g. ``rmsnorm_mxfp8``'s; ``data_t`` the column copy) in
+            the recipes fc1 reads (gemm_fp8's: ``MX_A`` / ``MX_B`` where ``mx_gemm_layout`` holds, raw else).
+        w1: [2I, K] fc1 weight (gate rows, then up), I % 128 == 0; w2: [K_out, I] fc2 weight. Plain, or cached
+            pairs (``create_quantized_weight(..., need_weight_transpose_cache=True)``). NT only: ``trans_w1`` /
+            ``trans_w2`` must be True.
+        out_dtype: bfloat16 (the default for bf16 inputs).
+        config: MX_BLOCKWISE Float8QuantConfig, format E4M3 (the fused kernels quantize to E4M3 both ways).
         fuse_wgrad_accum_pattern: ``"megatron"``: each wgrad accumulates into its weight's ``main_grad``
             (bf16 or fp32; ``main_grad`` / ``grad_added_to_main_grad`` on the weight or its pair's ``data``).
         activation: ``"silu"`` (default) or ``"gelu"`` (tanh); ``clamp_limit``: DeepSeek-V4's clamp, or None.
     """
-    del num_cu
     if config is None or config.granularity != ScalingGranularity.MX_BLOCKWISE:
         raise ValueError("mlp_fp8: an MX_BLOCKWISE Float8QuantConfig is required")
+    if config.format != Format.E4M3:
+        raise ValueError(
+            f"mlp_fp8: format E4M3 only (its fused GLU / dGLU quantize to E4M3), got {config.format}"
+        )
     if not (trans_w1 and trans_w2):
         raise ValueError("mlp_fp8: NT only (trans_w1 = trans_w2 = True)")
     if not is_gfx1250():
@@ -142,9 +143,15 @@ def mlp_fp8(
     x, x_t = (x.data, x.data_t) if isinstance(x, QuantizedTensorPair) else (x, None)
     w1, w1_t = (w1.data, w1.data_t) if isinstance(w1, QuantizedTensorPair) else (w1, None)
     w2, w2_t = (w2.data, w2.data_t) if isinstance(w2, QuantizedTensorPair) else (w2, None)
+    if x.ndim != 2 or w1.ndim != 2 or w2.ndim != 2:
+        raise ValueError(
+            f"mlp_fp8: 2-D x, w1, w2 (flatten the leading dims), got {x.shape}, {w1.shape}, {w2.shape}"
+        )
     if out_dtype is None:
         assert w1.dtype == w2.dtype, "w1 and w2 must have the same dtype"
         out_dtype = torch.promote_types(x.dtype, w1.dtype)
+    if out_dtype != torch.bfloat16:
+        raise ValueError(f"mlp_fp8: bfloat16 output only (the fused GLU / dGLU read bf16), got {out_dtype}")
     return FP8MLPMXFunc.apply(
         x, w1, w2, x_t, w1_t, w2_t, activation, clamp_limit, out_dtype, config, fuse_wgrad_accum_pattern
     )
