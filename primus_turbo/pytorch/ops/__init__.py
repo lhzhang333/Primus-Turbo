@@ -31,3 +31,4 @@ from .moe import *
 from .normalization import *
 from .quantization import *
 from .rope import *
+from .utils import DUMMY_WGRAD_FLAT_POOL, get_dummy_wgrad

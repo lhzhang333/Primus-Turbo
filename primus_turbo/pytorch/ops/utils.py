@@ -64,26 +64,35 @@ def _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern: Optional[str]):
     return True, b.main_grad
 
 
+DUMMY_WGRAD_FLAT_POOL = True  # get_dummy_wgrad hands out views of one flat buffer per (dtype, device)
 _dummy_wgrads = {}
 
 
-def _get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tensor:
-    """Returns a dummy tensor of given shape.
+def get_dummy_wgrad(shape, dtype: torch.dtype, device, zero: bool = False) -> torch.Tensor:
+    """A placeholder gradient of ``shape`` / ``dtype`` on ``device`` for a weight whose gradient went elsewhere (a
+    fused wgrad accumulated it into ``main_grad``): a contiguous view of the first ``numel`` elements of one flat
+    buffer per (dtype, device), so the placeholders of all weights cost the largest one once.
 
-    Supports arbitrary rank (2D for plain Linear weights, 3D for stacked
-    grouped-linear weights ``(num_gemms, out_features, in_features)``, etc.).
-    Tensors are cached by ``(shape, dtype)`` so each distinct weight layout
-    only allocates one persistent buffer that gets reused across steps.
-    """
-    global _dummy_wgrads
-    key = (tuple(shape), dtype)
-    if key not in _dummy_wgrads:
-        _dummy_wgrads[key] = torch.empty(
-            shape,
-            dtype=dtype,
-            device="cuda",
-            requires_grad=False,
-        )
+    Never written: views of the buffer alias each other, so their contents are undefined and nobody may write or
+    read them; the fused-wgrad ops only hand them to autograd, which takes one over as the weight's ``.grad``.
+    ``zero=True`` zeroes this view for a framework that adds the placeholder (Megatron's ``zero_out_wgrad``). The
+    buffer only grows; views handed out earlier keep the old one alive until they are dropped."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    numel = 1
+    for d in shape:
+        numel *= int(d)
+    key = (dtype, device)
+    buf = _dummy_wgrads.get(key)
+    if buf is None or buf.numel() < numel:
+        buf = _dummy_wgrads[key] = torch.empty(numel, dtype=dtype, device=device)
+    view = buf[:numel].view(*shape)
     if zero:
-        _dummy_wgrads[key].fill_(0)
-    return _dummy_wgrads[key].detach()
+        view.fill_(0)
+    return view.detach()
+
+
+def _get_dummy_wgrad(shape, dtype: torch.dtype, zero=False) -> torch.Tensor:
+    """``get_dummy_wgrad`` on the current CUDA device: the fused-wgrad ops' placeholder gradient."""
+    return get_dummy_wgrad(shape, dtype, torch.cuda.current_device(), zero)
