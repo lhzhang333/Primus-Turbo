@@ -1496,11 +1496,9 @@ def grouped_gemm_mxfp8_gfx1250(
             group_offs.shape,
             group_offs.stride(),
             group_offs.dtype,
-            group_offs.device,
             group_offs_padded.shape,
             group_offs_padded.stride(),
             group_offs_padded.dtype,
-            group_offs_padded.device,
         ),
     )
     plan = _PLANS.get(key)
@@ -1585,7 +1583,7 @@ def grouped_gemm_mxfp8_variable_k_gfx1250(
         accumulate,
         config,
         b_preshuffled,
-        (group_offs.shape, group_offs.stride(), group_offs.dtype, group_offs.device),
+        (group_offs.shape, group_offs.stride(), group_offs.dtype),
     )
     plan = _PLANS.get(key)
     if plan is not None:
