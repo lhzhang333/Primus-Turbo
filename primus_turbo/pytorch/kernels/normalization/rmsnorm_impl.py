@@ -78,7 +78,7 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
         ns = 3 if BLOCK_H <= 128 else 2
         return "multi", BLOCK_H, ROWS, 4, ns
 
-    if BLOCK_H <= 8192:
+    if BLOCK_H <= 8192 and is_gfx1250():
         # Tiled grid-stride: ~16K-element tiles (ROWS rows), one program per CU at most (the dgamma partials stay
         # in the Triton finalize), loads pipelined over 2 stages. Fixed per width -- no autotune: num_warps and
         # ROWS set the order of each row's sum, i.e. dx's last bits, which must not depend on the process.
@@ -90,9 +90,10 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
     half_wave = rows_per_program <= 13 and wide_row
     grid = min(B, _num_cus() // 2 if half_wave else _num_cus())
     if is_gfx1250():
-        # A fixed launch config instead of the autotune: each process picks its own winner (the candidates time within
-        # ~1% of each other), and num_warps sets the order of tl.sum, so dx's last bits could differ across ranks.
-        return "grid", BLOCK_H, grid, (8 if BLOCK_H >= 4096 else 4), 1
+        # BLOCK_H > 8192 here. A fixed launch config instead of the autotune: each process picks its own winner (the
+        # candidates time within ~1% of each other), and num_warps sets the order of tl.sum, so dx's last bits could
+        # differ across ranks.
+        return "grid", BLOCK_H, grid, 8, 1
     return "grid", BLOCK_H, grid, 0, 0
 
 
@@ -245,10 +246,10 @@ def rmsnorm_bwd_impl(
             0,
             0,
             B=B,
+            num_programs=num_programs,
             H=H,
             BLOCK_H=BLOCK_H,
             ROWS=GR,
-            NUM_PROGRAMS=num_programs,
             NUM_STAGES=num_stages,
             ZERO_CENTERED=zero_centered,
             num_warps=num_warps,
@@ -461,10 +462,10 @@ def rmsnorm_bwd_residual_impl(
             dxpr2.stride(0),
             dxpr2.stride(1),
             B=B,
+            num_programs=num_programs,
             H=H,
             BLOCK_H=BLOCK_H,
             ROWS=GR,
-            NUM_PROGRAMS=num_programs,
             NUM_STAGES=num_stages,
             HAS_RESIDUAL=True,
             num_warps=num_warps,

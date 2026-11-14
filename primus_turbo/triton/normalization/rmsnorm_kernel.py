@@ -376,10 +376,10 @@ def rmsnorm_bwd_kernel_grid_stride(
 
 
 # ---------------------------------------------------------------------------
-# Backward — tiled grid-stride (256 < BLOCK_H <= 8192): each program walks tiles
-# of ROWS rows (stride NUM_PROGRAMS tiles) with the loads pipelined across tiles,
-# and keeps its dgamma accumulator in fp32 registers. Many rows per load keep the
-# memory system busy where the one-row-at-a-time grid-stride loop is latency-bound.
+# Backward — tiled grid-stride (gfx1250, 256 < BLOCK_H <= 8192): each program walks
+# tiles of ROWS rows (stride num_programs tiles) with the loads pipelined across
+# tiles, and keeps its dgamma accumulator in fp32 registers. Many rows per load keep
+# the memory system busy where the one-row-at-a-time grid-stride loop is latency-bound.
 # HAS_RESIDUAL: the fused-residual variant, dx = dx_norm + d(x + r).
 # ---------------------------------------------------------------------------
 @triton.jit
@@ -401,10 +401,10 @@ def rmsnorm_bwd_kernel_tiled(
     stride_dxprb,
     stride_dxprh,
     B,
+    num_programs,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     ROWS: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     ZERO_CENTERED: tl.constexpr = False,
     HAS_RESIDUAL: tl.constexpr = False,
@@ -417,7 +417,7 @@ def rmsnorm_bwd_kernel_tiled(
         g = g + 1.0  # dgamma is unchanged: d(1 + g)/dg = 1
     dg_acc = tl.zeros((ROWS, BLOCK_H), dtype=tl.float32)
 
-    for tile in tl.range(pid, tl.cdiv(B, ROWS), NUM_PROGRAMS, num_stages=NUM_STAGES):
+    for tile in tl.range(pid, tl.cdiv(B, ROWS), num_programs, num_stages=NUM_STAGES):
         row_offs = tile * ROWS + tl.arange(0, ROWS)
         row_mask = row_offs < B
         mask = row_mask[:, None] & h_mask[None, :]
@@ -435,7 +435,9 @@ def rmsnorm_bwd_kernel_tiled(
         dx = (dxhat - x_hat * m[:, None]) * rstd[:, None]
         if HAS_RESIDUAL:
             dx += tl.load(
-                DXPR_ptr + row_offs[:, None] * stride_dxprb + h_offs[None, :] * stride_dxprh, mask=mask, other=0.0
+                DXPR_ptr + row_offs[:, None] * stride_dxprb + h_offs[None, :] * stride_dxprh,
+                mask=mask,
+                other=0.0,
             ).to(tl.float32)
         tl.store(
             DX_ptr + row_offs[:, None] * stride_dxb + h_offs[None, :] * stride_dxh,

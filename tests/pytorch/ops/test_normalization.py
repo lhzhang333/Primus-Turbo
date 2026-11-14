@@ -123,10 +123,10 @@ def test_rmsnorm_residual_ops(dtype, outer_shape, inner_shape):
 
 @pytest.mark.parametrize("residual", [False, True])
 @pytest.mark.parametrize("B,H", [(8192, 512), (8192, 1536), (4096, 7168), (300, 2880)])
-def test_rmsnorm_bwd_tiled(B, H, residual):
-    """The tiled backward at the DSv3 norm widths (kv / q / hidden) and a ragged shape: dx / dgamma vs torch
-    (bf16), the residual variant with gradients through both outputs, and bitwise the same on a rerun (fixed
-    launch configs, no autotune)."""
+def test_rmsnorm_bwd_bf16(B, H, residual):
+    """The backward at the DSv3 norm widths (kv / q / hidden) and a ragged shape (gfx1250: the tiled kernel):
+    dx / dgamma vs torch (bf16), the residual variant with gradients through both outputs, and bitwise the same
+    on a rerun."""
     torch.manual_seed(B + H)
     eps = 1e-6
     x = torch.randn(B, H, dtype=torch.bfloat16, device="cuda")
