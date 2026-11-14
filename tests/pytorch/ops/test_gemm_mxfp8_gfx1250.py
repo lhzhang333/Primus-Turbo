@@ -59,7 +59,11 @@ def _exact(t):
     """``t`` in a fresh allocation of exactly its size. At 10 MiB or more that is a segment of its own, so the tensor
     likely ends where the mapping does (best effort: the address range after it may still be mapped)."""
     torch.cuda.empty_cache()
-    x = torch.empty(t.numel() * t.element_size(), dtype=torch.uint8, device=t.device).view(t.dtype).view(t.shape)
+    x = (
+        torch.empty(t.numel() * t.element_size(), dtype=torch.uint8, device=t.device)
+        .view(t.dtype)
+        .view(t.shape)
+    )
     return x.copy_(t)
 
 
@@ -91,7 +95,12 @@ def _eq(out, ref):
 
 # (config, packed scales, preshuffled B, (M, N, K)): every tile shape, pipeline depth and cluster of the tables once
 DENSE_CASES = [
-    (C(256, 256, 2, 2, 1, 1), False, False, (300, 264, 576)),  # raw / row-major; M, N tails; a half last K step
+    (
+        C(256, 256, 2, 2, 1, 1),
+        False,
+        False,
+        (300, 264, 576),
+    ),  # raw / row-major; M, N tails; a half last K step
     (C(128, 128, 4, 1, 1, 1), False, False, (257, 136, 1008)),  # K % 32 != 0: the last scale block half data
     (C(128, 256, 3, 2, 1, 4), True, True, (640, 1024, 2048)),
     (C(256, 128, 4, 1, 4, 1), True, True, (1024, 512, 7168)),
@@ -103,7 +112,9 @@ DENSE_CASES = [
 ]
 
 
-@pytest.mark.parametrize("cfg, packed, bsh, shape", DENSE_CASES, ids=lambda x: str(tuple(x)) if isinstance(x, tuple) else str(x))
+@pytest.mark.parametrize(
+    "cfg, packed, bsh, shape", DENSE_CASES, ids=lambda x: str(tuple(x)) if isinstance(x, tuple) else str(x)
+)
 def test_gemm_mxfp8_int_exact(cfg, packed, bsh, shape):
     M, N, K = shape
     a, sa, b, sb, ref = _dense(M, N, K, packed, bsh, seed=M + N + K)
@@ -127,7 +138,9 @@ def test_gemm_mxfp8_fp32_out_and_accumulate(cfg, shape):
     for dt, acc in kinds:
         c0 = (torch.randn(M, N, device=DEV) * 64).to(dt)
         out, check = _guarded((M, N), dt, c0 if acc else None)
-        gemm_mxfp8_gfx1250(a, sa, b, sb, out_dtype=dt, out=out, config=cfg, b_preshuffled=True, accumulate=acc)
+        gemm_mxfp8_gfx1250(
+            a, sa, b, sb, out_dtype=dt, out=out, config=cfg, b_preshuffled=True, accumulate=acc
+        )
         _eq(out, (ref + c0.float()) if acc else ref)
         check()
 
@@ -197,18 +210,32 @@ def test_grouped_gemm_mxfp8():
     m = sum(RAGGED)
     sb4 = torch.stack([pack_scales(sb[g]) for g in range(len(RAGGED))])
     out, check = _guarded((m, N), BF16)
-    grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(preshuffle_b16(b)), sb4, offs, offs_p, m, out=out)
+    grouped_gemm_mxfp8_gfx1250(
+        _slack(a), pack_scales(sa), _slack(preshuffle_b16(b)), sb4, offs, offs_p, m, out=out
+    )
     _eq(out, ref)
     check()
     out, check = _guarded((m, N), F32)
     grouped_gemm_mxfp8_gfx1250(
-        _slack(a), _slack(sa), _slack(b), _slack(sb), offs, offs_p, m, F32, out, C(256, 256, 2, 2, 1, 2), False
+        _slack(a),
+        _slack(sa),
+        _slack(b),
+        _slack(sb),
+        offs,
+        offs_p,
+        m,
+        F32,
+        out,
+        C(256, 256, 2, 2, 1, 2),
+        False,
     )
     _eq(out, ref)
     check()
     zero = torch.zeros_like(offs)
     out, check = _guarded((64, N), BF16)
-    grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(preshuffle_b16(b)), sb4, zero, zero, 64, out=out)
+    grouped_gemm_mxfp8_gfx1250(
+        _slack(a), pack_scales(sa), _slack(preshuffle_b16(b)), sb4, zero, zero, 64, out=out
+    )
     assert torch.isnan(out).all()
     check()
 
@@ -222,7 +249,9 @@ def test_grouped_gemm_mxfp8_many_experts():
     m = sum(lens)
     sb4 = torch.stack([pack_scales(sb[g]) for g in range(len(lens))])
     out, check = _guarded((m, N), BF16)
-    grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _slack(preshuffle_b16(b)), sb4, offs, offs_p, m, out=out)
+    grouped_gemm_mxfp8_gfx1250(
+        _slack(a), pack_scales(sa), _slack(preshuffle_b16(b)), sb4, offs, offs_p, m, out=out
+    )
     _eq(out, ref)
     check()
 
@@ -241,8 +270,12 @@ def _vk(lens, M, N, seed):
         sa[:, -(-t0 // 32) : t1 // 32], sb[:, -(-t0 // 32) : t1 // 32] = PAD_SCALE, PAD_SCALE
     ref = torch.stack(
         [
-            gemm_ref(a[:, o[g] : o[g + 1]], sa[:, o[g] // 32 : o[g + 1] // 32], b[:, o[g] : o[g + 1]],
-                     sb[:, o[g] // 32 : o[g + 1] // 32])
+            gemm_ref(
+                a[:, o[g] : o[g + 1]],
+                sa[:, o[g] // 32 : o[g + 1] // 32],
+                b[:, o[g] : o[g + 1]],
+                sb[:, o[g] // 32 : o[g + 1] // 32],
+            )
             for g in range(len(lens))
         ]
     ).float()
@@ -273,7 +306,9 @@ def test_grouped_gemm_mxfp8_variable_k_narrow():
     a, sa, b, sb, offs, ref = _vk(lens, M, N, seed=17)
     c0 = (torch.randn(len(lens), M, N, device=DEV) * 64).to(BF16)
     out, check = _guarded((len(lens), M, N), BF16, c0)
-    grouped_gemm_mxfp8_variable_k_gfx1250(_slack(a), sa, _slack(preshuffle_b16(b)), sb, offs, out=out, accumulate=True)
+    grouped_gemm_mxfp8_variable_k_gfx1250(
+        _slack(a), sa, _slack(preshuffle_b16(b)), sb, offs, out=out, accumulate=True
+    )
     _eq(out, ref + c0.float())
     check()
 
@@ -289,7 +324,9 @@ def test_gemm_mxfp8_deterministic():
     ga, gsa, gb, gsb, offs, offs_p, _ = _grouped(RAGGED, 1024, 2048, seed=7)
     gsa, gsb4 = pack_scales(gsa), torch.stack([pack_scales(gsb[e]) for e in range(len(RAGGED))])
     ga, gb = _slack(ga), _slack(preshuffle_b16(gb))
-    calls.append(lambda out: grouped_gemm_mxfp8_gfx1250(ga, gsa, gb, gsb4, offs, offs_p, sum(RAGGED), out=out))
+    calls.append(
+        lambda out: grouped_gemm_mxfp8_gfx1250(ga, gsa, gb, gsb4, offs, offs_p, sum(RAGGED), out=out)
+    )
     lens = [128 * (i % 5) + (0 if i % 7 == 3 else 37 * (i % 3)) for i in range(40)]
     va, vsa, vb, vsb, voffs, _ = _vk(lens, 320, 2560, seed=13)
     va, vb = _slack(va), _slack(preshuffle_b16(vb))
@@ -329,7 +366,12 @@ def test_gemm_mxfp8_tail_at_allocation_end():
     c0 = (torch.randn(M, N, device=DEV) * 64).to(BF16)
     out = c0.clone()
     gemm_mxfp8_gfx1250(
-        _slack(a), pack_scales(sa), _exact(preshuffle_b16(b)), pack_scales(sb), out=out, b_preshuffled=True,
+        _slack(a),
+        pack_scales(sa),
+        _exact(preshuffle_b16(b)),
+        pack_scales(sb),
+        out=out,
+        b_preshuffled=True,
         accumulate=True,
     )
     _eq(out, ref + c0.float())
@@ -337,14 +379,19 @@ def test_gemm_mxfp8_tail_at_allocation_end():
     lens = [5000, 0, 6000, 4000]
     a, sa, b, sb, offs, offs_p, ref = _grouped(lens, 512, 640, seed=3)
     sb4 = torch.stack([pack_scales(sb[g]) for g in range(len(lens))])
-    out = grouped_gemm_mxfp8_gfx1250(_slack(a), pack_scales(sa), _exact(preshuffle_b16(b)), sb4, offs, offs_p, 15000)
+    out = grouped_gemm_mxfp8_gfx1250(
+        _slack(a), pack_scales(sa), _exact(preshuffle_b16(b)), sb4, offs, offs_p, 15000
+    )
     _eq(out, ref)
     # variable-K, odd counts of 128 tokens and an empty last expert (its K step starts at T, the end of a and b)
     lens = [384, 128, 1408, 2048, 1152, 0]
     M, N = 2048, 2048
     a, sa, b, sb, offs, ref = _vk(lens, M, N, seed=4)
     a = _exact(a)
-    for bs in (_slack(preshuffle_b16(b)), _exact(preshuffle_b16(b))):  # kpair 2 with half steps; no slack: kpair 1
+    for bs in (
+        _slack(preshuffle_b16(b)),
+        _exact(preshuffle_b16(b)),
+    ):  # kpair 2 with half steps; no slack: kpair 1
         _eq(grouped_gemm_mxfp8_variable_k_gfx1250(a, sa, bs, sb, offs), ref)
     a, sa, b, sb = int_valued_operands(256, 256, 576)
     with pytest.raises(ValueError, match="pad K"):
@@ -361,7 +408,13 @@ def test_gemm_mxfp8_rejects():
     with pytest.raises(ValueError, match="persist=True needs"):
         gemm_mxfp8_gfx1250(a, sa, b, sb, config=C(256, 256, 4, 1, 1, 1, persist=True))
     with pytest.raises(ValueError, match="row stride"):  # overlapping output rows
-        gemm_mxfp8_gfx1250(a, sa, b, sb, out=torch.empty(256 * 128 + 128, dtype=BF16, device=DEV).as_strided((256, 256), (128, 1)))
+        gemm_mxfp8_gfx1250(
+            a,
+            sa,
+            b,
+            sb,
+            out=torch.empty(256 * 128 + 128, dtype=BF16, device=DEV).as_strided((256, 256), (128, 1)),
+        )
     offs = torch.tensor([0, 128, 256, 256], dtype=torch.int64, device=DEV)
     with pytest.raises(ValueError, match="contiguous int64"):
         grouped_gemm_mxfp8_gfx1250(a, sa, b.view(1, 256, 256), sb.view(1, 256, 8), offs[::2], offs[::2], 256)
