@@ -60,6 +60,8 @@ from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
 from primus_turbo.flydsl.mega.gfx1250.prims import CPOL_DEVICE, cast, ld, st
 from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
     BLOCK_M,
+    EPOCH_SLOT_WORDS,
+    EPOCH_SLOTS,
     TOKEN_DTYPE,
     Workspace,
     get_symm_buffer_for_mega_moe,
@@ -87,6 +89,7 @@ def _launch_dispatch_gemm_nt(
     arg_chunk_counter: fx.Pointer,
     arg_parity: fx.Pointer,
     arg_expected: fx.Pointer,
+    arg_epoch: fx.Pointer,
     sym_buffer,
     stream: fx.Stream,
     grid_size: fx.Int32,
@@ -125,14 +128,23 @@ def _launch_dispatch_gemm_nt(
         )
 
     @flyc.kernel(name="mega_gfx1250_dispatch_epoch_bump", known_block_size=[64, 1, 1])
-    def epoch_bump(arg_parity: fx.Pointer, arg_expected: fx.Pointer):
-        """Flip the parity and raise the new bank's expected flag value by one per sender rank."""
-        if fx.Int32(fx.thread_idx.x) == fx.Int32(0):
-            parity_addr, expected_addr = _addr(arg_parity), _addr(arg_expected)
-            new_parity = ld(parity_addr, fx.Int32(0), dtype=fx.T.i64) ^ fx.Int64(1)
+    def epoch_bump(arg_parity: fx.Pointer, arg_expected: fx.Pointer, arg_epoch: fx.Pointer):
+        """Flip the parity, raise the new bank's expected flag value by one per sender rank, and copy both into
+        every workgroup's epoch slot."""
+        tid = fx.Int32(fx.thread_idx.x)
+        parity_addr, expected_addr = _addr(arg_parity), _addr(arg_expected)
+        new_parity = ld(parity_addr, fx.Int32(0), dtype=fx.T.i64) ^ fx.Int64(1)
+        bank = cast(new_parity, fx.T.i32)
+        new_expected = ld(expected_addr, bank, dtype=fx.T.i64) + fx.Int64(NUM_RANKS)
+        fx.gpu.barrier()  # every lane read the old epoch before lane 0 replaces it
+        if tid == fx.Int32(0):
             st(parity_addr, fx.Int32(0), new_parity)
-            bank = cast(new_parity, fx.T.i32)
-            st(expected_addr, bank, ld(expected_addr, bank, dtype=fx.T.i64) + fx.Int64(NUM_RANKS))
+            st(expected_addr, bank, new_expected)
+        slot = tid
+        while slot < fx.Int32(EPOCH_SLOTS):
+            st(_addr(arg_epoch), slot * fx.Int32(EPOCH_SLOT_WORDS), new_parity)
+            st(_addr(arg_epoch), slot * fx.Int32(EPOCH_SLOT_WORDS) + fx.Int32(1), new_expected)
+            slot = slot + fx.Int32(64)
 
     @flyc.kernel(name="dispatch_gemm_nt", known_block_size=[block, 1, 1])
     def dispatch_gemm_nt(
@@ -150,6 +162,7 @@ def _launch_dispatch_gemm_nt(
         arg_chunk_counter: fx.Pointer,
         arg_parity: fx.Pointer,
         arg_expected: fx.Pointer,
+        arg_epoch: fx.Pointer,
         sym_buffer,
     ):
         if const_expr(wmma_b2b):
@@ -173,9 +186,11 @@ def _launch_dispatch_gemm_nt(
         dispatch_flag_base = workspace.get_dispatch_flag_ptr()
         num_pool_blocks = int(workspace.num_max_pool_blocks)
         a_rows = fx.Int32(int(workspace.num_max_recv_tokens))
-        # this launch's epoch, already bumped: parity picks the flag bank, expected is the target
-        parity = cast(ld(_addr(arg_parity), fx.Int32(0), dtype=fx.T.i64), fx.T.i32)
-        expected = ld(_addr(arg_expected), parity, dtype=fx.T.i64)
+        # this launch's epoch, already bumped, from this workgroup's own slot: parity picks the flag bank,
+        # expected is the target
+        epoch_slot = _addr(arg_epoch) + fx.Int64(bid % fx.Int32(EPOCH_SLOTS)) * fx.Int64(EPOCH_SLOT_WORDS * 8)
+        parity = cast(ld(epoch_slot, fx.Int32(0), dtype=fx.T.i64), fx.T.i32)
+        expected = ld(epoch_slot, fx.Int32(1), dtype=fx.T.i64)
 
         if bid < fx.Int32(NUM_CHUNKS * NUM_RANKS):
             dispatch_bf16_tile(
@@ -283,7 +298,7 @@ def _launch_dispatch_gemm_nt(
             edge_a_cache_modifier=CPOL_DEVICE if (HIDDEN * EB) % GATHER_LINE_BYTES else 0,
         )
 
-    epoch_bump(arg_parity, arg_expected).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+    epoch_bump(arg_parity, arg_expected, arg_epoch).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
     dispatch_gemm_nt(
         arg_out,
         arg_x,
@@ -299,6 +314,7 @@ def _launch_dispatch_gemm_nt(
         arg_chunk_counter,
         arg_parity,
         arg_expected,
+        arg_epoch,
         sym_buffer,
     ).launch(grid=(grid_size, 1, 1), block=(block, 1, 1), stream=stream)
 
@@ -306,7 +322,7 @@ def _launch_dispatch_gemm_nt(
 _launch_dispatch_gemm_nt.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
 
 _COMPILED: dict = {}
-_CONSTEXPR0 = 17
+_CONSTEXPR0 = 18
 
 
 def dispatch_gemm_nt_gfx1250(
@@ -442,6 +458,7 @@ def _run(
         _as_ptr(symm._dispatch_chunk_counter),
         _as_ptr(symm._dispatch_parity),
         _as_ptr(symm._dispatch_expected),
+        _as_ptr(symm._dispatch_epoch),
         symm.get_sym_buffer(),
         torch.cuda.current_stream(),
         # the comm workgroups, then the GEMM tiles of this call's pool (the prologue's
