@@ -738,7 +738,9 @@ def grouped_quantize_mxfp8_impl(
                 layout=lay,
             )
         rows, cols = with_trans or axis == 1, with_trans or axis == 0
-        out = Q.grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype, rule, True, rows, cols, layout=lay)
+        out = Q.grouped_quant_mxfp8_raw(
+            x, group_lens, group_offs, out_dtype, rule, True, rows, cols, layout=lay
+        )
         if with_trans:
             return out
         return (out[0], out[1], out[4], out[5]) if rows else (out[2], out[3], out[6], out[7])

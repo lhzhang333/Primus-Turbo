@@ -296,4 +296,6 @@ def test_mlp(M, H, I, mode):
         return res + [p.data.main_grad for p in ws]
 
     for i, (got, ref) in enumerate(zip(run(fused), run(chain))):
-        assert got.dtype == ref.dtype and torch.equal(got, ref), f"result {i}: max |diff| {(got - ref).abs().max()}"
+        assert got.dtype == ref.dtype and torch.equal(got, ref), (
+            f"result {i}: max |diff| {(got - ref).abs().max()}"
+        )

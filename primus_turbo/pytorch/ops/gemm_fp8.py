@@ -750,7 +750,13 @@ class FP8GemmMXFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         grad_a, grad_b = _mx_linear_bwd(
-            grad_out, ctx.saved_tensors, ctx.lay, ctx.config, ctx.out_dtype, ctx.fuse_bgrad_accum, ctx.main_grad
+            grad_out,
+            ctx.saved_tensors,
+            ctx.lay,
+            ctx.config,
+            ctx.out_dtype,
+            ctx.fuse_bgrad_accum,
+            ctx.main_grad,
         )
         return (
             grad_a,  # a
