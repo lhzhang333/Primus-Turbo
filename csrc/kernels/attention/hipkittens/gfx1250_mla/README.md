@@ -76,8 +76,19 @@ never fails the install.
 
 ## Performance
 
-MI455X (GPU clock held at 1.3 GHz on the test node), DeepSeek-V3 MBS 2 (b2 s4096 h128), SBHD, causal, bf16, through
-the impl layer training uses; medians of 3 processes x 10 interleaved rounds of 20 back-to-back calls each:
+**Forward.** MI455X, kernel durations from GPU timestamps (rocprofv3 kernel trace; medians of 250 back-to-back calls in
+10 rotated rounds), kernel layout [b, s, h, d], causal, bf16; the FlyDSL forward of this tree for reference:
+
+| [b, s, h] | FlyDSL (us) | HipKittens forward (us) | speedup |
+|---|---|---|---|
+| [1, 4096, 256] (DeepSeek-V3 MBS 2, SBHD folded) | 710.5 | 654.2 | 1.09x |
+| [2, 4096, 128] | 710.0 | 654.5 | 1.08x |
+| [1, 1024, 256] | 67.0 | 60.3 | 1.11x |
+| [1, 8192, 128] | 1301.6 | 1215.2 | 1.07x |
+
+**Backward.** MI455X (GPU clock held at 1.3 GHz on the test node), DeepSeek-V3 MBS 2 (b2 s4096 h128), SBHD, causal,
+bf16, through the impl layer training uses; medians of 3 processes x 10 interleaved rounds of 20 back-to-back calls
+each:
 
 | | FlyDSL (ms) | HipKittens backward (ms) | speedup |
 |---|---|---|---|
