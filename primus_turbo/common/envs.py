@@ -154,6 +154,15 @@ def _mxfp8_scale_rule() -> str:
     return value
 
 
+def _mx_strict() -> int:
+    """PRIMUS_TURBO_MX_STRICT: 0 (also unset or blank), 1 or 2."""
+    raw = os.getenv("PRIMUS_TURBO_MX_STRICT", "")
+    value = raw.strip() or "0"
+    if value not in ("0", "1", "2"):
+        raise ValueError(f"PRIMUS_TURBO_MX_STRICT={raw!r}: expected 0, 1 or 2")
+    return int(value)
+
+
 def _deepep_cpu_timeout() -> int:
     raw = os.getenv("PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT")
     if not raw:
@@ -292,13 +301,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keep the atomic path. Read once, when the MXFP4 quant kernel module is imported.
     "PRIMUS_TURBO_DGATE_ACC_ATOMIC": lambda: os.getenv("PRIMUS_TURBO_DGATE_ACC_ATOMIC", "1") != "0",
     # ================== MXFP8 ==================
-    # MXFP8 strict mode (tests, gates): an MX op raises instead of taking a silent fallback
+    # MXFP8 strict mode (tests, gates): an MXFP8 op raises instead of taking a silent fallback
     # (``low_precision.mx_strict``). 1: a GEMM backend other than the default or pinned one, and a
     # quantized operand re-quantized from its dequantized values because its transposed copy is
-    # missing; 2: also the HIP MXFP8 quantization on gfx1250 (the check belongs to the gfx1250
-    # quantization dispatch, added with the FlyDSL gfx1250 quantization). Unset, 0 or a non-integer: off.
-    # Clamped to [0, 2]. Read at the first MX op that could fall back.
-    "PRIMUS_TURBO_MX_STRICT": env_clamped_int("PRIMUS_TURBO_MX_STRICT", 0, 0, 2),
+    # missing; 2: also the HIP MXFP8 quantization on gfx1250. Unset or blank: 0 (off); any value
+    # other than 0, 1 or 2 raises ValueError. Read at the first MXFP8 op that could fall back.
+    "PRIMUS_TURBO_MX_STRICT": _mx_strict,
 }
 
 

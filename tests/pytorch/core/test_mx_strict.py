@@ -53,14 +53,24 @@ def strict(monkeypatch):
 def test_levels(strict):
     strict(0)
     mx_strict("off")
-    mx_strict("off", level=2)
+    mx_strict(lambda: pytest.fail("the message is built only to raise"), level=1)
     strict(1)
     with pytest.raises(RuntimeError, match="PRIMUS_TURBO_MX_STRICT=1: a fallback"):
         mx_strict("a fallback")
+    with pytest.raises(RuntimeError, match="PRIMUS_TURBO_MX_STRICT=1: built"):
+        mx_strict(lambda: "built")
     mx_strict("the HIP quantization", level=2)  # level 2 only
     strict(2)
     with pytest.raises(RuntimeError, match="PRIMUS_TURBO_MX_STRICT=2"):
         mx_strict("the HIP quantization", level=2)
+
+
+@pytest.mark.parametrize("value", ["true", "on", "3", "-1", "1.0"])
+def test_bad_value_raises(strict, value):
+    """A safety switch fails loudly: anything but 0, 1, 2 (or unset / blank) is an error, not "off"."""
+    strict(value)
+    with pytest.raises(ValueError, match="PRIMUS_TURBO_MX_STRICT"):
+        mx_strict("a fallback")
 
 
 class _Never(KernelBackend):
@@ -94,21 +104,29 @@ class _Dispatcher(AutoKernelDispatcher):
         return 0
 
 
-@pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE, ScalingGranularity.TENSORWISE])
-def test_dispatcher_fallback(strict, granularity):
-    """Only an MX_BLOCKWISE call is refused its fallback, through dispatch and resolve alike."""
+@pytest.mark.parametrize(
+    "granularity, a_dtype, refused",
+    [
+        (ScalingGranularity.MX_BLOCKWISE, float8_e4m3, True),  # MXFP8
+        (ScalingGranularity.MX_BLOCKWISE, torch.uint8, False),  # MXFP4 (packed e2m1)
+        (ScalingGranularity.TENSORWISE, float8_e4m3, False),
+    ],
+)
+def test_dispatcher_fallback(strict, granularity, a_dtype, refused):
+    """Only an MXFP8 call is refused its fallback, through dispatch and resolve alike."""
     flydsl = BackendChoice(backend=BackendType.FLYDSL)
+    kw = dict(granularity=granularity, a=torch.empty(1, dtype=a_dtype))
     strict(0)
-    assert _Dispatcher.dispatch(flydsl, None, granularity=granularity) == "fallback"
+    assert _Dispatcher.dispatch(flydsl, None, **kw) == "fallback"
     strict(1)
-    if granularity == ScalingGranularity.MX_BLOCKWISE:
+    if refused:
         with pytest.raises(RuntimeError, match="default backend FLYDSL .* would fall back to TRITON"):
-            _Dispatcher.dispatch(flydsl, None, granularity=granularity)
+            _Dispatcher.dispatch(flydsl, None, **kw)
         with pytest.raises(RuntimeError, match="would fall back to TRITON"):
-            _Dispatcher.resolve(BackendType.FLYDSL, None, granularity=granularity)
+            _Dispatcher.resolve(BackendType.FLYDSL, None, **kw)
     else:
-        assert _Dispatcher.dispatch(flydsl, None, granularity=granularity) == "fallback"
-        assert _Dispatcher.resolve(BackendType.FLYDSL, None, granularity=granularity) == BackendType.TRITON
+        assert _Dispatcher.dispatch(flydsl, None, **kw) == "fallback"
+        assert _Dispatcher.resolve(BackendType.FLYDSL, None, **kw) == BackendType.TRITON
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not check_mxfp8_support()[0], reason="needs MXFP8")

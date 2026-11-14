@@ -33,7 +33,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     create_quantized_weight,
 )
 from primus_turbo.pytorch.core.utils import is_gfx1250
-from primus_turbo.pytorch.ops import gemm_fp8, mlp_fp8, mx_weight_layout_recipe
+from primus_turbo.pytorch.ops import gemm_fp8, grouped_gemm_fp8, mlp_fp8
 from primus_turbo.pytorch.ops.normalization import rmsnorm_mxfp8
 from primus_turbo.pytorch.ops.utils import MX_A, MX_W
 from tests.pytorch.ref.mxfp8_ref import dequant, quant_2d, quant_dual, snr_db
@@ -103,12 +103,14 @@ def test_linear(M, N, K):
 @pytest.mark.parametrize("gemm_layout", [True, False])
 def test_cached_weight(gemm_layout):
     """A weight quantized ahead (``create_quantized_weight``, Primus' first-micro-batch cache), in gfx1250's MX GEMM
-    layout (``MX_W``: what the op quantizes a plain weight into here, so bitwise the same) or the raw one (another
-    kernel config, the same values: >= 50 dB)."""
+    layout (``MX_W``, its default here: what the op quantizes a plain weight into, so bitwise the same) or the raw
+    one (another kernel config, the same values: >= 50 dB)."""
     x, w, dy = _data(512, 1536, 1024)
+    recipe = MX_W if gemm_layout else ScalingRecipe(use_2d_block=True)
     q, q_t = create_quantized_weight(
-        w, float8_e4m3, MX, need_weight_transpose_cache=True, scaling_recipe=MX_W if gemm_layout else None
+        w, float8_e4m3, MX, need_weight_transpose_cache=True, scaling_recipe=recipe
     )
+    assert create_quantized_weight(w, float8_e4m3, MX)[0].scaling_recipe == MX_W  # the default here
     res = []
     for b in (w, QuantizedTensorPair(q, q_t)):
         xg = x.clone().requires_grad_()
@@ -134,6 +136,44 @@ def test_chain():
         assert got is not None and snr_db(got, ref) >= 20, name
 
 
+@pytest.mark.parametrize("fmt, dtype", [(Format.HYBRID, torch.bfloat16), (Format.E4M3, torch.float16)])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_other_formats_take_the_raw_layouts(strict, fmt, dtype, grouped):
+    """What gfx1250's quantizers cannot write in its GEMM layouts (E5M2 gradients, fp16) runs on the raw layouts with
+    the HIP quantizers and the Triton MX GEMM (strict mode off: those are fallbacks) instead of raising; a weight
+    cached in the GEMM layout is refused up front."""
+    strict(0)
+    mx = ScalingGranularity.MX_BLOCKWISE
+    cfg = Float8QuantConfig(format=fmt, granularity=mx, scale_dtype=ScaleDtype.E8M0, block_size=32)
+    x, w, dy = (t.to(dtype) for t in _data(256, 512, 384))
+    lens = torch.tensor([96, 160], device="cuda", dtype=torch.int64)
+    wg = w.view(1, 512, 384).expand(2, 512, 384).contiguous() if grouped else w
+    xg, wl = x.clone().requires_grad_(), wg.clone().requires_grad_()
+    if grouped:
+        out = grouped_gemm_fp8(xg, wl, lens, trans_b=True, config=cfg)
+    else:
+        out = gemm_fp8(xg, wl, trans_b=True, out_dtype=dtype, config=cfg)
+    out.backward(dy)
+    xf, wf, dyf = x.float(), w.float(), dy.float()
+    dw = dyf.t() @ xf
+    if grouped:
+        dw = torch.stack([dyf[:96].t() @ xf[:96], dyf[96:].t() @ xf[96:]])
+    bwd_min = 18 if fmt == Format.HYBRID else 20  # E5M2 gradients: 2 mantissa bits
+    for name, got, ref, snr_min in (
+        ("out", out, xf @ wf.t(), 20),
+        ("dx", xg.grad, dyf @ wf, bwd_min),
+        ("dw", wl.grad, dw, bwd_min),
+    ):
+        s = snr_db(got, ref)
+        assert got.dtype == dtype and s >= snr_min, f"{name}: SNR {s:.2f} dB"
+    if not grouped:  # a weight cached in the GEMM layout (from bf16, E4M3) forces it: refused here
+        q = create_quantized_weight(
+            w.bfloat16(), float8_e4m3, MX, need_weight_transpose_cache=True, scaling_recipe=MX_W
+        )
+        with pytest.raises(ValueError, match="cached weight is in gfx1250's MX GEMM layout"):
+            gemm_fp8(x, QuantizedTensorPair(*q), trans_b=True, out_dtype=dtype, config=cfg)
+
+
 def test_fallback_refused(strict):
     """N % 8 != 0 is not the FlyDSL kernel's: strict mode refuses the Triton fallback; without it, Triton's result."""
     x, w, _ = _data(256, 100, 384)
@@ -150,7 +190,10 @@ def test_prequantized_recipe_mismatch():
     x, w, _ = _data(256, 512, 1024)
     gamma = torch.ones(1024, device="cuda", dtype=torch.bfloat16)
     _, pair = rmsnorm_mxfp8(x, gamma)  # gfx1250 default: MX_A rows, MX_B columns
-    raw_w = QuantizedTensorPair(*create_quantized_weight(w, float8_e4m3, MX, need_weight_transpose_cache=True))
+    raw = ScalingRecipe(use_2d_block=True)
+    raw_w = QuantizedTensorPair(
+        *create_quantized_weight(w, float8_e4m3, MX, need_weight_transpose_cache=True, scaling_recipe=raw)
+    )
     with pytest.raises(ValueError, match="a was quantized with .* raw MX layout"):
         gemm_fp8(pair, raw_w, trans_b=True, out_dtype=torch.bfloat16, config=MX)
     _, pair = rmsnorm_mxfp8(x, gamma, row_recipe=MX_A, col_recipe=ScalingRecipe())
@@ -206,14 +249,17 @@ class _KernelSwiGLU(torch.autograd.Function):
         return grad
 
 
-# DSv3 shared expert at T = 8192 (H 7168, I 2048); M / H tails (H % 128 = 64)
-@pytest.mark.parametrize("M, H, I", [(8192, 7168, 2048), (1000, 576, 256)])
-@pytest.mark.parametrize("mode", ["plain", "cached_bf16", "cached_fp32"])
+# M / H tails (H % 128 = 64) in every mode; the DSv3 shared expert at T = 8192 (H 7168, I 2048) as Primus runs it
+@pytest.mark.parametrize(
+    "M, H, I, mode",
+    [(1000, 576, 256, mode) for mode in ("plain", "cached_bf16", "cached_fp32")]
+    + [(8192, 7168, 2048, "cached_fp32")],
+)
 def test_mlp(M, H, I, mode):
     """mlp_fp8 (one Function: fc1, fused GLU + dual cast, fc2; fused dGLU in the backward) bitwise equal to the
     unfused gemm_fp8 chain with the same recipes: out, dx and the weight gradients -- plain bf16 weights, or
-    weight caches (``mx_weight_layout_recipe``) with the wgrads accumulated into a bf16 / fp32 main_grad
-    (two micro-batches)."""
+    weight caches (``create_quantized_weight``'s default recipe) with the wgrads accumulated into a bf16 / fp32
+    main_grad (two micro-batches)."""
     g = torch.Generator(device="cuda").manual_seed(M + H)
     w1 = (torch.randn(2 * I, H, device="cuda", generator=g) / H**0.5).bfloat16()
     w2 = (torch.randn(H, I, device="cuda", generator=g) / I**0.5).bfloat16()
@@ -238,8 +284,7 @@ def test_mlp(M, H, I, mode):
         dtype = torch.bfloat16 if mode == "cached_bf16" else torch.float32
         ws = []
         for w, mg in zip((w1, w2), main_grads):
-            q, q_t = create_quantized_weight(w, float8_e4m3, MX, need_weight_transpose_cache=True,
-                                             scaling_recipe=mx_weight_layout_recipe(False, w.shape))  # fmt: skip
+            q, q_t = create_quantized_weight(w, float8_e4m3, MX, need_weight_transpose_cache=True)
             q.main_grad, q.grad_added_to_main_grad = mg.to(dtype), False
             ws.append(QuantizedTensorPair(q, q_t))
         res = []
@@ -251,4 +296,6 @@ def test_mlp(M, H, I, mode):
         return res + [p.data.main_grad for p in ws]
 
     for i, (got, ref) in enumerate(zip(run(fused), run(chain))):
-        assert got.dtype == ref.dtype and torch.equal(got, ref), f"result {i}: max |diff| {(got - ref).abs().max()}"
+        assert got.dtype == ref.dtype and torch.equal(got, ref), (
+            f"result {i}: max |diff| {(got - ref).abs().max()}"
+        )

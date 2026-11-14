@@ -5,7 +5,6 @@
 ###############################################################################
 
 import functools
-import inspect
 from typing import Tuple
 
 import torch
@@ -105,7 +104,7 @@ class GEMMFP8HipBLASLtBackend(KernelBackend):
         supported = True
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             supported &= not is_gfx942()
-            supported &= not is_gfx1250()  # wrong there: ~8 dB vs its own dequantized operands (2026-11-11)
+            supported &= not is_gfx1250()  # its MX GEMM is not correct on gfx1250
         # check ScalingGranularity
         supported &= granularity in GEMMFP8HipBLASLtBackend.SUPPORTED_GRANULARITIES
         # check dtype
@@ -260,10 +259,10 @@ def _mx_dense_triton(a, a_scale_inv, b, b_scale_inv, out_dtype, beta=0.0, out=No
 
 @functools.lru_cache(maxsize=None)
 def mx1250_gemm():
-    """(gfx1250's MX GEMM ``gemm_mxfp8_gfx1250``, whether it has the beta=1 epilogue: ``accumulate=``)."""
-    from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 import gemm_mxfp8_gfx1250 as fn
+    """gfx1250's MX GEMM ``gemm_mxfp8_gfx1250`` (imported on first use)."""
+    from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 import gemm_mxfp8_gfx1250
 
-    return fn, "accumulate" in inspect.signature(fn).parameters
+    return gemm_mxfp8_gfx1250
 
 
 def _mx1250_scale_ok(s, rows: int, k: int, batch: tuple = ()) -> bool:
@@ -292,46 +291,38 @@ def mx1250_out_ok(out, shape, accumulate: bool, out_dtype) -> bool:
 
 
 def _mx1250_can_handle(a, sa, b, sb, out_dtype, accumulate, out, kw) -> bool:
-    """``gemm_mxfp8_gfx1250`` (NT): ``b`` row-major or (``b_preshuffled``) dense 16x16 blocks; beta=1 if it has it."""
+    """``gemm_mxfp8_gfx1250`` (NT): ``b`` row-major or (``b_preshuffled``) dense 16x16 blocks, optionally beta=1."""
     if a.dim() != 2 or b.dim() != 2:
         return False
     (m, k), n = a.shape, b.shape[0]
     ok = mx1250_operands_ok(a, sa, b, sb, k)
     ok = ok and (not kw.get("b_preshuffled") or (n % 16 == 0 and b.stride(0) == k))
-    return ok and (not accumulate or mx1250_gemm()[1]) and mx1250_out_ok(out, (m, n), accumulate, out_dtype)
-
-
-_MX1250_DIRECT: dict = {}  # operand signature -> gemm_mxfp8_gfx1250, or None where the FlyDSL can_handle said no
+    return ok and mx1250_out_ok(out, (m, n), accumulate, out_dtype)
 
 
 def mx1250_gemm_direct(a, sa, b, sb, out_dtype, b_preshuffled=False, out=None):
     """``gemm_fp8_impl`` (NT, MX) or, with ``out``, ``gemm_fp8_accum_impl`` (beta=1 into ``out``) as a direct call
-    of gfx1250's ``gemm_mxfp8_gfx1250``: the same kernel with the same arguments, without torch.library's per-call
-    dispatch or the backend dispatcher. Taken when nothing needs those -- eager mode (no torch.compile, no dispatch
-    mode), no FP8 GEMM backend pinned, no auto-tune -- and the FlyDSL backend's ``can_handle`` accepted this operand
-    signature once (shapes, row strides, dtypes, 16-byte alignment; the scales' layout follows from their shapes for
-    the quantizers' outputs, and the kernel re-checks it); else None, and the caller runs the custom op."""
-    if torch.compiler.is_compiling() or torch._C._len_torch_dispatch_stack() or not is_gfx1250():
+    of gfx1250's ``gemm_mxfp8_gfx1250``: the kernel call the dispatcher makes through its default backend (FlyDSL)
+    when that backend's ``can_handle`` (``_mx1250_can_handle``) takes it, without torch.library's per-call dispatch
+    or the dispatcher's. None, and the caller runs the custom op, off gfx1250, under torch.compile, for tensor
+    subclasses (e.g. fake tensors), with an FP8 GEMM backend pinned or auto-tune on, or where FlyDSL would not take
+    the call."""
+    if not is_gfx1250() or torch.compiler.is_compiling():
+        return None
+    if any(t is not None and type(t) is not torch.Tensor for t in (a, sa, b, sb, out)):
         return None
     pinned = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
-    if (pinned is not None and (pinned.backend is not None or pinned.auto_tune)) or (
-        GlobalBackendManager.auto_tune_enabled()
-    ):
+    if pinned is not None and (pinned.backend is not None or pinned.auto_tune):
         return None
-    sig = (a.shape, a.stride(), b.shape, b.stride(), sa.shape, sb.shape, a.dtype, b.dtype, out_dtype, b_preshuffled,
-           None if out is None else (out.shape, out.stride(), out.dtype),
-           (a.data_ptr() | b.data_ptr() | (0 if out is None else out.data_ptr())) & 15)  # fmt: skip
-    fn = _MX1250_DIRECT.get(sig, False)
-    if fn is False:
-        kw = {"b_preshuffled": bool(b_preshuffled)}
-        ok = _mx1250_can_handle(a, sa, b, sb, out_dtype, out is not None, out, kw)
-        fn = _MX1250_DIRECT[sig] = mx1250_gemm()[0] if ok else None
-    if fn is None:
+    if GlobalBackendManager.auto_tune_enabled():
         return None
-    if out is None:
-        return fn(a, sa, b, sb, b_preshuffled=b_preshuffled)
-    fn(a, sa, b, sb, out_dtype=out.dtype, out=out, accumulate=True, b_preshuffled=b_preshuffled)
-    torch.autograd.graph.increment_version(out)  # what the custom op's ADInplaceOrView step does
+    accumulate = out is not None
+    if not _mx1250_can_handle(a, sa, b, sb, out_dtype, accumulate, out, {"b_preshuffled": b_preshuffled}):
+        return None
+    if not accumulate:
+        return mx1250_gemm()(a, sa, b, sb, b_preshuffled=b_preshuffled)
+    mx1250_gemm()(a, sa, b, sb, out_dtype=out.dtype, out=out, accumulate=True, b_preshuffled=b_preshuffled)
+    torch.autograd.graph.increment_version(out)  # as the custom op's mutation of ``out`` does
     return out
 
 
@@ -351,7 +342,6 @@ class GEMMFP8TritonBackend(KernelBackend):
         ScalingGranularity.TENSORWISE,
         ScalingGranularity.ROWWISE,
         ScalingGranularity.BLOCKWISE,
-        ScalingGranularity.MX_BLOCKWISE,
     }
 
     SUPPORTED_DTYPES = set(_COMMON_SUPPORTED_DTYPES + _HYBRID_SUPPORTED_DTYPES)
@@ -371,7 +361,8 @@ class GEMMFP8TritonBackend(KernelBackend):
         out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
-        if granularity == ScalingGranularity.MX_BLOCKWISE:  # gfx1250 only: other archs keep their MX backends
+        # MX_BLOCKWISE (not in SUPPORTED_GRANULARITIES): gfx1250 only, other archs keep their MX backends
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
             ok = is_gfx1250() and not trans_a and trans_b and not trans_c and a.dim() == b.dim() == 2
             ok = ok and b.shape[1] == a.shape[1] and a.shape[1] % 128 == 0
             ok = ok and out_dtype in (torch.bfloat16, torch.float16) and not kwargs.get("b_preshuffled")
@@ -581,7 +572,7 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
     ):
         if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
             acc = dict(out_dtype=out.dtype, out=out, accumulate=True) if inplace_add_to_out else {}
-            return mx1250_gemm()[0](
+            return mx1250_gemm()(
                 a, a_scale_inv, b, b_scale_inv, b_preshuffled=kwargs.get("b_preshuffled", False), **acc
             )
         if granularity == ScalingGranularity.MX_BLOCKWISE:
@@ -634,7 +625,9 @@ class GEMMFP8KernelDispatcher(AutoKernelDispatcher):
     @classmethod
     def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, **kwargs):
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
-        return (m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
+        # + the operand layout: B in 16x16 blocks, the scales' rank (raw 2-D or gfx1250's packed 4-D)
+        layout = (bool(kwargs.get("b_preshuffled")), kwargs["a_scale_inv"].dim())
+        return (m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity, *layout)
 
 
 @_torch_custom_op_wrapper("primus_turbo::gemm_fp8_impl", mutates_args=(), device_types="cuda")
