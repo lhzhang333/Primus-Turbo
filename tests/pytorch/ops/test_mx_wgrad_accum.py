@@ -228,6 +228,29 @@ def test_operand_recipe_checks(monkeypatch):
         gemm_fp8(a, w, **kw)
 
 
+def test_autotune_keys_carry_the_layout():
+    """A backend tuned on raw MX operands is not reused for gfx1250's GEMM layout (16x16 B, packed scales)."""
+    from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import GEMMFP8KernelDispatcher
+    from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
+        GroupedGEMMFP8KernelDispatcher,
+        GroupedGEMMFP8VariableKKernelDispatcher,
+    )
+
+    a, b, g = torch.empty(64, 128), torch.empty(4, 32, 128), torch.zeros(4, dtype=torch.int64)
+    raw, packed = torch.empty(64, 4), torch.empty(2, 1, 32, 4)
+    mx = ScalingGranularity.MX_BLOCKWISE
+    common = dict(trans_a=False, trans_b=True, out_dtype=torch.bfloat16, granularity=mx)
+    dense = dict(a=a, b=b[0], trans_c=False, b_scale_inv=raw, **common)
+    grouped = dict(a=a, b=b, b_scales=raw, group_lens=g, group_offs=g, num_cu=None, **common)
+    for make_key, kw, scale in (
+        (GEMMFP8KernelDispatcher.make_key, dense, "a_scale_inv"),
+        (GroupedGEMMFP8KernelDispatcher.make_key, grouped, "a_scales"),
+        (GroupedGEMMFP8VariableKKernelDispatcher.make_key, dict(grouped, trans_c=False), "a_scales"),
+    ):
+        layouts = [{scale: s, "b_preshuffled": shuf} for s in (raw, packed) for shuf in (False, True)]
+        assert len({make_key(**kw, **layout) for layout in layouts}) == 4
+
+
 def test_fused_glu_e4m3_only_on_gfx1250(monkeypatch):
     """gfx1250's fused MXFP8 GLU / dGLU quantize to E4M3 both ways: HYBRID is refused before any GEMM runs."""
     import primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl as gimpl

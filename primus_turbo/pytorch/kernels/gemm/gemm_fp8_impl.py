@@ -625,7 +625,9 @@ class GEMMFP8KernelDispatcher(AutoKernelDispatcher):
     @classmethod
     def make_key(cls, a, b, trans_a, trans_b, trans_c, out_dtype, granularity, **kwargs):
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
-        return (m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
+        # + the operand layout: B in 16x16 blocks, the scales' rank (raw 2-D or gfx1250's packed 4-D)
+        layout = (bool(kwargs.get("b_preshuffled")), kwargs["a_scale_inv"].dim())
+        return (m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity, *layout)
 
 
 @_torch_custom_op_wrapper("primus_turbo::gemm_fp8_impl", mutates_args=(), device_types="cuda")
