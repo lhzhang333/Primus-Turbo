@@ -8,8 +8,7 @@
 GLU / dGLU in two phases (the grouped MX GEMM, then the FlyDSL GLU / dGLU + dual-quant kernel), against BF16, at a
 toy shape and the DSv3 expert shape (32 experts x 2048 tokens, H 7168, I 2048), balanced and skewed (empty experts),
 and as Primus runs them (cached weights, wgrads fused into main_grad).
-The grouped GEMMs run on gfx1250's FlyDSL MX kernels ("default"; skipped while they are missing) or on Triton, pinned
-(the fallback)."""
+The grouped GEMMs run on gfx1250's FlyDSL MX kernels ("default") or on Triton, pinned (the fallback)."""
 
 import pytest
 import torch
@@ -61,11 +60,6 @@ def backend(request, monkeypatch):
     GlobalBackendManager.reset()
     if request.param == "triton":
         GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON, PrecisionType.FP8)
-    else:
-        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import mx1250_grouped
-
-        if None in mx1250_grouped():
-            pytest.skip("gemm_mxfp8_kernel_gfx1250 has no grouped mode yet")
     yield request.param
     GlobalBackendManager.reset()
 
@@ -166,7 +160,7 @@ def test_grouped_mlp(backend, G, M, H, I, skew):
 @pytest.mark.parametrize("G, M, H, I", SHAPES)
 def test_grouped_mlp_primus(backend, G, M, H, I, main_grad_dtype):
     """Primus' routed experts (fused grouped MLP, several micro-batches): w1 / w2 cached by create_quantized_weight
-    in the recipe ``mx_weight_layout_recipe`` asks for (gfx1250's GEMM layout once its FlyDSL grouped kernels run),
+    in the recipe ``mx_weight_layout_recipe`` asks for (gfx1250's GEMM layout; raw with Triton pinned),
     wgrads accumulated into main_grad (beta=1): y / dx / dprobs bitwise those of plain bf16 weights (the same
     operands), each main_grad increment vs the plain run's dw (>= 40 dB: one rounding against two) and BF16."""
     if not mx_wgrad_accum_supported(True, main_grad_dtype):

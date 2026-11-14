@@ -500,16 +500,19 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
 
 @functools.lru_cache(maxsize=None)
 def mx1250_grouped():
-    """gfx1250's (grouped-M, variable-K) MX GEMMs of ``gemm_mxfp8_kernel_gfx1250``, None while it lacks them."""
-    from primus_turbo.flydsl.gemm import gemm_mxfp8_kernel_gfx1250 as k
+    """gfx1250's grouped-M and variable-K MX GEMMs (``gemm_mxfp8_kernel_gfx1250``, imported on first use)."""
+    from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 import (
+        grouped_gemm_mxfp8_gfx1250,
+        grouped_gemm_mxfp8_variable_k_gfx1250,
+    )
 
-    return tuple(getattr(k, f"grouped_gemm_mxfp8{m}_gfx1250", None) for m in ("", "_variable_k"))
+    return grouped_gemm_mxfp8_gfx1250, grouped_gemm_mxfp8_variable_k_gfx1250
 
 
 def _mx1250_grouped_ok(a, sa, b, sb, group_offs, out_dtype, kw) -> bool:
     """gfx1250 fwd / dgrad: ``a [M, K]`` read under ``group_offs`` (32-aligned for packed scales),
     ``b [G, N, K]`` row-major or (``b_preshuffled``) 16x16 blocks, out tight under ``group_offs_out``."""
-    if mx1250_grouped()[0] is None or a.dim() != 2 or b.dim() != 3:
+    if a.dim() != 2 or b.dim() != 3:
         return False
     (m, k), (g, n) = a.shape, b.shape[:2]
     ok = mx1250_operands_ok(a, sa, b, sb, k, (g,)) and b.is_contiguous() and group_offs.dtype == torch.int64
@@ -521,7 +524,7 @@ def _mx1250_vk_ok(a, sa, b, sb, trans_c, group_offs, out_dtype, accumulate, out,
     """gfx1250 wgrad ``out[g] (+)= lhs[:, T_g] @ rhs[:, T_g]^T`` of the [rows, T] column copies (``trans_c``
     swaps them; rhs row-major or 16x16 blocks), T_g from ``group_offs`` (multiples of 128)."""
     (lhs, ls), (rhs, rs) = ((b, sb), (a, sa)) if trans_c else ((a, sa), (b, sb))
-    if mx1250_grouped()[1] is None or lhs.dim() != 2 or rhs.dim() != 2:
+    if lhs.dim() != 2 or rhs.dim() != 2:
         return False
     (m, t), n = lhs.shape, rhs.shape[0]
     ok = t % 128 == 0 and mx1250_operands_ok(lhs, ls, rhs, rs, t) and group_offs.dtype == torch.int64

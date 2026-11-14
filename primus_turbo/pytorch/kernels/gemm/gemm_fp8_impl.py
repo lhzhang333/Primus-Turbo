@@ -5,7 +5,6 @@
 ###############################################################################
 
 import functools
-import inspect
 from typing import Tuple
 
 import torch
@@ -105,7 +104,7 @@ class GEMMFP8HipBLASLtBackend(KernelBackend):
         supported = True
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             supported &= not is_gfx942()
-            supported &= not is_gfx1250()  # wrong there: ~8 dB vs its own dequantized operands (2026-11-11)
+            supported &= not is_gfx1250()  # its MX GEMM is not correct on gfx1250
         # check ScalingGranularity
         supported &= granularity in GEMMFP8HipBLASLtBackend.SUPPORTED_GRANULARITIES
         # check dtype
@@ -260,10 +259,10 @@ def _mx_dense_triton(a, a_scale_inv, b, b_scale_inv, out_dtype, beta=0.0, out=No
 
 @functools.lru_cache(maxsize=None)
 def mx1250_gemm():
-    """(gfx1250's MX GEMM ``gemm_mxfp8_gfx1250``, whether it has the beta=1 epilogue: ``accumulate=``)."""
-    from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 import gemm_mxfp8_gfx1250 as fn
+    """gfx1250's MX GEMM ``gemm_mxfp8_gfx1250`` (imported on first use)."""
+    from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel_gfx1250 import gemm_mxfp8_gfx1250
 
-    return fn, "accumulate" in inspect.signature(fn).parameters
+    return gemm_mxfp8_gfx1250
 
 
 def _mx1250_scale_ok(s, rows: int, k: int, batch: tuple = ()) -> bool:
@@ -292,13 +291,13 @@ def mx1250_out_ok(out, shape, accumulate: bool, out_dtype) -> bool:
 
 
 def _mx1250_can_handle(a, sa, b, sb, out_dtype, accumulate, out, kw) -> bool:
-    """``gemm_mxfp8_gfx1250`` (NT): ``b`` row-major or (``b_preshuffled``) dense 16x16 blocks; beta=1 if it has it."""
+    """``gemm_mxfp8_gfx1250`` (NT): ``b`` row-major or (``b_preshuffled``) dense 16x16 blocks, optionally beta=1."""
     if a.dim() != 2 or b.dim() != 2:
         return False
     (m, k), n = a.shape, b.shape[0]
     ok = mx1250_operands_ok(a, sa, b, sb, k)
     ok = ok and (not kw.get("b_preshuffled") or (n % 16 == 0 and b.stride(0) == k))
-    return ok and (not accumulate or mx1250_gemm()[1]) and mx1250_out_ok(out, (m, n), accumulate, out_dtype)
+    return ok and mx1250_out_ok(out, (m, n), accumulate, out_dtype)
 
 
 _MX1250_DIRECT: dict = {}  # operand signature -> gemm_mxfp8_gfx1250, or None where the FlyDSL can_handle said no
@@ -325,7 +324,7 @@ def mx1250_gemm_direct(a, sa, b, sb, out_dtype, b_preshuffled=False, out=None):
     if fn is False:
         kw = {"b_preshuffled": bool(b_preshuffled)}
         ok = _mx1250_can_handle(a, sa, b, sb, out_dtype, out is not None, out, kw)
-        fn = _MX1250_DIRECT[sig] = mx1250_gemm()[0] if ok else None
+        fn = _MX1250_DIRECT[sig] = mx1250_gemm() if ok else None
     if fn is None:
         return None
     if out is None:
@@ -581,7 +580,7 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
     ):
         if granularity == ScalingGranularity.MX_BLOCKWISE and is_gfx1250():
             acc = dict(out_dtype=out.dtype, out=out, accumulate=True) if inplace_add_to_out else {}
-            return mx1250_gemm()[0](
+            return mx1250_gemm()(
                 a, a_scale_inv, b, b_scale_inv, b_preshuffled=kwargs.get("b_preshuffled", False), **acc
             )
         if granularity == ScalingGranularity.MX_BLOCKWISE:

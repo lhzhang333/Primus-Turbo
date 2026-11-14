@@ -54,45 +54,27 @@ def _backend_state():
 
 
 @pytest.mark.parametrize(
-    "grouped, pinned, arch, fly_accum, dtype, want",
+    "grouped, pinned, arch, dtype, want",
     [
-        (False, None, "gfx950", False, torch.bfloat16, True),  # hipBLASLt
-        (False, None, "gfx950", False, torch.float32, True),
-        # gfx1250: FlyDSL, once its kernel has the beta=1 epilogue (until then the unfused path)
-        (False, None, "gfx1250", False, torch.bfloat16, False),
-        (False, None, "gfx1250", True, torch.bfloat16, True),
-        (False, None, "gfx1250", True, torch.float32, True),
-        (False, None, "gfx1250", True, torch.float16, False),
-        (
-            False,
-            BackendType.HIPBLASLT,
-            "gfx1250",
-            True,
-            torch.bfloat16,
-            False,
-        ),  # hipBLASLt's MX GEMM is wrong there
-        (
-            False,
-            BackendType.TRITON,
-            "gfx950",
-            False,
-            torch.bfloat16,
-            False,
-        ),  # the dense Triton MX path is gfx1250's
-        (False, BackendType.TRITON, "gfx1250", False, torch.float32, True),
-        (True, None, "gfx1250", False, torch.bfloat16, False),
-        (True, None, "gfx1250", True, torch.float32, True),
-        (True, BackendType.TRITON, "gfx1250", False, torch.float32, True),
-        (True, BackendType.FLYDSL, "gfx950", False, torch.bfloat16, True),  # gfx950 FlyDSL: 16-bit only
-        (True, BackendType.FLYDSL, "gfx950", False, torch.float32, False),
-        (True, BackendType.CK, "gfx950", False, torch.bfloat16, False),  # no MX beta=1 epilogue
+        (False, None, "gfx950", torch.bfloat16, True),  # hipBLASLt
+        (False, None, "gfx950", torch.float32, True),
+        (False, None, "gfx1250", torch.bfloat16, True),  # FlyDSL
+        (False, None, "gfx1250", torch.float32, True),
+        (False, None, "gfx1250", torch.float16, False),
+        (False, BackendType.HIPBLASLT, "gfx1250", torch.bfloat16, False),  # no hipBLASLt MX GEMM there
+        (False, BackendType.TRITON, "gfx950", torch.bfloat16, False),  # the dense Triton MX path is gfx1250's
+        (False, BackendType.TRITON, "gfx1250", torch.float32, True),
+        (True, None, "gfx1250", torch.float32, True),
+        (True, BackendType.TRITON, "gfx1250", torch.float32, True),
+        (True, BackendType.FLYDSL, "gfx950", torch.bfloat16, True),  # gfx950 FlyDSL: 16-bit only
+        (True, BackendType.FLYDSL, "gfx950", torch.float32, False),
+        (True, BackendType.CK, "gfx950", torch.bfloat16, False),  # no MX beta=1 epilogue
     ],
 )
-def test_supported(monkeypatch, grouped, pinned, arch, fly_accum, dtype, want):
+def test_supported(monkeypatch, grouped, pinned, arch, dtype, want):
     monkeypatch.setattr(ops_utils, "is_gfx942", lambda: False)
     monkeypatch.setattr(ops_utils, "is_gfx950", lambda: arch == "gfx950")
     monkeypatch.setattr(ops_utils, "is_gfx1250", lambda: arch == "gfx1250")
-    monkeypatch.setattr(ops_utils, "_mx1250_flydsl_accum", lambda grouped: fly_accum)
     choice = BackendChoice(backend=pinned) if pinned is not None else None
     getter = "get_grouped_gemm_backend" if grouped else "get_gemm_backend"
     monkeypatch.setattr(GlobalBackendManager, getter, classmethod(lambda cls, precision: choice))
@@ -100,29 +82,18 @@ def test_supported(monkeypatch, grouped, pinned, arch, fly_accum, dtype, want):
 
 
 @pytest.mark.parametrize(
-    "arch, grouped, kernels, pinned, shape, want",
+    "arch, grouped, pinned, shape, want",
     [
-        ("gfx1250", False, False, None, (64, 64), True),  # dense: the FlyDSL dense MX GEMM reads it
-        (
-            "gfx1250",
-            True,
-            False,
-            None,
-            (4, 64, 64),
-            False,
-        ),  # grouped: not until the grouped entry points are in
-        ("gfx1250", True, True, None, (4, 64, 64), True),
-        ("gfx1250", False, False, BackendType.TRITON, (64, 64), False),  # another FP8 backend pinned
-        ("gfx1250", True, True, BackendType.TRITON, (4, 64, 64), False),
-        ("gfx1250", False, False, None, (64, 72), False),  # no 16x16 blocks
-        ("gfx950", False, False, None, (64, 64), False),
+        ("gfx1250", False, None, (64, 64), True),  # the FlyDSL MX GEMMs read it
+        ("gfx1250", True, None, (4, 64, 64), True),
+        ("gfx1250", False, BackendType.TRITON, (64, 64), False),  # another FP8 backend pinned
+        ("gfx1250", True, BackendType.TRITON, (4, 64, 64), False),
+        ("gfx1250", False, None, (64, 72), False),  # no 16x16 blocks
+        ("gfx950", False, None, (64, 64), False),
     ],
 )
-def test_weight_layout_recipe(monkeypatch, arch, grouped, kernels, pinned, shape, want):
-    import primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl as gimpl
-
+def test_weight_layout_recipe(monkeypatch, arch, grouped, pinned, shape, want):
     monkeypatch.setattr(ops_utils, "is_gfx1250", lambda: arch == "gfx1250")
-    monkeypatch.setattr(gimpl, "mx1250_grouped", lambda: (min, max) if kernels else (None, None))
     choice = BackendChoice(backend=pinned) if pinned is not None else None
     getter = "get_grouped_gemm_backend" if grouped else "get_gemm_backend"
     monkeypatch.setattr(GlobalBackendManager, getter, classmethod(lambda cls, precision: choice))

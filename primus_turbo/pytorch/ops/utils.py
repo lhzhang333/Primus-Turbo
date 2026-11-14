@@ -26,27 +26,17 @@ from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950, is_gfx1250
 _ALL, _BF16_FP32 = (torch.bfloat16, torch.float16, torch.float32), (torch.bfloat16, torch.float32)
 # main_grad dtypes an MXFP8 wgrad with a beta=1 epilogue (fuse_bgrad_accum_pattern) adds into, per (arch, grouped,
 # backend); dense = gemm_fp8's wgrad, grouped = grouped_gemm_fp8's variable-K one. gfx950 FlyDSL: 16-bit only.
+# gfx1250: FlyDSL, and Triton as its fallback (no hipBLASLt MX GEMM there).
 _MX_WGRAD_ACCUM = {
     ("gfx950", False, BackendType.HIPBLASLT): _ALL,
     ("gfx950", False, BackendType.FLYDSL): _ALL[:2],
     ("gfx950", True, BackendType.TRITON): _ALL,
     ("gfx950", True, BackendType.FLYDSL): _ALL[:2],
-    ("gfx1250", False, BackendType.FLYDSL): _BF16_FP32,  # once the kernels have it (_mx1250_flydsl_accum)
+    ("gfx1250", False, BackendType.FLYDSL): _BF16_FP32,
     ("gfx1250", True, BackendType.FLYDSL): _BF16_FP32,
-    ("gfx1250", False, BackendType.TRITON): _ALL,  # the fallback (hipBLASLt's MX GEMM is wrong there)
+    ("gfx1250", False, BackendType.TRITON): _ALL,
     ("gfx1250", True, BackendType.TRITON): _ALL,
 }
-
-
-def _mx1250_flydsl_accum(grouped: bool) -> bool:
-    """Whether gfx1250's FlyDSL MX wgrad has its beta=1 epilogue yet (``accumulate=`` / the variable-K mode)."""
-    if grouped:
-        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import mx1250_grouped
-
-        return mx1250_grouped()[1] is not None
-    from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import mx1250_gemm
-
-    return mx1250_gemm()[1]
 
 
 def mx_wgrad_accum_backend(grouped: bool) -> BackendType:
@@ -60,15 +50,13 @@ def mx_wgrad_accum_backend(grouped: bool) -> BackendType:
 def mx_wgrad_accum_supported(grouped: bool, main_grad_dtype: torch.dtype) -> bool:
     """Whether the MXFP8 wgrad of ``grouped_gemm_fp8`` (``grouped``) / ``gemm_fp8`` can add into a ``main_grad`` of
     ``main_grad_dtype`` with the backend it would run (pinned through GlobalBackendManager or its env variable, else
-    ``mx_wgrad_accum_backend``). Frameworks ask before passing fuse_bgrad_accum_pattern; on gfx1250 it is False
-    until the FlyDSL kernels have the beta=1 epilogue (the framework adds the wgrad itself)."""
+    ``mx_wgrad_accum_backend``). Frameworks ask before passing fuse_bgrad_accum_pattern; where it is False they add
+    the wgrad themselves."""
     if is_gfx942():
         return False
     get = GlobalBackendManager.get_grouped_gemm_backend if grouped else GlobalBackendManager.get_gemm_backend
     backend = getattr(get(PrecisionType.FP8), "backend", None) or mx_wgrad_accum_backend(grouped)
     arch = "gfx1250" if is_gfx1250() else "gfx950" if is_gfx950() else None
-    if arch == "gfx1250" and backend == BackendType.FLYDSL and not _mx1250_flydsl_accum(grouped):
-        return False
     return main_grad_dtype in _MX_WGRAD_ACCUM.get((arch, grouped, backend), ())
 
 
@@ -79,18 +67,12 @@ MX_W = ScalingRecipe(use_2d_block=True, shuffle_scale=True, shuffle_out=True)
 
 
 def _mx1250_layout_ok(grouped: bool) -> bool:
-    """Whether gfx1250's FlyDSL MX GEMMs of this op kind run here and read the GEMM layouts: on gfx1250 with no
-    other FP8 backend pinned, and (``grouped``) the grouped-M / variable-K entry points present."""
+    """Whether gfx1250's FlyDSL MX GEMMs of this op kind (dense / ``grouped``) run here: on gfx1250, with no other
+    FP8 GEMM backend pinned."""
     if not is_gfx1250():
         return False
     get = GlobalBackendManager.get_grouped_gemm_backend if grouped else GlobalBackendManager.get_gemm_backend
-    if getattr(get(PrecisionType.FP8), "backend", None) not in (None, BackendType.FLYDSL):
-        return False
-    if grouped:
-        from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import mx1250_grouped
-
-        return None not in mx1250_grouped()
-    return True
+    return getattr(get(PrecisionType.FP8), "backend", None) in (None, BackendType.FLYDSL)
 
 
 def mx_weight_layout_recipe(grouped: bool, shape=None) -> ScalingRecipe:
