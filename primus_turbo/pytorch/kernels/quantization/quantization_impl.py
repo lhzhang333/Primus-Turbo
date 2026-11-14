@@ -58,12 +58,12 @@ def _gfx1250_mxfp8(
     a shuffled recipe they cannot take raises, and so does any HIP fallback under PRIMUS_TURBO_MX_STRICT=2.
     The E8M0 rule is PRIMUS_TURBO_MXFP8_SCALE_RULE (nosat by default). Calls the kernels take are memoized
     (the rule is part of the key); the others go through the checks every time."""
+    if not is_gfx1250():
+        return None
     key = (x.dtype, out_dtype, row, col, same_blocks, envs.PRIMUS_TURBO_MXFP8_SCALE_RULE)
     hit = _MX1250.get(key)
     if hit is not None:
         return hit
-    if not is_gfx1250():
-        return None
     if (
         x.dtype == torch.bfloat16
         and out_dtype == torch.float8_e4m3fn

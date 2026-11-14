@@ -251,6 +251,21 @@ def test_autotune_keys_carry_the_layout():
         assert len({make_key(**kw, **layout) for layout in layouts}) == 4
 
 
+def test_scale_rule_read_on_gfx1250_only(monkeypatch):
+    """PRIMUS_TURBO_MXFP8_SCALE_RULE belongs to gfx1250's quantizers: other archs never read it."""
+    import primus_turbo.common.envs as envs
+    import primus_turbo.pytorch.kernels.quantization.quantization_impl as qimpl
+
+    monkeypatch.setenv("PRIMUS_TURBO_MXFP8_SCALE_RULE", "rne")
+    envs.reset_cache()
+    x, raw = torch.empty(32, 64, dtype=torch.bfloat16), ScalingRecipe()
+    monkeypatch.setattr(qimpl, "is_gfx1250", lambda: False)
+    assert qimpl._gfx1250_mxfp8(x, torch.float8_e4m3fn, raw, raw) is None
+    monkeypatch.setattr(qimpl, "is_gfx1250", lambda: True)
+    with pytest.raises(ValueError, match="PRIMUS_TURBO_MXFP8_SCALE_RULE='rne'"):
+        qimpl._gfx1250_mxfp8(x, torch.float8_e4m3fn, raw, raw)
+
+
 def test_fused_glu_e4m3_only_on_gfx1250(monkeypatch):
     """gfx1250's fused MXFP8 GLU / dGLU quantize to E4M3 both ways: HYBRID is refused before any GEMM runs."""
     import primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl as gimpl
