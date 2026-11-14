@@ -22,14 +22,16 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.core.utils import is_gfx950, is_gfx1250
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_dglu_impl,
     grouped_gemm_fp8_glu_impl,
     grouped_gemm_fp8_impl,
     grouped_gemm_fp8_variable_k_accum_impl,
     grouped_gemm_fp8_variable_k_impl,
+    grouped_gemm_mxfp8_dglu,
     grouped_gemm_mxfp8_dglu_impl,
+    grouped_gemm_mxfp8_glu,
     grouped_gemm_mxfp8_glu_impl,
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
@@ -468,6 +470,15 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
         )
 
 
+def _mx_glu(op, fn, a):
+    """The fused MXFP8 GLU / dGLU to call for operand ``a``: on gfx1250, in eager mode on plain tensors, the plain
+    function ``fn`` (no torch.library dispatch per call; its outputs may share an allocation); else the custom op
+    ``op`` (torch.compile, fake / subclass tensors, other archs)."""
+    if is_gfx1250() and type(a) is torch.Tensor and not torch.compiler.is_compiling():
+        return fn
+    return op
+
+
 def _quantize_weight(
     w: Union[torch.Tensor, QuantizedTensor],
     w_t: Optional[QuantizedTensor],
@@ -628,7 +639,8 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
 
         # The activation is quantised inside the epilogue: it feeds nothing but the
         # quantiser, so staging it in out_dtype would be an [M, I] round trip through HBM.
-        l1, act_row, act_row_scale, act_col, act_col_scale = grouped_gemm_mxfp8_glu_impl(
+        glu = _mx_glu(grouped_gemm_mxfp8_glu_impl, grouped_gemm_mxfp8_glu, x_row)
+        l1, act_row, act_row_scale, act_col, act_col_scale = glu(
             x_row,
             w1_row,
             x_row_scale,
@@ -763,7 +775,8 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
 
         # dgrad against w2_col, contracting K_out; the epilogue turns it into the
         # pre-activation gradient and quantises that, so neither reaches HBM.
-        grad_probs, gl_row, gl_row_scale, gl_col, gl_col_scale = grouped_gemm_mxfp8_dglu_impl(
+        dglu = _mx_glu(grouped_gemm_mxfp8_dglu_impl, grouped_gemm_mxfp8_dglu, go_row)
+        grad_probs, gl_row, gl_row_scale, gl_col, gl_col_scale = dglu(
             go_row,
             w2_col,
             go_row_scale,

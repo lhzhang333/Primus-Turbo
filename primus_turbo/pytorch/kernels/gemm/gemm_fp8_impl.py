@@ -300,6 +300,32 @@ def _mx1250_can_handle(a, sa, b, sb, out_dtype, accumulate, out, kw) -> bool:
     return ok and mx1250_out_ok(out, (m, n), accumulate, out_dtype)
 
 
+def mx1250_gemm_direct(a, sa, b, sb, out_dtype, b_preshuffled=False, out=None):
+    """``gemm_fp8_impl`` (NT, MX) or, with ``out``, ``gemm_fp8_accum_impl`` (beta=1 into ``out``) as a direct call
+    of gfx1250's ``gemm_mxfp8_gfx1250``: the kernel call the dispatcher makes through its default backend (FlyDSL)
+    when that backend's ``can_handle`` (``_mx1250_can_handle``) takes it, without torch.library's per-call dispatch
+    or the dispatcher's. None, and the caller runs the custom op, off gfx1250, under torch.compile, for tensor
+    subclasses (e.g. fake tensors), with an FP8 GEMM backend pinned or auto-tune on, or where FlyDSL would not take
+    the call."""
+    if not is_gfx1250() or torch.compiler.is_compiling():
+        return None
+    if any(t is not None and type(t) is not torch.Tensor for t in (a, sa, b, sb, out)):
+        return None
+    pinned = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
+    if pinned is not None and (pinned.backend is not None or pinned.auto_tune):
+        return None
+    if GlobalBackendManager.auto_tune_enabled():
+        return None
+    accumulate = out is not None
+    if not _mx1250_can_handle(a, sa, b, sb, out_dtype, accumulate, out, {"b_preshuffled": b_preshuffled}):
+        return None
+    if not accumulate:
+        return mx1250_gemm()(a, sa, b, sb, b_preshuffled=b_preshuffled)
+    mx1250_gemm()(a, sa, b, sb, out_dtype=out.dtype, out=out, accumulate=True, b_preshuffled=b_preshuffled)
+    torch.autograd.graph.increment_version(out)  # as the custom op's mutation of ``out`` does
+    return out
+
+
 class GEMMFP8TritonBackend(KernelBackend):
     """Triton persistent-kernel backend for FP8 GEMM.
 

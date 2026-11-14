@@ -234,6 +234,7 @@ def test_operand_recipe_checks(monkeypatch):
         return torch.empty(32, 64)
 
     monkeypatch.setattr(gemm_fp8_mod, "check_mxfp8_support", lambda: (True, ""))
+    monkeypatch.setattr(gemm_fp8_mod, "mx1250_gemm_direct", lambda *args, **kw: None)
     monkeypatch.setattr(gemm_fp8_mod, "gemm_fp8_impl", gemm)
     raw_a, raw_w, mx_w = ScalingRecipe(), ScalingRecipe(use_2d_block=True), ops_utils.MX_W
     a = QuantizedTensorPair(_qt((32, 64), raw_a), _qt((32, 64), raw_w, axis=-2))  # a_t: 2-D blocks
