@@ -24,9 +24,10 @@ workgroup in straight-line code and masked off with ``live`` where it has nothin
 workgroups, pool blocks past this call's tile count): a dynamic branch over the TDM pipeline
 is what the grouped kernel's ``dead_tile_exit`` found to fault intermittently.
 
-Every workgroup is ``m_warp * n_warp`` wave32 waves; the comm role runs the shared
-``dispatch_bf16_tile`` on that many threads (one hardware wave per copy). ``DISPATCH_ONLY`` compiles
-the GEMM role out: the launch is the comm workgroups and one workgroup that waits for every sender.
+Every workgroup is ``m_warp * n_warp`` wave32 waves. The comm role runs on that many threads: the shared
+``dispatch_bf16_tile`` (64-lane copy warps, expert by expert) next to the GEMM tiles, and
+``dispatch_tile_batched`` (one hardware wave per copy, batches of rows in flight) in the ``DISPATCH_ONLY``
+launch, which compiles the GEMM role out: the comm workgroups and one workgroup that waits for every sender.
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHa
 from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
     dispatch_bf16_tile,
     dispatch_table_lds_words,
+    dispatch_tile_batched,
     spin_until_flag_reaches,
 )
 from primus_turbo.flydsl.mega.gfx1250.prims import CPOL_DEVICE, cast, ld, st
@@ -202,28 +204,56 @@ def _launch_dispatch_gemm_nt(
         expected = ld(epoch_slot, fx.Int32(1), dtype=fx.T.i64)
 
         if bid < fx.Int32(NUM_CHUNKS * NUM_RANKS):
-            dispatch_bf16_tile(
-                sym_buffer,
-                workspace,
-                thread_index=tid,
-                block_index=bid,
-                hidden_size=HIDDEN,
-                input_res=create_buffer_resource_from_addr(_addr(arg_x)),
-                expert_send_dst_rank_res=create_buffer_resource_from_addr(_addr(arg_send_dst_rank)),
-                expert_send_count_res=create_buffer_resource_from_addr(_addr(arg_send_count)),
-                expert_send_offset_res=create_buffer_resource_from_addr(_addr(arg_send_offset)),
-                dispatched_token_idx_res=create_buffer_resource_from_addr(_addr(arg_dispatched_token_idx)),
-                dispatch_parity=parity,
-                dispatch_chunk_counter_ptr=_addr(arg_chunk_counter),
-                num_chunks=NUM_CHUNKS,
-                num_ranks=NUM_RANKS,
-                num_experts_per_rank=num_experts_per_rank,
-                rank=RANK,
-                lds_base=_addr(base_ptr),
-                block_threads=block,
-                experts_per_publish=EXPERTS_PER_PUBLISH,
-                scale_res=create_buffer_resource_from_addr(_addr(arg_x_scale)) if const_expr(MX) else None,
-            )
+            if const_expr(DISPATCH_ONLY):
+                dispatch_tile_batched(
+                    sym_buffer,
+                    workspace,
+                    thread_index=tid,
+                    block_index=bid,
+                    hidden_size=HIDDEN,
+                    input_res=create_buffer_resource_from_addr(_addr(arg_x)),
+                    expert_send_dst_rank_res=create_buffer_resource_from_addr(_addr(arg_send_dst_rank)),
+                    expert_send_count_res=create_buffer_resource_from_addr(_addr(arg_send_count)),
+                    expert_send_offset_res=create_buffer_resource_from_addr(_addr(arg_send_offset)),
+                    dispatched_token_idx_res=create_buffer_resource_from_addr(
+                        _addr(arg_dispatched_token_idx)
+                    ),
+                    dispatch_parity=parity,
+                    dispatch_chunk_counter_ptr=_addr(arg_chunk_counter),
+                    num_chunks=NUM_CHUNKS,
+                    num_ranks=NUM_RANKS,
+                    num_experts_per_rank=num_experts_per_rank,
+                    rank=RANK,
+                    lds_base=_addr(base_ptr),
+                    block_threads=block,
+                    experts_per_publish=EXPERTS_PER_PUBLISH,
+                    scale_res=create_buffer_resource_from_addr(_addr(arg_x_scale))
+                    if const_expr(MX)
+                    else None,
+                )
+            else:
+                dispatch_bf16_tile(
+                    sym_buffer,
+                    workspace,
+                    thread_index=tid,
+                    block_index=bid,
+                    hidden_size=HIDDEN,
+                    input_res=create_buffer_resource_from_addr(_addr(arg_x)),
+                    expert_send_dst_rank_res=create_buffer_resource_from_addr(_addr(arg_send_dst_rank)),
+                    expert_send_count_res=create_buffer_resource_from_addr(_addr(arg_send_count)),
+                    expert_send_offset_res=create_buffer_resource_from_addr(_addr(arg_send_offset)),
+                    dispatched_token_idx_res=create_buffer_resource_from_addr(
+                        _addr(arg_dispatched_token_idx)
+                    ),
+                    dispatch_parity=parity,
+                    dispatch_chunk_counter_ptr=_addr(arg_chunk_counter),
+                    num_chunks=NUM_CHUNKS,
+                    num_ranks=NUM_RANKS,
+                    num_experts_per_rank=num_experts_per_rank,
+                    rank=RANK,
+                    block_threads=block,
+                    experts_per_publish=EXPERTS_PER_PUBLISH,
+                )
 
         pid = bid - fx.Int32(NUM_DISPATCH_CU)
         if const_expr(DISPATCH_ONLY):

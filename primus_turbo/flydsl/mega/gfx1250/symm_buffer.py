@@ -405,7 +405,7 @@ class SymmBuffer:
         self._sym_buffer = None  # cached so its peer-delta table stays alive with this heap
 
     def dispatch_fp8_views(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """The dispatch token buffer as MXFP8 tokens (``ep_intranode.dispatch_bf16_tile`` with scales):
+        """The dispatch token buffer as MXFP8 tokens (``ep_intranode.dispatch_tile_batched`` with scales):
         E4M3 rows ``[R, hidden]``, then their raw E8M0 scale rows ``[R, hidden / 32]`` (uint8), R the
         receive rows; both fit the bf16-sized region, so the heap layout is the bf16 one."""
         rows, hidden = self.dispatch_token_buffer.shape
