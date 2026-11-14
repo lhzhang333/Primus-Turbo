@@ -13,7 +13,7 @@
 
 """Host side of the gfx1250 MLA flash-attention backward: shape rules, launch plan, entry point.
 
-k_delta_bshd (bwd_delta_kernel: delta and the row constants NL / ND), then per head chunk k_dkdv96ds (bwd_dkdv_kernel:
+k_delta_bshd (bwd_delta_kernel: the row constants NL / ND), then per head chunk k_dkdv96ds (bwd_dkdv_kernel:
 dK and dV over 96-row kv blocks, and every bf16 dS^T tile it feeds its dK WMMA also into a scratch) and k_dqds
 (bwd_dq_kernel: dQ = dS K from that scratch), so S and dP are computed once.
 
@@ -151,21 +151,19 @@ def _launches(dout, q, k, v, out, lse, softmax_scale, causal, stream):
     """(launcher, args) of every launch in issue order, and the (dq, dk, dv) they write: k_delta_bshd, then
     k_dkdv96ds and k_dqds per head chunk. torch.OutOfMemoryError when even one head's scratch cannot be allocated."""
     delta_launch, bufs = _delta_launch(dout, q, k, v, out, lse, softmax_scale, stream)
-    return [delta_launch] + _chunk_launches(dout, q, k, v, softmax_scale, causal, stream, bufs), bufs[3:]
+    return [delta_launch] + _chunk_launches(dout, q, k, v, softmax_scale, causal, stream, bufs), bufs[2:]
 
 
 def _delta_launch(dout, q, k, v, out, lse, softmax_scale, stream):
-    """The k_delta_bshd launch and the buffers of the whole backward but the scratch: (delta, NL, ND, dq, dk, dv)."""
+    """The k_delta_bshd launch and the buffers of the whole backward but the scratch: (NL, ND, dq, dk, dv)."""
     b, sq, h, _ = q.shape
-    delta = torch.empty((b, h, sq), device=q.device, dtype=torch.float32)
-    nl = torch.empty_like(delta)  # -LOG2E * lse
-    nd = torch.empty_like(delta)  # -scale * delta
-    bufs = (delta, nl, nd, q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape))
+    nl = torch.empty((b, h, sq), device=q.device, dtype=torch.float32)  # -LOG2E * lse
+    nd = torch.empty_like(nl)  # -scale * rowsum(dO * O)
+    bufs = (nl, nd, q.new_empty(q.shape), k.new_empty(k.shape), v.new_empty(v.shape))
     launch = _positional(
         _delta.launch_delta,
         DO=dout,
         O=out,
-        DEL=delta,
         LSE=lse,
         NL=nl,
         ND=nd,
@@ -173,7 +171,7 @@ def _delta_launch(dout, q, k, v, out, lse, softmax_scale, stream):
         S=sq,
         H=h,
         n_rows=b * sq * h,
-        nsblk=sq // _delta.ROWS_DELTA,
+        nsblk=-(-sq // _delta.ROWS_DELTA),
         nbh=b * h,
         stream=stream,
     )
@@ -183,7 +181,7 @@ def _delta_launch(dout, q, k, v, out, lse, softmax_scale, stream):
 def _chunk_launches(dout, q, k, v, softmax_scale, causal, stream, bufs):
     """The dS scratch (the backward's last allocation: when it fits, the backward fits) and the k_dkdv96ds / k_dqds
     launches of each head chunk, in issue order."""
-    _, nl, nd, dq, dk, dv = bufs
+    nl, nd, dq, dk, dv = bufs
     b, sq, h, _ = q.shape
     skv = k.shape[1]
     c = int(bool(causal))
@@ -382,4 +380,4 @@ def flash_attn_mla_bwd(
             _launch(launcher, args)
         if side is not None:
             stream.wait_stream(side)
-    return bufs[3:]
+    return bufs[2:]

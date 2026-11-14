@@ -11,10 +11,10 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""k_delta_bshd of the gfx1250 MLA attention backward: delta = rowsum(dO * O) and the row constants of the dK / dV
-kernel, NL = -LOG2E * lse and ND = -scale * delta.
+"""k_delta_bshd of the gfx1250 MLA attention backward: the row constants of the dK / dV kernel, NL = -LOG2E * lse and
+ND = -scale * delta with delta = rowsum(dO * O).
 
-o / do are [B, S, H, D_V] bf16; lse (natural log), delta, NL and ND are [B, H, S] fp32.
+o / do are [B, S, H, D_V] bf16; lse (natural log), NL and ND are [B, H, S] fp32.
 """
 
 import flydsl.compiler as flyc
@@ -37,7 +37,7 @@ WAVE = 32
 DELTA_THREADS = 256
 LANES_PER_ROW = D_V // 8
 ROWS_PER_PASS = DELTA_THREADS // LANES_PER_ROW
-ROWS_DELTA = 32  # queries per k_delta workgroup
+ROWS_DELTA = 128  # queries per k_delta workgroup (32 or 64: 1.3x / 2x slower at the DSv3 shape)
 PASSES_PER_WG = ROWS_DELTA // ROWS_PER_PASS
 
 
@@ -79,7 +79,6 @@ def _lds_barrier():
 def k_delta_bshd(
     DO: fx.Tensor,
     O: fx.Tensor,
-    DEL: fx.Tensor,
     LSE: fx.Tensor,
     NL: fx.Tensor,
     ND: fx.Tensor,
@@ -99,7 +98,6 @@ def k_delta_bshd(
     h = bh - b * H
     g_do = _bv(DO, n_rows * (D_V * 2), fx.BFloat16, 8)
     g_o = _bv(O, n_rows * (D_V * 2), fx.BFloat16, 8)
-    g_delta = _bv(DEL, n_rows * 4, fx.Float32)
     g_lse = _bv(LSE, n_rows * 4, fx.Float32)
     g_nl = _bv(NL, n_rows * 4, fx.Float32)
     g_nd = _bv(ND, n_rows * 4, fx.Float32)
@@ -137,8 +135,8 @@ def k_delta_bshd(
     l32 = tid % fx.Int32(ROWS_DELTA)
     v = fx.Float32(llvm.load(fx.Float32.ir_type, lds_ptr(lds0 + l32 * fx.Int32(4))))
     dst = bh * S + s0 + l32
-    w0 = tid < fx.Int32(ROWS_DELTA)
-    _st1(v, g_delta, w0.select(dst, n_rows), fx.Float32)
+    # (seqlen is a multiple of 64, not of ROWS_DELTA: the last block's rows past S are not stored)
+    w0 = (tid < fx.Int32(ROWS_DELTA)) & (s0 + l32 < S)
     _st1(v * (fx.Float32(0.0) - scale), g_nd, w0.select(dst, n_rows), fx.Float32)
     lse_r = _ld1(g_lse, dst, fx.Float32)
     _st1(lse_r * fx.Float32(-LOG2E), g_nl, w0.select(dst, n_rows), fx.Float32)
@@ -148,7 +146,6 @@ def k_delta_bshd(
 def launch_delta(
     DO,
     O,
-    DEL,
     LSE,
     NL,
     ND,
@@ -161,7 +158,7 @@ def launch_delta(
     stream: fx.Stream,
 ):
     _ = SOURCE_DIGEST  # FlyDSL disk-cache key
-    # grid = (S / ROWS_DELTA query blocks, B * H heads)
-    k_delta_bshd(DO, O, DEL, LSE, NL, ND, scale, S, H, n_rows).launch(
+    # grid = (ceil(S / ROWS_DELTA) query blocks, B * H heads)
+    k_delta_bshd(DO, O, LSE, NL, ND, scale, S, H, n_rows).launch(
         grid=(nsblk, nbh, 1), block=(DELTA_THREADS, 1, 1), stream=stream
     )

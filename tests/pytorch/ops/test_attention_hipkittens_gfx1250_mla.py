@@ -693,13 +693,12 @@ def test_hk_delta_matches_flydsl(dims, special):
     name, grid, values = launches[0]
     stream = torch.cuda.current_stream()
     hk._mla_kernel(name)(grid, values, stream)
-    delta, nl, nd = (torch.full((b, h, s), float("nan"), device="cuda") for _ in range(3))
+    nl, nd = (torch.full((b, h, s), float("nan"), device="cuda") for _ in range(2))
     fly._launch(
         bwd_delta_kernel.launch_delta,
         (
             do,
             o,
-            delta,
             lse,
             nl,
             nd,
@@ -707,7 +706,7 @@ def test_hk_delta_matches_flydsl(dims, special):
             s,
             h,
             b * s * h,
-            s // bwd_delta_kernel.ROWS_DELTA,
+            -(-s // bwd_delta_kernel.ROWS_DELTA),
             b * h,
             stream,
         ),
@@ -716,6 +715,7 @@ def test_hk_delta_matches_flydsl(dims, special):
         assert not torch.isnan(x).any(), label
         assert torch.equal(x.view(torch.int32), y.view(torch.int32)), label
     if special:
+        delta = (do.float() * o.float()).sum(-1).transpose(1, 2)  # rowsum(dO * O), [B, H, S]
         tiny = (delta != 0) & (delta.abs() < torch.finfo(torch.float32).tiny)
         assert tiny.any(), "no denormal delta: the inputs do not reach the fp32 denormal range"
 
