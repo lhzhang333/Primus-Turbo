@@ -161,22 +161,22 @@ def _cvt16(words, byte, rule_c, swap=None):
     return swap.select(out[1].shuffle(out[0], [0, 1, 2, 3]), out[0].shuffle(out[1], [0, 1, 2, 3]))
 
 
-def _store16(rsrc, off, codes, ok, room, width, cm=0):
+def _store16(rsrc, off, codes, ok, room, width):
     """16 code bytes at byte offset ``off``; ``width`` < 16 stores only the first ``room`` bytes."""
     if const_expr(width == 16):
-        buffer_store(codes, rsrc, off, mask=ok, offset_is_bytes=True, cache_modifier=cm)
+        buffer_store(codes, rsrc, off, mask=ok, offset_is_bytes=True)
         return
     vals = codes.bitcast(fx.Int32 if width == 4 else fx.Int8)
     for s in range_constexpr(16 // width):
-        buffer_store(vals[s], rsrc, off + I32(s * width), mask=ok & (I32((s + 1) * width) <= room), cache_modifier=cm,
+        buffer_store(vals[s], rsrc, off + I32(s * width), mask=ok & (I32((s + 1) * width) <= room),
                      offset_is_bytes=True)
 
 
-def _store_byte(rsrc, off, byte, ok, cm=0):
-    buffer_store(ArithValue(_raw(byte)).trunci(T.i8), rsrc, off, mask=ok, offset_is_bytes=True, cache_modifier=cm)
+def _store_byte(rsrc, off, byte, ok):
+    buffer_store(ArithValue(_raw(byte)).trunci(T.i8), rsrc, off, mask=ok, offset_is_bytes=True)
 
 
-def _tdm_load(lds, gaddr, cols, rows, stride, cm=0):
+def _tdm_load(lds, gaddr, cols, rows, stride):
     """TDM load of a BM x BK bf16 tile at ``gaddr`` (row stride ``stride`` elements) into LDS at
     ``lds``; ``cols`` / ``rows`` (from the tile start) bound it, the rest of the tile is zero."""
     g0 = [I32(1), lds, I32(gaddr), I32(gaddr >> I64(32)) | I32(-(1 << 31))]
@@ -192,7 +192,7 @@ def _tdm_load(lds, gaddr, cols, rows, stride, cm=0):
     ]
     vec = [_vector.from_elements(T.vec(len(g), T.i32), [_raw(v) for v in g]) for g in (g0, g1)]
     z4, z8 = _raw(Vec.filled(4, 0, I32)), _raw(Vec.filled(8, 0, I32))
-    rocdl.tensor_load_to_lds(vec[0], vec[1], z4, z4, z8, cache_policy=cm)
+    rocdl.tensor_load_to_lds(vec[0], vec[1], z4, z4, z8)
 
 
 def _group_scan(arg_go, mc0, G, lane):
@@ -285,7 +285,6 @@ def _launch(
     RULE_C: Constexpr[int],
     G: Constexpr[int],
     WM: Constexpr[int],
-    CPOL: Constexpr[int],
     KO: Constexpr[int],
     PADM: Constexpr[int],
     ACT: Constexpr[str],
@@ -306,7 +305,6 @@ def _launch(
     TILE = BM * PITCH
     O_SR = NTILE * TILE  # scale bytes: the row copy's [BM][4], then the column copy's [BK][4]
     O_SC, O_TAB = O_SR + BM * 4, O_SR + (BM + BK) * 4
-    CST = CPOL & 31  # output stores' cache policy (gfx12 TH | SCOPE << 3); CPOL >> 5: the TDM loads'
     FULLM = EXP or PADM  # the column copy holds whole 128-token tiles
     # LAY: packed scales [rows/32][K/128][32][4] for the row (1) / column (2) copy, 16x16-preshuffled codes
     # [rows/16][K/16][16][16] for the row (4) / column (8) copy (the gfx1250 MX GEMM's fast layouts)
@@ -365,7 +363,7 @@ def _launch(
             if const_expr(PROD in (P_DENSE, P_GROUPED, P_NORM)):
                 xs = i32_t if PROD == P_NORM else I32(K)  # row stride of x (elements)
                 if wave == I32(0):
-                    _tdm_load(base, _addr(arg_x) + (row0 * I64(xs) + I64(k0)) * I64(2), cols, nreal, xs, CPOL >> 5)
+                    _tdm_load(base, _addr(arg_x) + (row0 * I64(xs) + I64(k0)) * I64(2), cols, nreal, xs)
                     rocdl.s_wait_tensorcnt(0)
             elif const_expr(PROD in (P_GLU, P_DGLU)):  # gate / up halves of l1, then dact
                 l1 = _addr(arg_x2 if PROD == P_DGLU else arg_x) + (row0 * I64(2 * K) + I64(k0)) * I64(2)
@@ -373,7 +371,7 @@ def _launch(
                     src = [l1, l1 + I64(2 * K), _addr(arg_x) + (row0 * I64(K) + I64(k0)) * I64(2)]
                     for w in range_constexpr(NTILE):
                         if wave == I32(w):
-                            _tdm_load(base + I32(w * TILE), src[w], cols, nreal, K if w == 2 else 2 * K, CPOL >> 5)
+                            _tdm_load(base + I32(w * TILE), src[w], cols, nreal, K if w == 2 else 2 * K)
                     rocdl.s_wait_tensorcnt(0)
             else:  # gather: row r is x[dest2src[in0 + r]], one 16-byte async load per lane and chunk
                 ri = _rsrc(_addr(arg_x2), i32_m * I32(4))
@@ -476,9 +474,9 @@ def _launch(
                         ok = (r < nrows) & (col < I32(KV))
                         if const_expr(SR):
                             off = ((r >> I32(4)) * I32(OW // 16) + ((ocol + col) >> I32(4))) * I32(256) + (r & I32(15)) * I32(16)
-                            _store16(qr, off, codes, ok, I32(16), 16, CST)
+                            _store16(qr, off, codes, ok, I32(16), 16)
                         else:
-                            _store16(qr, r * I32(OW) + ocol + col, codes, ok, I32(KV) - col, WK, CST)
+                            _store16(qr, r * I32(OW) + ocol + col, codes, ok, I32(KV) - col, WK)
                         if h == I32(0):
                             _lds_st(base + I32(O_SR) + r * I32(4) + kb, ArithValue(_raw(byte)).trunci(T.i8), 1)
                 # ---- cols phase: lane = (column of an 8-column chunk, 16 rows of a 64-row slab); codes and
@@ -526,7 +524,7 @@ def _launch(
                             c, q16 = idx // I32(8), (idx % I32(8)) * I32(16)
                             off, w = c * i32_mc + mc0 + q16, width
                         v = _lds_v4(sb + c * I32(CPITCH) + q16)
-                        _store16(qc, off, v, (c < ncol) & (q16 < mroom), mroom - q16, w, CST)
+                        _store16(qc, off, v, (c < ncol) & (q16 < mroom), mroom - q16, w)
                 rs = t % I32(BM)  # lanes 0..127: row rs of the row copy's scales; 128..255: of the column copy's
                 sbyte = I32(_llvm.LoadOp(T.i32, _lds_ptr(base + I32(O_SR) + t * I32(4)), alignment=4).result)
                 if t < I32(BM):
@@ -537,17 +535,15 @@ def _launch(
                             n32 = ((nreal + I32(31)) >> I32(5)) << I32(5)
                             sr = _rsrc(_addr(arg_sr) + gbase * I64(RT * 128), (n32 >> I32(5)) * I32(RT * 128))
                             off = ((rs >> I32(5)) * I32(RT) + kbg // I32(4)) * I32(128) + (rs & I32(31)) * I32(4)
-                            buffer_store((rs < nrows).select(sbyte, I32(0)), sr, off, mask=rs < n32, offset_is_bytes=True,
-                                         cache_modifier=CST)
+                            buffer_store((rs < nrows).select(sbyte, I32(0)), sr, off, mask=rs < n32, offset_is_bytes=True)
                         else:
                             sr = _rsrc(_addr(arg_sr) + rowbase * I64(KBO), nrows * I32(KBO))
                             if const_expr(OW % BK == 0 and KV % BK == 0):  # 4 whole, dword-aligned bytes per row
-                                buffer_store(sbyte, sr, rs * I32(KBO) + kbg, mask=rs < nrows, offset_is_bytes=True,
-                                             cache_modifier=CST)
+                                buffer_store(sbyte, sr, rs * I32(KBO) + kbg, mask=rs < nrows, offset_is_bytes=True)
                             else:
                                 for b in range_constexpr(4):
                                     ok = (rs < nrows) & ((k0 + I32(32 * b)) < I32(KV))
-                                    _store_byte(sr, rs * I32(KBO) + kbg + I32(b), sbyte >> I32(8 * b), ok, CST)
+                                    _store_byte(sr, rs * I32(KBO) + kbg + I32(b), sbyte >> I32(8 * b), ok)
                 elif const_expr(OUT & O_COLS):
                     if const_expr(PC):  # rows past the columns of x: zero bytes (as mxfp8_ref.pack_scales pads)
                         ct = (mcb + I32(3)) >> I32(2)  # 128-token steps of the column copy
@@ -555,17 +551,15 @@ def _launch(
                         c32 = ((ncol + I32(31)) >> I32(5)) << I32(5)
                         sc = _rsrc(_addr(arg_sc) + gbase * I64(ct) * I64(128), (c32 >> I32(5)) * ct * I32(128))
                         off = ((rs >> I32(5)) * ct + mt) * I32(128) + (rs & I32(31)) * I32(4)
-                        buffer_store((rs < ncol).select(sbyte, I32(0)), sc, off, mask=rs < c32, offset_is_bytes=True,
-                                     cache_modifier=CST)
+                        buffer_store((rs < ncol).select(sbyte, I32(0)), sc, off, mask=rs < c32, offset_is_bytes=True)
                     else:
                         sc = _rsrc(_addr(arg_sc) + cbase * I64(mcb), ncol * mcb)
                         if (mcb % I32(4) == I32(0)) & ((nreal == I32(BM)) | fx.Boolean(bool(FULLM))):
-                            buffer_store(sbyte, sc, rs * mcb + mt * I32(4), mask=rs < ncol, offset_is_bytes=True,
-                                         cache_modifier=CST)
+                            buffer_store(sbyte, sc, rs * mcb + mt * I32(4), mask=rs < ncol, offset_is_bytes=True)
                         else:
                             for b in range_constexpr(4):
                                 ok = (rs < ncol) & (I32(32 * b) < (I32(BM) if FULLM else nreal))
-                                _store_byte(sc, rs * mcb + mt * I32(4) + I32(b), sbyte >> I32(8 * b), ok, CST)
+                                _store_byte(sc, rs * mcb + mt * I32(4) + I32(b), sbyte >> I32(8 * b), ok)
                 if const_expr(hf + 1 < HALVES):
                     gpu.barrier()  # the scale bytes and the stage are rewritten by the next half
 
@@ -574,7 +568,6 @@ def _launch(
 
 
 _COMPILED: dict = {}
-CACHE_POLICY = 0  # stores | TDM loads << 5 (gfx12 TH | SCOPE << 3 each); 0 = default write-back
 _E8 = getattr(torch, "float8_e8m0fnu", torch.uint8)
 _ZERO: dict = {}
 PACK_ROW, PACK_COL, SHUF_ROW, SHUF_COL = 1, 2, 4, 8  # ``layout`` bits (the kernel's LAY)
@@ -605,8 +598,8 @@ def _run(prod, out, rule, x, outs, m, mc, m_tiles, k, ko=0, b2d=0, padm=0, go=No
     grid = m_tiles * -(-k // BK)
     if grid == 0 or batch == 0:
         return
-    tail = (k, prod, out, b2d, RULES[rule], 0 if go is None else go.shape[0] - 1, _width(mc), CACHE_POLICY, ko or k,
-            padm, act, float(clamp or 0.0), int(dbg is not None or (prod == P_GATHER and p is not None)), lay,
+    tail = (k, prod, out, b2d, RULES[rule], 0 if go is None else go.shape[0] - 1, _width(mc), ko or k, padm, act,
+            float(clamp or 0.0), int(dbg is not None or (prod == P_GATHER and p is not None)), lay,
             int(p is None and prod in (P_GLU, P_DGLU)))
     dev = x.get_device()
     zero = _ZERO.get(dev)
