@@ -77,6 +77,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe.py",
     # The same op across every visible GPU (EP2+).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe_ep.py",
+    # Triton RMSNorm (primus_turbo/triton/normalization): fixed backward launch configs on gfx1250.
+    "tests/pytorch/ops/test_normalization.py",
 )
 
 

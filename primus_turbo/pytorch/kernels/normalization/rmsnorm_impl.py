@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.triton.normalization.rmsnorm_kernel import (
     rmsnorm_bwd_finalize_kernel,
     rmsnorm_bwd_kernel_grid_stride,
@@ -80,6 +81,10 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
     wide_row = H >= 16384 or (BLOCK_H == 8192 and H <= 8192)
     half_wave = rows_per_program <= 13 and wide_row
     grid = min(B, _num_cus() // 2 if half_wave else _num_cus())
+    if is_gfx1250():
+        # A fixed launch config instead of the autotune: each process picks its own winner (the candidates time within
+        # ~1% of each other), and num_warps sets the order of tl.sum, so dx's last bits could differ across ranks.
+        return "grid", BLOCK_H, grid, (8 if BLOCK_H >= 4096 else 4), 1
     return "grid", BLOCK_H, grid, 0, 0
 
 
@@ -214,7 +219,10 @@ def rmsnorm_bwd_impl(
     else:  # "grid": persistent grid-stride
         num_programs = GR
         dg_partial = torch.empty(num_programs, H, device=x2.device, dtype=torch.float32)
-        rmsnorm_bwd_kernel_grid_stride[(num_programs,)](
+        kernel, launch = rmsnorm_bwd_kernel_grid_stride, {}
+        if num_warps:  # a fixed launch config (gfx1250): the kernel without its autotuner
+            kernel, launch = kernel.fn, dict(num_warps=num_warps, num_stages=num_stages)
+        kernel[(num_programs,)](
             dy2,
             x2,
             gamma,
@@ -233,6 +241,7 @@ def rmsnorm_bwd_impl(
             BLOCK_H=BLOCK_H,
             num_programs=num_programs,
             ZERO_CENTERED=zero_centered,
+            **launch,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
@@ -372,7 +381,10 @@ def rmsnorm_bwd_residual_impl(
     else:  # "grid": persistent grid-stride
         num_programs = GR
         dg_partial = torch.empty(num_programs, H, device=x_plus_r.device, dtype=torch.float32)
-        rmsnorm_bwd_residual_kernel_grid_stride[(num_programs,)](
+        kernel, launch = rmsnorm_bwd_residual_kernel_grid_stride, {}
+        if num_warps:  # a fixed launch config (gfx1250): the kernel without its autotuner
+            kernel, launch = kernel.fn, dict(num_warps=num_warps, num_stages=num_stages)
+        kernel[(num_programs,)](
             dy2,
             dxpr2,
             x_plus_r,
@@ -393,6 +405,7 @@ def rmsnorm_bwd_residual_impl(
             H=H,
             BLOCK_H=BLOCK_H,
             num_programs=num_programs,
+            **launch,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
