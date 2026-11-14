@@ -24,8 +24,10 @@ workgroup in straight-line code and masked off with ``live`` where it has nothin
 workgroups, pool blocks past this call's tile count): a dynamic branch over the TDM pipeline
 is what the grouped kernel's ``dead_tile_exit`` found to fault intermittently.
 
-Every workgroup is ``m_warp * n_warp`` wave32 waves; the comm role runs the shared
-``dispatch_bf16_tile`` on that many threads (64-lane copy warps).
+Every workgroup is ``m_warp * n_warp`` wave32 waves. The comm role runs on that many threads: the shared
+``dispatch_bf16_tile`` (64-lane copy warps, expert by expert) next to the GEMM tiles, and
+``dispatch_tile_batched`` (one hardware wave per copy, batches of rows in flight) in the ``DISPATCH_ONLY``
+launch, which compiles the GEMM role out: the comm workgroups and one workgroup that waits for every sender.
 """
 
 from __future__ import annotations
@@ -55,6 +57,8 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
 from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
 from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
     dispatch_bf16_tile,
+    dispatch_table_lds_words,
+    dispatch_tile_batched,
     spin_until_flag_reaches,
 )
 from primus_turbo.flydsl.mega.gfx1250.prims import CPOL_DEVICE, cast, ld, st
@@ -77,6 +81,7 @@ def _addr(p):
 def _launch_dispatch_gemm_nt(
     arg_out: fx.Pointer,
     arg_x: fx.Pointer,
+    arg_x_scale: fx.Pointer,
     arg_w: fx.Pointer,
     arg_token_buffer: fx.Pointer,
     arg_row_idx: fx.Pointer,
@@ -116,12 +121,17 @@ def _launch_dispatch_gemm_nt(
     issue_first: Constexpr[int],
     wmma_b2b: Constexpr[int],
     lds_cosched: Constexpr[int],
+    MX: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
-    arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
+    if MX and not DISPATCH_ONLY:
+        raise ValueError("MXFP8 tokens only go through the dispatch-only launch (the GEMM tile is bf16)")
+    num_experts_per_rank = NUM_EXPERTS // NUM_RANKS
+    # the comm role's send table sits at the arena base; DISPATCH_ONLY holds nothing else
+    comm_bytes = dispatch_table_lds_words(num_experts_per_rank, block) * 4
+    arena_bytes = max(comm_bytes, 0 if DISPATCH_ONLY else tile_geometry(tile_m, tile_n, tile_k, B_NN)[3])
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
-    num_experts_per_rank = NUM_EXPERTS // NUM_RANKS
     if DISPATCH_ONLY and num_experts_per_rank > block:
         raise ValueError(
             f"the dispatch-only wait gives each of {num_experts_per_rank} experts a lane of {block}"
@@ -150,6 +160,7 @@ def _launch_dispatch_gemm_nt(
     def dispatch_gemm_nt(
         arg_out: fx.Pointer,
         arg_x: fx.Pointer,
+        arg_x_scale: fx.Pointer,
         arg_w: fx.Pointer,
         arg_token_buffer: fx.Pointer,
         arg_row_idx: fx.Pointer,
@@ -193,30 +204,58 @@ def _launch_dispatch_gemm_nt(
         expected = ld(epoch_slot, fx.Int32(1), dtype=fx.T.i64)
 
         if bid < fx.Int32(NUM_CHUNKS * NUM_RANKS):
-            dispatch_bf16_tile(
-                sym_buffer,
-                workspace,
-                thread_index=tid,
-                block_index=bid,
-                hidden_size=HIDDEN,
-                input_res=create_buffer_resource_from_addr(_addr(arg_x)),
-                expert_send_dst_rank_res=create_buffer_resource_from_addr(_addr(arg_send_dst_rank)),
-                expert_send_count_res=create_buffer_resource_from_addr(_addr(arg_send_count)),
-                expert_send_offset_res=create_buffer_resource_from_addr(_addr(arg_send_offset)),
-                dispatched_token_idx_res=create_buffer_resource_from_addr(_addr(arg_dispatched_token_idx)),
-                dispatch_parity=parity,
-                dispatch_chunk_counter_ptr=_addr(arg_chunk_counter),
-                num_chunks=NUM_CHUNKS,
-                num_ranks=NUM_RANKS,
-                num_experts_per_rank=num_experts_per_rank,
-                rank=RANK,
-                block_threads=block,
-                experts_per_publish=EXPERTS_PER_PUBLISH,
-            )
+            if const_expr(DISPATCH_ONLY):
+                dispatch_tile_batched(
+                    sym_buffer,
+                    workspace,
+                    thread_index=tid,
+                    block_index=bid,
+                    hidden_size=HIDDEN,
+                    input_res=create_buffer_resource_from_addr(_addr(arg_x)),
+                    expert_send_dst_rank_res=create_buffer_resource_from_addr(_addr(arg_send_dst_rank)),
+                    expert_send_count_res=create_buffer_resource_from_addr(_addr(arg_send_count)),
+                    expert_send_offset_res=create_buffer_resource_from_addr(_addr(arg_send_offset)),
+                    dispatched_token_idx_res=create_buffer_resource_from_addr(
+                        _addr(arg_dispatched_token_idx)
+                    ),
+                    dispatch_parity=parity,
+                    dispatch_chunk_counter_ptr=_addr(arg_chunk_counter),
+                    num_chunks=NUM_CHUNKS,
+                    num_ranks=NUM_RANKS,
+                    num_experts_per_rank=num_experts_per_rank,
+                    rank=RANK,
+                    lds_base=_addr(base_ptr),
+                    block_threads=block,
+                    experts_per_publish=EXPERTS_PER_PUBLISH,
+                    scale_res=create_buffer_resource_from_addr(_addr(arg_x_scale))
+                    if const_expr(MX)
+                    else None,
+                )
+            else:
+                dispatch_bf16_tile(
+                    sym_buffer,
+                    workspace,
+                    thread_index=tid,
+                    block_index=bid,
+                    hidden_size=HIDDEN,
+                    input_res=create_buffer_resource_from_addr(_addr(arg_x)),
+                    expert_send_dst_rank_res=create_buffer_resource_from_addr(_addr(arg_send_dst_rank)),
+                    expert_send_count_res=create_buffer_resource_from_addr(_addr(arg_send_count)),
+                    expert_send_offset_res=create_buffer_resource_from_addr(_addr(arg_send_offset)),
+                    dispatched_token_idx_res=create_buffer_resource_from_addr(
+                        _addr(arg_dispatched_token_idx)
+                    ),
+                    dispatch_parity=parity,
+                    dispatch_chunk_counter_ptr=_addr(arg_chunk_counter),
+                    num_chunks=NUM_CHUNKS,
+                    num_ranks=NUM_RANKS,
+                    num_experts_per_rank=num_experts_per_rank,
+                    rank=RANK,
+                    block_threads=block,
+                    experts_per_publish=EXPERTS_PER_PUBLISH,
+                )
 
-        # ---- GEMM role: straight-line for every workgroup, masked by `live` ----
         pid = bid - fx.Int32(NUM_DISPATCH_CU)
-        real_tiles = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tile_blocks)[fx.Int32(0)])
         if const_expr(DISPATCH_ONLY):
             # No GEMM tile waits on the expert flags, so the one workgroup past the comm ones
             # holds the launch open until every sender has pushed every expert of this rank: the
@@ -230,78 +269,81 @@ def _launch_dispatch_gemm_nt(
                     RANK,
                     "dispatch_only",
                 )
-            real_tiles = fx.Int32(0)
-        live = (pid >= fx.Int32(0)) & (pid < real_tiles * fx.Int32(N_BLOCKS_N))
-        pid = live.select(pid, fx.Int32(0))
-        num_pid_in_group = fx.Int32(group_m * N_BLOCKS_N)
-        first_pid_m = (pid // num_pid_in_group) * fx.Int32(group_m)
-        remaining_m = real_tiles - first_pid_m
-        group_size_m = (remaining_m < fx.Int32(group_m)).select(remaining_m, fx.Int32(group_m))
-        group_size_m = (group_size_m > fx.Int32(0)).select(group_size_m, fx.Int32(1))
-        pid_in_group = pid % num_pid_in_group
-        block_m = rocdl.readfirstlane(
-            T.i32, live.select(first_pid_m + pid_in_group % group_size_m, fx.Int32(0))
-        )
-        block_n = rocdl.readfirstlane(T.i32, live.select(pid_in_group // group_size_m, fx.Int32(0)))
-        expert = rocdl.readfirstlane(T.i32, _i32_table(arg_tile_to_expert)[block_m])
-        expert = live.select(expert, fx.Int32(0))
-
-        # every sender has pushed this expert (and, by push order, every lower one); a masked
-        # tile waits for 0, which any flag already meets
-        if fx.Int32(tid) == fx.Int32(0):
-            spin_until_flag_reaches(
-                dispatch_flag_base,
-                parity * fx.Int32(num_pool_blocks) + expert,
-                live.select(expected, fx.Int64(0)),
-                "sys",
-                RANK,
-                "dispatch_gemm",
+        else:
+            # ---- GEMM role: straight-line for every workgroup, masked by `live` ----
+            real_tiles = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tile_blocks)[fx.Int32(0)])
+            live = (pid >= fx.Int32(0)) & (pid < real_tiles * fx.Int32(N_BLOCKS_N))
+            pid = live.select(pid, fx.Int32(0))
+            num_pid_in_group = fx.Int32(group_m * N_BLOCKS_N)
+            first_pid_m = (pid // num_pid_in_group) * fx.Int32(group_m)
+            remaining_m = real_tiles - first_pid_m
+            group_size_m = (remaining_m < fx.Int32(group_m)).select(remaining_m, fx.Int32(group_m))
+            group_size_m = (group_size_m > fx.Int32(0)).select(group_size_m, fx.Int32(1))
+            pid_in_group = pid % num_pid_in_group
+            block_m = rocdl.readfirstlane(
+                T.i32, live.select(first_pid_m + pid_in_group % group_size_m, fx.Int32(0))
             )
-        fx.gpu.barrier()
+            block_n = rocdl.readfirstlane(T.i32, live.select(pid_in_group // group_size_m, fx.Int32(0)))
+            expert = rocdl.readfirstlane(T.i32, _i32_table(arg_tile_to_expert)[block_m])
+            expert = live.select(expert, fx.Int32(0))
 
-        blk_n = block_n * fx.Int32(tile_n)
-        m_row = block_m * fx.Int32(tile_m)
-        c_addr = _addr(fx.recast_iter(fx.Int8, arg_out)) + (
-            fx.Int64(m_row) * fx.Int64(N) + fx.Int64(blk_n)
-        ) * fx.Int64(EB)
-        nt_gemm_tile(
-            base_ptr,
-            gA_base=fx.recast_iter(fx.Int8, arg_token_buffer),
-            lda=HIDDEN,
-            a_row0=m_row,
-            a_rows=a_rows,
-            row_idx_table=_i32_table(arg_row_idx),
-            row_idx_base=m_row,
-            gB_base=fx.recast_iter(fx.Int8, arg_w),
-            ldb=N if B_NN else HIDDEN,
-            b_slab=fx.Int64(expert) * fx.Int64(N * HIDDEN * EB),
-            blk_n=blk_n,
-            c_addr=c_addr,
-            ldc=N,
-            m_rows=fx.Int32(tile_m),
-            n_valid=fx.Int32(N) - blk_n,
-            i32_k=fx.Int32(HIDDEN),
-            live=live,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            m_warp=m_warp,
-            n_warp=n_warp,
-            gather=True,
-            idx_bits=idx_bits,
-            b_nn=B_NN,
-            issue_first=bool(issue_first),
-            lds_cosched=bool(lds_cosched),
-            i32_n=fx.Int32(N),
-            # a row edge sharing a line with a row the comm workgroups may still be writing is read
-            # past this CU's caches: device scope sees the landed bytes
-            edge_a_cache_modifier=CPOL_DEVICE if (HIDDEN * EB) % GATHER_LINE_BYTES else 0,
-        )
+            # every sender has pushed this expert (and, by push order, every lower one); a masked
+            # tile waits for 0, which any flag already meets
+            if fx.Int32(tid) == fx.Int32(0):
+                spin_until_flag_reaches(
+                    dispatch_flag_base,
+                    parity * fx.Int32(num_pool_blocks) + expert,
+                    live.select(expected, fx.Int64(0)),
+                    "sys",
+                    RANK,
+                    "dispatch_gemm",
+                )
+            fx.gpu.barrier()
+
+            blk_n = block_n * fx.Int32(tile_n)
+            m_row = block_m * fx.Int32(tile_m)
+            c_addr = _addr(fx.recast_iter(fx.Int8, arg_out)) + (
+                fx.Int64(m_row) * fx.Int64(N) + fx.Int64(blk_n)
+            ) * fx.Int64(EB)
+            nt_gemm_tile(
+                base_ptr,
+                gA_base=fx.recast_iter(fx.Int8, arg_token_buffer),
+                lda=HIDDEN,
+                a_row0=m_row,
+                a_rows=a_rows,
+                row_idx_table=_i32_table(arg_row_idx),
+                row_idx_base=m_row,
+                gB_base=fx.recast_iter(fx.Int8, arg_w),
+                ldb=N if B_NN else HIDDEN,
+                b_slab=fx.Int64(expert) * fx.Int64(N * HIDDEN * EB),
+                blk_n=blk_n,
+                c_addr=c_addr,
+                ldc=N,
+                m_rows=fx.Int32(tile_m),
+                n_valid=fx.Int32(N) - blk_n,
+                i32_k=fx.Int32(HIDDEN),
+                live=live,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                m_warp=m_warp,
+                n_warp=n_warp,
+                gather=True,
+                idx_bits=idx_bits,
+                b_nn=B_NN,
+                issue_first=bool(issue_first),
+                lds_cosched=bool(lds_cosched),
+                i32_n=fx.Int32(N),
+                # a row edge sharing a line with a row the comm workgroups may still be writing is read
+                # past this CU's caches: device scope sees the landed bytes
+                edge_a_cache_modifier=CPOL_DEVICE if (HIDDEN * EB) % GATHER_LINE_BYTES else 0,
+            )
 
     epoch_bump(arg_parity, arg_expected, arg_epoch).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
     dispatch_gemm_nt(
         arg_out,
         arg_x,
+        arg_x_scale,
         arg_w,
         arg_token_buffer,
         arg_row_idx,
@@ -322,7 +364,7 @@ def _launch_dispatch_gemm_nt(
 _launch_dispatch_gemm_nt.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
 
 _COMPILED: dict = {}
-_CONSTEXPR0 = 18
+_CONSTEXPR0 = 19
 
 
 def dispatch_gemm_nt_gfx1250(
@@ -371,11 +413,19 @@ def dispatch_gemm_nt_gfx1250(
 
 
 def dispatch_only_gfx1250(
-    x: torch.Tensor, handle: DispatchHandle, *, num_dispatch_cu: int | None = None
-) -> torch.Tensor:
+    x: torch.Tensor,
+    handle: DispatchHandle,
+    *,
+    num_dispatch_cu: int | None = None,
+    x_scale: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Dispatch ``x`` by ``handle`` and return the dispatch token buffer it lands in, in receive
     order (``handle.pool_row_to_recv_token`` maps pool rows to it). ``num_dispatch_cu`` defaults
-    to every CU but the one the launch's waiting workgroup holds: no GEMM shares the launch."""
+    to every CU but the one the launch's waiting workgroup holds: no GEMM shares the launch.
+
+    With ``x_scale`` the tokens are MXFP8: ``x`` E4M3 ``[T, hidden]`` and ``x_scale`` its raw E8M0
+    ``[T, hidden / 32]`` (one byte each), landing in ``SymmBuffer.dispatch_fp8_views()``, whose
+    ``(rows, scales)`` pair is returned instead (hidden % 512 == 0: whole 16-byte scale rows)."""
     if num_dispatch_cu is None:
         num_dispatch_cu = torch.cuda.get_device_properties(x.device).multi_processor_count - 1
     symm = get_symm_buffer_for_mega_moe()
@@ -386,6 +436,7 @@ def dispatch_only_gfx1250(
         x,
         shape_only,
         handle,
+        x_scale=x_scale,
         dispatch_only=True,
         b_nn=False,
         num_dispatch_cu=num_dispatch_cu,
@@ -400,7 +451,7 @@ def dispatch_only_gfx1250(
         wmma_b2b=0,
         lds_cosched=0,
     )
-    return symm.dispatch_token_buffer
+    return symm.dispatch_token_buffer if x_scale is None else symm.dispatch_fp8_views()
 
 
 def _run(
@@ -408,6 +459,7 @@ def _run(
     w1,
     handle,
     *,
+    x_scale=None,
     dispatch_only,
     b_nn,
     num_dispatch_cu,
@@ -428,8 +480,26 @@ def _run(
         K, N = N, K
         assert N >= tile_n, "an NN block backs its B read off into the row, so N >= tile_n"
     tile_k = tile_k or (128 if K % 128 == 0 else 64)
-    assert x.dtype == w1.dtype == torch.bfloat16 and x.is_contiguous()
-    assert dispatch_only or w1.is_contiguous()
+    mx = x_scale is not None
+    if mx:
+        if not dispatch_only or x.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"MXFP8 tokens go through dispatch_only_gfx1250 as E4M3 rows, got {x.dtype}")
+        if x.shape[1] % 512:
+            raise ValueError(
+                f"MXFP8 dispatch: hidden % 512 == 0 (whole 16-byte E8M0 scale rows), got {x.shape[1]}"
+            )
+        if (
+            tuple(x_scale.shape) != (x.shape[0], x.shape[1] // 32)
+            or x_scale.element_size() != 1
+            or not x_scale.is_contiguous()
+        ):
+            raise ValueError(
+                f"x_scale: contiguous raw E8M0 bytes [T, hidden / 32] = {(x.shape[0], x.shape[1] // 32)}, "
+                f"got {tuple(x_scale.shape)} {x_scale.dtype}"
+            )
+    else:
+        assert x.dtype == w1.dtype == torch.bfloat16
+    assert x.is_contiguous() and (dispatch_only or w1.is_contiguous())
     assert K == x.shape[1] == int(symm.hidden), "w1 K, x hidden and the symmetric buffer's hidden must agree"
     assert tile_m == BLOCK_M, "a GEMM tile is one Mega pool block"
     assert K % tile_k == 0 and K // tile_k >= NUM_BUFFERS, "K must be a whole number of >= 2 k-tiles"
@@ -446,6 +516,7 @@ def _run(
     args = (
         _as_ptr(out),
         _as_ptr(x),
+        _as_ptr(x_scale if mx else x),
         _as_ptr(w1),
         _as_ptr(symm.dispatch_token_buffer),
         _as_ptr(handle.pool_row_to_recv_token),
@@ -489,6 +560,7 @@ def _run(
         issue_first,
         wmma_b2b,
         lds_cosched,
+        int(mx),
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

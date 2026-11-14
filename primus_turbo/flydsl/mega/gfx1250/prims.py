@@ -298,6 +298,17 @@ def copy_warp(
         buffer_store(v, dst, dst_off + o, cache_modifier=store_cache_modifier)
 
 
+def wave_inclusive_scan(value: ArithValue) -> ArithValue:
+    """Inclusive prefix sum of an i32 over the lanes of one hardware wave, lane 0 first."""
+    lane = fx.Int32(fx.thread_idx.x) % fx.Int32(WAVE)
+    step = 1
+    while step < WAVE:
+        moved = fx.gpu.shuffle_up(value, step, WAVE)
+        value = value + arith.select(lane >= fx.Int32(step), moved, fx.Int32(0))
+        step *= 2
+    return value
+
+
 def wave_match_rank(key: ArithValue):
     """``(rank, is_last)`` of this lane's i32 ``key`` within its hardware wave: how many lower lanes hold the same
     key, and whether no higher lane does. A negative key is no key (``is_last`` false). It goes by lane number, so
