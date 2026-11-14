@@ -1340,8 +1340,10 @@ def _check_mx_out_recipes(row: ScalingRecipe, col: ScalingRecipe) -> None:
     reference it has to match byte for byte. Rejecting it here keeps the op from accepting the
     flag and silently emitting 1-D scales.
 
-    Net effect today: both recipes must be the default. The signature carries them per
-    operand because the epilogue does quantise the two on their own terms, and that is
+    Net effect: both recipes must be the default, except that on gfx1250, whose GLU / dGLU
+    quant is the second phase of a two-phase op (``_mx1250_glu_phase1``), ``shuffle_scale`` /
+    ``shuffle_out`` select that arch's MX GEMM layouts for the copy. The signature carries them
+    per operand because the epilogue does quantise the two on their own terms, and that is
     where 2-D block scaling will land when it is wired up.
     """
     for name, recipe in (("row", row), ("col", col)):
@@ -1679,12 +1681,9 @@ def grouped_gemm_fp8_dglu_impl_meta(
     return grad_probs, grad_intermediate, grad_scale_inv
 
 
-def _own_storage(outs: tuple, share_storage: bool) -> tuple:
-    """A custom op may not return two views of one allocation, which gfx1250's quantizers hand back (a copy's
-    codes and scales carved from one buffer): clone each output whose storage an earlier one already holds, unless
-    the caller ran the op's Python body directly (``share_storage``, see ``eager_body``)."""
-    if share_storage:
-        return outs
+def _own_storage(outs: tuple) -> tuple:
+    """A custom op may not return two views of one allocation, which gfx1250's quantizers hand back (a copy's codes
+    and scales carved from one buffer): each output whose storage an earlier one already holds, cloned."""
     seen, out = set(), []
     for t in outs:
         key = t.untyped_storage().data_ptr()
@@ -1693,31 +1692,32 @@ def _own_storage(outs: tuple, share_storage: bool) -> tuple:
     return tuple(out)
 
 
-def eager_body(op):
-    """The Python body of custom op ``op`` when nothing traces (eager, no dispatch mode): calling it skips
-    torch.library's per-call dispatch (and its aliasing check); else None, and the caller runs the custom op."""
-    fn = getattr(op, "_init_fn", None)
-    if fn is None or torch.compiler.is_compiling() or torch._C._len_torch_dispatch_stack():
-        return None
-    return fn
-
-
 def _mx1250_glu_phase1(
-    a, b, a_scales, b_scales, group_lens, group_offs, out_dtype, num_cu, M, row, col, qdtype
+    a, b, a_scales, b_scales, group_lens, group_offs, out_dtype, num_cu, M, row, col, qdtype, b_preshuffled
 ):
     """gfx1250's fused GLU / dGLU run in two phases; this is the first: the grouped MX GEMM's bf16 output
     (tight ``[M, N]``) and the tight offsets, then (the quantizer module, its scale rule, the layout bits of the
-    ``row`` / ``col`` out recipes) for the second, the fused GLU / dGLU + dual-quant kernel. A shuffled out
-    recipe means the MX GEMM layouts throughout, ``b`` (a weight copy) included: 16x16 blocks."""
+    ``row`` / ``col`` out recipes) for the second, the fused GLU / dGLU + dual-quant kernel."""
     from primus_turbo.pytorch.kernels.quantization.quantization_impl import _gfx1250_mxfp8
 
     offs = torch.zeros(group_lens.shape[0] + 1, device=a.device, dtype=torch.int64)
     torch.cumsum(group_lens, 0, out=offs[1:])
     out = grouped_gemm_fp8_impl(
-        a, b, a_scales, b_scales, group_lens, group_offs, False, True, out_dtype,
-        ScalingGranularity.MX_BLOCKWISE.value, num_cu, BackendType.FLYDSL.value, group_offs_out=offs,
-        b_preshuffled=row.shuffle_scale,
-    )[:M]  # fmt: skip
+        a,
+        b,
+        a_scales,
+        b_scales,
+        group_lens,
+        group_offs,
+        False,
+        True,
+        out_dtype,
+        ScalingGranularity.MX_BLOCKWISE.value,
+        num_cu,
+        BackendType.FLYDSL.value,
+        group_offs_out=offs,
+        b_preshuffled=b_preshuffled,
+    )[:M]
     quant = _gfx1250_mxfp8(out, qdtype, row, col)
     assert quant is not None, (
         f"gfx1250 fused MXFP8 GLU / dGLU: no FlyDSL quantizer for {out.dtype} -> {qdtype}"
@@ -1725,8 +1725,7 @@ def _mx1250_glu_phase1(
     return (out, offs, *quant)
 
 
-@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_mxfp8_glu_impl", mutates_args=(), device_types="cuda")
-def grouped_gemm_mxfp8_glu_impl(
+def grouped_gemm_mxfp8_glu(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scales: torch.Tensor,
@@ -1743,7 +1742,7 @@ def grouped_gemm_mxfp8_glu_impl(
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
     clamp_limit: float | None = None,
-    share_storage: bool = False,
+    b_preshuffled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc1 grouped MXFP8 GEMM with the GLU activation and its quantisation fused in.
 
@@ -1767,6 +1766,10 @@ def grouped_gemm_mxfp8_glu_impl(
     bakes them into the graph and guards on their equality rather than tracing into them.
     That is also why they carry no defaults: the schema admits an opaque type only as a
     required parameter.
+
+    ``b_preshuffled``: ``b`` in 16x16 blocks, gfx1250's MX GEMM layout. On gfx1250 the outputs may
+    share an allocation (a copy's codes and scales); :func:`grouped_gemm_mxfp8_glu_impl` is this
+    function as a torch.library custom op, whose outputs do not.
     """
     _check_mx_glu_dispatch(config, trans_a, trans_b)
     _check_mx_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
@@ -1780,14 +1783,26 @@ def grouped_gemm_mxfp8_glu_impl(
         assert I % _MX_ROW_ALIGN == 0, f"gfx1250 fused MXFP8 GLU: I ({I}) must be a multiple of 128"
         qdtype = _get_fp8_dtype(config.format, True)
         l1, offs, Q, rule, lay = _mx1250_glu_phase1(
-            a, b, a_scales, b_scales, group_lens, group_offs, out_dtype, num_cu, int(probs.shape[0]),
-            out_row_scaling_recipe, out_col_scaling_recipe, qdtype,
-        )  # fmt: skip
+            a,
+            b,
+            a_scales,
+            b_scales,
+            group_lens,
+            group_offs,
+            out_dtype,
+            num_cu,
+            int(probs.shape[0]),
+            out_row_scaling_recipe,
+            out_col_scaling_recipe,
+            qdtype,
+            b_preshuffled,
+        )
         q = Q.grouped_glu_quant_mxfp8(
             l1, probs.float(), group_lens, offs, activation, clamp_limit, qdtype, rule, layout=lay
         )
-        return _own_storage((l1, q[0], q[1], q[2], q[3]), share_storage)
+        return l1, q[0], q[1], q[2], q[3]
 
+    assert not b_preshuffled, "b_preshuffled is gfx1250's MX GEMM layout"
     from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_glu_kernel import (
         glu_epi_quant_supported,
         grouped_gemm_mxfp8_epi_glu_quant_flydsl_kernel,
@@ -1830,6 +1845,50 @@ def grouped_gemm_mxfp8_glu_impl(
     return intermediate, row_out, row_sc, col_out, col_sc
 
 
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_mxfp8_glu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_mxfp8_glu_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    config: Float8QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+    b_preshuffled: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`grouped_gemm_mxfp8_glu` as a custom op: the same outputs, none sharing an allocation."""
+    return _own_storage(
+        grouped_gemm_mxfp8_glu(
+            a,
+            b,
+            a_scales,
+            b_scales,
+            group_lens,
+            group_offs,
+            trans_a,
+            trans_b,
+            out_dtype,
+            num_cu,
+            probs,
+            config,
+            out_row_scaling_recipe,
+            out_col_scaling_recipe,
+            activation,
+            clamp_limit,
+            b_preshuffled,
+        )
+    )
+
+
 @grouped_gemm_mxfp8_glu_impl.register_fake
 def grouped_gemm_mxfp8_glu_impl_meta(
     a: torch.Tensor,
@@ -1848,7 +1907,7 @@ def grouped_gemm_mxfp8_glu_impl_meta(
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
     clamp_limit: float | None = None,
-    share_storage: bool = False,
+    b_preshuffled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
 
@@ -1867,14 +1926,18 @@ def grouped_gemm_mxfp8_glu_impl_meta(
     M_pad_col = -(-(M + G * _MX_COL_ALIGN) // _MX_COL_ALIGN) * _MX_COL_ALIGN
     intermediate = torch.empty((M, N), device=a.device, dtype=out_dtype)
     row_out, row_sc, col_out, col_sc = _alloc_mx_act_buffers(
-        I, M_pad_row, M_pad_col, _get_fp8_dtype(config.format, True), a.device, out_row_scaling_recipe,
+        I,
+        M_pad_row,
+        M_pad_col,
+        _get_fp8_dtype(config.format, True),
+        a.device,
+        out_row_scaling_recipe,
         out_col_scaling_recipe,
-    )  # fmt: skip
+    )
     return intermediate, row_out, row_sc, col_out, col_sc
 
 
-@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_mxfp8_dglu_impl", mutates_args=(), device_types="cuda")
-def grouped_gemm_mxfp8_dglu_impl(
+def grouped_gemm_mxfp8_dglu(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scales: torch.Tensor,
@@ -1892,7 +1955,7 @@ def grouped_gemm_mxfp8_dglu_impl(
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
     clamp_limit: float | None = None,
-    share_storage: bool = False,
+    b_preshuffled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc2 dgrad with the GLU activation gradient and its quantisation fused in.
 
@@ -1904,6 +1967,9 @@ def grouped_gemm_mxfp8_dglu_impl(
     the kernel's per-tile partials, then the four operands. As in the forward, the
     row-wise pair sits on the padded rows ``group_offs`` addresses and the col-wise pair
     on the 128-aligned table the wgrad builds from ``group_lens``.
+
+    ``b_preshuffled`` and the outputs' storage as in :func:`grouped_gemm_mxfp8_glu`;
+    :func:`grouped_gemm_mxfp8_dglu_impl` is the custom op.
     """
     _check_mx_glu_dispatch(config, trans_a, trans_b)
     _check_mx_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
@@ -1914,15 +1980,35 @@ def grouped_gemm_mxfp8_dglu_impl(
     if is_gfx1250():
         qdtype = _get_fp8_dtype(config.format, False)
         grad_act, offs, Q, rule, lay = _mx1250_glu_phase1(
-            a, b, a_scales, b_scales, group_lens, group_offs, out_dtype, num_cu, int(probs.shape[0]),
-            out_row_scaling_recipe, out_col_scaling_recipe, qdtype,
-        )  # fmt: skip
+            a,
+            b,
+            a_scales,
+            b_scales,
+            group_lens,
+            group_offs,
+            out_dtype,
+            num_cu,
+            int(probs.shape[0]),
+            out_row_scaling_recipe,
+            out_col_scaling_recipe,
+            qdtype,
+            b_preshuffled,
+        )
         grad_probs, *q = Q.grouped_dglu_quant_mxfp8(
-            grad_act, intermediate, probs.float(), group_lens, offs, activation, clamp_limit, qdtype, rule,
+            grad_act,
+            intermediate,
+            probs.float(),
+            group_lens,
+            offs,
+            activation,
+            clamp_limit,
+            qdtype,
+            rule,
             layout=lay,
-        )  # fmt: skip
-        return _own_storage((grad_probs, q[0], q[1], q[2], q[3]), share_storage)
+        )
+        return grad_probs, q[0], q[1], q[2], q[3]
 
+    assert not b_preshuffled, "b_preshuffled is gfx1250's MX GEMM layout"
     from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_glu_kernel import (
         dglu_epi_quant_supported,
         grouped_gemm_mxfp8_dglu_grad_probs_partial_spec,
@@ -1972,6 +2058,52 @@ def grouped_gemm_mxfp8_dglu_impl(
     return torch.sum(grad_probs_partial[:, :M], dim=0), row_out, row_sc, col_out, col_sc
 
 
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_mxfp8_dglu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_mxfp8_dglu_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    intermediate: torch.Tensor,
+    config: Float8QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+    b_preshuffled: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`grouped_gemm_mxfp8_dglu` as a custom op: the same outputs, none sharing an allocation."""
+    return _own_storage(
+        grouped_gemm_mxfp8_dglu(
+            a,
+            b,
+            a_scales,
+            b_scales,
+            group_lens,
+            group_offs,
+            trans_a,
+            trans_b,
+            out_dtype,
+            num_cu,
+            probs,
+            intermediate,
+            config,
+            out_row_scaling_recipe,
+            out_col_scaling_recipe,
+            activation,
+            clamp_limit,
+            b_preshuffled,
+        )
+    )
+
+
 @grouped_gemm_mxfp8_dglu_impl.register_fake
 def grouped_gemm_mxfp8_dglu_impl_meta(
     a: torch.Tensor,
@@ -1991,7 +2123,7 @@ def grouped_gemm_mxfp8_dglu_impl_meta(
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
     clamp_limit: float | None = None,
-    share_storage: bool = False,
+    b_preshuffled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
 
@@ -2009,7 +2141,12 @@ def grouped_gemm_mxfp8_dglu_impl_meta(
     M_pad_col = -(-(M + G * _MX_COL_ALIGN) // _MX_COL_ALIGN) * _MX_COL_ALIGN
     grad_probs = torch.empty((M,), device=a.device, dtype=torch.float32)
     row_out, row_sc, col_out, col_sc = _alloc_mx_act_buffers(
-        2 * I, M_pad_row, M_pad_col, _get_fp8_dtype(config.format, False), a.device, out_row_scaling_recipe,
+        2 * I,
+        M_pad_row,
+        M_pad_col,
+        _get_fp8_dtype(config.format, False),
+        a.device,
+        out_row_scaling_recipe,
         out_col_scaling_recipe,
-    )  # fmt: skip
+    )
     return grad_probs, row_out, row_sc, col_out, col_sc

@@ -300,8 +300,8 @@ def test_grouped_mlp_permute_fusion(backend, T, H, I, skew, monkeypatch):
 
 @pytest.mark.parametrize("G, M, H, I", SHAPES[:1])
 def test_grouped_mlp_custom_op_path(backend, G, M, H, I, monkeypatch):
-    """The fused GLU / dGLU through their torch.library custom ops (torch.compile's path; eager calls run the bodies,
-    whose outputs may share an allocation): unaliased outputs, bitwise the eager results."""
+    """The fused GLU / dGLU through their torch.library custom ops (torch.compile's path; eager calls run the plain
+    functions, whose outputs may share an allocation): unaliased outputs, bitwise the eager results."""
     import importlib
 
     op = importlib.import_module("primus_turbo.pytorch.ops.grouped_mlp_fp8")
@@ -318,6 +318,6 @@ def test_grouped_mlp_custom_op_path(backend, G, M, H, I, monkeypatch):
         return [y] + [t.grad for t in leaves]
 
     eager = run()
-    monkeypatch.setattr(op, "_mx_glu_op", lambda f: f)  # the custom ops themselves
+    monkeypatch.setattr(op, "_mx_glu", lambda custom_op, fn, a: custom_op)  # the custom ops themselves
     for name, a, b in zip(("y", "dx", "dw1", "dw2", "dprobs"), run(), eager):
         assert torch.equal(a, b), name
