@@ -7,8 +7,8 @@
 reference tests/pytorch/ref/mxfp8_ref.py, bit for bit (reference on the CPU: IEEE denormals, no device pow). Each
 case compiles its own kernel (widths, expert counts, rules, layouts and producers are compile-time), so every
 feature appears in a few cases rather than in a full sweep: K / M tails (K % 128, K % 8, M % 128 / 32 / 16 / 4),
-both scale rules, 2-D blocks, every layout, each producer (dense, grouped, GLU / dGLU grouped and dense, gather),
-empty experts, and inputs that end where their mapping does."""
+both scale rules, 2-D blocks, every layout, each producer (dense, grouped, GLU / dGLU grouped and dense, gather,
+MX-row gather), empty experts, and inputs that end where their mapping does."""
 
 import pytest
 import torch
@@ -187,6 +187,29 @@ def test_glu(case, I, act, clamp, rule):
     _check_grouped(out, act_v, lens, rule)
 
 
+@pytest.mark.parametrize("I,packed", [(2048, False), (2048, True), (96, True)])
+def test_glu_rows_only(I, packed):
+    """``cols=False`` (the MX Mega's forward when no backward follows): the row copy and its lens / offsets of the
+    ``cols=True`` call bit for bit, and no column copy (I = 96: the masked loads of the last row's partial k-tile)."""
+    lay = PACK_ROW if packed else 0
+    lens = _lens("skew", I)
+    M = int(lens.sum())
+    g = torch.Generator(device="cuda").manual_seed(M + I)
+    l1 = (torch.randn(M, 2 * I, generator=g, device="cuda") * 3).to(torch.bfloat16)
+    probs = torch.rand(M, generator=g, device="cuda")
+    lens_d = lens.cuda()
+    offs = _offs(lens_d)
+    both = Q.grouped_glu_quant_mxfp8(l1, probs, lens_d, offs, layout=lay | PACK_COL | SHUF_COL)
+    rows = Q.grouped_glu_quant_mxfp8(l1, probs, lens_d, offs, layout=lay, cols=False)
+    assert rows[2] is None and rows[3] is None, "cols=False: no column copy"
+    Mr = int(both[5][-1])
+    _eq(rows[0][:Mr], both[0][:Mr], "q_row")
+    n = Mr // 32 if packed else Mr
+    _eq(rows[1][:n], both[1][:n], "s_row")
+    for i, what in ((4, "lens_row"), (5, "offs_row")):
+        assert torch.equal(rows[i], both[i]), what
+
+
 @pytest.mark.parametrize("case,I,act,clamp,rule", GLU_CASES)
 def test_dglu(case, I, act, clamp, rule):
     lens = _lens(case, I + 1)
@@ -230,6 +253,42 @@ def test_gather(case, H, with_probs, rule):
     lens_d = lens.cuda()
     out = Q.grouped_gather_quant_mxfp8(x, d2s, lens_d, _offs(lens_d), pp, rule=rule)
     _check_grouped(out, R.gather_rows(x.cpu(), d2s.cpu(), None if pp is None else pp.cpu()), lens, rule)
+
+
+# MegaMoE's pool gather of dispatched MX rows (P_FP8), each layout once: raw; the MX Mega's dy (packed scales) and x
+# (+ 16x16 column codes); 16x16 row codes alone and with both copies shuffled
+@pytest.mark.parametrize(
+    "case,H,lay",
+    [
+        ([0, 5, 0], 512, "raw"),
+        ([31, 32, 33, 1, 0, 127, 128, 129], 7168, "dy"),
+        ("skew", 7168, "x"),
+        ("skew", 512, "rows16"),
+        ([31, 32, 33, 1, 0, 127, 128, 129], 512, "all16"),
+    ],
+)
+def test_gather_fp8(case, H, lay):
+    """Codes and scales kept by the row copy, the columns re-quantized from the exact dequantized values."""
+    lay = {
+        "raw": 0,
+        "dy": PACK_ROW | PACK_COL,
+        "x": PACK_ROW | PACK_COL | SHUF_COL,
+        "rows16": PACK_ROW | SHUF_ROW,
+        "all16": PACK_ROW | SHUF_ROW | PACK_COL | SHUF_COL,
+    }[lay]
+    lens = _lens(case, H)
+    M = int(lens.sum())
+    T = max(1, M // 3)
+    x = _x(T, H, seed=H, special=False)
+    x[::7, :32] = 0
+    q, s = R.quant_rows(x.cpu())
+    g = torch.Generator(device="cuda").manual_seed(M + H)
+    d2s = torch.randint(-1, T, (M,), generator=g, device="cuda", dtype=torch.int32)
+    if M > 4:
+        d2s[3] = T + 5
+    lens_d = lens.cuda()
+    out = Q.grouped_gather_fp8_quant_mxfp8(q.cuda(), s.cuda(), d2s, lens_d, _offs(lens_d), layout=lay)
+    R.check_grouped_ref(out, R.quant_grouped_fp8(q, s, d2s.cpu(), lens), lens, **_flags(lay))
 
 
 # ---- layouts: packed scales / 16x16 codes, the same kernels with other store addressing

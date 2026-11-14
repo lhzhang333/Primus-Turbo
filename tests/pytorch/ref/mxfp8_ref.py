@@ -27,7 +27,8 @@ One int32 of it is the WMMA scale operand of one row for one 128-wide K step. Pa
 MoE (``quant_grouped``): rows as ``quant_rows`` per expert padded to 32 rows, the column copy per expert
 padded to 128 tokens; pad rows and blocks without a token get scale ``PAD_SCALE`` (127). Fused producers:
 ``glu_ref`` / ``dglu_ref`` (the grouped MLP's activation and its gradient, bf16 before quantization),
-``gather_rows`` (permute). B operands of the GEMM may be 16x16-preshuffled (``preshuffle_b16``).
+``gather_rows`` (permute), ``quant_grouped_fp8`` (MegaMoE: gathered MX rows). B operands of the GEMM may be
+16x16-preshuffled (``preshuffle_b16``).
 """
 
 import torch
@@ -212,6 +213,29 @@ def gather_rows(x, dest2src, permuted_probs=None):
     return torch.where(ok[:, None], x[idx.clamp(0, x.shape[0] - 1)], torch.zeros((), dtype=x.dtype))
 
 
+def gather_mx_rows(q, s, row_map):
+    """MX rows ``q [T, C]`` with raw scales ``s [T, ceil(C/32)]``, row d = row ``row_map[d]``; out of range: zero codes,
+    byte-0 scales (a zero row)."""
+    idx = row_map.long()
+    ok = ((idx >= 0) & (idx < q.shape[0]))[:, None]
+    i = idx.clamp(0, q.shape[0] - 1)
+    zero = torch.zeros((), dtype=torch.uint8)
+    qg = torch.where(ok, q.view(torch.uint8)[i], zero).view(torch.float8_e4m3fn)
+    return qg, torch.where(ok, s.view(torch.uint8)[i], zero)
+
+
+def quant_grouped_fp8(q, s, row_map, group_lens, rule="nosat"):
+    """``quant_grouped`` of gathered MX rows (MegaMoE's pool, ``gather_mx_rows``): the row copy keeps each row's codes
+    and scales, the column copy quantizes the dequantized (exact) values."""
+    qg, sg = gather_mx_rows(q, s, row_map)
+    out = list(quant_grouped(dequant(qg, sg, torch.bfloat16), group_lens, rule))
+    q_row, o, orow = out[0].view(torch.uint8), 0, 0
+    for n, pn in zip(group_lens.tolist(), out[6].tolist()):
+        q_row[orow : orow + n], out[1][orow : orow + n] = qg[o : o + n].view(torch.uint8), sg[o : o + n]
+        o, orow = o + n, orow + pn
+    return tuple(out)
+
+
 def pack_scales(s: torch.Tensor) -> torch.Tensor:
     """Raw E8M0 [.., R, ceil(K/32)] -> the GEMM layout [.., ceil(R/32), ceil(K/128), 32, 4], pad bytes 0x00."""
     if s.ndim > 2:
@@ -329,10 +353,17 @@ def to_layout(copies, pack_row=False, shuf_row=False, pack_col=False, shuf_col=F
 
 
 def check_grouped(out, vals, lens, rule, pack_row=False, shuf_row=False, pack_col=False, shuf_col=False):
-    """A grouped quantizer's 8-tuple against ``quant_grouped`` of the bf16 values it quantized: the allocation
-    bounds (rows ceil32(M + 32 G), tokens ceil128(M + 128 G)), the 32-row / 128-token padded lens and offsets of
-    both copies, and the rows / columns up to them in the given layout."""
-    q_row, s_row, q_col, s_col, lens_c, offs_c, lens_r, offs_r = quant_grouped(vals.cpu(), lens, rule)
+    """A grouped quantizer's 8-tuple against ``quant_grouped`` of the bf16 values it quantized (see
+    ``check_grouped_ref``)."""
+    ref = quant_grouped(vals.cpu(), lens, rule)
+    check_grouped_ref(out, ref, lens, pack_row, shuf_row, pack_col, shuf_col)
+
+
+def check_grouped_ref(out, ref, lens, pack_row=False, shuf_row=False, pack_col=False, shuf_col=False):
+    """A grouped quantizer's 8-tuple against a reference 8-tuple (``quant_grouped``'s order): the allocation bounds
+    (rows ceil32(M + 32 G), tokens ceil128(M + 128 G)), the 32-row / 128-token padded lens and offsets of both
+    copies, and the rows / columns up to them in the given layout."""
+    q_row, s_row, q_col, s_col, lens_c, offs_c, lens_r, offs_r = ref
     M, G, Mr, Mc = int(lens.sum()), len(lens), int(offs_r[-1]), int(offs_c[-1])
     assert (
         out[0].shape[0] == -(-(M + 32 * G) // 32) * 32 and out[2].shape[1] == -(-(M + 128 * G) // 128) * 128

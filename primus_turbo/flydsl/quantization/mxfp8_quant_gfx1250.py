@@ -35,8 +35,9 @@ tile per workgroup (8 waves):
   it, so ``q_t == q.T``;
 * ``grouped`` (MoE): the row copy per expert zero-padded to 32 rows, the column copy to 128 tokens (pad
   rows / blocks: scale 127, Turbo's grouped contract); HIP's 8-tuple with both padded lens / offsets.
-* producers of the tile besides a plain load: fused GLU / dGLU (MoE, or dense: ``glu_quant_mxfp8``) and
-  gather (permute).
+* producers of the tile besides a plain load: fused GLU / dGLU (MoE, or dense: ``glu_quant_mxfp8``),
+  gather (permute), gather of E4M3 rows with raw E8M0 scales (``P_FP8``, MegaMoE's dispatched rows: dequantized
+  exactly, the row copy keeps their codes and scales, the column copy re-quantizes).
 
 Scale rules (compile-time): ``nosat`` (default: the smallest 2^e with amax / 2^e <= 448) and
 ``even`` (Turbo's HIP rule). ``tests/pytorch/ref/mxfp8_ref.py`` is the bitwise reference.
@@ -82,7 +83,7 @@ NT = 256  # 8 waves
 # TDM group-1 word 0: 2-byte elements, LDS padding 4 dwords after every 64 (one tile row)
 TDM_W0 = (1 << 16) | (1 << 20) | (5 << 22) | (3 << 25)
 RULES = {"nosat": 0x1F, "even": 0x08}  # added to |amax| bf16 bits before taking the exponent
-P_DENSE, P_GROUPED, P_GLU, P_DGLU, P_GATHER = range(5)  # producers of the bf16 tile
+P_DENSE, P_GROUPED, P_GLU, P_DGLU, P_GATHER, P_FP8 = range(6)  # producers of the bf16 tile
 O_ROWS, O_COLS = 1, 2  # outputs
 PAD_SCALE = 127
 
@@ -326,7 +327,7 @@ def _launch(
     # (rows % 16 bytes: K % 8 == 0; the entries give narrower inputs storage past their end instead).
     TAIL = K % BK != 0 and K % 8 == 0
     # expert-padded copies: the MoE producers; GLU / dGLU without group offsets (G = 0) are dense
-    EXP = PROD in (P_GROUPED, P_GATHER) or (PROD in (P_GLU, P_DGLU) and G > 0)
+    EXP = PROD in (P_GROUPED, P_GATHER, P_FP8) or (PROD in (P_GLU, P_DGLU) and G > 0)
     HALVES = 2 if PROD == P_DGLU else 1  # dGLU quantizes dgate (columns [0, K)) and dup ([K, 2K))
     OW = 2 * K if PROD == P_DGLU else KO  # row-copy width (KO > K: zero columns to a 128 pad)
     KV = K if PROD in (P_GLU, P_DGLU) else KO  # columns of a half the row copy holds
@@ -436,7 +437,9 @@ def _launch(
                         if wave == I32(w):
                             _tdm_load(base + I32(w * TILE), src[w], cols, nreal, K if w == 2 else 2 * K)
                     rocdl.s_wait_tensorcnt(0)
-            else:  # gather: row r is x[dest2src[in0 + r]], one 16-byte async load per lane and chunk
+            elif const_expr(
+                PROD == P_GATHER
+            ):  # row r is x[dest2src[in0 + r]], one 16-byte async load per lane and chunk
                 ri = _rsrc(_addr(arg_x2), i32_m * I32(4))
                 rp = _rsrc(_addr(arg_p), i32_m * I32(4))
                 for i in range_constexpr(BM * BK // 8 // NT):
@@ -456,6 +459,39 @@ def _launch(
                         gp, _lds_ptr(base + r * I32(PITCH) + c16 * I32(16)), 0
                     )
                 rocdl.s_wait_asynccnt(0)
+            else:  # P_FP8: row r is the E4M3 row x[x2[in0 + r]] (16 codes per lane and chunk) times its E8M0 scales
+                # (p, raw [t, K / 32]), exact in bf16; an out-of-range row is zero. The rows phase takes the staged
+                # scales back, so the row copy keeps the source codes (a re-derived scale can differ by one step).
+                ri = _rsrc(_addr(arg_x2), i32_m * I32(4))
+                qs = _rsrc(_addr(arg_x), i32_t * I32(K))
+                ss = _rsrc(_addr(arg_p), i32_t * I32(K // 32))
+                for i in range_constexpr(BM * BK // 16 // NT):
+                    q = t + I32(i * NT)
+                    r, c16 = q // I32(8), q % I32(8)
+                    src = I32(buffer_load(ri, in0 + r, vec_width=1, dtype=T.i32))
+                    ok = (r < nreal) & (src >= I32(0)) & (src < i32_t)
+                    codes = Vec(
+                        buffer_load(
+                            qs,
+                            src * I32(K // 4) + kt * I32(BK // 4) + c16 * I32(4),
+                            vec_width=4,
+                            dtype=T.i32,
+                            mask=ok,
+                        )
+                    )
+                    sw = I32(buffer_load(ss, src * I32(K // BK) + kt, vec_width=1, dtype=T.i32, mask=ok))
+                    if c16 == I32(0):
+                        _lds_st(base + I32(O_SR) + r * I32(4), sw, 4)
+                    # 8 codes -> f32 at scale 2^0 (gfx1250's v_cvt_scale_pk8_f32_fp8, as aiter's MegaMoE combine), times
+                    # the block's exact power of two (byte 0: 2^-127 as a denormal, 0xFF: NaN, the reference's values)
+                    b = (sw >> ((c16 >> I32(1)) * I32(8))) & I32(0xFF)
+                    scale = (
+                        (b << I32(23)) | ((b == I32(0)) | (b == I32(0xFF))).select(I32(0x400000), I32(0))
+                    ).bitcast(fx.Float32)
+                    for h in range_constexpr(2):
+                        pk8 = Vec.from_elements([codes[2 * h], codes[2 * h + 1]], I32)
+                        v8 = Vec(rocdl.cvt_scale_pk8_f32_fp8(T.vec(8, T.f32), _raw(pk8), _raw(I32(127)), 0))
+                        _lds_st(base + r * I32(PITCH) + c16 * I32(32) + I32(16 * h), _bf8(v8 * scale), 16)
             gpu.barrier()
             if const_expr(PROD in (P_GLU, P_DGLU)):  # elementwise GLU / dGLU, rounded to bf16 in place
                 rp = _rsrc(_addr(arg_p), i32_m * I32(4))
@@ -536,7 +572,15 @@ def _launch(
                         col = k0 + kb * I32(32) + h * I32(16)
                         a0 = tb + r * I32(PITCH) + (kb * I32(2) + h) * I32(32)
                         words = [_lds_v4(a0), _lds_v4(a0 + I32(16))]
-                        byte = _e8m0(blk_amax(words, (r // I32(32)) * I32(4) + kb, 0xB1), RULE_C)
+                        if const_expr(PROD == P_FP8):  # the source row's scale, staged by the producer
+                            sw = I32(
+                                _llvm.LoadOp(
+                                    T.i32, _lds_ptr(base + I32(O_SR) + r * I32(4)), alignment=4
+                                ).result
+                            )
+                            byte = (sw >> (kb * I32(8))) & I32(0xFF)
+                        else:
+                            byte = _e8m0(blk_amax(words, (r // I32(32)) * I32(4) + kb, 0xB1), RULE_C)
                         if const_expr(EXP):  # pad rows: 127 over the real columns, 0 in the K padding
                             byte = ((r >= nreal) & (k0 + kb * I32(32) < I32(K))).select(I32(PAD_SCALE), byte)
                         codes = _cvt16(words, byte, RULE_C)
@@ -1030,11 +1074,12 @@ def grouped_glu_quant_mxfp8(
     rule="nosat",
     act_out=None,
     layout=0,
+    cols=True,
 ):
     """GLU forward + MoE dual cast: act = bf16(f(min(gate, L)) * clamp(up, -L, L) * probs[row]) from
     l1 [M, 2I] bf16 (gate | up, Turbo's fc1 layout; probs [M] fp32), quantized as
     ``grouped_quant_mxfp8_raw`` would quantize it (the 8-tuple, act [M, I]). ``act_out`` [M, I] bf16
-    (tests): also receives act."""
+    (tests): also receives act. ``cols`` False leaves the column copy out (None)."""
     l1 = _check(l1, out_dtype, rule, (2,))
     M, I = l1.shape[0], l1.shape[1] // 2
     assert l1.shape[1] == 2 * I and I % 16 == 0 and probs.shape == (M,) and probs.dtype == torch.float32
@@ -1047,6 +1092,7 @@ def grouped_glu_quant_mxfp8(
         rule,
         I,
         M,
+        cols=cols,
         p=probs.contiguous(),
         dbg=act_out,
         act=_check_activation(activation),
@@ -1095,6 +1141,50 @@ def grouped_dglu_quant_mxfp8(
         layout=layout,
     )
     return (part.sum(0), *out)
+
+
+def grouped_gather_fp8_quant_mxfp8(
+    q,
+    s,
+    row_map,
+    group_lens,
+    group_offs,
+    out_dtype=torch.float8_e4m3fn,
+    rule="nosat",
+    total_m=None,
+    rows=True,
+    cols=True,
+    layout=0,
+):
+    """Gather of MX rows + MoE dual cast (MegaMoE: the dispatched rows into pool order): row d is the E4M3 row
+    ``q[row_map[d]]`` with its raw E8M0 scales ``s[row_map[d]]`` (``q [T, K]``, ``s [T, K / 32]``, ``row_map`` int32;
+    out of [0, T): a zero row). The row copy keeps each row's codes and scales (laid out as ``layout`` says), the
+    column copy quantizes the dequantized values, exact (up to E4M3 subnormals) under the nosat rule only. Returns
+    the 8-tuple of ``grouped_quant_mxfp8_raw``."""
+    assert rule == "nosat", "the columns of fp8 rows re-quantize exactly under the nosat rule only"
+    assert q.dtype == torch.float8_e4m3fn and q.is_contiguous() and s.is_contiguous(), "contiguous E4M3 rows"
+    T, K = q.shape
+    assert K % BK == 0 and tuple(s.shape) == (T, K // 32) and T * K < 2**31, (
+        "q [T, K % 128 == 0], s [T, K / 32]"
+    )
+    M = int(total_m if total_m is not None else row_map.shape[0])
+    assert row_map.dtype == torch.int32 and row_map.numel() >= M
+    return _grouped(
+        P_FP8,
+        q,
+        group_lens,
+        group_offs,
+        out_dtype,
+        rule,
+        K,
+        M,
+        rows,
+        cols,
+        layout=layout,
+        x2=row_map.contiguous(),
+        p=s.view(torch.uint8),
+        t=T,
+    )
 
 
 def _dense_glu(prod, x, l1, probs, I, out_dtype, rule, pad, layout, **kw):
