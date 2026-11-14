@@ -43,6 +43,7 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
 )
 from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     EB,
+    GATHER_LINE_BYTES,
     GFX1250_LDS_BYTES,
     NUM_BUFFERS,
     WAVE,
@@ -56,7 +57,7 @@ from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
     dispatch_bf16_tile,
     spin_until_flag_reaches,
 )
-from primus_turbo.flydsl.mega.gfx1250.prims import cast, ld, st
+from primus_turbo.flydsl.mega.gfx1250.prims import CPOL_DEVICE, cast, ld, st
 from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
     BLOCK_M,
     TOKEN_DTYPE,
@@ -277,6 +278,9 @@ def _launch_dispatch_gemm_nt(
             issue_first=bool(issue_first),
             lds_cosched=bool(lds_cosched),
             i32_n=fx.Int32(N),
+            # a row edge sharing a line with a row the comm workgroups may still be writing is read
+            # past this CU's caches: device scope sees the landed bytes
+            edge_a_cache_modifier=CPOL_DEVICE if (HIDDEN * EB) % GATHER_LINE_BYTES else 0,
         )
 
     epoch_bump(arg_parity, arg_expected).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)

@@ -50,6 +50,10 @@ def ep1_group():
         (333, 7168, 2048, 32, 8, 5),  # ragged token count, five experts receive nothing
         (2048, 2048, 1408, 16, 4, 0),  # N = 2816 = 11 tiles, a different hidden
         (1, 7168, 2048, 32, 8, 0),  # one token: every live tile is mostly padding
+        # GPT-OSS: 5760-byte rows end mid 256-byte line (64-wide k-tiles), so a row's edge shares a line
+        # with its neighbour's; from the 2nd call on, stale neighbour bytes once corrupted a few rows
+        (1024, 2880, 2880, 32, 4, 0),
+        (1024, 2880, 2880, 32, 8, 0),
     ],
 )
 def test_dispatch_gemm_nt_ep1(ep1_group, num_tokens, hidden, inter, num_experts, num_topk, num_empty):
