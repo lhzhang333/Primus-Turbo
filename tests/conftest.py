@@ -71,8 +71,12 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
     # MXFP8 quantization (primus_turbo/flydsl/quantization/mxfp8_quant_gfx1250.py), bitwise vs the reference.
     "tests/pytorch/ops/test_quant_mxfp8_gfx1250.py",
-    # The op layer on those quantizers: dispatch and layouts, strict mode, operand slack.
+    # The op layer on those quantizers: dispatch and layouts, strict mode, operand slack, the MoE gather
+    # handoffs.
     "tests/pytorch/ops/test_mxfp8_ops_gfx1250.py",
+    # The MoE gather handoffs' host-side contract (primus_turbo/pytorch/ops/moe_gather.py), gfx1250's
+    # backward-plan gate included.
+    "tests/pytorch/ops/test_moe_gather_handoff.py",
     # The MXFP8 quantization ops, which dispatch bf16 / E4M3 to those kernels on gfx1250 (HIP layouts). Not
     # test_quantize_mxfp8_shuffle: on gfx1250 the shuffle flags mean the gfx1250 GEMM layouts, not HIP's.
     "tests/pytorch/ops/test_quantization.py::test_quantize_mxfp8[",

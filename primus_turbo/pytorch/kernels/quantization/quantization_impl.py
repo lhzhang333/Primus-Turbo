@@ -671,6 +671,9 @@ def grouped_quantize_mxfp8_impl(
     with_trans: bool = False,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+    dest2src: Optional[torch.Tensor] = None,
+    permuted_probs: Optional[torch.Tensor] = None,
+    total_m: Optional[int] = None,
 ) -> Union[
     Tuple[
         torch.Tensor,
@@ -691,6 +694,12 @@ def grouped_quantize_mxfp8_impl(
     is virtually zero-padded along M: rowwise to 32 and colwise to 128.  The
     padded per-group layouts are computed on GPU (no D2H sync). On gfx1250 the
     shuffle flags select the gfx1250 GEMM layouts (see ``_gfx1250_mxfp8``).
+
+    ``dest2src`` (the routing/permute -> MXFP8 fusion seam, as in
+    :func:`grouped_quantize_mxfp4_impl`): ``x`` is then the pre-permutation source
+    and destination row ``d`` is ``x[dest2src[d]]`` (zero where ``permuted_probs`` is
+    exactly 0); needs ``with_trans`` and ``total_m``. gfx1250 gathers inside the
+    quantizer; elsewhere the gather is materialized first.
     """
     assert block_size == MXFP8_BLOCK_SIZE, f"The block size must be {MXFP8_BLOCK_SIZE} for MXFP8 quantization"
 
@@ -701,6 +710,33 @@ def grouped_quantize_mxfp8_impl(
     )
     if q1250 is not None:
         Q, rule, lay = q1250
+        if dest2src is not None:
+            assert with_trans and total_m is not None, (
+                "a gathered quantization is the dual one, given total_m"
+            )
+            if x.shape[1] % 8:  # the fused gather loads 16-byte row chunks: gather here, same rule
+                pp = None if permuted_probs is None else permuted_probs[:total_m]
+                return Q.grouped_quant_mxfp8_raw(
+                    _gathered_rows(x, dest2src[:total_m], pp),
+                    group_lens,
+                    group_offs,
+                    out_dtype,
+                    rule,
+                    True,
+                    layout=lay,
+                )
+            return Q.grouped_gather_quant_mxfp8(
+                x,
+                dest2src,
+                group_lens,
+                group_offs,
+                permuted_probs,
+                out_dtype,
+                rule,
+                total_m,
+                pad=True,
+                layout=lay,
+            )
         rows, cols = with_trans or axis == 1, with_trans or axis == 0
         out = Q.grouped_quant_mxfp8_raw(
             x, group_lens, group_offs, out_dtype, rule, True, rows, cols, layout=lay
@@ -710,6 +746,10 @@ def grouped_quantize_mxfp8_impl(
         return (out[0], out[1], out[4], out[5]) if rows else (out[2], out[3], out[6], out[7])
     mxfp8_support, reason = check_mxfp8_support()
     assert mxfp8_support, reason
+    if dest2src is not None:
+        assert total_m is not None, "a gathered quantization needs total_m"
+        probs = None if permuted_probs is None else permuted_probs[:total_m]
+        x = _materialize_gathered_activation(x, dest2src[:total_m], probs)
 
     if with_trans:
         scaling_recipe_for_trans = (
@@ -770,6 +810,17 @@ def _mxfp4_gather_xcd(hidden: int, bk: int = 128) -> Tuple[int, int]:
     n_pad = (hidden + 127) // 128 * 128
     nbk = (n_pad + bk - 1) // bk
     return 4, 4 * nbk
+
+
+def _gathered_rows(x: torch.Tensor, dest2src: torch.Tensor, permuted_probs: Optional[torch.Tensor]):
+    """Row d = x[dest2src[d]], zero where the index is out of [0, rows) or the row's prob is exactly 0:
+    what the gfx1250 fused gather + quantization reads (no host sync)."""
+    idx = dest2src.long()
+    ok = (idx >= 0) & (idx < x.shape[0])
+    if permuted_probs is not None:
+        ok &= permuted_probs != 0
+    rows = x.index_select(0, idx.clamp(0, max(x.shape[0] - 1, 0)))
+    return torch.where(ok[:, None], rows, torch.zeros((), dtype=x.dtype, device=x.device))
 
 
 def _materialize_gathered_activation(

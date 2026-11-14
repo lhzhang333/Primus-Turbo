@@ -5,7 +5,8 @@
 ###############################################################################
 """The op layer on gfx1250's MXFP8 quantizers (primus_turbo/flydsl/quantization/mxfp8_quant_gfx1250.py), bit for
 bit against tests/pytorch/ref/mxfp8_ref.py: the quantization ops' dispatch (HIP layouts, and the GEMM layouts the
-recipes' shuffle flags select), the strict mode's HIP fallback, the GEMM operands' storage slack."""
+recipes' shuffle flags select), the strict mode's HIP fallback, the GEMM operands' storage slack, the permute ->
+grouped MXFP8 handoffs (ops.moe_gather)."""
 
 import pytest
 import torch
@@ -43,6 +44,94 @@ def _lay(ref, lay):
 
 def _check_grouped(out, vals, lens, rule, lay=0):
     R.check_grouped(out, vals, lens, rule, **_flags(lay))
+
+
+@pytest.mark.parametrize("H", [384, 7168])
+@pytest.mark.parametrize("routing", ["balanced", "skew"])
+def test_moe_gather_handoff(H, routing):
+    """The permute -> grouped MXFP8 handoffs as Turbo's fused grouped MLP takes them (ops.moe_gather), at the DSv3
+    routing (32 experts, top-8): forward, the lazy permute placeholder quantized straight from x (with the routing
+    probs' zero rule, the activation's layouts); backward, the deferred unpermute gradient resolved to dOut plus
+    dest2src and quantized without probs (dY: both copies packed). Each = the grouped dual cast of the materialized
+    gather, bit for bit, through quantization.grouped_quantize_fp8_with_trans."""
+    from primus_turbo.pytorch.core.low_precision import ScalingGranularity, float8_e4m3
+    from primus_turbo.pytorch.ops import moe_gather as MG
+    from primus_turbo.pytorch.ops.quantization import grouped_quantize_fp8_with_trans
+    from primus_turbo.pytorch.ops.utils import MX_A, MX_B
+
+    T, E, k = 257, 32, 8
+    g = torch.Generator(device="cuda").manual_seed(H + len(routing))
+    if routing == "balanced":
+        experts = (torch.arange(T, device="cuda")[:, None] + 4 * torch.arange(k, device="cuda")) % E
+    else:  # hot experts, several empty ones
+        w = torch.rand(E, generator=g, device="cuda") ** 4
+        w[3:9] = 0
+        experts = torch.multinomial(w.expand(T, E), k, generator=g)
+    rmap = torch.zeros(T, E, dtype=torch.bool, device="cuda").scatter_(1, experts, True)
+    probs = torch.rand(T, E, generator=g, device="cuda") * rmap
+    probs[::11] = 0  # exact zeros: the permute's padding rule zeroes those rows
+    e_idx, t_idx = rmap.T.nonzero(as_tuple=True)  # the permuted row order: expert-major, tokens in order
+    d2s, pprobs = t_idx.to(torch.int32), probs[t_idx, e_idx]
+    lens = rmap.sum(0)
+    offs = torch.nn.functional.pad(torch.cumsum(lens, 0), (1, 0))
+    M, row_id_map = int(d2s.numel()), torch.zeros(T, 2 * E + 1, dtype=torch.int32, device="cuda")
+    x, dout = _x(T, H, seed=H, special=False), _x(T, H, seed=H + 1, special=False)
+
+    def quant(src, rec, rec_t, **gather):
+        return grouped_quantize_fp8_with_trans(
+            src,
+            float8_e4m3,
+            ScalingGranularity.MX_BLOCKWISE,
+            lens,
+            offs,
+            block_size=32,
+            scaling_recipe=rec,
+            scaling_recipe_for_trans=rec_t,
+            **gather,
+        )
+
+    # forward: the placeholder resolves (with the backward plan) to x + dest2src + permuted probs
+    placeholder = torch.empty(1, H, dtype=torch.bfloat16, device="cuda").expand(M, H)
+    MG.register_permuted_activation_seam(
+        placeholder, x, d2s, pprobs, row_id_map, fuse_backward_permute_quant=True
+    )
+    src, dest2src, pp, plan = MG.lookup_permuted_activation_seam(placeholder, include_plan=True)
+    assert plan is not None and plan.experts == E and plan.shape == (M, H), (
+        "no backward plan at the DSv3 shape"
+    )
+    act = R.gather_rows(x.cpu(), d2s.cpu(), pprobs.cpu())
+    _check_grouped(
+        quant(src, MX_A, MX_B, dest2src=dest2src, permuted_probs=pp, total_m=M),
+        act,
+        lens.cpu(),
+        "nosat",
+        PACK_ROW | PACK_COL | SHUF_COL,
+    )
+    MG.register_permuted_activation_seam(
+        placeholder, x, d2s, pprobs, row_id_map
+    )  # the dispatcher's own lookup
+    _check_grouped(quant(placeholder, MX_A, MX_B), act, lens.cpu(), "nosat", PACK_ROW | PACK_COL | SHUF_COL)
+
+    # backward: the fused MLP enrolls its output, the unpermute claims it and defers its no-probs gather of dOut
+    owner, y = type("Owner", (), {})(), torch.empty(M, H, dtype=torch.bfloat16, device="cuda")
+    MG.enroll_backward_gather_output(y, plan, owner)
+    assert MG.claim_backward_gather_output(y, row_id_map, None, None, T, E, H) is plan
+    with torch.no_grad():  # (autograd's backward)
+        lazy = MG.make_backward_gather(dout, plan)
+        grad, gather = MG.resolve_backward_gather(lazy, plan)
+    assert (
+        grad is dout
+        and gather["dest2src"] is d2s
+        and gather["permuted_probs"] is None
+        and gather["total_m"] == M
+    )
+    _check_grouped(
+        quant(grad, MX_A, MX_A, **gather),
+        R.gather_rows(dout.cpu(), d2s.cpu()),
+        lens.cpu(),
+        "nosat",
+        PACK_ROW | PACK_COL,
+    )
 
 
 def _dispatch_names():

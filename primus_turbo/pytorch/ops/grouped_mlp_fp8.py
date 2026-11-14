@@ -35,6 +35,11 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     group_offs_from_lens,
 )
+from primus_turbo.pytorch.ops.moe_gather import (
+    enroll_backward_gather_output,
+    lookup_permuted_activation_seam,
+    resolve_backward_gather,
+)
 from primus_turbo.pytorch.ops.quantization import (
     grouped_quantize_fp8_with_trans,
     quantize_fp8_with_trans,
@@ -52,8 +57,15 @@ from primus_turbo.pytorch.ops.utils import (
 )
 
 __all__ = [
+    "CONSUMES_PERMUTE_SEAM_MXFP8",
     "grouped_mlp_fp8",
 ]
+
+# The MXFP8 path takes the MoE permute -> MXFP8 handoff of ops/moe_gather.py: an ``x`` registered as a lazy permute
+# placeholder (no values) is quantized from the un-permuted rows through ``dest2src``, and the unpermute's backward
+# gather is deferred into the quantization of ``grad_out``. Frameworks check this before handing over a placeholder.
+# The TENSORWISE path does not take it.
+CONSUMES_PERMUTE_SEAM_MXFP8 = True
 
 
 _SUPPORTED_ACTIVATIONS = ("silu", "gelu")
@@ -570,6 +582,15 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             w2=(w2, w_rec),
             w2_t=(w2_t, w_rec),
         )
+        # x may be a lazy permute placeholder (Primus' moe_permute_quant_fusion, ops/moe_gather.py): quantize
+        # straight from the un-permuted source through dest2src, and keep the plan that lets the unpermute's
+        # backward hand grad_out over the same way.
+        seam = lookup_permuted_activation_seam(x, include_plan=True)
+        ctx.backward_gather_plan, gather = None, {}
+        if seam is not None:
+            total_m = int(x.shape[0])
+            x, dest2src, permuted_probs, ctx.backward_gather_plan = seam
+            gather = dict(dest2src=dest2src, permuted_probs=permuted_probs, total_m=total_m)
         if not isinstance(x, QuantizedTensor):
             x_row, x_row_scale, x_col, x_col_scale, _, offs_row, _, _ = grouped_quantize_fp8_with_trans(
                 x,
@@ -580,6 +601,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
                 block_size=MXFP8_BLOCK_SIZE,
                 scaling_recipe=x_rec,
                 scaling_recipe_for_trans=x_t_rec,
+                **gather,
             )
         else:
             assert x._is_grouped_tensor, "a QuantizedTensor input must be a grouped tensor"
@@ -671,10 +693,13 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
         # version counter saved tensors are checked against.
         ctx.w1_main_grad = w1_main_grad
         ctx.w2_main_grad = w2_main_grad
+        enroll_backward_gather_output(out, ctx.backward_gather_plan, ctx)
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
+        # a deferred unpermute gradient: the un-permuted dOut + dest2src, gathered inside the quantizer
+        grad_out, gather = resolve_backward_gather(grad_out, ctx.backward_gather_plan)
         grad_out = _ensure_contiguous_grad_out(grad_out)
         (
             x_col,
@@ -712,6 +737,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             block_size=ctx.config.block_size,
             scaling_recipe=g_rec,
             scaling_recipe_for_trans=g_rec,
+            **gather,
         )
         default_backend = BackendType.FLYDSL.value
 
