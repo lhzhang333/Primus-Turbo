@@ -164,7 +164,9 @@ def _launch_gemm_combine_nt(
     # COMBINE_ONLY: the L2 output comes in through ``arg_l2``, computed elsewhere (the MXFP8 Mega's grouped
     # GEMM); every workgroup combines, and the LDS holds only the combine's tables
     _LDS_FIRST_CHUNK, _LDS_START_ROW, _LDS_FOLD_COUNT, combine_words = _combine_lds_layout(NUM_EXPERTS, block)
-    arena_bytes = max(combine_words * 4, 0 if COMBINE_ONLY else tile_geometry(tile_m, tile_n, tile_k, B_NN)[3])
+    arena_bytes = max(
+        combine_words * 4, 0 if COMBINE_ONLY else tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
+    )
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
     NUM_COMBINE = NUM_LEAD_COMBINE + NUM_TAIL_COMBINE
@@ -276,7 +278,8 @@ def _launch_gemm_combine_nt(
 
         num_tiles_m = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tile_blocks)[fx.Int32(0)])
         if const_expr(COMBINE_ONLY):
-            num_tiles_m = fx.Int32(0)  # no GEMM tile: no combine waits, and the flags of every pool block topped up
+            # no GEMM tile: no combine waits, and the flags of every pool block topped up
+            num_tiles_m = fx.Int32(0)
         combine_start = num_tiles_m * fx.Int32(N_BLOCKS_N * LEAD_GEMM_PERCENT // 100)
         tail_combine_start = num_tiles_m * fx.Int32(N_BLOCKS_N) + fx.Int32(NUM_LEAD_COMBINE)
         is_lead_combine = (bid >= combine_start) & (bid < combine_start + fx.Int32(NUM_LEAD_COMBINE))
@@ -366,14 +369,18 @@ def _launch_gemm_combine_nt(
             total_chunks = rocdl.readfirstlane(
                 T.i32, ld(lds, fx.Int32(_LDS_FIRST_CHUNK + NUM_EXPERTS), scope="workgroup", space=3)
             )
-            chunk = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(_LDS_COMBINE_SLOT), scope="workgroup", space=3))
+            chunk = rocdl.readfirstlane(
+                T.i32, ld(lds, fx.Int32(_LDS_COMBINE_SLOT), scope="workgroup", space=3)
+            )
             # every pool block below next_tile_m is already confirmed, so each is polled once
             next_tile_m = fx.Int32(0)
             segment_idx = fx.Int32(0)
             slot = fx.Int32(0)
             while chunk < total_chunks:
                 # taken chunks only grow, so the segment cursor only moves forward
-                while ld(lds, fx.Int32(_LDS_FIRST_CHUNK + 1) + segment_idx, scope="workgroup", space=3) <= chunk:
+                while (
+                    ld(lds, fx.Int32(_LDS_FIRST_CHUNK + 1) + segment_idx, scope="workgroup", space=3) <= chunk
+                ):
                     segment_idx = segment_idx + fx.Int32(1)
                 segment_idx = rocdl.readfirstlane(T.i32, segment_idx)
                 first_chunk = ld(lds, fx.Int32(_LDS_FIRST_CHUNK) + segment_idx, scope="workgroup", space=3)
@@ -585,7 +592,6 @@ def gemm_combine_nt_gfx1250(
     issue_first: int = 1,
     wmma_b2b: int | None = None,
     lds_cosched: int = -1,
-    l2: torch.Tensor | None = None,
 ):
     """``act`` [pool rows, K] (pool order, as the L1 + activation left it) -> ``[tokens, N]`` combined,
     ``tokens = topk_idx.shape[0]``.
@@ -601,10 +607,56 @@ def gemm_combine_nt_gfx1250(
     ``issue_first`` issues each k-tile's prefetch at the top of the previous one, ``lds_cosched``
     interleaves the fragment reads with the matrix ops (``nt_gemm_tile``; -1: wherever the tile and
     ``issue_first`` allow it) and ``wmma_b2b`` turns the WMMA arbitration stall off (None: on for NT,
-    off with ``b_nn``).
+    off with ``b_nn``)."""
+    return _launch(
+        act,
+        w2,
+        None,
+        handle,
+        topk_idx,
+        num_lead_combine=num_lead_combine,
+        num_tail_combine=num_tail_combine,
+        lead_gemm_percent=lead_gemm_percent,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        m_warp=m_warp,
+        n_warp=n_warp,
+        grad_gate=grad_gate,
+        b_nn=b_nn,
+        bias=bias,
+        bias_scale=bias_scale,
+        issue_first=issue_first,
+        wmma_b2b=wmma_b2b,
+        lds_cosched=lds_cosched,
+    )
 
-    ``l2`` [pool rows, N] bf16 (``act`` and ``w2`` then None): the L2 output itself, computed elsewhere (the
-    MXFP8 Mega's grouped GEMM); the launch is the combine and reduce alone (``combine_only_gfx1250``)."""
+
+def _launch(
+    act: torch.Tensor | None,
+    w2: torch.Tensor | None,
+    l2: torch.Tensor | None,
+    handle: DispatchHandle,
+    topk_idx: torch.Tensor,
+    *,
+    num_lead_combine: int = 0,
+    num_tail_combine: int = 0,
+    lead_gemm_percent: int = 25,
+    tile_m: int = 256,
+    tile_n: int = 256,
+    tile_k: int = 0,
+    m_warp: int = 4,
+    n_warp: int = 2,
+    grad_gate: torch.Tensor | None = None,
+    b_nn: bool = False,
+    bias: torch.Tensor | None = None,
+    bias_scale: torch.Tensor | None = None,
+    issue_first: int = 1,
+    wmma_b2b: int | None = None,
+    lds_cosched: int = -1,
+):
+    """The launch behind ``gemm_combine_nt_gfx1250`` (``act``, ``w2``) and ``combine_only_gfx1250`` (``l2``
+    [pool rows, N] bf16, the L2 output computed elsewhere: the combine and reduce alone)."""
     if wmma_b2b is None:
         wmma_b2b = 0 if b_nn else 1
     lds_cosched = resolve_lds_cosched(lds_cosched, issue_first, tile_m, tile_n, m_warp, n_warp)
@@ -688,7 +740,9 @@ def gemm_combine_nt_gfx1250(
         torch.cuda.current_stream(),
         # GEMM tiles of this call's pool (the prologue's num_tile_blocks), then the combine
         # workgroups: a worst-case grid would queue idle tiles ahead of the tail combine
-        (0 if combine_only else rows // BLOCK_M * ((N + tile_n - 1) // tile_n)) + num_lead_combine + num_tail_combine,
+        (0 if combine_only else rows // BLOCK_M * ((N + tile_n - 1) // tile_n))
+        + num_lead_combine
+        + num_tail_combine,
         N,
         K,
         int(symm.num_max_pool_tokens) // BLOCK_M,
@@ -731,4 +785,4 @@ def combine_only_gfx1250(l2: torch.Tensor, handle: DispatchHandle, topk_idx: tor
     """The combine and reduce of ``gemm_combine_nt_gfx1250`` over an L2 output computed elsewhere: ``l2`` [pool rows,
     hidden] bf16 in pool order (padding rows unread) -> ``out [tokens, hidden]``, and with ``grad_gate`` (f32 per
     pool row) also ``grad_topk_weights [tokens, topk]``, as that call returns them."""
-    return gemm_combine_nt_gfx1250(None, None, handle, topk_idx, grad_gate=grad_gate, l2=l2)
+    return _launch(None, None, l2, handle, topk_idx, grad_gate=grad_gate)

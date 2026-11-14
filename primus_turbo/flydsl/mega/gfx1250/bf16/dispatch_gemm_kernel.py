@@ -388,13 +388,14 @@ def dispatch_only_gfx1250(
     *,
     num_dispatch_cu: int | None = None,
     x_scale: torch.Tensor | None = None,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Dispatch ``x`` by ``handle`` and return the dispatch token buffer it lands in, in receive
     order (``handle.pool_row_to_recv_token`` maps pool rows to it). ``num_dispatch_cu`` defaults
     to every CU but the one the launch's waiting workgroup holds: no GEMM shares the launch.
 
     With ``x_scale`` the tokens are MXFP8: ``x`` E4M3 ``[T, hidden]`` and ``x_scale`` its raw E8M0
-    ``[T, hidden / 32]``, landing in ``SymmBuffer.dispatch_fp8_views()`` (returned instead)."""
+    ``[T, hidden / 32]`` (one byte each), landing in ``SymmBuffer.dispatch_fp8_views()``, whose
+    ``(rows, scales)`` pair is returned instead (hidden % 512 == 0: whole 16-byte scale rows)."""
     if num_dispatch_cu is None:
         num_dispatch_cu = torch.cuda.get_device_properties(x.device).multi_processor_count - 1
     symm = get_symm_buffer_for_mega_moe()
@@ -451,8 +452,21 @@ def _run(
     tile_k = tile_k or (128 if K % 128 == 0 else 64)
     mx = x_scale is not None
     if mx:
-        assert dispatch_only and x.dtype == torch.float8_e4m3fn and x_scale.is_contiguous()
-        assert tuple(x_scale.shape) == (x.shape[0], x.shape[1] // 32), "raw E8M0 scales [T, hidden / 32]"
+        if not dispatch_only or x.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"MXFP8 tokens go through dispatch_only_gfx1250 as E4M3 rows, got {x.dtype}")
+        if x.shape[1] % 512:
+            raise ValueError(
+                f"MXFP8 dispatch: hidden % 512 == 0 (whole 16-byte E8M0 scale rows), got {x.shape[1]}"
+            )
+        if (
+            tuple(x_scale.shape) != (x.shape[0], x.shape[1] // 32)
+            or x_scale.element_size() != 1
+            or not x_scale.is_contiguous()
+        ):
+            raise ValueError(
+                f"x_scale: contiguous raw E8M0 bytes [T, hidden / 32] = {(x.shape[0], x.shape[1] // 32)}, "
+                f"got {tuple(x_scale.shape)} {x_scale.dtype}"
+            )
     else:
         assert x.dtype == w1.dtype == torch.bfloat16
     assert x.is_contiguous() and (dispatch_only or w1.is_contiguous())

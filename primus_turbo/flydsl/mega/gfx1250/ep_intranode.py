@@ -20,10 +20,10 @@ from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.utils.arith import ArithValue
 
 from primus_turbo.flydsl.mega.gfx1250.prims import (
+    _COPY_VEC_I32,
     CPOL_DEVICE_STREAM,
     CPOL_SYSTEM_STREAM,
     WAVE,
-    _COPY_VEC_I32,
     _readfirstlane_i32,
     _readlane_i32,
     atomic_add,
@@ -191,7 +191,13 @@ def _copy_rows(rows, load_cache_modifier: int, store_cache_modifier: int) -> Non
     offsets = {nbytes: _wave_copy_offsets(nbytes) for _, _, _, nbytes, _ in rows}
     values = [
         [
-            buffer_load(src_res, src_off + o, vec_width=_COPY_VEC_I32, dtype=fx.T.i32, cache_modifier=load_cache_modifier)
+            buffer_load(
+                src_res,
+                src_off + o,
+                vec_width=_COPY_VEC_I32,
+                dtype=fx.T.i32,
+                cache_modifier=load_cache_modifier,
+            )
             for o in offsets[nbytes][0]
         ]
         for src_res, src_off, _, nbytes, _ in rows
@@ -267,14 +273,17 @@ def dispatch_bf16_tile(
     assert block_threads % WAVE == 0, "a block is a whole number of copy waves"
     num_waves = block_threads // WAVE
     row_stride = num_chunks * num_waves  # copy waves per dst rank
-    scale_bytes = hidden_size // 32
+    scale_bytes = hidden_size // 32 if const_expr(mx) else 0  # an E8M0 scale row
     loads_per_row = ceildiv(hidden_bytes, WAVE * _COPY_VEC_I32 * 4) + (1 if mx else 0)
     rows_per_batch = max(1, _MAX_COPY_LOADS // loads_per_row)
     num_max_pool_blocks = int(workspace.num_max_pool_blocks)
     recv_token_base = rank * int(workspace.num_max_tokens_per_rank)
     # hoist workspace-derived values before any dynamic control flow (rewriter can't carry Workspace)
     token_buffer_ptr = workspace.get_dispatch_token_buffer_ptr()
-    scale_buffer_ptr = token_buffer_ptr + int(workspace.num_max_recv_tokens) * hidden_size
+    # the scale plane follows the receive rows (``SymmBuffer.dispatch_fp8_views``)
+    scale_buffer_ptr = (
+        token_buffer_ptr + int(workspace.num_max_recv_tokens) * hidden_size if const_expr(mx) else None
+    )
     dispatch_flag_ptr = workspace.get_dispatch_flag_ptr()
     # LDS words: [0, num_waves) scan scratch, then the prefix (one per expert + the total), then the offsets
     lds_prefix = num_waves
@@ -306,9 +315,16 @@ def dispatch_bf16_tile(
 
     for group in range(fx.Int32(num_experts_per_rank // experts_per_publish)):
         first_expert = group * fx.Int32(experts_per_publish)
-        group_start = _readfirstlane_i32(ld(lds_base, fx.Int32(lds_prefix) + first_expert, scope="workgroup", space=3))
+        group_start = _readfirstlane_i32(
+            ld(lds_base, fx.Int32(lds_prefix) + first_expert, scope="workgroup", space=3)
+        )
         group_end = _readfirstlane_i32(
-            ld(lds_base, fx.Int32(lds_prefix + experts_per_publish) + first_expert, scope="workgroup", space=3)
+            ld(
+                lds_base,
+                fx.Int32(lds_prefix + experts_per_publish) + first_expert,
+                scope="workgroup",
+                space=3,
+            )
         )
         # this wave's tokens of the group: flat positions group_start + wave_id + k * row_stride
         num_rows = (group_end - group_start - wave_id + fx.Int32(row_stride - 1)) // fx.Int32(row_stride)
@@ -335,7 +351,9 @@ def dispatch_bf16_tile(
                 for u in range_constexpr(rows_per_batch):
                     is_valid = batch_start + fx.Int32(u) < round_rows
                     # an idle slot copies token 0 (the batch's first slot is always a real row) into nothing
-                    token = arith.select(is_valid, _readlane_i32(token_of_lane, batch_start + fx.Int32(u)), fx.Int32(0))
+                    token = arith.select(
+                        is_valid, _readlane_i32(token_of_lane, batch_start + fx.Int32(u)), fx.Int32(0)
+                    )
                     recv_row = cast(fx.Int32(recv_token_base) + token, fx.T.i64)
                     copies.append(
                         (
@@ -364,7 +382,9 @@ def dispatch_bf16_tile(
         if thread_index == fx.Int32(0):
             counter_index = first_expert * fx.Int32(num_ranks) + block_dst_rank
             # each chunk's stores retired before its counter add, so the last chunk's flag adds publish them all
-            chunk_count_before_add = atomic_add(dispatch_chunk_counter_ptr, counter_index, fx.Int64(1), scope="agent")
+            chunk_count_before_add = atomic_add(
+                dispatch_chunk_counter_ptr, counter_index, fx.Int64(1), scope="agent"
+            )
             if chunk_count_before_add == fx.Int64(num_chunks - 1):
                 # the last chunk rearms the counter, so every launch starts from 0 whatever its chunk count
                 st(dispatch_chunk_counter_ptr, counter_index, fx.Int64(0), scope="agent")
@@ -694,7 +714,9 @@ def topk_reduce_bf16_tile(
     hw_wave = WAVE
     is_wave_leader = thread_index % fx.Int32(hw_wave) == fx.Int32(0)
     assert not has_grad_gate or num_topk <= hw_wave, "lane j of the first wave moves route j's gate gradient"
-    plus_zero = _vector.broadcast(f32_vec, fx.arith.constant(0.0)) if const_expr(num_route_slots > 0) else None
+    plus_zero = (
+        _vector.broadcast(f32_vec, fx.arith.constant(0.0)) if const_expr(num_route_slots > 0) else None
+    )
     while token < num_tokens:
         route_base = token * fx.Int32(num_topk)
         expert_ids = []
@@ -791,7 +813,9 @@ def topk_reduce_bf16_tile(
             # that wave moves route j's gate gradient, so the routes take one round trip, not one each
             is_valid_route = expert_ids[0] >= fx.Int32(0)
             for j in range_constexpr(1, num_topk):
-                is_valid_route = arith.select(lane_id == fx.Int32(j), expert_ids[j] >= fx.Int32(0), is_valid_route)
+                is_valid_route = arith.select(
+                    lane_id == fx.Int32(j), expert_ids[j] >= fx.Int32(0), is_valid_route
+                )
             if lane_id < fx.Int32(num_topk):
                 gate_value = buffer_load(
                     combine_gate_res,
