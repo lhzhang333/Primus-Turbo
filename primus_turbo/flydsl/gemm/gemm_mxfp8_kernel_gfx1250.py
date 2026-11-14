@@ -67,15 +67,12 @@ from primus_turbo.flydsl.gemm.gemm_mxfp8_gfx1250_configs import (
     pick_config,
     pick_grouped_config,
 )
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
-    _make_lds_copy_ops,
-    _require_gfx1250,
-)
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
 )
+from primus_turbo.flydsl.utils.gfx1250_utils import make_lds_copy_ops, require_gfx1250
 
 WAVE = 32
 WMMA_K = 128  # K per WMMA = per scale word (4 E8M0 bytes)
@@ -440,8 +437,8 @@ def _launch_gemm_mxfp8(
             return _prepare, t_step, last_slot
 
         wmb, wnb = wave_m * WM, wave_n * WN
-        lds_load_b32, _ = _make_lds_copy_ops(32)
-        lds_load_b128, _ = _make_lds_copy_ops(128)
+        lds_load_b32, _ = make_lds_copy_ops(32)
+        lds_load_b128, _ = make_lds_copy_ops(128)
 
         # ---- fragment / scale read addresses per unrolled stage (displacements stay DS immediates) ----
         a_byte = (wmb + lane16) * LDS_ROW + kgrp * 16
@@ -522,6 +519,9 @@ def _launch_gemm_mxfp8(
             (and not read by the old-C loads)."""
             _, out_row0, m_valid, blk_n, n_valid, expert, _, _, _ = dec
             m_ext = (m_valid < tile_m).select(m_valid, fx.Int32(tile_m))
+            if const_expr(mode == GROUPED_M):  # (rows past out's m_out: a bad offset table must not store there)
+                rows_left = i32_m - out_row0
+                m_ext = (m_ext < rows_left).select(m_ext, rows_left)
             m_ext = (m_ext > zero).select(m_ext, zero)
             n_ext = (n_valid < tile_n).select(n_valid, fx.Int32(tile_n))
             c_addr = fx.Int64(fx.ptrtoint(arg_c)) + (fx.Int64(out_row0) * fx.Int64(i32_ldc) + fx.Int64(blk_n)) * OB
@@ -981,18 +981,19 @@ def constexprs(mode, cfg, M, N, G, packed, b_preshuffled, k_tail, out_f32, beta1
 _RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
-def _stream():
-    """The current stream of the current device as the launcher takes it (a raw handle: 10x cheaper than
-    ``torch.cuda.current_stream()``)."""
+def _stream(device: int):
+    """The current stream of ``device`` (the current device) as the launcher takes it (a raw handle: 10x cheaper
+    than ``torch.cuda.current_stream()``)."""
     if _RAW_STREAM is None:
         return torch.cuda.current_stream()
-    return _RAW_STREAM(torch._C._cuda_getDevice())
+    return _RAW_STREAM(device)
 
 
 # Host plans: a call signature -> (launcher, its int arguments, constexpr tuple, the storage slack the config relied
 # on, out shape), made by the full path; a later call with the same signature only checks alignment (and that slack)
 # and launches. The signature has every property the full path checks.
 _PLANS: dict = {}
+_MAX_PLANS = 4096
 
 
 def _plan_key(mode, a, b, sa, sb, out, out_dtype, accumulate, config, b_preshuffled, extra=()):
@@ -1006,13 +1007,14 @@ def _run_plan(plan, out, a, b, sa, sb, g0=None, g1=None) -> bool:
     lack the storage slack the plan's config relies on."""
     fn, ints, const, slack, _ = plan
     o, pa, pb = out.data_ptr(), a.data_ptr(), b.data_ptr()
-    if (o | pa | pb) & 15:
+    dev = torch._C._cuda_getDevice()
+    if (o | pa | pb) & 15 or a.get_device() != dev:
         return False
     for i, n in slack:
         if _slack((a, b, sa, sb)[i]) < n:
             return False
     fn(o, pa, pb, sa.data_ptr(), sb.data_ptr(), o if g0 is None else g0.data_ptr(), o if g1 is None else g1.data_ptr(),
-       *ints, _stream(), *const)
+       *ints, _stream(dev), *const)
     return True
 
 
@@ -1024,8 +1026,11 @@ def _launch(who, mode, cfg, out, a, b, sa, sb, g0, g1, M, N, K, lda, ldb, ldsa, 
         raise ValueError(f"{who}: a / b must be float8_e4m3fn, got {a.dtype}, {b.dtype}")
     if a.stride(-1) != 1 or b.stride(-1) != 1 or lda % 16 or ldb % 16 or K % 16:
         raise ValueError(f"{who}: K ({K}) and the a / b row strides must be multiples of 16 bytes, K contiguous")
-    if N % 8 or out.stride(-1) != 1 or out.stride(-2) % 8:
-        raise ValueError(f"{who}: N ({N}) and the out row stride must be multiples of 8 (16-byte output rows)")
+    if N % 8 or out.stride(-1) != 1 or out.stride(-2) % 8 or out.stride(-2) < N:
+        raise ValueError(f"{who}: N ({N}) and the out row stride (>= N) must be multiples of 8 (16-byte output rows)")
+    dev = torch.cuda.current_device()
+    if any(t is not None and t.device != torch.device("cuda", dev) for t in (a, b, sa, sb, out, g0, g1)):
+        raise ValueError(f"{who}: every tensor must be on the current device cuda:{dev} (a is on {a.device})")
     if b_preshuffled and (N % 16 or ldb != K):
         raise ValueError(f"{who}: a preshuffled b needs N % 16 == 0 and dense [N/16][K/16][16][16] blocks")
     for t in (a, b, out):
@@ -1038,15 +1043,16 @@ def _launch(who, mode, cfg, out, a, b, sa, sb, g0, g1, M, N, K, lda, ldb, ldsa, 
             tabs[1].data_ptr())
     fn = _COMPILED.get(const)
     if fn is None:
-        ptr = lambda t: flyc.from_c_void_p(fx.Int8, t.data_ptr(), assumed_align=16)  # noqa: E731
-        first = (ptr(out), ptr(a), ptr(b), ptr(sa), ptr(sb), ptr(tabs[0]), ptr(tabs[1])) + ints + \
-            (torch.cuda.current_stream(),) + const
+        first = tuple(flyc.from_c_void_p(fx.Int8, p, assumed_align=16) for p in ptrs) + ints
+        first += (torch.cuda.current_stream(),) + const
         fn = flyc.compile(_launch_gemm_mxfp8, *first)  # compiles and runs this call
         if fn is not None:
             _COMPILED[const] = fn
     else:
-        fn(*ptrs, *ints, _stream(), *const)
+        fn(*ptrs, *ints, _stream(dev), *const)
     if plan_key is not None and fn is not None:
+        if len(_PLANS) >= _MAX_PLANS:
+            _PLANS.clear()
         _PLANS[plan_key] = (fn, ints, const, slack, tuple(out.shape))
     return out
 
@@ -1115,7 +1121,7 @@ def gemm_mxfp8_gfx1250(
         res = torch.empty(plan[4], dtype=out_dtype, device=a.device) if out is None else out
         if _run_plan(plan, res, a, b, a_scale, b_scale):
             return res
-    _require_gfx1250(a.device)
+    require_gfx1250(a.device, "gemm_mxfp8_gfx1250")
     M, K = a.shape
     N = b.shape[0]
     if b.shape[1] != K:
@@ -1161,14 +1167,14 @@ def grouped_gemm_mxfp8_gfx1250(
         res = torch.empty(plan[4], dtype=out_dtype, device=a.device) if out is None else out
         if _run_plan(plan, res, a, b, a_scale, b_scale, group_offs, group_offs_padded):
             return res
-    _require_gfx1250(a.device)
     who = "grouped_gemm_mxfp8_gfx1250"
+    require_gfx1250(a.device, who)
     G, N, K = b.shape
     if a.shape[1] != K or group_offs.numel() != G + 1 or group_offs_padded.numel() != G + 1:
         raise ValueError(f"{who}: a {tuple(a.shape)}, b {tuple(b.shape)}, offsets {group_offs.numel()} / "
                          f"{group_offs_padded.numel()} entries")
-    if group_offs.dtype != torch.int64 or group_offs_padded.dtype != torch.int64:
-        raise ValueError(f"{who}: group offsets must be int64")
+    if any(t.dtype != torch.int64 or not t.is_contiguous() for t in (group_offs, group_offs_padded)):
+        raise ValueError(f"{who}: group offsets must be contiguous int64")
     if not b.is_contiguous():
         raise ValueError(f"{who}: b must be contiguous [G, N, K]")
     out = _out(out, (m_out, N), out_dtype, False, a.device, who)
@@ -1210,12 +1216,14 @@ def grouped_gemm_mxfp8_variable_k_gfx1250(
         res = torch.empty(plan[4], dtype=out_dtype, device=a.device) if out is None else out
         if _run_plan(plan, res, a, b, a_scale, b_scale, group_offs):
             return res
-    _require_gfx1250(a.device)
     who = "grouped_gemm_mxfp8_variable_k_gfx1250"
+    require_gfx1250(a.device, who)
     (M, T), N = a.shape, b.shape[0]
     G = group_offs.numel() - 1
-    if b.shape[1] != T or group_offs.dtype != torch.int64 or T % 128:
-        raise ValueError(f"{who}: a {tuple(a.shape)}, b {tuple(b.shape)}, token count a multiple of 128, int64 offsets")
+    if b.shape[1] != T or group_offs.dtype != torch.int64 or not group_offs.is_contiguous() or T % 128:
+        raise ValueError(
+            f"{who}: a {tuple(a.shape)}, b {tuple(b.shape)}, token count a multiple of 128, contiguous int64 offsets"
+        )
     out = _out(out, (G, M, N), out_dtype, accumulate, a.device, who)
     if out.stride(0) != M * out.stride(1):
         raise ValueError(f"{who}: out must be [G, M, ldc] with expert stride M * ldc")
