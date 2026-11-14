@@ -59,8 +59,15 @@ from primus_turbo.pytorch.ops.utils import (
 )
 
 __all__ = [
+    "CONSUMES_PERMUTE_SEAM_MXFP8",
     "grouped_mlp_fp8",
 ]
+
+# The MXFP8 path takes the MoE permute -> MXFP8 handoff of ops/moe_gather.py: an ``x`` registered as a lazy permute
+# placeholder (no values) is quantized from the un-permuted rows through ``dest2src``, and the unpermute's backward
+# gather is deferred into the quantization of ``grad_out``. Frameworks check this before handing over a placeholder.
+# The TENSORWISE path does not take it.
+CONSUMES_PERMUTE_SEAM_MXFP8 = True
 
 
 _SUPPORTED_ACTIVATIONS = ("silu", "gelu")

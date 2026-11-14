@@ -253,6 +253,7 @@ def test_grouped_mlp_permute_fusion(backend, T, H, I, skew, monkeypatch):
     from primus_turbo.pytorch.ops import grouped_mlp_fp8 as op
     from primus_turbo.pytorch.ops import moe_gather
 
+    assert op.CONSUMES_PERMUTE_SEAM_MXFP8  # what Primus probes before it hands over a placeholder
     E, k = 32, 8
     g = torch.Generator(device="cuda").manual_seed(T + H)
     if skew:  # hot experts, empty ones
