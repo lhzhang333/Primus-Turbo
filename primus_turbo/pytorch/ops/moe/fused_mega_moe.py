@@ -189,8 +189,11 @@ def fused_mega_moe(
     return FusedMegaMoEFunction.apply(x, topk_idx, topk_weights, w1, w2, group, activation)
 
 
-def _wgrad_accum_target(w: torch.Tensor, pattern: Optional[str], needs_grad: bool) -> Optional[torch.Tensor]:
+def _wgrad_accum_target(
+    w: torch.Tensor, pattern: Optional[str], needs_grad: bool, supported=None
+) -> Optional[torch.Tensor]:
     """``w.main_grad`` when this op's wgrad can accumulate into it, else None (ordinary gradient).
+    ``supported(w)``: whether the wgrad kernel can (default: the bf16 gfx1250 variable-K's check).
 
     Checked BEFORE ``_setup_fused_grad_accum``, which marks the weight as already accumulated as a
     side effect: marking a weight whose gradient then takes the ordinary path would drop it.
@@ -206,11 +209,12 @@ def _wgrad_accum_target(w: torch.Tensor, pattern: Optional[str], needs_grad: boo
         and main_grad.is_contiguous()
     ):
         return None
-    from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_impl import (
-        wgrad_accum_supported,
-    )
+    if supported is None:
+        from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_impl import (
+            wgrad_accum_supported as supported,
+        )
 
-    if not wgrad_accum_supported(w):
+    if not supported(w):
         return None
     _, main_grad = _setup_fused_grad_accum(w, pattern)
     return main_grad
