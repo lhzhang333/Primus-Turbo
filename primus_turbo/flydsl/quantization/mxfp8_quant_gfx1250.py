@@ -30,7 +30,7 @@ tile per workgroup (8 waves):
 * cols phase: the same on half a 32-block of a column, read by two ``ds_load_tr16_b128`` (the
   LDS transposes 8 x 8 bf16 blocks), giving the transposed copy ``q_col [cols, rows]``; its codes
   (staged in the consumed bf16 tile) and all scale bytes go through LDS, then out as whole 128-byte
-  lines and one scale dword per row (byte and half-line stores cost the first version ~45%);
+  lines and one scale dword per row;
 * ``2d`` (weights): one scale per 32 x 32 block, its max from a pre-pass into LDS; both copies use
   it, so ``q_t == q.T``;
 * ``grouped`` (MoE): the row copy per expert zero-padded to 32 rows, the column copy to 128 tokens (pad
@@ -303,7 +303,8 @@ def _launch(
     PADM: Constexpr[int],
     ACT: Constexpr[str],
     CLAMP: Constexpr[float],
-    AUX: Constexpr[int],
+    DBG: Constexpr[int],
+    ZPROB: Constexpr[int],
     LAY: Constexpr[int],
     NOP: Constexpr[int],
 ):
@@ -421,7 +422,7 @@ def _launch(
                     r, c16 = q // I32(16), q % I32(16)
                     src = I32(buffer_load(ri, in0 + r, vec_width=1, dtype=T.i32))
                     ok = (r < nreal) & (src >= I32(0)) & (src < i32_t) & (k0 + c16 * I32(8) < I32(K))
-                    if const_expr(AUX):  # zero the rows whose prob is 0 (the permute's padding rule)
+                    if const_expr(ZPROB):  # zero the rows whose prob is 0 (the permute's padding rule)
                         ok = ok & (fx.Float32(buffer_load(rp, in0 + r, vec_width=1, dtype=T.f32)) != fx.Float32(0.0))
                     ga = ok.select(_addr(arg_x) + (I64(src) * I64(K) + I64(k0 + c16 * I32(8))) * I64(2), _addr(arg_z))
                     gp = _llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(ga))
@@ -450,11 +451,11 @@ def _launch(
                             buffer_store(gsum, gpr, in0 + r, mask=(r < nreal) & (q % I32(16) == I32(15)))
                     for w in range_constexpr(len(res)):
                         _lds_st(off + I32(w * TILE), res[w], 16)
-                        if const_expr(AUX):  # the bf16 values (tests)
+                        if const_expr(DBG):  # the bf16 values (tests)
                             buffer_store(res[w], dbg, (r * I32(OW) + I32(w * K) + k0 + c8) * I32(2), mask=dok,
                                          offset_is_bytes=True)
                 gpu.barrier()
-            if const_expr(PROD == P_NORM):  # RMSNorm: y = bf16((x * rstd[row]) * gamma[col]) in place; AUX: y out
+            if const_expr(PROD == P_NORM):  # RMSNorm: y = bf16((x * rstd[row]) * gamma[col]) in place; DBG: y out
                 rp = _rsrc(_addr(arg_p), i32_m * I32(4))
                 ys = _rsrc(_addr(arg_dbg) + row0 * I64(K * 2), nreal * I32(K * 2))
                 c8 = (t % I32(16)) * I32(8)  # a lane's 8 columns, the same in every pass
@@ -466,7 +467,7 @@ def _launch(
                     rstd = fx.Float32(buffer_load(rp, in0 + r, vec_width=1, dtype=T.f32))
                     yv = _bf8((Vec(_lds_v4(off)).bitcast(fx.BFloat16).to(fx.Float32) * rstd) * gam)
                     _lds_st(off, yv, 16)
-                    if const_expr(AUX):
+                    if const_expr(DBG):
                         buffer_store(yv, ys, (r * I32(K) + k0 + c8) * I32(2), mask=(r < nreal) & (k0 + c8 < I32(K)),
                                      offset_is_bytes=True)
                 gpu.barrier()
@@ -639,7 +640,7 @@ def _run(prod, out, rule, x, outs, m, mc, m_tiles, k, ko=0, b2d=0, padm=0, go=No
     if grid == 0 or batch == 0:
         return
     tail = (k, prod, out, b2d, RULES[rule], 0 if go is None else go.shape[0] - 1, _width(mc), ko or k, padm, act,
-            float(clamp or 0.0), int(dbg is not None or (prod == P_GATHER and p is not None)), lay,
+            float(clamp or 0.0), int(dbg is not None), int(prod == P_GATHER and p is not None), lay,
             int(p is None and prod in (P_GLU, P_DGLU)))
     dev = x.get_device()
     zero = _ZERO.get(dev)
@@ -746,34 +747,31 @@ def quant_mxfp8_cols(x, out_dtype=torch.float8_e4m3fn, rule="nosat", blk_2d=Fals
     return q, s
 
 
+def _dual(x, ndim, out_dtype, row_2d, col_2d, rule, pad, layout):
+    assert row_2d == col_2d, "the 32x32 block scale is shared by both copies"
+    x = _check(x, out_dtype, rule, (ndim,))
+    *b, M, K = x.shape
+    KO, Mc = (_ceil128(K), _ceil128(M)) if pad else (K, M)
+    qr, sr = _bufs(b, M, KO, layout & PACK_ROW, layout & SHUF_ROW, out_dtype, x)
+    qc, sc = _bufs(b, K, Mc, layout & PACK_COL, layout & SHUF_COL, out_dtype, x)
+    _run(P_DENSE, O_ROWS | O_COLS, rule, x, (qr, sr, qc, sc, None, None), M, Mc, -(-M // BM), K, KO, int(row_2d),
+         int(pad), lay=layout)
+    return qr, sr, qc, sc
+
+
 def quant_mxfp8_raw_batched(x, out_dtype=torch.float8_e4m3fn, row_2d=False, col_2d=False, rule="nosat", pad=False,
                             layout=0):
     """Dual cast of x [B, M, K] bf16, read once: (q_row [B, M, K], s_row, q_col [B, K, M], s_col); raw scales
     [B, M, ceil(K/32)] / [B, K, ceil(M/32)] unless ``layout`` packs them. ``row_2d == col_2d == True``: 32 x 32
     blocks (weights), one scale per block shared by both copies; otherwise 1 x 32 blocks along each copy's rows.
     ``pad``: the HIP layout, K and M padded to 128 (zero codes, byte-0 scales)."""
-    assert row_2d == col_2d, "the 32x32 block scale is shared by both copies"
-    x = _check(x, out_dtype, rule, (3,))
-    B, M, K = x.shape
-    KO, Mc = (_ceil128(K), _ceil128(M)) if pad else (K, M)
-    qr, sr = _bufs((B,), M, KO, layout & PACK_ROW, layout & SHUF_ROW, out_dtype, x)
-    qc, sc = _bufs((B,), K, Mc, layout & PACK_COL, layout & SHUF_COL, out_dtype, x)
-    _run(P_DENSE, O_ROWS | O_COLS, rule, x, (qr, sr, qc, sc, None, None), M, Mc, -(-M // BM), K, KO, int(row_2d),
-         int(pad), lay=layout)
-    return qr, sr, qc, sc
+    return _dual(x, 3, out_dtype, row_2d, col_2d, rule, pad, layout)
 
 
 def quant_mxfp8_raw(x, out_dtype=torch.float8_e4m3fn, row_2d=False, col_2d=False, rule="nosat", pad=False, layout=0):
-    """Dual cast of x [M, K]: ``quant_mxfp8_raw_batched`` with B = 1 (2-D outputs, 4-D packed scales)."""
-    assert row_2d == col_2d, "the 32x32 block scale is shared by both copies"
-    x = _check(x, out_dtype, rule, (2,))
-    M, K = x.shape
-    KO, Mc = (_ceil128(K), _ceil128(M)) if pad else (K, M)
-    qr, sr = _bufs((), M, KO, layout & PACK_ROW, layout & SHUF_ROW, out_dtype, x)
-    qc, sc = _bufs((), K, Mc, layout & PACK_COL, layout & SHUF_COL, out_dtype, x)
-    _run(P_DENSE, O_ROWS | O_COLS, rule, x, (qr, sr, qc, sc, None, None), M, Mc, -(-M // BM), K, KO, int(row_2d),
-         int(pad), lay=layout)
-    return qr, sr, qc, sc
+    """Dual cast of x [M, K]: ``quant_mxfp8_raw_batched`` without the batch dim (the CDNA4 module's pair of
+    entries, which the op layer picks by ``x.ndim``)."""
+    return _dual(x, 2, out_dtype, row_2d, col_2d, rule, pad, layout)
 
 
 def _grouped(prod, x, group_lens, group_offs, out_dtype, rule, k, M, rows=True, cols=True, pad=False, layout=0, **kw):
