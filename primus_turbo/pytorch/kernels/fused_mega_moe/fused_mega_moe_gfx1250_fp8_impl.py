@@ -36,6 +36,7 @@ from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
     DispatchHandle,
     run_dispatch_prologue,
 )
+from primus_turbo.flydsl.mega.gfx1250.symm_buffer import TOKEN_ALIGNMENT, align
 from primus_turbo.flydsl.quantization import mxfp8_quant_gfx1250 as Q
 from primus_turbo.flydsl.utils.glu_activation import GLUActivation
 from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_fp8_weights import _version_keyed_weight_prep
@@ -46,8 +47,27 @@ _COLS_A, _COLS_B = Q.PACK_COL, Q.PACK_COL | Q.SHUF_COL  # a column copy as the w
 
 def supported(hidden: int, inter: int) -> bool:
     """Whether experts of this hidden / intermediate size run here: whole 16-byte E8M0 scale rows on the wire
-    (hidden % 512) and the GLU's packed row scales (inter % 128)."""
+    (hidden % 512) and the GLU's packed row scales (inter % 128). There is no padding fallback on gfx1250."""
     return hidden % 512 == 0 and inter % 128 == 0
+
+
+_UNCHECKED = object()
+
+
+def check(w1: torch.Tensor, activation=_UNCHECKED, fc1_bias: Optional[torch.Tensor] = None) -> None:
+    """Raise, before any cross-rank work, what the stages would refuse later: an expert shape off the grid
+    (``supported``), a non-nosat scale rule, an fc1 bias, and (when given) an activation ``glu_form`` refuses."""
+    hidden, inter = w1.shape[2], w1.shape[1] // 2
+    if not supported(hidden, inter):
+        raise ValueError(
+            f"MXFP8 MegaMoE on gfx1250 needs hidden % 512 == 0 and intermediate % 128 == 0 (no padding fallback), "
+            f"got w1 {tuple(w1.shape)}: hidden {hidden}, intermediate {inter}"
+        )
+    _rule()
+    if fc1_bias is not None:
+        raise NotImplementedError("MXFP8 MegaMoE on gfx1250: no fc1 bias")
+    if activation is not _UNCHECKED:
+        glu_form(activation)
 
 
 def glu_form(activation) -> tuple:
@@ -67,7 +87,9 @@ def glu_form(activation) -> tuple:
 def _rule() -> str:
     rule = envs.PRIMUS_TURBO_MXFP8_SCALE_RULE
     if rule != "nosat":
-        raise NotImplementedError("MXFP8 MegaMoE re-quantizes columns of fp8 rows: exact under the nosat rule only")
+        raise NotImplementedError(
+            "MXFP8 MegaMoE re-quantizes columns of fp8 rows: exact under the nosat rule only"
+        )
     return rule
 
 
@@ -131,8 +153,15 @@ def _wgrad(a, b, handle: DispatchHandle, out: Optional[torch.Tensor]) -> Optiona
 def stage1_forward(x, w1, group, topk_idx, topk_weights, save_bwd: bool = True):
     """dispatch + fc1 -> ``(l1 [P, 2I] bf16, dispatch_weights [P] f32, handle, x_col, None)``, the gfx950 fp8
     stage1's contract; ``x_col`` (the pool's column copy and its scales, dW1's operand) None without ``save_bwd``."""
-    assert supported(w1.shape[2], w1.shape[1] // 2), f"MXFP8 MegaMoE on gfx1250: hidden % 512, inter % 128, got {w1.shape}"
-    assert x.dtype == torch.bfloat16 and x.shape[1] == w1.shape[2]
+    check(w1)
+    if x.dtype != torch.bfloat16 or x.shape[1] != w1.shape[2]:
+        raise ValueError(f"x must be bf16 [T, {w1.shape[2]}], got {x.dtype} {tuple(x.shape)}")
+    recv_rows = group.size() * align(x.shape[0], TOKEN_ALIGNMENT)  # the receive buffer the pool gather reads
+    if recv_rows * x.shape[1] >= 2**31:
+        raise ValueError(
+            f"MXFP8 MegaMoE on gfx1250 addresses the receive buffer with 32-bit offsets: ranks x align(tokens, "
+            f"{TOKEN_ALIGNMENT}) x hidden must stay below 2**31, got {recv_rows} rows x {x.shape[1]}"
+        )
     handle, dispatch_weights = run_dispatch_prologue(x, w1, group, topk_idx, topk_weights)
     xr, sxr, xc, sxc = _send(x, handle, _COLS_B, cols=save_bwd)
     W1, sW1, _, _ = _weights(w1)
@@ -140,9 +169,9 @@ def stage1_forward(x, w1, group, topk_idx, topk_weights, save_bwd: bool = True):
     return l1, dispatch_weights, handle, ((xc, sxc) if save_bwd else None), None
 
 
-def stage2_forward(l1, w2, handle, topk_idx, dispatch_weights, activation):
+def stage2_forward(l1, w2, handle, topk_idx, dispatch_weights, activation, save_bwd: bool = True):
     """GLU (routing weight inside) + quant, fc2, combine -> ``(y [T, H], act_col)``, ``act_col`` (the activation's
-    column copy and its scales) dW2's operand."""
+    column copy and its scales) dW2's operand, None (and not built) without ``save_bwd``."""
     act, clamp = glu_form(activation)
     handle = DispatchHandle(*handle)
     ar, sar, ac, sac, *_ = Q.grouped_glu_quant_mxfp8(
@@ -153,18 +182,22 @@ def stage2_forward(l1, w2, handle, topk_idx, dispatch_weights, activation):
         act,
         clamp,
         rule=_rule(),
-        layout=_ROWS | _COLS_B,
+        layout=_ROWS | (_COLS_B if save_bwd else 0),
+        cols=save_bwd,
     )
     W2, sW2, _, _ = _weights(w2)
-    return combine_only_gfx1250(_grouped(ar, sar, W2, sW2, handle), handle, topk_idx), (ac, sac)
+    y = combine_only_gfx1250(_grouped(ar, sar, W2, sW2, handle), handle, topk_idx)
+    return y, ((ac, sac) if save_bwd else None)
 
 
 def stage2_backward(grad_y, l1, dispatch_weights, w2, handle, act_col, activation, dw2_out=None):
     """dy dispatch + fc2 dgrad + GLU backward + quant + dW2 -> ``(grad_l1 rows, grad_l1 columns, grad_gate [P],
-    dW2)``, each copy with its scales; dW2 None when added into ``dw2_out``."""
+    dW2)``, each copy with its scales; dW2 None when added into ``dw2_out``, or when ``act_col`` is None (the
+    forward kept no column copy: w2 needs no gradient), and then no dy column copy is built either."""
     act, clamp = glu_form(activation)
     handle = DispatchHandle(*handle)
-    dr, sdr, dc, sdc = _send(grad_y.to(torch.bfloat16), handle, _COLS_A)
+    dw2 = act_col is not None
+    dr, sdr, dc, sdc = _send(grad_y.to(torch.bfloat16), handle, _COLS_A, cols=dw2)
     _, _, W2t, sW2t = _weights(w2)
     grad_gate, gr, sgr, gc, sgc, *_ = Q.grouped_dglu_quant_mxfp8(
         _grouped(dr, sdr, W2t, sW2t, handle),
@@ -177,7 +210,7 @@ def stage2_backward(grad_y, l1, dispatch_weights, w2, handle, act_col, activatio
         rule=_rule(),
         layout=_ROWS | _COLS_A,
     )
-    return (gr, sgr), (gc, sgc), grad_gate, _wgrad((dc, sdc), act_col, handle, dw2_out)
+    return (gr, sgr), (gc, sgc), grad_gate, (_wgrad((dc, sdc), act_col, handle, dw2_out) if dw2 else None)
 
 
 def stage1_backward(grad_l1_row, grad_l1_col, grad_gate, x_col, w1, handle, topk_idx, dw1_out=None):
