@@ -619,7 +619,7 @@ def flash_attn_func(
 ):
     """q/k/v are ``[b, s, h, d]``-shaped; an sbhd caller passes a permuted view and permutes
     the result back. aiter reads the memory layout to allocate outputs and grads matching it.
-    FlyDSL takes sbhd only on gfx950 and any layout on gfx1250, where its head-dim-128 kernels
+    FlyDSL takes sbhd only on gfx950 and any layout on gfx1250, where its head-dim-64/128 kernels
     return contiguous [b, s, h, d] outputs and grads.
     """
     qkv_format = _infer_qkv_format(q, k, v)
