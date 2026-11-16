@@ -16,15 +16,15 @@
 flash_attn_bwd_kernel.py's backward runs two kernels that both recompute S and dP: k_dkdv
 (4 GEMMs per 32q x 32kv unit) and k_dqg (3 GEMMs). Here one 4-wave workgroup owns 128 kv rows of
 one (batch, kv head) and does all 5 GEMMs: wave w keeps the K/V fragments of its 32 kv rows
-resident, and dQ[32q][D/4 slice of wave w] = dS[32q][128kv] . K[128kv][D/4] is added into an fp32
+resident, and dQ[32q][32d slice of wave w] = dS[32q][128kv] . K[128kv][32d] is added into an fp32
 workspace with device-scope atomics, so dQ is not bitwise reproducible run to run (dK/dV are).
 interface.flash_attn_bwd takes this path only when the caller does not ask for a deterministic
-backward. Head dim 64 or 128 (HD, compile-time); with WIN the causal mask gets a sliding window
-on the left (runtime extent wl): the pairs past the window's far edge are skipped and those it
-cuts through run masked, first in the descending step order.
+backward, and only at head dim 128 (HEAD_DIM; at head dim 64 the two-kernel backward runs two
+waves per SIMD and is the faster one). With WIN (compile-time) the causal mask gets a sliding
+window on the left (runtime extent wl): the pairs past the window's far edge are skipped and
+those it cuts through run masked, first in the descending step order.
 
-Per step s (one 32-query pair x one q head of the GQA group; descending pairs, heads inner; the
-instruction counts are those of head dim 128, and the d-side ones halve at 64):
+Per step s (one 32-query pair x one q head of the GQA group; descending pairs, heads inner):
   (C) S^T / dP^T: 32 WMMAs on the step's Q/dO B operands, read back from LDS ring slot s % 4
       during step s-1 and carried in VGPRs, as are the step's LSE and delta.
   (D) softmax: exp2(S * scale * log2e - lse * log2e) as one fma; P goes to the wave's private P
@@ -51,7 +51,6 @@ batches of one wave completing in order.
 """
 
 import functools
-from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -73,6 +72,9 @@ from .flash_attn_bwd_kernel import (
 )
 from .flash_attn_utils import LOG2E, WAVE_SIZE, create_llvm_ptr
 
+HEAD_DIM = 128  # the one head dim these kernels are built for
+D, DV8, NDT, NDO, NST, X_ROW_B = dims(HEAD_DIM)
+
 _ir = fx.as_ir_value
 
 W4 = 4  # waves per workgroup
@@ -83,54 +85,23 @@ W4_LEAD = W4_RING - 1  # TDM of step s + W4_LEAD is issued after wait B_s
 W4_TDM_OPS = 4  # tensor ops per wave per step: dO, Q, LSE, delta
 W4_TW_LOOP = W4_TDM_OPS  # per-step tensor wait: retire TDM(s+1), leave TDM(s+2) in flight
 W4_TW_PRO = 2 * W4_TDM_OPS  # prologue: only TDM(0) of TDM(0..2) must have landed
-# The shared dS buffer is [32 q][128 kv] bf16 whatever the head dim: 128*2 + 16 = 272 B rows
-# (68 dwords: 16 distinct bank groups, as for the staged Q/dO rows).
-DS_ROW_B = W4_BKV * 2 + 16
-W4_DSBUF_B = 32 * DS_ROW_B  # one shared dS buffer
+W4_QDO_B = 2 * 32 * X_ROW_B  # dO [32][272 B] at 0, Q at 8704
+W4_LSE_OFF = W4_QDO_B  # LSE [32] fp32 at +17408, delta [32] fp32 at +17536
+W4_STAGE_B = W4_QDO_B + 256  # one ring slot
+W4_DSBUF_B = 32 * X_ROW_B  # one shared dS buffer [32 q][128 kv] bf16, 272 B rows
 W4_P_B = 32 * S_ROW_B  # one wave's private P tile [32 q][32 kv]
 W4_OFF_RING = 0
 W4_OFF_DS = 131072  # dS double buffer, its own LDS segment
 W4_OFF_P = W4_OFF_DS + 2 * W4_DSBUF_B
 W4_OFF_K = 196608  # K image, prologue only
+W4_K_B = W4_BKV * X_ROW_B
+W4_LDS = W4_OFF_K + W4_K_B
 W4_EPI_CB = 48
-W4_R1_LOADS_PER_DTILE = 2  # each B operand of the dV GEMM is two ds_load_tr16_b128
+W4_EPI_B = 4 * 128 * W4_EPI_CB  # one wave's dK/dV epilogue staging
+W4_R1_LOADS = 18  # DS loads issued between the P/dS store burst and signal B_s
+assert W4_RING * W4_STAGE_B <= W4_OFF_DS
 assert W4_OFF_P + W4 * W4_P_B <= W4_OFF_K
-
-
-class W4Layout(NamedTuple):
-    """The head-dim-dependent LDS layout of the fused kernel (``w4_layout(hd)``)."""
-
-    X_ROW_B: int  # staged Q/dO/K row pitch, D*2 + 16 B
-    QDO_B: int  # dO [32][X_ROW_B] at 0, Q at 32*X_ROW_B
-    LSE_OFF: int  # LSE [32] fp32 at QDO_B, delta [32] fp32 at QDO_B + 128
-    STAGE_B: int  # one ring slot
-    K_B: int  # K image [128 kv][X_ROW_B]
-    LDS: int  # LDS per workgroup
-    EPI_B: int  # one wave's dK/dV epilogue staging: 4 images x D rows x W4_EPI_CB
-    NJ: int  # 16-column dQ tiles per wave: the wave owns dQ columns [16*NJ*w, 16*NJ*(w+1))
-    R1_LOADS: int  # DS loads issued between the P/dS store burst and signal B_s
-
-
-def w4_layout(hd):
-    x_row_b = dims(hd).X_ROW_B
-    qdo_b = 2 * 32 * x_row_b
-    k_b = W4_BKV * x_row_b
-    lay = W4Layout(
-        X_ROW_B=x_row_b,
-        QDO_B=qdo_b,
-        LSE_OFF=qdo_b,
-        STAGE_B=qdo_b + 256,
-        K_B=k_b,
-        LDS=W4_OFF_K + k_b,
-        EPI_B=4 * hd * W4_EPI_CB,
-        NJ=hd // (16 * W4),
-        # a_p0 (2 loads) and b_do (NDO operands of 2 loads each)
-        R1_LOADS=2 + W4_R1_LOADS_PER_DTILE * (hd // 16),
-    )
-    assert W4_RING * lay.STAGE_B <= W4_OFF_DS
-    assert W4 * lay.EPI_B <= lay.LDS
-    return lay
-
+assert W4 * W4_EPI_B <= W4_LDS
 
 # One shape rule for the host: the kv rows split into 128-row workgroup blocks, the queries into
 # 32-row pairs (and the 64-row tiles of k_delta / the dQ conversion).
@@ -141,7 +112,6 @@ SEQLEN_Q_MULTIPLE = 64
 def _dkdv_fused_impl(
     PARTIAL,
     G_,
-    HD,
     WIN,
     Q,
     K,
@@ -164,14 +134,9 @@ def _dkdv_fused_impl(
     nsp,
     wl,
 ):
-    """grid = (Hkv [* nsp], Skv / 128, B), block = 128 (4 waves). G_ (Hq / Hkv), HD (head dim) and
-    WIN (sliding window on) are Python ints: the step -> (q pair, q head) split below is a shift
-    and a mask, not a runtime division."""
-    D, DV8, NDT, NDO, NST, X_ROW_B = dims(HD)
-    lay = w4_layout(HD)
-    NJ = lay.NJ
-    NDQ = 2 * NJ  # dQ accumulators per wave and step: 2 q halves x NJ d tiles
-    NQD = 8 * NDT  # carried S/dP B operand chunks: 2 q halves x {Q, dO} x NDT x 2
+    """grid = (Hkv [* nsp], Skv / 128, B), block = 128 (4 waves). G_ (Hq / Hkv) and WIN (sliding
+    window on) are Python ints: the step -> (q pair, q head) split below is a shift and a mask,
+    not a runtime division."""
     G = fx.Int32(G_)
     tid = fx.Int32(fx.thread_idx.x)
     lane = tid % fx.Int32(WAVE_SIZE)
@@ -203,7 +168,7 @@ def _dkdv_fused_impl(
     rs_kv = Hkv * fx.Int32(DV8)
     base_kv = bat * Skv * rs_kv + hkv * fx.Int32(DV8)
 
-    smem = fx.SharedAllocator().allocate(lay.LDS)
+    smem = fx.SharedAllocator().allocate(W4_LDS)
     _lds0 = fx.Int32(fx.ptrtoint(smem.peek().ptr))
     lds_ring = _lds0 + fx.Int32(W4_OFF_RING)
     lds_dsb = _lds0 + fx.Int32(W4_OFF_DS)
@@ -297,7 +262,7 @@ def _dkdv_fused_impl(
                 l_view = fx.Tensor(
                     fx.make_view(
                         fx.inttoptr(
-                            _lds_f32_ty, lds_ring + slot_off + fx.Int32(lay.LSE_OFF + lo) + wv * fx.Int32(32)
+                            _lds_f32_ty, lds_ring + slot_off + fx.Int32(W4_LSE_OFF + lo) + wv * fx.Int32(32)
                         ),
                         fx.make_layout((1, 8), (8, 1)),
                     )
@@ -315,7 +280,7 @@ def _dkdv_fused_impl(
                         llvm_dialect.load(
                             v1f,
                             create_llvm_ptr(
-                                lds_ring + slot_off + fx.Int32(lay.LSE_OFF + lo) + o, address_space=3
+                                lds_ring + slot_off + fx.Int32(W4_LSE_OFF + lo) + o, address_space=3
                             ),
                         )
                     )
@@ -388,11 +353,11 @@ def _dkdv_fused_impl(
         return _clampqt(p_begin + (_mk + _cnt) - fx.Int32(1) - qi), sc - qi * G
 
     def _dq_atomics(dq, qt, gh):
-        """16*NJ closures, one fp32 atomic each, for this wave's 16*NJ d columns of the step's dQ.
+        """32 closures, one fp32 atomic each, for this wave's 32 d columns of the step's dQ.
 
-        The fp32 workspace is in WMMA C-fragment order: per (b, qh, q pair) a 32*D*4 B block;
-        element (q, d) sits at slot k = (qh16*NJ + j)*8 + si (512 B) + wave*128 B + lane*4 B, where
-        q = qh16*16 + half*8 + si, d = 16*NJ*wave + 16*j + row and lane = half*16 + row. One atomic
+        The fp32 workspace is in WMMA C-fragment order: per (b, qh, q pair) a 16 KB block; element
+        (q, d) sits at slot k = (qh16*2 + j)*8 + si (512 B) + wave*128 B + lane*4 B, where
+        q = qh16*16 + half*8 + si, d = 32*wave + 16*j + row and lane = half*16 + row. One atomic
         instruction is then one full, aligned 128 B line. The constant part of each index goes
         into an inbounds GEP, so it becomes the instruction's immediate offset.
         """
@@ -401,16 +366,16 @@ def _dkdv_fused_impl(
         pb = fx.to_llvm_ptr(fx.add_offset(fx.get_iter(DQA), base))
         fns = []
         for qh16 in range_constexpr(2):
-            for j in range_constexpr(NJ):
+            for j in range_constexpr(2):
                 for si in range_constexpr(8):
 
                     def _g(qh16=qh16, j=j, si=si):
-                        v = fx.Vector(dq[qh16 * NJ + j])[si]
+                        v = fx.Vector(dq[qh16 * 2 + j])[si]
                         p = llvm_dialect.GEPOp(
                             pb.type,
                             pb,
                             [],
-                            [((qh16 * NJ + j) * 8 + si) * (W4 * WAVE_SIZE)],
+                            [((qh16 * 2 + j) * 8 + si) * (W4 * WAVE_SIZE)],
                             fx.Float32.ir_type,
                             llvm_dialect.GEPNoWrapFlags.inbounds,
                         ).result
@@ -431,8 +396,8 @@ def _dkdv_fused_impl(
     _t1 = _tile(fx.Int32(1))
     _t2 = _tile(fx.Int32(2))
     for _t, _slot in ((_t0, 0), (_t1, 1), (_t2, 2)):
-        _tdm(_t[0], _t[1], fx.Int32(_slot * lay.STAGE_B), "qdo")
-        _tdm(_t[0], _t[1], fx.Int32(_slot * lay.STAGE_B), "lse")
+        _tdm(_t[0], _t[1], fx.Int32(_slot * W4_STAGE_B), "qdo")
+        _tdm(_t[0], _t[1], fx.Int32(_slot * W4_STAGE_B), "lse")
     k2 = [
         [gfrag2(g_k, base_kv, rs_kv, kv0 + fx.Int32(kh * 16), dt) for dt in range(NDT)] for kh in range(NKV)
     ]
@@ -454,24 +419,22 @@ def _dkdv_fused_impl(
                 )
     _split_barrier_signal(W4_TW_PRO)
     _split_barrier_wait()
-    # K^T B fragments for dQ, resident: kt[j][kc] covers d in [16*NJ*wv + 16*j, +16) x kv in
-    # [kvw0 + 32*kc, +32)
+    # K^T B fragments for dQ, resident: kt[j][kc] covers d in [32*wv + 16*j, +16) x kv in [kvw0 + 32*kc, +32)
     kt = [
         [
             tr(
                 lds_k
                 + (fx.Int32(kc * 32) + lane_r) * fx.Int32(X_ROW_B)
-                + (lane_c + wv * fx.Int32(16 * NJ) + fx.Int32(j * 16)) * fx.Int32(2),
+                + (lane_c + wv * fx.Int32(32) + fx.Int32(j * 16)) * fx.Int32(2),
                 X_ROW_B,
             )
             for kc in range_constexpr(W4)
         ]
-        for j in range_constexpr(NJ)
+        for j in range_constexpr(2)
     ]
 
     def _rdqd(slot_off):
-        """The NQD = 8*NDT ds_load_b128 of a ring slot's S/dP B operands, index
-        hh*4*NDT + {Q 0, dO 2*NDT} + dt*2 + u."""
+        """The 32 ds_load_b128 of a ring slot's S/dP B operands, index hh*16 + {Q 0, dO 8} + dt*2 + u."""
         lq = lds_ring + slot_off + fx.Int32(32 * X_ROW_B)
         ld = lds_ring + slot_off
         out = []
@@ -485,14 +448,14 @@ def _dkdv_fused_impl(
 
     def _body(st, s, do_mask):
         acc = st[:NST]
-        dqp = st[NST : NST + NDQ]
-        pre = [fx.Vector(v) for v in st[NST + NDQ : NST + NDQ + 4]]
-        qd = [fx.Vector(v) for v in st[NST + NDQ + 4 : NST + NDQ + 4 + NQD]]
+        dqp = st[NST : NST + 4]
+        pre = [fx.Vector(v) for v in st[NST + 4 : NST + 8]]
+        qd = [fx.Vector(v) for v in st[NST + 8 : NST + 40]]
         qt, gh = _tile(s)
         q0 = qt * fx.Int32(32)
         qtp, ghp = _tile(s - fx.Int32(1))
         atomics = _dq_atomics(dqp, qtp, ghp)  # step s-1's dQ, issued in (F)
-        lds_do = lds_ring + (s % fx.Int32(W4_RING)) * fx.Int32(lay.STAGE_B)
+        lds_do = lds_ring + (s % fx.Int32(W4_RING)) * fx.Int32(W4_STAGE_B)
         lds_q = lds_do + fx.Int32(32 * X_ROW_B)
         lds_ds = lds_dsb + (s % fx.Int32(2)) * fx.Int32(W4_DSBUF_B)
 
@@ -506,15 +469,13 @@ def _dkdv_fused_impl(
         for hh in range_constexpr(2):
             qfr.append(
                 [
-                    qd[hh * 4 * NDT + dt * 2].shuffle(qd[hh * 4 * NDT + dt * 2 + 1], list(range(16)))
+                    qd[hh * 16 + dt * 2].shuffle(qd[hh * 16 + dt * 2 + 1], list(range(16)))
                     for dt in range_constexpr(NDT)
                 ]
             )
             dfr.append(
                 [
-                    qd[hh * 4 * NDT + 2 * NDT + dt * 2].shuffle(
-                        qd[hh * 4 * NDT + 2 * NDT + dt * 2 + 1], list(range(16))
-                    )
+                    qd[hh * 16 + 8 + dt * 2].shuffle(qd[hh * 16 + 8 + dt * 2 + 1], list(range(16)))
                     for dt in range_constexpr(NDT)
                 ]
             )
@@ -566,7 +527,7 @@ def _dkdv_fused_impl(
                 (
                     ds_l,
                     lds_ds
-                    + (fx.Int32(hh * 16) + row) * fx.Int32(DS_ROW_B)
+                    + (fx.Int32(hh * 16) + row) * fx.Int32(X_ROW_B)
                     + wv * fx.Int32(64)
                     + fx.Int32(kh * 32)
                     + half * fx.Int32(16),
@@ -605,19 +566,19 @@ def _dkdv_fused_impl(
         a_p0 = _a(lds_p, S_ROW_B, 0)
         b_do = [_b(lds_do, dtile) for dtile in range_constexpr(NDO)]
         rocdl.sched_barrier(0)
-        # signal B_s: the lay.R1_LOADS loads above are the only younger DS ops, and DS completes in
+        # signal B_s: the W4_R1_LOADS loads above are the only younger DS ops, and DS completes in
         # order, so this retires every P/dS store
-        rocdl.s_wait_dscnt(lay.R1_LOADS)
+        rocdl.s_wait_dscnt(W4_R1_LOADS)
         tdm_ops.tensor_wait(W4_TW_LOOP)
         rocdl.s_barrier_signal(-1)
         rocdl.sched_barrier(0)
-        a_ds0 = _a(lds_dsw, DS_ROW_B, 0)
+        a_ds0 = _a(lds_dsw, X_ROW_B, 0)
         b_q = [_b(lds_q, dtile) for dtile in range_constexpr(NDO)]
         rocdl.sched_barrier(0)
         _mm(0, a_p0, b_do, 0)
         rocdl.sched_barrier(0)
         a_p1 = _a(lds_p, S_ROW_B, 1)
-        a_ds1 = _a(lds_dsw, DS_ROW_B, 1)
+        a_ds1 = _a(lds_dsw, X_ROW_B, 1)
         rocdl.sched_barrier(0)
         for _f in atomics:  # one burst; the loads above run under it
             _f()
@@ -630,7 +591,7 @@ def _dkdv_fused_impl(
         # (G) wait B_s, then refill the slot step s-1 used with step s+3's dO/Q
         _split_barrier_wait()
         qt2, gh2 = _tile(s + fx.Int32(W4_LEAD))
-        _slot2 = ((s + fx.Int32(W4_LEAD)) % fx.Int32(W4_RING)) * fx.Int32(lay.STAGE_B)
+        _slot2 = ((s + fx.Int32(W4_LEAD)) % fx.Int32(W4_RING)) * fx.Int32(W4_STAGE_B)
         _tdm(qt2, gh2, _slot2, "qdo")
         rocdl.sched_barrier(0)
 
@@ -638,7 +599,7 @@ def _dkdv_fused_impl(
         # S/dP operands; 16 dQ WMMAs (2 q halves x 2 d tiles, 4-deep chains over the 128 kv)
         afrs = []
         for qh16 in range_constexpr(2):
-            xo = (fx.Int32(qh16 * 16) + row) * fx.Int32(DS_ROW_B) + half * fx.Int32(16)
+            xo = (fx.Int32(qh16 * 16) + row) * fx.Int32(X_ROW_B) + half * fx.Int32(16)
             afrs.append(
                 [
                     _l8(lds_ds + xo + fx.Int32(kc * 64)).shuffle(
@@ -647,13 +608,13 @@ def _dkdv_fused_impl(
                     for kc in range_constexpr(W4)
                 ]
             )
-        _slot1 = ((s + fx.Int32(1)) % fx.Int32(W4_RING)) * fx.Int32(lay.STAGE_B)
+        _slot1 = ((s + fx.Int32(1)) % fx.Int32(W4_RING)) * fx.Int32(W4_STAGE_B)
         nxt = _rdl(_slot1)
         rb = _rdqd(_slot1)
         rocdl.sched_barrier(0)
         dq = []
         for qh16 in range_constexpr(2):
-            for j in range_constexpr(NJ):
+            for j in range_constexpr(2):
                 c = _ir(fx.Vector.filled(8, 0.0, fx.Float32))
                 for kc in range_constexpr(W4):
                     c = rocdl.wmma_f32_16x16x32_bf16(
@@ -681,7 +642,7 @@ def _dkdv_fused_impl(
 
     init = (
         [_ir(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(NST)]
-        + [_ir(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(NDQ)]
+        + [_ir(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(4)]
         + [_ir(v) for v in _rdl(fx.Int32(0))]
         + [_ir(v) for v in _rdqd(fx.Int32(0))]
     )
@@ -696,7 +657,7 @@ def _dkdv_fused_impl(
 
     # flush the last step's dQ (zeros to a clamped, in-bounds tile if n_all == 0)
     _tl = _tile(n_all - fx.Int32(1))
-    for f in _dq_atomics(out[NST : NST + NDQ], _tl[0], _tl[1]):
+    for f in _dq_atomics(out[NST : NST + 4], _tl[0], _tl[1]):
         f()
     # epilogue barrier: every wave's TDM retired and every LDS read done before any wave
     # overwrites the ring/dS/P area with its epilogue staging
@@ -715,13 +676,13 @@ def _dkdv_fused_impl(
                     _st1(ov[si], g_dv, idx, fx.Float32)
                     _st1(ok_[si] * scale, g_dk, idx, fx.Float32)
     else:
-        # LDS-transposed bf16 epilogue, one lay.EPI_B staging area per wave
+        # LDS-transposed bf16 epilogue, one W4_EPI_B staging area per wave
         g_dv8 = _bv(DV_, ndkv_b, fx.BFloat16, 8)
         g_dk8 = _bv(DK, ndkv_b, fx.BFloat16, 8)
-        lds_e = _lds0 + wv * fx.Int32(lay.EPI_B)
+        lds_e = _lds0 + wv * fx.Int32(W4_EPI_B)
         for kh in range_constexpr(NKV):
-            lds_ev = lds_e + fx.Int32((kh * 2 + 0) * D * W4_EPI_CB)
-            lds_ek = lds_e + fx.Int32((kh * 2 + 1) * D * W4_EPI_CB)
+            lds_ev = lds_e + fx.Int32((kh * 2 + 0) * 128 * W4_EPI_CB)
+            lds_ek = lds_e + fx.Int32((kh * 2 + 1) * 128 * W4_EPI_CB)
             for dtile in range_constexpr(NDO):
                 ov = fx.Vector(out[kh * NDO + dtile])
                 ok_ = fx.Vector(out[(NKV + kh) * NDO + dtile])
@@ -739,9 +700,9 @@ def _dkdv_fused_impl(
 
 
 @functools.lru_cache(maxsize=None)
-def _dkdv_fused_kernels(group: int, hd: int = 128, win: int = 0):
-    """The fused kernels for one GQA group size (Hq / Hkv), head dim and window mode; all three
-    are baked into the code."""
+def _dkdv_fused_kernels(group: int, win: int = 0):
+    """The fused kernels for one GQA group size (Hq / Hkv) and window mode; both are baked into
+    the code."""
 
     @flyc.kernel(name="k_flash_attn_bwd_dkdv_fused", known_block_size=[W4_THREADS, 1, 1])
     def k_dkdv_fused(
@@ -768,7 +729,6 @@ def _dkdv_fused_kernels(group: int, hd: int = 128, win: int = 0):
         _dkdv_fused_impl(
             False,
             group,
-            hd,
             win,
             Q,
             K,
@@ -818,7 +778,6 @@ def _dkdv_fused_kernels(group: int, hd: int = 128, win: int = 0):
         _dkdv_fused_impl(
             True,
             group,
-            hd,
             win,
             Q,
             K,
@@ -869,11 +828,10 @@ def launch_dkdv_fused(
     nb: fx.Int32,
     wl: fx.Int32,
     group: fx.Constexpr[int],
-    hd: fx.Constexpr[int],
     win: fx.Constexpr[int],
     stream: fx.Stream,
 ):
-    _dkdv_fused_kernels(group, hd, win)[0](
+    _dkdv_fused_kernels(group, win)[0](
         Q, K, V, DO, LSE, DEL, DV_, DK, DQA, scale, Sq, Skv, Hq, Hkv, nqt, cshift, causal, nb, wl
     ).launch(grid=(nhkv, nblk, nb), block=(W4_THREADS, 1, 1), stream=stream)
 
@@ -904,35 +862,24 @@ def launch_dkdv_fused_sp(
     nxs: fx.Int32,
     wl: fx.Int32,
     group: fx.Constexpr[int],
-    hd: fx.Constexpr[int],
     win: fx.Constexpr[int],
     stream: fx.Stream,
 ):
-    _dkdv_fused_kernels(group, hd, win)[1](
+    _dkdv_fused_kernels(group, win)[1](
         Q, K, V, DO, LSE, DEL, DV_, DK, DQA, scale, Sq, Skv, Hq, Hkv, nqt, cshift, causal, nb, nsp, wl
     ).launch(grid=(nxs, nblk, nb), block=(W4_THREADS, 1, 1), stream=stream)
 
 
 # ---- dQ conversion: fp32 C-fragment-order workspace -> scaled bf16 [B, Sq, Hq, D] ---------------
-# One 256-thread workgroup per (b, qh, q pair): its 32*D*4 B fp32 tile is read contiguously (D/32
-# vec4 per thread, every 128 B line read once and whole), scattered into an LDS [32 q][D] bf16
-# tile and written back as whole D*2 B dQ rows (D/64 x 16 B per thread).
+# One 256-thread workgroup per (b, qh, q pair): its 16 KB fp32 tile is read contiguously (4 vec4
+# per thread, every 128 B line read once and whole), scattered into an LDS [32 q][128 d] bf16 tile
+# and written back as whole 256 B dQ rows (2 x 16 B per thread).
 CVT_THREADS = 256
+CVT_ROW_B = D * 2 + 16  # LDS row pitch
 
 
 @flyc.kernel(name="k_flash_attn_bwd_dq_cvt", known_block_size=[CVT_THREADS, 1, 1])
-def k_dq_cvt(
-    DQA: fx.Tensor,
-    DQ: fx.Tensor,
-    Sq: fx.Int32,
-    Hq: fx.Int32,
-    n_tiles: fx.Int32,
-    scale: fx.Float32,
-    HD: fx.Constexpr[int],
-):
-    D = HD
-    NJ = w4_layout(HD).NJ
-    CVT_ROW_B = D * 2 + 16  # LDS row pitch
+def k_dq_cvt(DQA: fx.Tensor, DQ: fx.Tensor, Sq: fx.Int32, Hq: fx.Int32, n_tiles: fx.Int32, scale: fx.Float32):
     tid = fx.Int32(fx.thread_idx.x)
     tile = fx.Int32(fx.block_idx.x)  # (b * Hq + qh) * (Sq / 32) + qt
     nqt2 = Sq // fx.Int32(32)
@@ -946,8 +893,8 @@ def k_dq_cvt(
     g_a = _bv(DQA, n_tiles * fx.Int32(32 * D * 4), fx.Float32, 4)
     g_q = _bv(DQ, n_tiles * fx.Int32(32 * D * 2), fx.BFloat16, 8)
     src0 = tile * fx.Int32(32 * D // 4)  # in vec4 units
-    for i in range_constexpr(32 * D // 4 // CVT_THREADS):
-        v = tid + fx.Int32(i * CVT_THREADS)  # vec4 index inside the 32*D*4 B tile
+    for i in range_constexpr(4):
+        v = tid + fx.Int32(i * CVT_THREADS)  # vec4 index inside the 16 KB tile
         x = _ldv(g_a, src0 + v, fx.Float32, 4)
         p = v * fx.Int32(4)
         k = p // fx.Int32(W4 * WAVE_SIZE)  # 128-float slot
@@ -955,11 +902,11 @@ def k_dq_cvt(
         w = e // fx.Int32(WAVE_SIZE)
         hf = (e // fx.Int32(16)) % fx.Int32(2)
         r16 = e % fx.Int32(16)
-        qh16 = k // fx.Int32(8 * NJ)
-        j = (k // fx.Int32(8)) % fx.Int32(NJ)
+        qh16 = k // fx.Int32(16)
+        j = (k // fx.Int32(8)) % fx.Int32(2)
         si = k % fx.Int32(8)
         q = qh16 * fx.Int32(16) + hf * fx.Int32(8) + si
-        d = w * fx.Int32(16 * NJ) + j * fx.Int32(16) + r16
+        d = w * fx.Int32(32) + j * fx.Int32(16) + r16
         vals = fx.Vector.from_elements(
             [(x[c] * scale).to(fx.BFloat16) for c in range_constexpr(4)], dtype=fx.BFloat16
         )
@@ -968,10 +915,10 @@ def k_dq_cvt(
             create_llvm_ptr(lds + q * fx.Int32(CVT_ROW_B) + d * fx.Int32(2), address_space=3),
         )
     fx.barrier()
-    for i in range_constexpr(32 * (D // 8) // CVT_THREADS):
-        c = tid + fx.Int32(i * CVT_THREADS)  # 16 B chunk: row c // (D/8), d chunk c % (D/8)
-        r = c // fx.Int32(D // 8)
-        dc = c - r * fx.Int32(D // 8)
+    for i in range_constexpr(2):
+        c = tid + fx.Int32(i * CVT_THREADS)  # 16 B chunk: row c // 16, d chunk c % 16
+        r = c // fx.Int32(16)
+        dc = c - r * fx.Int32(16)
         val = fx.Vector(
             llvm_dialect.load(
                 v8b, create_llvm_ptr(lds + r * fx.Int32(CVT_ROW_B) + dc * fx.Int32(16), address_space=3)
@@ -983,15 +930,8 @@ def k_dq_cvt(
 
 @flyc.jit
 def launch_dq_cvt(
-    DQA,
-    DQ,
-    Sq: fx.Int32,
-    Hq: fx.Int32,
-    n_tiles: fx.Int32,
-    scale: fx.Float32,
-    hd: fx.Constexpr[int],
-    stream: fx.Stream,
+    DQA, DQ, Sq: fx.Int32, Hq: fx.Int32, n_tiles: fx.Int32, scale: fx.Float32, stream: fx.Stream
 ):
-    k_dq_cvt(DQA, DQ, Sq, Hq, n_tiles, scale, hd).launch(
+    k_dq_cvt(DQA, DQ, Sq, Hq, n_tiles, scale).launch(
         grid=(n_tiles, 1, 1), block=(CVT_THREADS, 1, 1), stream=stream
     )

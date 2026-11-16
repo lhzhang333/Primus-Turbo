@@ -789,10 +789,10 @@ def test_compiled_launchers_are_cached_per_constexpr_value(monkeypatch):
         calls.clear()
         utils._run_compiled(exe, t, n, group, None)
         assert calls == [(expect, group)], (group, n)
-    # the real fused launchers declare the group, the head dim and the window mode as fx.Constexpr
-    # (positions 21-23 / 23-25 of their arguments)
-    assert utils._constexpr_values(fused.launch_dkdv_fused, list(range(25))) == (21, 22, 23)
-    assert utils._constexpr_values(fused.launch_dkdv_fused_sp, list(range(27))) == (23, 24, 25)
+    # the real fused launchers declare the group and the window mode as fx.Constexpr
+    # (positions 21-22 / 23-24 of their arguments)
+    assert utils._constexpr_values(fused.launch_dkdv_fused, list(range(24))) == (21, 22)
+    assert utils._constexpr_values(fused.launch_dkdv_fused_sp, list(range(26))) == (23, 24)
 
 
 @needs_flydsl

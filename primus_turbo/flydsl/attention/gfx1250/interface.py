@@ -218,7 +218,6 @@ def _side_stream(device):
 # GEMMs saved (MI455X, b1 s4096 hq128 hkv16: window 2047 0.46 ms against 0.73 ms, full causal
 # 0.58 against 1.05).
 # Its split-K over the q loop aims at two dispatch waves of the 4-wave workgroups (one per CU).
-_FUSED_HEAD_DIM = 128
 _FUSED_TARGET_WGS = 512
 _FUSED_NSP_CAP = 16
 
@@ -226,7 +225,7 @@ _FUSED_NSP_CAP = 16
 def _fused_ok(sq, skv, d, causal):
     return (
         bool(causal)
-        and d == _FUSED_HEAD_DIM
+        and d == _fused.HEAD_DIM
         and sq % _fused.SEQLEN_Q_MULTIPLE == 0
         and skv % _fused.SEQLEN_KV_MULTIPLE == 0
     )
@@ -276,7 +275,6 @@ def _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, wl, stream):
                 b,
                 wl,
                 g,
-                d,
                 win,
                 stream,
             ),
@@ -312,7 +310,6 @@ def _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, wl, stream):
                 hkv * nsp,
                 wl,
                 g,
-                d,
                 win,
                 stream,
             ),
@@ -322,7 +319,7 @@ def _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, wl, stream):
             "redsp", _bwd.launch_redsp, (dkp, dvp, dk, dv, n_vec, nsp, -(-n_vec // _bwd.RED_THREADS), stream)
         )
     dq = torch.empty((b, sq, hq, d), device=q.device, dtype=q.dtype)
-    _launch("dq_cvt", _fused.launch_dq_cvt, (dqa, dq, sq, hq, b * hq * (sq // 32), scale, d, stream))
+    _launch("dq_cvt", _fused.launch_dq_cvt, (dqa, dq, sq, hq, b * hq * (sq // 32), scale, stream))
     return dq, dk, dv
 
 
