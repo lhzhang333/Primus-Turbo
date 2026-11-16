@@ -52,6 +52,7 @@ and masks the tiles the band's left edge cuts through in a separate loop, as it 
 for the causal diagonal.
 """
 
+import functools
 from typing import NamedTuple
 
 from .flydsl_version import require_flydsl
@@ -109,6 +110,26 @@ def dims(hd):
 # order, so waiting until TDM_IN_FLIGHT ops remain retires exactly the older stage in flight.
 TDM_DEPTH = 3
 TDM_IN_FLIGHT = 2 * (TDM_DEPTH - 2)
+
+
+def _wave_attrs(hd):
+    """The ``gpu.func`` attributes of the single-wave kernels (k_dkdv, k_dkdv_sp, k_dqg,
+    k_dq_sp) at head dim ``hd``.
+
+    A gfx1250 SIMD has 1024 VGPRs: a kernel that keeps to 512 runs two waves on it. At head dim
+    64 these kernels carry half the accumulators and operand tiles of head dim 128 and fit, so
+    ``rocdl.waves_per_eu`` = 2 holds the register allocator to that budget (left alone it
+    takes 513 for k_dkdv) and the dispatcher places 8 of their workgroups on a CU instead of
+    4. At head dim 128 they need more than 512 and stay at one wave per SIMD (None: FlyDSL
+    attaches no attribute).
+    """
+    return {"rocdl.waves_per_eu": 2 if hd == 64 else None}
+
+
+def _at(kernel, hd):
+    """``kernel`` (one of the single-wave kernels) with the attributes of head dim ``hd``."""
+    return functools.partial(kernel, value_attrs=_wave_attrs(hd))
+
 
 # sched_group_barrier instruction classes (LLVM AMDGPU scheduling-group mask bits).
 _SG_VALU = 0x002
@@ -319,12 +340,14 @@ def _dkdv_impl(
     rs_kv = Hkv * DV8  # vec8 tiles between consecutive kv rows
     base_kv = bat * Skv * rs_kv + hkv * DV8
 
-    # LDS: the Q/dO ring at offset 0 and the P/dS tiles exactly 65536 B up, so the output
-    # GEMM's A reads (P, dS) and B reads (dO, Q) differ in address bit 16 whatever the physical
-    # LDS base. This placement was chosen by measurement: it ran faster than packing the two
-    # regions together. Occupancy is unchanged: 70656 B still allows 4 workgroups per CU, and
-    # VGPR use (1 wave/SIMD) caps it at 4 anyway.
-    LDS_SEG = 65536
+    # LDS: the Q/dO ring at offset 0 and the P/dS tiles a power of two up, so the output GEMM's
+    # A reads (P, dS) and B reads (dO, Q) differ in one address bit whatever the physical LDS
+    # base. This placement was chosen by measurement: it ran faster than packing the two
+    # regions together. The offset is the first power of two past the ring. At head dim 128
+    # that is 65536 (70656 B in all: 4 workgroups per CU, as many as its one wave per SIMD
+    # runs anyway); at head dim 64, 32768 (37888 B: the 8 workgroups per CU of two waves per
+    # SIMD -- see _wave_attrs -- which 65536 would cap at 4).
+    LDS_SEG = 65536 if HD == 128 else 32768
     smem = fx.SharedAllocator().allocate(LDS_SEG + 2 * 32 * S_ROW_B)
     _lds0 = fx.Int32(fx.ptrtoint(smem.peek().ptr))
     lds_p = _lds0 + LDS_SEG
@@ -369,10 +392,12 @@ def _dkdv_impl(
     # Q/dO staging through the TDM into the TDM_DEPTH-stage ring. One TDM op per tensor writes
     # the [32 q rows][D] bf16 tile: row r at r*X_ROW_B, element c at 2c, 16 B pad per row
     # (pad_interval = D elements, pad_amount = 8 elements). Stage s is [s*QDO_B, (s+1)*QDO_B):
-    # dO at +0, Q at +32*X_ROW_B; the three stages (52224 B) stay in LDS segment 0.
+    # dO at +0, Q at +32*X_ROW_B; the three stages (52224 B at head dim 128, 27648 B at 64)
+    # stay below LDS_SEG.
     # Tile origin element ((bat*Sq + q0)*Hq + qh)*D, row stride Hq*D, outer extent Sq - q0,
     # which is >= 32 for every issued tile (Sq % 64 == 0 and qt is clamped into [0, nqt2-1]).
     QDO_B = 2 * 32 * X_ROW_B
+    assert TDM_DEPTH * QDO_B <= LDS_SEG, "the Q/dO ring must end below the P/dS tiles"
     X_ROW_EL = X_ROW_B // 2
     _lds_bf_ty = fx.PointerType.get(
         elem_ty=fx.BFloat16.ir_type, address_space=fx.AddressSpace.Shared, alignment=16
@@ -987,7 +1012,7 @@ def launch_dkdv(
     win: fx.Constexpr[int],
     stream: fx.Stream,
 ):
-    k_dkdv(
+    _at(k_dkdv, hd)(
         Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, nb, wl, hd, win
     ).launch(grid=(nhkv, nblk, nb), block=(32, 1, 1), stream=stream)
 
@@ -1023,7 +1048,7 @@ def launch_dkdv_sp(
 ):
     # nxs = nhkv * nsp, computed on the host: grid.x carries the split index in its low
     # digits so the kv tile stays on grid.y.
-    k_dkdv_sp(
+    _at(k_dkdv_sp, hd)(
         Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, nb, nsp, wl, hd, win
     ).launch(grid=(nxs, nblk, nb), block=(32, 1, 1), stream=stream)
 
@@ -1374,7 +1399,7 @@ def launch_dq_sp(
     stream: fx.Stream,
 ):
     # nxq = nhq * nsp, computed on the host -- same shape as launch_dkdv_sp's nxs.
-    k_dq_sp(
+    _at(k_dq_sp, hd)(
         Q, K, V, DO, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, nb, nsp, wl, hd, win
     ).launch(grid=(nxq, nblk, nb), block=(32, 1, 1), stream=stream)
 
@@ -1787,9 +1812,9 @@ def launch_dqg(
     stream: fx.Stream,
 ):
     # grid = (Hq q heads, Sq / DQ_BQW query tiles, B)
-    k_dqg(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, wl, hd, win).launch(
-        grid=(nhq, nblk, nb), block=(32, 1, 1), stream=stream
-    )
+    _at(k_dqg, hd)(
+        Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, wl, hd, win
+    ).launch(grid=(nhq, nblk, nb), block=(32, 1, 1), stream=stream)
 
 
 # ================================================================= redsp ==========

@@ -870,6 +870,16 @@ def test_backward_kernels_and_streams(monkeypatch, shape, dkdv_chain, dq_chain):
     assert dq.dtype == dk.dtype == dv.dtype == torch.bfloat16
 
 
+@needs_flydsl
+def test_single_wave_backward_kernels_run_two_waves_per_simd_at_head_dim_64():
+    """k_dkdv / k_dkdv_sp / k_dqg / k_dq_sp are compiled for two waves per SIMD at head dim 64 (512 VGPRs each, of
+    the SIMD's 1024) and left alone at 128; None is an attribute FlyDSL does not attach."""
+    from primus_turbo.flydsl.attention.gfx1250 import flash_attn_bwd_kernel as bwd
+
+    assert bwd._wave_attrs(64) == {"rocdl.waves_per_eu": 2}
+    assert bwd._wave_attrs(128) == {"rocdl.waves_per_eu": None}
+
+
 # ---------------------------------------------------------------------------
 # Numerics (gfx1250)
 # ---------------------------------------------------------------------------
@@ -947,17 +957,28 @@ def _check(got, ref, min_db=40.0, skip=()):
         ((4, 8192, 8192, 32, 8), False, False, None),
         ((1, 1024, 1088, 8, 2), True, False, None),
         ((4, 8192, 8192, 32, 8), True, True, None),
+        ((1, 4096, 4096, 128, 16, 64), True, False, None),
+        ((1, 1024, 1024, 8, 2, 64), True, False, None),
     ],
-    ids=["llama3.1-8b", "small_grid", "sq_lt_skv", "non_causal", "skv_not_x128", "deterministic"],
+    ids=[
+        "llama3.1-8b",
+        "small_grid",
+        "sq_lt_skv",
+        "non_causal",
+        "skv_not_x128",
+        "deterministic",
+        "head_dim_64",
+        "head_dim_64_small_grid",
+    ],
 )
 def test_fused_backward_launch_plan(monkeypatch, shape, causal, deterministic, chain):
-    """Which calls take the fused backward (dQ inside the dK/dV kernel, fp32 dQ atomics): causal,
+    """Which calls take the fused backward (dQ inside the dK/dV kernel, fp32 dQ atomics): causal, head dim 128,
     Skv a multiple of 128 (Sq is always one of 64 here) and not deterministic. Its launches all go to the caller's
     stream, in order; chain None means the two-kernel path (it forks a side stream)."""
     from primus_turbo.flydsl.attention.gfx1250 import interface
 
-    b, sq, skv, hq, hkv = shape
-    q, k, v = _meta(b, sq, skv, hq, hkv)
+    b, sq, skv, hq, hkv, d = shape if len(shape) == 6 else (*shape, D)
+    q, k, v = _meta(b, sq, skv, hq, hkv, d)
     lse = torch.empty(b, hq, sq, device="meta")
     launches = []
 
@@ -1101,8 +1122,9 @@ _D64_WINDOW_SHAPES = {
 
 @needs_flydsl
 def test_d64_and_window_shapes_reach_every_kernel_variant(monkeypatch):
-    """The head-dim-64 shapes reach both forward tilings and every backward kernel, and so do
-    the windowed ones; checked with the kernels and streams faked, so no GPU kernel runs."""
+    """The head-dim-64 shapes reach both forward tilings and every kernel of the two-kernel backward (the only
+    one head dim 64 takes), unwindowed and windowed; the windowed head-dim-128 ones reach the fused kernels too.
+    Checked with the kernels and streams faked, so no GPU kernel runs."""
     from primus_turbo.flydsl.attention.gfx1250 import interface
 
     class Stream:
@@ -1124,7 +1146,7 @@ def test_d64_and_window_shapes_reach_every_kernel_variant(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: Stream())
     monkeypatch.setattr(torch.cuda, "Stream", lambda device=None: Stream())
     for b, sq, skv, hq, hkv, d, wl in _D64_WINDOW_SHAPES.values():
-        key = "window" if wl >= 0 else "d64"
+        key = (d, wl >= 0)
         plan.setdefault(key, set())
         q, k, v = _meta(b, sq, skv, hq, hkv, d)
         lse = torch.empty(b, hq, sq, device="meta")
@@ -1133,7 +1155,7 @@ def test_d64_and_window_shapes_reach_every_kernel_variant(monkeypatch):
             interface.flash_attn_bwd(
                 q, q, k, v, q, lse, causal=True, deterministic=deterministic, window_left=wl
             )
-    every = {
+    two_kernel = {
         "k_flash_attn_fwd",
         "k_flash_attn_fwd_small_grid",
         "delta",
@@ -1143,11 +1165,9 @@ def test_d64_and_window_shapes_reach_every_kernel_variant(monkeypatch):
         "dqg",
         "dq_sp",
         "redsp_q",
-        "dkdv_fused",
-        "dkdv_fused_sp",
-        "dq_cvt",
     }
-    assert plan == {"d64": every, "window": every}
+    fused = {"dkdv_fused", "dkdv_fused_sp", "dq_cvt"}
+    assert plan == {(64, False): two_kernel, (64, True): two_kernel, (128, True): two_kernel | fused}
 
 
 @needs_gfx1250
@@ -1158,6 +1178,8 @@ def test_matches_reference_d64_and_windows(shape, deterministic):
     every query sees only itself: dS = P (dP - delta) is exactly 0, so the reference dQ / dK are
     0 and only their finiteness is checked."""
     *dims_, d, wl = shape
+    if deterministic and d == 64:
+        pytest.skip("head dim 64 takes the two-kernel backward either way")
     q, k, v, dout = _inputs(*dims_, d=d)
     window_size = (wl, 0) if wl >= 0 else (-1, -1)
     got = _run(q, k, v, dout, True, deterministic=deterministic, window_size=window_size)
@@ -1221,21 +1243,35 @@ def test_backward_is_deterministic(d, window_size):
 
 
 @needs_gfx1250
+@pytest.mark.parametrize("window_size", [(-1, -1), (300, 0)], ids=["full", "sliding"])
+def test_head_dim_64_backward_is_deterministic_by_default(window_size):
+    """Head dim 64 takes the two-kernel backward whether or not the caller asks for a deterministic one: the default
+    call repeats bitwise and equals the deterministic one."""
+    q, k, v, dout = _inputs(2, 1024, 1024, 32, 8, d=64)
+    first = _run(q, k, v, dout, True, window_size=window_size)
+    for again in (
+        _run(q, k, v, dout, True, window_size=window_size),
+        _run(q, k, v, dout, True, deterministic=True, window_size=window_size),
+    ):
+        for name, a, b in zip(("out", "lse", "dq", "dk", "dv"), first, again):
+            assert torch.equal(a, b), name
+
+
+@needs_gfx1250
 @pytest.mark.parametrize(
     ("shape", "window_size"),
     [
         ((2, 1024, 1024, 32, 8), (-1, -1)),
         ((2, 4096, 4096, 32, 8), (-1, -1)),
-        ((2, 1024, 1024, 32, 8, 64), (300, 0)),
-        ((1, 4096, 4096, 128, 16, 64), (2047, 0)),
+        ((2, 1024, 1024, 32, 8), (300, 0)),
+        ((1, 4096, 4096, 32, 16), (2047, 0)),
     ],
-    ids=["split", "unsplit", "d64_window_split", "muse_spark_window_unsplit"],
+    ids=["split", "unsplit", "window_split", "window_unsplit"],
 )
 def test_fused_backward_repeats(shape, window_size):
     """The fused backward sums dQ with fp32 atomics in no fixed order: out, lse, dK and dV are
     still bitwise reproducible, dQ to rounding only."""
-    *dims_, d = shape if len(shape) == 6 else (*shape, D)
-    q, k, v, dout = _inputs(*dims_, d=d)
+    q, k, v, dout = _inputs(*shape)
     first = _run(q, k, v, dout, True, window_size=window_size)
     for _ in range(3):
         again = _run(q, k, v, dout, True, window_size=window_size)

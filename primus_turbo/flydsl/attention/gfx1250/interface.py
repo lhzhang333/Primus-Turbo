@@ -210,15 +210,26 @@ def _side_stream(device):
 
 
 # The fused backward (flash_attn_bwd_fused_kernel: dQ inside the dK/dV kernel, 5 GEMMs per unit
-# instead of 7) covers causal problems with Sq a multiple of 64 and Skv of 128. It adds dQ with
-# fp32 atomics, so dQ is not bitwise reproducible; deterministic=True keeps the two-kernel path.
+# instead of 7) covers causal problems of head dim 128 with Sq a multiple of 64 and Skv of 128.
+# It adds dQ with fp32 atomics, so dQ is not bitwise reproducible; deterministic=True keeps the
+# two-kernel path. Head dim 64 takes the two-kernel path as well: its single-wave kernels run
+# two waves per SIMD there (flash_attn_bwd_kernel._wave_attrs), which the fused kernel's 4-wave
+# workgroups (one K/V image of 128 kv rows in LDS each) do not reach, and that outweighs the two
+# GEMMs saved (MI455X, b1 s4096 hq128 hkv16: window 2047 0.46 ms against 0.73 ms, full causal
+# 0.58 against 1.05).
 # Its split-K over the q loop aims at two dispatch waves of the 4-wave workgroups (one per CU).
+_FUSED_HEAD_DIM = 128
 _FUSED_TARGET_WGS = 512
 _FUSED_NSP_CAP = 16
 
 
-def _fused_ok(sq, skv, causal):
-    return bool(causal) and sq % _fused.SEQLEN_Q_MULTIPLE == 0 and skv % _fused.SEQLEN_KV_MULTIPLE == 0
+def _fused_ok(sq, skv, d, causal):
+    return (
+        bool(causal)
+        and d == _FUSED_HEAD_DIM
+        and sq % _fused.SEQLEN_Q_MULTIPLE == 0
+        and skv % _fused.SEQLEN_KV_MULTIPLE == 0
+    )
 
 
 def _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, wl, stream):
@@ -318,11 +329,12 @@ def _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, wl, stream):
 def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, deterministic=False, window_left=-1):
     """Returns (dq, dk, dv) in q/k/v's dtype and layout; dk/dv have Hkv heads.
 
-    Unless ``deterministic``, a causal call with Sq a multiple of 64 and Skv of 128 takes the
-    fused backward (_flash_attn_bwd_fused), whose dQ is summed with fp32 atomics: dK/dV are
-    bitwise reproducible, dQ only to rounding. Otherwise, and for every other call: the GQA
-    reduction happens inside k_dkdv (one workgroup streams every q head of its kv head), so
-    every output element is written exactly once: deterministic, no atomics.
+    Unless ``deterministic``, a causal call of head dim 128 with Sq a multiple of 64 and Skv
+    of 128 takes the fused backward (_flash_attn_bwd_fused), whose dQ is summed with fp32
+    atomics: dK/dV are bitwise reproducible, dQ only to rounding. Otherwise, and for every
+    other call (every call of head dim 64 among them): the GQA reduction happens inside k_dkdv
+    (one workgroup streams every q head of its kv head), so every output element is written
+    exactly once: deterministic, no atomics.
 
     Streams: the dQ chain runs on a side stream (see _SIDE_STREAMS) that first waits for the
     caller's current stream, and the current stream waits for the side stream before this
@@ -347,7 +359,7 @@ def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, determi
     g = hq // hkv
     cz = int(bool(causal))
     stream = torch.cuda.current_stream()
-    if not deterministic and _fused_ok(sq, skv, causal):
+    if not deterministic and _fused_ok(sq, skv, d, causal):
         return _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, wl, stream)
     wl = max(wl, 0)  # read by the kernels only when win
     n_rows = b * sq * hq
