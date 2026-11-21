@@ -11,11 +11,13 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""FlyDSL flash-attention backward for gfx1250 (MI455X) at head dim 128 with GQA, on generated tile schedules.
+"""FlyDSL flash attention for gfx1250 (MI455X) at head dim 128 with GQA, on generated tile schedules.
 
-The design of the DeepSeek-V3 MLA backward (``gfx1250_mla``) at q / k / v head dim 128: k_dkdv computes S and dP once,
-produces dK / dV and stores every dS^T tile into a scratch, k_dqds computes dQ = dS K from it. The assembly model
-(``gfx1250_mla.asm``), the shell helpers (``gfx1250_mla.common``) and k_delta_bshd are shared with that package.
+The design of the DeepSeek-V3 MLA kernels (``gfx1250_mla``) at q / k / v head dim 128. Forward (fwd): 256-row q
+blocks, on persistent workgroups where the grid allows them, the tile math generated (fwd_sched). Backward (bwd):
+k_dkdv computes S and dP once, produces dK / dV and stores every dS^T tile into a scratch, k_dqds computes dQ = dS K
+from it. The assembly model (``gfx1250_mla.asm``), the shell helpers (``gfx1250_mla.common``) and k_delta_bshd are
+shared with that package.
 """
 
 import hashlib

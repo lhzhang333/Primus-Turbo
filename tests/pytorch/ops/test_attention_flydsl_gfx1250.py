@@ -799,6 +799,15 @@ def tile_kernels_backward(monkeypatch):
     monkeypatch.setattr(interface, "BWD_SCHED", False)
 
 
+@pytest.fixture
+def tile_kernels_forward(monkeypatch):
+    """The forward of flash_attn_fwd_kernel's tilings at every size: what a non-causal problem or a causal one outside
+    the sched forward's shape rules (seqlen_kv a multiple of 32 only) runs."""
+    from primus_turbo.flydsl.attention.gfx1250 import interface
+
+    monkeypatch.setattr(interface, "FWD_SCHED", False)
+
+
 @needs_flydsl
 @pytest.mark.parametrize(
     ("shape", "dkdv_chain", "dq_chain"),
@@ -1004,7 +1013,7 @@ _NUMERIC_SHAPES = {
 
 
 @needs_flydsl
-def test_numeric_shapes_reach_every_kernel_variant(monkeypatch, tile_kernels_backward):
+def test_numeric_shapes_reach_every_kernel_variant(monkeypatch, tile_kernels_forward, tile_kernels_backward):
     """The shapes of test_matches_reference reach both forward tilings at every GQA ratio (the
     tiling picked for a device of 256 CUs), split and unsplit dK/dV, split and grouped dQ, and
     the fused backward split and unsplit.
@@ -1052,7 +1061,7 @@ def test_numeric_shapes_reach_every_kernel_variant(monkeypatch, tile_kernels_bac
 @pytest.mark.parametrize("shape", list(_NUMERIC_SHAPES.values()), ids=list(_NUMERIC_SHAPES))
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("deterministic", [False, True], ids=["fast", "deterministic"])
-def test_matches_reference(tile_kernels_backward, shape, causal, deterministic):
+def test_matches_reference(tile_kernels_forward, tile_kernels_backward, shape, causal, deterministic):
     """Covers both forward variants (grid below / above the CU count) at every GQA ratio and the
     backward's split-K (small grids), grouped dQ (large grids) and unsplit dK/dV (dkdv_unsplit,
     whose Skv/32 * Hkv * B = 2048 kv tiles fill the machine twice; gqa2_large_grid) paths.
@@ -1145,6 +1154,55 @@ def test_torch_compile_fullgraph():
         out, lse = fn(q_, k_, v_)
     out.backward(dout.to("cuda"))
     _check((out, lse, q_.grad, k_.grad, v_.grad), ref)
+
+
+# ---------------------------------------------------------------------------
+# The forward on generated tile schedules (interface._sched_fwd)
+# ---------------------------------------------------------------------------
+@needs_flydsl
+@pytest.mark.parametrize(
+    ("shape", "causal", "taken", "grid"),
+    [
+        ((4, 8192, 8192, 32, 8), True, True, (256, 32)),  # persistent workgroups, one per CU
+        ((1, 2048, 2048, 32, 8), True, True, (0, 8)),  # an odd number of steps: one workgroup per q block
+        ((1, 448, 448, 16, 1), True, True, (0, 2)),  # not whole q blocks
+        ((1, 256, 512, 8, 2), True, True, (0, 1)),  # seqlen_q < seqlen_kv
+        ((1, 128, 128, 2, 1), True, True, (0, 1)),  # no size rule
+        ((4, 8192, 8192, 32, 8), False, False, None),
+        ((1, 256, 288, 8, 2), True, False, None),  # seqlen_kv not a multiple of 64
+    ],
+    ids=["llama3.1-8b", "odd_steps", "seq_448", "sq_lt_skv", "toy", "non_causal", "skv_x32"],
+)
+def test_sched_forward_dispatch(monkeypatch, shape, causal, taken, grid):
+    """Which calls take the sched forward (every causal one inside its shape rules), with which launch grid
+    (workgroups of the persistent schedule or 0, q blocks) on a device of 256 CUs."""
+    from primus_turbo.flydsl.attention.gfx1250 import interface
+
+    b, sq, skv, hq, hkv = shape
+    q, k, v = _meta(b, sq, skv, hq, hkv)
+    calls = []
+    monkeypatch.setattr(interface, "_num_cu", lambda device: 256)
+    monkeypatch.setattr(interface._fwd, "flash_attn_fwd", lambda *a, **kw: calls.append("tile"))
+    monkeypatch.setattr(interface._sched_fwd, "flash_attn_fwd", lambda *a, **kw: calls.append("sched"))
+    interface.flash_attn_fwd(q, k, v, causal=causal)
+    assert calls == ["sched" if taken else "tile"]
+    if taken:
+        assert interface._sched_fwd.launch_grid(q, k) == grid
+
+
+@needs_gfx1250
+@pytest.mark.parametrize(
+    "shape", [(2, 1024, 1024, 64, 32), (1, 1024, 1024, 32, 8)], ids=["persistent_grid", "block_per_workgroup"]
+)
+def test_sched_forward_matches_reference(shape):
+    """The default dispatch of two grids the sched backward's cases do not reach: persistent workgroups (with the
+    sched backward) and one workgroup per q block over several q blocks (with the per-tile backward kernels);
+    against the fp32 reference, out and lse bitwise the same when repeated."""
+    q, k, v, dout = _inputs(*shape)
+    first = _run(q, k, v, dout, True)
+    _check(first, _reference(q, k, v, dout, True))
+    for name, a, b in zip(("out", "lse"), first, _run(q, k, v, dout, True)):
+        assert torch.equal(a, b), f"{name} differs between two runs"
 
 
 # ---------------------------------------------------------------------------
@@ -1276,7 +1334,7 @@ def test_llama31_8b_training_shape():
     reason="forward repeatability at seq 8192; set PRIMUS_TURBO_TEST_LARGE=1",
 )
 @pytest.mark.parametrize("causal", [True, False])
-def test_forward_repeats_bitwise_at_seq_8192(causal):
+def test_forward_repeats_bitwise_at_seq_8192(tile_kernels_forward, causal):
     """The forward is built in expert scheduling mode 2 (ENABLE_SCHED_MODE2 of
     flash_attn_fwd_kernel), under which the upstream kernel's notes report a rare failure at
     seq 8192, non-causal. 500 forwards of the Llama-3.1-8B training shape: every output finite

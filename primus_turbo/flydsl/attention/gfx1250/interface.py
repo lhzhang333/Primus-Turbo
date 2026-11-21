@@ -41,6 +41,7 @@ from . import flash_attn_bwd_kernel as _bwd
 from . import flash_attn_fwd_kernel as _fwd
 from .flash_attn_utils import _run_compiled
 from .sched import bwd as _sched
+from .sched import fwd as _sched_fwd
 
 HEAD_DIM = _bwd.D
 if _fwd.HEAD_DIM != HEAD_DIM:
@@ -135,13 +136,28 @@ def _num_cu(device) -> int:
     return _NUM_CU[idx]
 
 
+# The forward on generated tile schedules (sched.fwd: 256-row q blocks on persistent workgroups where the grid allows
+# them, the tile math generated) takes every causal problem inside its shape rules: it measured faster than the
+# kernels below at every size and grid kind tried on MI455X (1.04x to 1.21x, 22 shapes from b1 s128 to b4 s8192).
+FWD_SCHED = True
+
+
+def _sched_fwd_ok(b, sq, skv, hq, hkv, causal):
+    return FWD_SCHED and bool(causal) and _sched_fwd.shape_unsupported_reason(b, sq, skv, hq, hkv) is None
+
+
 def flash_attn_fwd(q, k, v, softmax_scale=None, causal=True):
-    """Returns (o [B, Sq, Hq, D] bf16, lse [B, Hq, Sq] fp32 natural log)."""
+    """Returns (o [B, Sq, Hq, D] bf16, lse [B, Hq, Sq] fp32 natural log).
+
+    A causal problem inside the sched forward's shape rules (_sched_fwd_ok: Skv a multiple of 64 too) runs on it;
+    anything else on flash_attn_fwd_kernel's tilings."""
     _check(q, k, v, causal)
     b, sq, hq, d = q.shape
-    hkv = k.shape[2]
+    skv, hkv = k.shape[1], k.shape[2]
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
+    if _sched_fwd_ok(b, sq, skv, hq, hkv, causal):
+        return _sched_fwd.flash_attn_fwd(q, k, v, float(softmax_scale))
     # An under-filled grid is bound by its heaviest workgroup's latency; the small-grid
     # tiling uses 64-row workgroups (BLOCK_M 64 instead of 256) to spread the work.
     grid = -(-sq * (hq // hkv) // _fwd.DEFAULT.block_m) * hkv * b
