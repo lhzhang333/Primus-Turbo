@@ -35,7 +35,7 @@ from primus_turbo.pytorch.ops import flash_attn_func
 from primus_turbo.pytorch.ops.attention import flash_attn_interface
 from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
 
-_KERNELS = "primus_turbo.flydsl.attention.gfx1250_mla"
+_KERNELS = "primus_turbo.flydsl.attention.gfx1250.mla"
 # Taken when pytest imports this module, before any test runs.
 _KERNEL_MODULES_AT_IMPORT = sorted(m for m in sys.modules if m == _KERNELS or m.startswith(_KERNELS + "."))
 
@@ -205,7 +205,7 @@ def test_gate_refuses(monkeypatch, tensors, kwargs):
 def test_gate_verdict_depends_on_batch_times_heads(b, s, h, accepted):
     """b > 1 SBHD storage reaches the kernels as [1, s, b * h, d]. The gate judges the op's shape and the backward's
     entry the kernels': they give one verdict because every size rule is on batch * heads."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd
+    from primus_turbo.flydsl.attention.gfx1250.mla import bwd
 
     assert (bwd.shape_unsupported_reason(b, s, s, h) is None) == accepted
     assert (bwd.shape_unsupported_reason(1, s, s, b * h) is None) == accepted
@@ -214,7 +214,7 @@ def test_gate_verdict_depends_on_batch_times_heads(b, s, h, accepted):
 def test_gate_keeps_batch_times_heads_in_the_16_bit_grid():
     """batch * heads is a dimension of the kernels' launch grids, which are 16-bit there: a launch of 65536 runs no
     workgroup and reports nothing. The rule is the first size rule, whatever the others allow."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd
+    from primus_turbo.flydsl.attention.gfx1250.mla import bwd
 
     for dims in ((1, 64, 64, 65536), (256, 64, 64, 256), (65536, 64, 64, 1), (1, 4096, 4096, 65536)):
         assert "under 65536" in bwd.shape_unsupported_reason(*dims), dims
@@ -355,7 +355,7 @@ def test_flash_attn_func_refuses_mixed_devices_without_the_gate(monkeypatch):
 def test_kernel_entries_raise_value_error(entry, change, match):
     """The kernel package's entries refuse what their kernels cannot run with ValueError, which
     python -O keeps, before anything is allocated or launched."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd, fwd
+    from primus_turbo.flydsl.attention.gfx1250.mla import bwd, fwd
 
     change = dict(change)
     b, causal = change.pop("b", 1), change.pop("causal", True)
@@ -598,7 +598,7 @@ def test_production_dispatch_matches_reference(monkeypatch):
     """(1, 4096, 4096, 16) takes the DeepSeek-V3 dispatch: grouped longest-first forward blocks and the
     backward's k_dkdv / k_dqds (q_off 256, XCD head remap) on all heads at once. The backward in four head chunks
     on two streams gives the same bits."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd
+    from primus_turbo.flydsl.attention.gfx1250.mla import bwd
 
     q, k, v, dout = _inputs(1, 4096, 4096, 16, layout="bshd")
     got = _run(q, k, v, dout)
@@ -650,7 +650,7 @@ def test_persistent_forward_equals_one_block_per_workgroup(monkeypatch, dims):
     """The persistent forward (one workgroup per CU on the static schedule, the TDM ring running on across a
     workgroup's blocks) gives the bits of one workgroup per q block. NaN-filled outputs expose a block no workgroup
     took."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import fwd
+    from primus_turbo.flydsl.attention.gfx1250.mla import fwd
 
     b, sq, skv, h = dims
     g = torch.Generator(device="cuda").manual_seed(0)
@@ -684,7 +684,7 @@ def test_largest_sizes_equal_head_slices(dims, heads):
     of the same problem run ``heads`` heads at a time, each slice far below that. NaN-filled outputs expose an element
     no launch wrote. At seqlen_kv 64 the bound is k_dkdv's padded kv block: the dK stores of its 128 idle rows reach
     just under 4 GiB, where the range check must still drop them."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd, fwd
+    from primus_turbo.flydsl.attention.gfx1250.mla import bwd, fwd
 
     b, sq, skv, h = dims
     assert bwd.shape_unsupported_reason(b, sq, skv, h) is None
@@ -712,7 +712,7 @@ def test_largest_sizes_equal_head_slices(dims, heads):
 def test_persistent_forward_under_cuda_graphs():
     """Two graphs captured on torch's shared capture stream, the second replayed first, give the eager bits (the
     persistent schedule is static: a launch keeps no state on the device)."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import fwd
+    from primus_turbo.flydsl.attention.gfx1250.mla import fwd
 
     q, k, v = (t.cuda() for t in _inputs(1, 4096, 4096, 32, layout="bshd")[:3])
     assert fwd.launch_grid(q, k)[0], "not a persistent shape"

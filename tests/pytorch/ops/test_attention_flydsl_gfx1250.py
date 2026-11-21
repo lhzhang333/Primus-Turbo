@@ -41,7 +41,7 @@ from primus_turbo.pytorch.kernels.attention.attention_impl import (
 from primus_turbo.pytorch.ops import flash_attn_func
 from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
 
-_PKG = "primus_turbo.flydsl.attention.gfx1250"
+_PKG = "primus_turbo.flydsl.attention.gfx1250.mha"
 
 
 def _gfx1250_modules():
@@ -53,7 +53,7 @@ _GFX1250_MODULES_AT_IMPORT = _gfx1250_modules()
 
 
 def _flydsl_reason():
-    from primus_turbo.flydsl.attention.gfx1250.flydsl_version import (
+    from primus_turbo.flydsl.attention.gfx1250.mha.flydsl_version import (
         flydsl_unavailable_reason,
     )
 
@@ -362,7 +362,7 @@ def test_importing_primus_turbo_does_not_import_the_gfx1250_package():
 def test_flydsl_version_module_imports_only_the_standard_library():
     """The gate asks flydsl_version before anything else, so loading it must not import flydsl
     or torch; checked in a fresh interpreter that loads the file by path."""
-    from primus_turbo.flydsl.attention.gfx1250 import flydsl_version
+    from primus_turbo.flydsl.attention.gfx1250.mha import flydsl_version
 
     code = (
         "import importlib.util, sys\n"
@@ -402,7 +402,7 @@ def _fake_flydsl(monkeypatch, version):
     ],
 )
 def test_flydsl_version_requirement(monkeypatch, version, ok, packaging):
-    from primus_turbo.flydsl.attention.gfx1250 import flydsl_version as ver
+    from primus_turbo.flydsl.attention.gfx1250.mha import flydsl_version as ver
 
     if not packaging:  # the release-number fallback
         monkeypatch.setitem(sys.modules, "packaging.specifiers", None)
@@ -434,7 +434,7 @@ def test_setup_py_flydsl_requirement_agrees_with_the_gate():
     specifiers = pytest.importorskip("packaging.specifiers")
     from packaging.version import Version
 
-    from primus_turbo.flydsl.attention.gfx1250 import flydsl_version as ver
+    from primus_turbo.flydsl.attention.gfx1250.mha import flydsl_version as ver
 
     setup_py = os.path.join(os.path.dirname(__file__), "..", "..", "..", "setup.py")
     if not os.path.isfile(setup_py):
@@ -464,7 +464,7 @@ def test_setup_py_flydsl_requirement_agrees_with_the_gate():
 @pytest.mark.parametrize("version", ["0.3.4.dev1", "0.3.4.1.dev0", "0.3.4.1rc1", "0.3.5rc1"])
 def test_flydsl_version_requirement_excludes_prereleases_outside(monkeypatch, version):
     pytest.importorskip("packaging")
-    from primus_turbo.flydsl.attention.gfx1250 import flydsl_version as ver
+    from primus_turbo.flydsl.attention.gfx1250.mha import flydsl_version as ver
 
     _fake_flydsl(monkeypatch, version)
     assert ver.flydsl_unavailable_reason() is not None
@@ -582,7 +582,7 @@ def test_package_modules_refuse_import_without_flydsl_0_3_4(monkeypatch, module)
 def test_kernel_modules_import():
     """With flydsl 0.3.4.1 the whole package imports, building no kernel, and interface exposes
     the shape rules the gate asks."""
-    from primus_turbo.flydsl.attention.gfx1250 import interface
+    from primus_turbo.flydsl.attention.gfx1250.mha import interface
 
     for m in ("flash_attn_fwd_kernel", "flash_attn_bwd_kernel"):
         assert f"{_PKG}.{m}" in sys.modules
@@ -612,7 +612,7 @@ def test_kernel_modules_import():
 def test_empty_or_non_4d_problems_are_refused(q_shape, k_shape):
     """Every dimension must be non-empty (an empty batch would launch zero-size grids) and q / k
     4-D: unsupported_reason says so, and the forward raises it before launching anything."""
-    from primus_turbo.flydsl.attention.gfx1250 import interface
+    from primus_turbo.flydsl.attention.gfx1250.mha import interface
 
     reason = interface.unsupported_reason(q_shape, k_shape, k_shape, torch.bfloat16, True)
     assert reason is not None and ("empty dimension" in reason or "4-D" in reason), reason
@@ -625,7 +625,7 @@ def test_empty_or_non_4d_problems_are_refused(q_shape, k_shape):
 @needs_flydsl
 def test_forward_refuses_tensors_on_two_devices():
     """flash_attn_fwd checks that q, k and v share a device before launching anything."""
-    from primus_turbo.flydsl.attention.gfx1250 import interface
+    from primus_turbo.flydsl.attention.gfx1250.mha import interface
 
     q, _, v = _meta(1, 256, 256, 4, 2)
     k = torch.empty(1, 256, 2, D, dtype=torch.bfloat16)
@@ -658,7 +658,7 @@ def test_forward_refuses_tensors_on_two_devices():
 def test_backward_refuses_mismatched_tensors(monkeypatch, name, make, match):
     """flash_attn_bwd checks do / o / lse against q before launching anything: the kernels take
     every shape from q and k, so a smaller tensor would be read past its end."""
-    from primus_turbo.flydsl.attention.gfx1250 import interface
+    from primus_turbo.flydsl.attention.gfx1250.mha import interface
 
     def forbidden(*args):
         raise AssertionError("launched despite a mismatched tensor")
@@ -686,7 +686,7 @@ def test_compiled_launchers_are_cached_per_launcher_device_and_signature(monkeyp
     faked: the first launch per launcher, device and tensor (dtype, rank) compiles (and, in
     flydsl, launches), later ones go through the cached function; a compile-only build is
     never cached, and a failed compile is re-raised with the MLIR context it left open closed."""
-    from primus_turbo.flydsl.attention.gfx1250 import flash_attn_utils as utils
+    from primus_turbo.flydsl.attention.gfx1250.mha import flash_attn_utils as utils
 
     calls, mode = [], {"compile": "ok"}
 
@@ -735,8 +735,8 @@ def test_compiled_launchers_are_cached_per_constexpr_value(monkeypatch):
     on another group's tensors would address the wrong q heads (past the end for a larger one)."""
     import flydsl.expr as fx
 
-    from primus_turbo.flydsl.attention.gfx1250 import flash_attn_bwd_fused_kernel as fused
-    from primus_turbo.flydsl.attention.gfx1250 import flash_attn_utils as utils
+    from primus_turbo.flydsl.attention.gfx1250.mha import flash_attn_bwd_fused_kernel as fused
+    from primus_turbo.flydsl.attention.gfx1250.mha import flash_attn_utils as utils
 
     def launcher(x: torch.Tensor, n: int, group: fx.Constexpr[int], stream):
         pass
@@ -791,7 +791,7 @@ def test_backward_kernels_and_streams(monkeypatch, shape, dkdv_chain, dq_chain):
     input or was allocated (on the caller's stream) before the fork: a block allocated after
     the fork can be one that caller-stream work issued after the fork still uses, and the side
     stream does not wait for that work."""
-    from primus_turbo.flydsl.attention.gfx1250 import interface
+    from primus_turbo.flydsl.attention.gfx1250.mha import interface
 
     b, sq, skv, hq, hkv = shape
     q, k, v = _meta(b, sq, skv, hq, hkv)
@@ -922,7 +922,7 @@ def test_fused_backward_launch_plan(monkeypatch, shape, causal, deterministic, c
     """Which calls take the fused backward (dQ inside the dK/dV kernel, fp32 dQ atomics): causal,
     Skv a multiple of 128 (Sq is always one of 64 here) and not deterministic. Its launches all go to the caller's
     stream, in order; chain None means the two-kernel path (it forks a side stream)."""
-    from primus_turbo.flydsl.attention.gfx1250 import interface
+    from primus_turbo.flydsl.attention.gfx1250.mha import interface
 
     b, sq, skv, hq, hkv = shape
     q, k, v = _meta(b, sq, skv, hq, hkv)
@@ -978,7 +978,7 @@ def test_numeric_shapes_reach_every_kernel_variant(monkeypatch):
     tiling picked for a device of 256 CUs), split and unsplit dK/dV, split and grouped dQ, and
     the fused backward split and unsplit.
     Checked with the kernels and streams faked, so no GPU kernel runs."""
-    from primus_turbo.flydsl.attention.gfx1250 import interface
+    from primus_turbo.flydsl.attention.gfx1250.mha import interface
 
     class Stream:
         def wait_stream(self, other):

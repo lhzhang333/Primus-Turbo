@@ -224,8 +224,8 @@ def _flydsl_gfx1250_ok(
     return_softmax,
 ) -> bool:
     """Eligibility for FlyDSL's gfx1250 kernels, two families told apart by head dims: the
-    DeepSeek-V3 MLA kernels (primus_turbo/flydsl/attention/gfx1250_mla, qk 192 / v 128) and the
-    head-dim-128 GQA kernels (primus_turbo/flydsl/attention/gfx1250).
+    DeepSeek-V3 MLA kernels (primus_turbo/flydsl/attention/gfx1250/mla, qk 192 / v 128) and the
+    head-dim-128 GQA kernels (primus_turbo/flydsl/attention/gfx1250/mha).
 
     Both take bf16 in any byte order (the tensors are [b, s, h, d]-shaped) and no dropout, bias,
     ALiBi, sink, sliding window or returned softmax; the shape rules (sequence multiples, sizes,

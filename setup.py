@@ -568,7 +568,7 @@ if __name__ == "__main__":
     # 0.4.* is excluded because the kernels here were never ported to or validated on
     # that line (0.2.4 -> 0.3.4.1 was #544; aiter itself skipped 0.4.2 -> 0.5.0).
     # NOTE: the gfx1250 attention kernels carry their own, tighter requirement in
-    # primus_turbo/flydsl/attention/gfx1250/flydsl_version.py and will decline (and
+    # primus_turbo/flydsl/attention/gfx1250/mha/flydsl_version.py and will decline (and
     # let the dispatcher fall back) on a flydsl this range admits but that one does
     # not. Widen FLYDSL_REQUIREMENT there only after re-validating on gfx1250 hardware.
     install_requires.append("flydsl>=0.3.4.1,!=0.4.*,<0.6")

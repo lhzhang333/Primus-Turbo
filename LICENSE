@@ -62,33 +62,30 @@ Primus-Turbo uses or references the following third-party projects:
        primus_turbo/flydsl/quantization/mxfp4_grouped_quant.py
        primus_turbo/flydsl/attention/sparse_mla_fwd.py
        primus_turbo/flydsl/attention/sparse_mla_bwd.py
-       primus_turbo/flydsl/attention/gfx1250_mla/fwd.py
-       primus_turbo/flydsl/attention/gfx1250_mla/fwd_kernel.py
-       primus_turbo/flydsl/attention/gfx1250_mla/fwd_staging.py
-       primus_turbo/flydsl/attention/gfx1250_mla/bwd.py
-       primus_turbo/flydsl/attention/gfx1250_mla/bwd_kernels.py
-       primus_turbo/flydsl/attention/gfx1250/__init__.py
-       primus_turbo/flydsl/attention/gfx1250/buffer_ops.py
-       primus_turbo/flydsl/attention/gfx1250/flash_attn_bwd_kernel.py
-       primus_turbo/flydsl/attention/gfx1250/flash_attn_bwd_fused_kernel.py
-       primus_turbo/flydsl/attention/gfx1250/flash_attn_fwd_kernel.py
-       primus_turbo/flydsl/attention/gfx1250/flash_attn_fwd_utils.py
-       primus_turbo/flydsl/attention/gfx1250/flash_attn_utils.py
-       primus_turbo/flydsl/attention/gfx1250/flydsl_version.py
-       primus_turbo/flydsl/attention/gfx1250/interface.py
+       primus_turbo/flydsl/attention/gfx1250/mla/fwd.py
+       primus_turbo/flydsl/attention/gfx1250/mla/fwd_kernel.py
+       primus_turbo/flydsl/attention/gfx1250/mla/bwd.py
+       primus_turbo/flydsl/attention/gfx1250/mha/__init__.py
+       primus_turbo/flydsl/attention/gfx1250/mha/buffer_ops.py
+       primus_turbo/flydsl/attention/gfx1250/mha/flash_attn_bwd_kernel.py
+       primus_turbo/flydsl/attention/gfx1250/mha/flash_attn_bwd_fused_kernel.py
+       primus_turbo/flydsl/attention/gfx1250/mha/flash_attn_fwd_kernel.py
+       primus_turbo/flydsl/attention/gfx1250/mha/flash_attn_fwd_utils.py
+       primus_turbo/flydsl/attention/gfx1250/mha/flash_attn_utils.py
+       primus_turbo/flydsl/attention/gfx1250/mha/flydsl_version.py
+       primus_turbo/flydsl/attention/gfx1250/mha/interface.py
 
 5. AITER
    - License: MIT License
    - Repository: https://github.com/ROCm/aiter.git
    - Note: the gfx1250 MLA attention forward is adapted from aiter's gfx1250
      FlyDSL FMHA forward prefill and carries the aiter copyright notice:
-       primus_turbo/flydsl/attention/gfx1250_mla/fwd_kernel.py
-       primus_turbo/flydsl/attention/gfx1250_mla/fwd_staging.py
+       primus_turbo/flydsl/attention/gfx1250/mla/fwd_kernel.py
    - Note: the gfx1250 flash-attention forward is adapted from aiter (commit 6963ae9d);
      the following files keep aiter's copyright notice (they are also listed
      under FlyDSL above, whose Apache-2.0 header they carry):
-       primus_turbo/flydsl/attention/gfx1250/flash_attn_fwd_kernel.py
-       primus_turbo/flydsl/attention/gfx1250/flash_attn_fwd_utils.py
+       primus_turbo/flydsl/attention/gfx1250/mha/flash_attn_fwd_kernel.py
+       primus_turbo/flydsl/attention/gfx1250/mha/flash_attn_fwd_utils.py
 
 6. Triton-distributed
    - License: MIT License

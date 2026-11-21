@@ -35,13 +35,13 @@ D_V = 128
 
 def _fwd():
     # Imported on first use: gfx1250-only kernels, never loaded on other archs.
-    from primus_turbo.flydsl.attention.gfx1250_mla import fwd
+    from primus_turbo.flydsl.attention.gfx1250.mla import fwd
 
     return fwd
 
 
 def _bwd():
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd
+    from primus_turbo.flydsl.attention.gfx1250.mla import bwd
 
     return bwd
 

@@ -11,10 +11,13 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""FlyDSL flash attention for gfx1250 (MI455X): forward and backward, bf16, head_dim 128.
+"""FlyDSL attention kernels for gfx1250 (MI455X), one package per kernel family:
 
-Import only on gfx1250; the kernels are wave32 WMMA code. The entry points live in
-``interface``. The kernels need a flydsl that satisfies ``flydsl_version.FLYDSL_REQUIREMENT``
-(``>=0.3.4.1,<0.3.5``): their modules raise ImportError under any other flydsl. This package
-module imports nothing, so ``flydsl_version`` can be asked first.
+    ``mha``         dense multi-head / grouped-query attention, bf16, head dim 128
+    ``mla``         multi-head latent attention at the DeepSeek-V3 head dims (qk 192, v 128)
+    ``sparse_mla``  DeepSeek-V4 sparse MLA
+
+This package module imports nothing. A family keeps its launchers and the helpers they call in
+its own directory: FlyDSL folds a helper's source into a kernel's disk-cache key only when the
+helper sits in the launcher's directory.
 """

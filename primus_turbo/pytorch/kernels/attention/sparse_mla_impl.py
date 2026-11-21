@@ -22,10 +22,10 @@ from typing import Optional, Tuple
 
 import torch
 
-from primus_turbo.flydsl.attention.gfx1250_sparse_mla.bwd_kernel import (
+from primus_turbo.flydsl.attention.gfx1250.sparse_mla.bwd_kernel import (
     sparse_mla_bwd_gfx1250,
 )
-from primus_turbo.flydsl.attention.gfx1250_sparse_mla.fwd_kernel import (
+from primus_turbo.flydsl.attention.gfx1250.sparse_mla.fwd_kernel import (
     sparse_mla_fwd_gfx1250,
 )
 from primus_turbo.flydsl.attention.sparse_mla_bwd import sparse_mla_bwd_flydsl

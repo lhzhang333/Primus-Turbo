@@ -240,7 +240,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Most dS scratch, in MiB, the FlyDSL gfx1250 MLA backward holds at once (5120 when unset). The backward stores dS
     # between its dK / dV and dQ kernels, about batch * heads * seqlen_q * seqlen_kv bytes in all (4.33 GB at b2 s4096
     # h128): all heads on one scratch when that is within this, else the heads in chunks, two in flight, that are
-    # (gfx1250_mla.bwd.ds_chunkings; a few percent slower); below two heads' scratch (0 included) it runs one head at
+    # (gfx1250.mla.bwd.ds_chunkings; a few percent slower); below two heads' scratch (0 included) it runs one head at
     # a time, on that one head's scratch even when it is over this (about batch * seqlen_q * seqlen_kv bytes: 16 GiB
     # at seqlen 131072; a device without that much free memory raises torch.OutOfMemoryError). Read at every MLA
     # backward (through the cache); a value that is not a non-negative integer raises ValueError.

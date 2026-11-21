@@ -43,7 +43,7 @@ REGIONS = {
 _EVERY_REGION = pytest.mark.parametrize(("sched", "name"), list(REGIONS), ids=["_".join(k) for k in REGIONS])
 
 
-_PACKAGE = "primus_turbo.flydsl.attention.gfx1250_mla"
+_PACKAGE = "primus_turbo.flydsl.attention.gfx1250.mla"
 
 
 def _module(name):
