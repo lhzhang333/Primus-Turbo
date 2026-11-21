@@ -454,3 +454,63 @@ def test_one_expert_at_a_keyed_shape_numeric(direction, N, K):
     else:
         b = torch.randn(G, K, N, dtype=torch.bfloat16, device=device)
         _assert_matches_ref(_run_nn(a, b, offs), a, b, offs, trans_b=False)
+
+
+# ---------------------------------------------------------------------------
+# The group cap of the variable-K backend: 64 is gfx950's measured boundary, gfx1250 was
+# measured correct up to 160 (GroupedGEMMVariableKFlyDSLBackend.MAX_G / MAX_G_GFX1250).
+# ---------------------------------------------------------------------------
+def _variable_k_call(groups, device="cpu"):
+    lens = (torch.arange(groups, dtype=torch.int64) % 5 * 32 + 64).to(device)
+    offs = torch.zeros(groups + 1, dtype=torch.int64, device=device)
+    offs[1:] = lens.cumsum(0)
+    rows = int(offs[-1])
+    gen = torch.Generator().manual_seed(groups)
+    a = torch.randn((rows, 512), generator=gen).to(device, torch.bfloat16)
+    b = torch.randn((rows, 768), generator=gen).to(device, torch.bfloat16)
+    return a, b, lens, offs
+
+
+def test_variable_k_group_cap_is_per_architecture(monkeypatch):
+    """Host-only: the gate reads shapes. Each cap is checked with a call that is fine otherwise."""
+    from primus_turbo.pytorch.kernels.grouped_gemm import grouped_gemm_impl as impl
+
+    backend = impl.GroupedGEMMVariableKFlyDSLBackend
+
+    def takes(groups, arch):
+        monkeypatch.setattr(impl, "is_gfx950", lambda: arch == "gfx950")
+        monkeypatch.setattr(impl, "is_gfx1250", lambda: arch == "gfx1250")
+        return backend.can_handle(*_variable_k_call(groups), True, False, False, None)
+
+    assert (backend.MAX_G, backend.MAX_G_GFX1250) == (64, 160)
+    assert takes(64, "gfx950") and not takes(65, "gfx950")
+    assert takes(160, "gfx1250") and not takes(161, "gfx1250")
+
+
+@needs_gfx1250
+@pytest.mark.parametrize("groups", [128, 160])  # MiniMax-M3's local experts on one GPU; the cap
+def test_variable_k_backend_above_64_groups_numeric(groups):
+    from primus_turbo.pytorch.core.backend import BackendType
+    from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import grouped_gemm_variable_k_impl
+
+    a, b, lens, offs = _variable_k_call(groups, "cuda")
+    out = grouped_gemm_variable_k_impl(
+        a,
+        b,
+        lens,
+        offs,
+        trans_a=True,
+        trans_b=False,
+        trans_c=False,
+        num_cu=None,
+        default_backend=BackendType.FLYDSL.value,
+    )
+    ref = torch.stack(
+        [
+            a[int(offs[g]) : int(offs[g + 1])].float().T @ b[int(offs[g]) : int(offs[g + 1])].float()
+            for g in range(groups)
+        ]
+    ).to(torch.bfloat16)
+    assert out.shape == ref.shape
+    assert compute_snr(ref, out) > 45.0
+    torch.testing.assert_close(out, ref, **get_tolerances(torch.bfloat16))
