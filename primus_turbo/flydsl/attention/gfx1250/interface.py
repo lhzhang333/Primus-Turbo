@@ -40,6 +40,7 @@ from . import flash_attn_bwd_fused_kernel as _fused
 from . import flash_attn_bwd_kernel as _bwd
 from . import flash_attn_fwd_kernel as _fwd
 from .flash_attn_utils import _run_compiled
+from .sched import bwd as _sched
 
 HEAD_DIM = _bwd.D
 if _fwd.HEAD_DIM != HEAD_DIM:
@@ -288,10 +289,25 @@ def _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, stream):
     return dq, dk, dv
 
 
+# The backward on generated tile schedules (sched: k_dkdv computes S and dP once and stores dS^T into a scratch,
+# k_dqds computes dQ from it; no atomics, bitwise reproducible) takes the causal problems whose kv blocks fill the
+# machine: its persistent workgroups (one per CU) run whole items, a kv block with all the q heads of its kv head,
+# so a smaller problem would leave CUs idle that the kernels below fill with one workgroup per tile.
+BWD_SCHED = True
+
+
+def _sched_ok(b, sq, skv, hq, hkv, causal, device):
+    if not (BWD_SCHED and causal) or _sched.shape_unsupported_reason(b, sq, skv, hq, hkv) is not None:
+        return False
+    return b * hkv * _sched.kv_blocks(skv) >= _num_cu(device)
+
+
 def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, deterministic=False):
     """Returns (dq, dk, dv) in q/k/v's dtype and layout; dk/dv have Hkv heads.
 
-    Unless ``deterministic``, a causal call with Sq a multiple of 64 and Skv of 128 takes the
+    A causal problem large enough to fill the machine with kv blocks (_sched_ok) takes the backward on generated
+    tile schedules (sched.bwd): every output element is written once, deterministic or not. Otherwise, unless
+    ``deterministic``, a causal call with Sq a multiple of 64 and Skv of 128 takes the
     fused backward (_flash_attn_bwd_fused), whose dQ is summed with fp32 atomics: dK/dV are
     bitwise reproducible, dQ only to rounding. Otherwise, and for every other call: the GQA
     reduction happens inside k_dkdv (one workgroup streams every q head of its kv head), so
@@ -318,6 +334,8 @@ def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, determi
     g = hq // hkv
     cz = int(bool(causal))
     stream = torch.cuda.current_stream()
+    if _sched_ok(b, sq, skv, hq, hkv, causal, q.device):
+        return _sched.flash_attn_bwd(do, q, k, v, o, lse, scale)
     if not deterministic and _fused_ok(sq, skv, causal):
         return _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, stream)
     n_rows = b * sq * hq
