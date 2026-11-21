@@ -64,9 +64,8 @@ import flydsl.expr as fx
 # UNSTABLE(gfx1250): readfirstlane and disable_xdl_arb_stall have no stable API in FlyDSL 0.3.4.1.
 from flydsl.expr import rocdl
 
-from primus_turbo.flydsl.utils.prims import LOG2E
-
 from primus_turbo.flydsl.attention.gfx1250_mla.common import inline_region, reserve_vgprs
+from primus_turbo.flydsl.utils.prims import LOG2E
 
 from . import SOURCE_DIGEST
 from . import bwd_dkdv_sched as sched

@@ -65,7 +65,9 @@ NKV = 3  # kv sub-tiles of 16 rows per wave
 NDT_QK, NDT_V = 4, 4  # WMMA k-steps of S = Q K^T and dP = dO V^T (head dim 128)
 NDO_V, NDO_QK = 8, 8  # 16-wide output tiles of dV^T and dK^T
 NOPS = 2  # TDM ops of a ring stage: dO, Q
-NQT_O = 6  # dK's Q^T operands 0..NQT_O - 1 go to O tuples, the rest to D[0], D[1] (free after dV); SEP_QT: unused
+NQT_O = (
+    6  # dK's Q^T operands 0..NQT_O - 1 go to O tuples, the rest to D[0], D[1] (free after dV); SEP_QT: unused
+)
 SEP_HH1 = True  # hh1's S / dP operands in tuples of their own (O1): loaded at the tile's start
 SEP_QT = True  # dK's Q^T operands in tuples of their own (QT)
 XK, XV = 272, 272  # LDS row strides (bytes) of Q / K and of dO / V rows (the TDM pads 16 B per row)
@@ -1046,7 +1048,9 @@ def loop_scalars(ops, stage, kofs):
 def loop_entry(ops, lp, fall=True):
     """After tile 0's scalars: an item's masked tiles come first (k < n_mask), in M<s>; with none, U0 (which follows
     when `fall`)."""
-    return [f"s_cmp_gt_i32 {ops['nmask']}, 0", f"s_cbranch_scc1 {lp}_M0"] + ([] if fall else [f"s_branch {lp}_U0"])
+    return [f"s_cmp_gt_i32 {ops['nmask']}, 0", f"s_cbranch_scc1 {lp}_M0"] + (
+        [] if fall else [f"s_branch {lp}_U0"]
+    )
 
 
 def region_loop(L, ops, lp):
@@ -1230,7 +1234,9 @@ def _body(L, ops, lp, entry_x, pieces):
     item = region_init(L, ops) + loop_init(L, lo) + loop_scalars(lo, 0, 0) + loop_entry(ops, lp)
     lines_item, fl = A.emit(item, hfl)
     main += lines_item
-    cont = region_init_cont(L, ops) + loop_init(L, lo) + loop_scalars(lo, 0, 0) + loop_entry(ops, lp, fall=False)
+    cont = (
+        region_init_cont(L, ops) + loop_init(L, lo) + loop_scalars(lo, 0, 0) + loop_entry(ops, lp, fall=False)
+    )
     lines_cont, cfl = A.emit(cont, hfl)
     blocks = region_loop(L, ops, lp)
     items = {name: [A.make_item("\t" + x) for x in texts] for name, _, texts, _ in blocks}

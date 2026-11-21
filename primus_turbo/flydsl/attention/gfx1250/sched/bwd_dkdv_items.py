@@ -156,7 +156,7 @@ def item_rows(hb, bid, gi, sq, skv, hq, hkv_n, h0, hc):
     bat = hb // hc
     hkv = h0 + hb - bat * hc
     qh = hkv * g + gi  # the sub-item's q head
-    rg = (hb * g + gi)  # its region of the dS^T scratch: (batch, q head of the launch)
+    rg = hb * g + gi  # its region of the dS^T scratch: (batch, q head of the launch)
     kv0 = bid * ROWS_B + wv * KV_W
     n, nm, qs = _tiles(bid, sq, skv)
     row = np.zeros((hb.shape[0], NW, ROW_DW), np.int64)

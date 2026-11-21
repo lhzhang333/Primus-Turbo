@@ -274,7 +274,9 @@ def test_forward_and_backward_route_to_the_gfx1250_kernels(monkeypatch, layout, 
     calls, base = [], {}
 
     def fwd(q, k, v, softmax_scale, causal):
-        calls.append(("fwd", tuple(q.shape), tuple(k.shape), tuple(v.shape), q.is_contiguous(), k.is_contiguous()))
+        calls.append(
+            ("fwd", tuple(q.shape), tuple(k.shape), tuple(v.shape), q.is_contiguous(), k.is_contiguous())
+        )
         calls.append(("copy", q.data_ptr() != base["q"], k.data_ptr() != base["k"]))
         return torch.zeros_like(q), torch.zeros(kb, kh * hq, sq)
 
@@ -307,10 +309,23 @@ def test_forward_and_backward_route_to_the_gfx1250_kernels(monkeypatch, layout, 
     finally:
         GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
 
-    assert calls[0] == ("fwd", (kb, sq, kh * hq, D), (kb, skv, kh * hkv, D), (kb, skv, kh * hkv, D), True, True)
+    assert calls[0] == (
+        "fwd",
+        (kb, sq, kh * hq, D),
+        (kb, skv, kh * hkv, D),
+        (kb, skv, kh * hkv, D),
+        True,
+        True,
+    )
     # contiguous storage in the kernels' order is not copied: SBHD when it folds (and at batch 1), BSHD as is
     assert calls[1] == ("copy", *2 * (layout == "bhsd",))
-    assert calls[2] == ("bwd", (kb, sq, kh * hq, D), True, (kb, kh * hq, sq), False)  # flash_attn_func's default
+    assert calls[2] == (
+        "bwd",
+        (kb, sq, kh * hq, D),
+        True,
+        (kb, kh * hq, sq),
+        False,
+    )  # flash_attn_func's default
     assert out.shape == (b, sq, hq, D) and lse.shape == (b, hq, sq)
     assert q.grad.shape == (b, sq, hq, D) and torch.all(q.grad == 1)
     assert k.grad.shape == (b, skv, hkv, D) and torch.all(k.grad == 1)
@@ -1260,7 +1275,10 @@ def test_sched_backward_launch_plan(monkeypatch, shape, causal, taken):
             assert events and all(e[0] in ("tile", "wait") for e in events)
             continue
         chunks = -(-hkv // sched.ds_chunkings(b, sq, skv, hq, hkv, 5120 << 20)[0][0])
-        assert events == [("launch_delta", "caller")] + chunks * [("launch_dkdv", "caller"), ("launch_dqds", "caller")]
+        assert events == [("launch_delta", "caller")] + chunks * [
+            ("launch_dkdv", "caller"),
+            ("launch_dqds", "caller"),
+        ]
 
 
 @needs_flydsl
