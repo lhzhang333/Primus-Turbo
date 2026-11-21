@@ -65,7 +65,9 @@ NKV = 3  # kv sub-tiles of 16 rows per wave
 NDT_QK, NDT_V = 4, 4  # WMMA k-steps of S = Q K^T and dP = dO V^T (head dim 128)
 NDO_V, NDO_QK = 8, 8  # 16-wide output tiles of dV^T and dK^T
 NOPS = 2  # TDM ops of a ring stage: dO, Q
-NQT_O = 6  # dK's Q^T operands 0..NQT_O - 1 go to O tuples, the rest to D[0], D[1] (free after dV)
+NQT_O = 6  # dK's Q^T operands 0..NQT_O - 1 go to O tuples, the rest to D[0], D[1] (free after dV); SEP_QT: unused
+SEP_HH1 = True  # hh1's S / dP operands in tuples of their own (O1): loaded at the tile's start
+SEP_QT = True  # dK's Q^T operands in tuples of their own (QT)
 XK, XV = 272, 272  # LDS row strides (bytes) of Q / K and of dO / V rows (the TDM pads 16 B per row)
 STAGE_B = 16 * (XV + XK)  # one half of a ring stage (16 query rows)
 QOFF = 16 * XV  # the Q rows inside a half stage
@@ -85,7 +87,7 @@ FINAL_LAG = 8  # FINAL: a global store trails its readback load by this many loa
 # hh0's S / dP operands (kind, dt) a tile loads itself, at its start, not the previous tile at its end: their tuples
 # (O[4], O[5]) are the last of dK's own Q^T operands in O to be released, and their loads would trail the tile's last
 # WMMA
-LATE = (("Q", 2), ("D", 2))
+LATE = () if SEP_QT else (("Q", 2), ("D", 2))
 BASE = 16  # the generated code's first VGPR; the kernel's own code stays below it
 SPILL_OFF = (
     0x40000000  # added to a dS^T store's voffset: past every descriptor's range (the store is dropped)
@@ -211,6 +213,8 @@ class Layout:
         self.kf = [[take(8, 8) for _ in range(NDT_QK)] for _ in range(NKV)]
         self.vf = [[take(8, 8) for _ in range(NDT_V)] for _ in range(NKV)]
         self.O = [take(8, 8) for _ in range(2 * NDT_V)]
+        self.O1 = [take(8, 8) for _ in range(2 * NDT_V)] if SEP_HH1 else self.O
+        self.QT = [take(8, 8) for _ in range(NDO_QK)] if SEP_QT else None
         self.R0 = [take(8, 8) for _ in range(2 * NKV)]
         self.R1 = [take(8, 8) for _ in range(2 * NKV)]
         self.D = [take(8, 8) for _ in range(NDO_V)]
@@ -224,9 +228,9 @@ class Layout:
         self.H1 = [take(1, 1) for _ in range(4)] if HH_REG else None
         self.top = max(a + m for blk in used for a, m in blk)
 
-    def sdp_a(self, isq, dt):
-        """S / dP A operand of dt: Q (isq) or dO."""
-        return self.O[2 * dt + (0 if isq else 1)]
+    def sdp_a(self, isq, dt, hh=0):
+        """S / dP A operand of dt of query half hh: Q (isq) or dO."""
+        return (self.O1 if hh else self.O)[2 * dt + (0 if isq else 1)]
 
     def raw(self, hh, kh, j):
         """Raw S (j 0) / dP (j 1) of (hh, kh)."""
@@ -238,6 +242,8 @@ class Layout:
 
     def dk_a(self, d):
         """Q^T A operand d of dK."""
+        if SEP_QT:
+            return self.QT[d]
         return self.O[d] if d < NQT_O else self.D[d - NQT_O]
 
     def dv(self, kh, d):
@@ -279,7 +285,7 @@ MIN_XDL_AFTER = 8
 QT_XDL_AFTER = 10
 # hh1's S / dP A operands of dt stream into the tuples hh0's dt releases, the late dt after hh1's first WMMAs: the
 # first position in hh1's WMMA stream at which the operands of dt have landed (hh1_order)
-HH1_AVAIL = (0, 6, 12, 18)
+HH1_AVAIL = (0, 0, 0, 0) if SEP_HH1 else (0, 6, 12, 18)
 SOFT_TAIL = 8  # dummy VALUs behind the softmax, before its one va_vdst(SOFT_TAIL) wait (step_nodes)
 DS_MAX = 56  # LDS loads in flight
 # issue model (4 waves per WGP): a WMMA occupies the XDL pipe 8 cycles; inside its window a VALU / TRANS issues only
@@ -728,10 +734,10 @@ def sdp_loads(L, ops, hh, stage):
     for dt in range(NDT_QK):
         for u in range(2):
             off = offset(hq + so + dt * 64 + u * 32)
-            out.append((("Q", dt, u), f"ds_load_b128 {vr(L.sdp_a(1, dt) + 4 * u, 4)}, {lq}{off}"))
+            out.append((("Q", dt, u), f"ds_load_b128 {vr(L.sdp_a(1, dt, hh) + 4 * u, 4)}, {lq}{off}"))
         for u in range(2 if dt < NDT_V else 0):
             off = offset(hv + so + dt * 64 + u * 32)
-            out.append((("D", dt, u), f"ds_load_b128 {vr(L.sdp_a(0, dt) + 4 * u, 4)}, {lv}{off}"))
+            out.append((("D", dt, u), f"ds_load_b128 {vr(L.sdp_a(0, dt, hh) + 4 * u, 4)}, {lv}{off}"))
     return out
 
 
@@ -820,18 +826,24 @@ def step_nodes(L, ops, masked, stage, scal):
     def wmma_sdp(hh, kind, kh, dt):
         if kind == "S":  # S = Q K^T from +0
             s_ = L.raw(hh, kh, 0)
-            return add(wmma(s_, L.sdp_a(1, dt), L.kf[kh][dt], None if dt == 0 else s_))
+            return add(wmma(s_, L.sdp_a(1, dt, hh), L.kf[kh][dt], None if dt == 0 else s_))
         d_ = L.raw(hh, kh, 1)  # dP = dO V^T from +0
-        return add(wmma(d_, L.sdp_a(0, dt), L.vf[kh][dt], None if dt == 0 else d_))
+        return add(wmma(d_, L.sdp_a(0, dt, hh), L.vf[kh][dt], None if dt == 0 else d_))
 
     # S / dP of hh0, dt outer (S of every kh, then dP: consecutive WMMAs share the A operand); hh1's operands of dt
     # stream into the tuples hh0's dt just released
     hh1 = dict(sdp_loads(L, ops, 1, stage))
+    if SEP_HH1:  # their own tuples: nothing to wait for
+        for dt in range(NDT_QK):
+            for u in range(2):
+                stage_reads.append(add(hh1[("Q", dt, u)]))
+                if dt < NDT_V:
+                    stage_reads.append(add(hh1[("D", dt, u)]))
     for dt in range(NDT_QK):
         for kind in ("S", "P") if dt < NDT_V else ("S",):
             for kh in range(NKV):
                 w_sdp0.append(wmma_sdp(0, kind, kh, dt))
-        for u in range(2):
+        for u in range(0 if SEP_HH1 else 2):
             stage_reads.append(add(hh1[("Q", dt, u)]))
             if dt < NDT_V:
                 stage_reads.append(add(hh1[("D", dt, u)]))
@@ -868,19 +880,19 @@ def step_nodes(L, ops, masked, stage, scal):
             base, ho = hbase(L, ops, "ltk", p)
             off = offset(ho + so + d * 32)
             i = add(f"ds_load_tr16_b128 {vr(L.dk_a(d) + 4 * p, 4)}, {base}{off}")
-            if d < NQT_O:  # under hh1's softmax
+            if d < NQT_O and not SEP_QT:  # under hh1's softmax
                 nodes[i].xdl_after = QT_XDL_AFTER
             stage_reads.append(i)
 
     # Q^T operands 0..NQT_O - 1 into O (hh1's operands are dead after its S / dP)
-    for d in range(NQT_O):
+    for d in range(NDO_QK if SEP_QT else NQT_O):
         q_t_loads(d)
     # dV^T += dO^T P, kh outer (dV of kh 0 needs P[0] only)
     for kh in range(NKV):
         for d in range(NDO_V):
             w_dv.append(add(wmma(L.dv(kh, d), L.dv_a(d), L.P[kh], L.dv(kh, d))))
     # Q^T operands NQT_O.. into D[0], D[1] (dead after dV)
-    for d in range(NQT_O, NDO_QK):
+    for d in range(NDO_QK if SEP_QT else NQT_O, NDO_QK):
         q_t_loads(d)
     # the dS^T stores of tile k; in a masked tile a block without an attended entry goes to an out-of-range voffset
     # (dropped: dslayout does not store it). The softmax tail first: (the masked tile's voffsets,) SOFT_TAIL dummy

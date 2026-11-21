@@ -768,6 +768,15 @@ def test_compiled_launchers_are_cached_per_constexpr_value(monkeypatch):
     assert utils._constexpr_values(fused.launch_dkdv_fused_sp, list(range(24))) == (22,)
 
 
+@pytest.fixture
+def tile_kernels_backward(monkeypatch):
+    """The backward of the per-tile kernels (two-kernel or fused) at every size: what a causal problem below the
+    sched backward's size, a non-causal one or one outside the sched backward's shape rules runs."""
+    from primus_turbo.flydsl.attention.gfx1250 import interface
+
+    monkeypatch.setattr(interface, "BWD_SCHED", False)
+
+
 @needs_flydsl
 @pytest.mark.parametrize(
     ("shape", "dkdv_chain", "dq_chain"),
@@ -780,7 +789,7 @@ def test_compiled_launchers_are_cached_per_constexpr_value(monkeypatch):
     ],
     ids=["llama3.1-8b", "small_grid", "dkdv_unsplit", "dq_unsplit", "gqa2_unsplit"],
 )
-def test_backward_kernels_and_streams(monkeypatch, shape, dkdv_chain, dq_chain):
+def test_backward_kernels_and_streams(monkeypatch, tile_kernels_backward, shape, dkdv_chain, dq_chain):
     """deterministic=True: flash_attn_bwd on meta tensors with the launches and streams faked, so
     no GPU kernel runs:
     k_delta_bshd on the caller's stream, the fork, the dK/dV chain on the caller's stream and
@@ -918,7 +927,7 @@ def _check(got, ref, min_db=40.0):
     ],
     ids=["llama3.1-8b", "small_grid", "sq_lt_skv", "non_causal", "skv_not_x128", "deterministic"],
 )
-def test_fused_backward_launch_plan(monkeypatch, shape, causal, deterministic, chain):
+def test_fused_backward_launch_plan(monkeypatch, tile_kernels_backward, shape, causal, deterministic, chain):
     """Which calls take the fused backward (dQ inside the dK/dV kernel, fp32 dQ atomics): causal,
     Skv a multiple of 128 (Sq is always one of 64 here) and not deterministic. Its launches all go to the caller's
     stream, in order; chain None means the two-kernel path (it forks a side stream)."""
@@ -973,7 +982,7 @@ _NUMERIC_SHAPES = {
 
 
 @needs_flydsl
-def test_numeric_shapes_reach_every_kernel_variant(monkeypatch):
+def test_numeric_shapes_reach_every_kernel_variant(monkeypatch, tile_kernels_backward):
     """The shapes of test_matches_reference reach both forward tilings at every GQA ratio (the
     tiling picked for a device of 256 CUs), split and unsplit dK/dV, split and grouped dQ, and
     the fused backward split and unsplit.
@@ -1021,7 +1030,7 @@ def test_numeric_shapes_reach_every_kernel_variant(monkeypatch):
 @pytest.mark.parametrize("shape", list(_NUMERIC_SHAPES.values()), ids=list(_NUMERIC_SHAPES))
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("deterministic", [False, True], ids=["fast", "deterministic"])
-def test_matches_reference(shape, causal, deterministic):
+def test_matches_reference(tile_kernels_backward, shape, causal, deterministic):
     """Covers both forward variants (grid below / above the CU count) at every GQA ratio and the
     backward's split-K (small grids), grouped dQ (large grids) and unsplit dK/dV (dkdv_unsplit,
     whose Skv/32 * Hkv * B = 2048 kv tiles fill the machine twice; gqa2_large_grid) paths.
@@ -1073,7 +1082,7 @@ def test_backward_is_deterministic():
 
 @needs_gfx1250
 @pytest.mark.parametrize("shape", [(2, 1024, 1024, 32, 8), (2, 4096, 4096, 32, 8)], ids=["split", "unsplit"])
-def test_fused_backward_repeats(shape):
+def test_fused_backward_repeats(tile_kernels_backward, shape):
     """The fused backward sums dQ with fp32 atomics in no fixed order: out, lse, dK and dV are
     still bitwise reproducible, dQ to rounding only."""
     q, k, v, dout = _inputs(*shape)
@@ -1114,6 +1123,108 @@ def test_torch_compile_fullgraph():
         out, lse = fn(q_, k_, v_)
     out.backward(dout.to("cuda"))
     _check((out, lse, q_.grad, k_.grad, v_.grad), ref)
+
+
+# ---------------------------------------------------------------------------
+# The backward on generated tile schedules (interface._sched)
+# ---------------------------------------------------------------------------
+@needs_flydsl
+@pytest.mark.parametrize(
+    ("shape", "causal", "taken"),
+    [
+        ((4, 8192, 8192, 32, 8), True, True),  # 4 * 8 * 43 kv blocks on 256 CUs
+        ((2, 1024, 1024, 64, 32), True, True),
+        ((2, 2048, 2048, 32, 8), True, False),  # 176 kv blocks: under one per CU
+        ((4, 8192, 8192, 32, 8), False, False),
+        ((4, 8192, 8224, 32, 8), True, False),  # seqlen_kv not a multiple of 64
+    ],
+    ids=["llama3.1-8b", "gqa2", "small", "non_causal", "skv_x32"],
+)
+def test_sched_backward_launch_plan(monkeypatch, shape, causal, taken):
+    """Which calls take the sched backward, deterministic or not, and its launches: k_delta_bshd, then k_dkdv and
+    k_dqds per chunk of kv heads within the scratch budget (meta tensors: all on the caller's stream; on a device
+    the chunks alternate between it and a side stream)."""
+    from primus_turbo.flydsl.attention.gfx1250 import interface
+
+    sched = interface._sched
+    b, sq, skv, hq, hkv = shape
+    q, k, v = _meta(b, sq, skv, hq, hkv)
+    lse = torch.empty(b, hq, sq, device="meta")
+    events = []
+
+    class FakeStream:
+        cuda_stream = 0
+
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, other):
+            events.append(("wait", self.name, other.name))
+
+    caller = FakeStream("caller")
+    monkeypatch.setattr(interface, "_num_cu", lambda device: 256)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: caller)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device=None: FakeStream("side"))
+    monkeypatch.setattr(interface, "_SIDE_STREAMS", {})
+    monkeypatch.setattr(sched, "_SIDE_STREAMS", {})
+    monkeypatch.setattr(interface, "_launch", lambda name, launcher, args: events.append(("tile", name)))
+    monkeypatch.setattr(
+        sched, "_launch", lambda launcher, args: events.append((launcher.func.__name__, args[-1].name))
+    )
+    monkeypatch.setattr(sched._items, "item_table", lambda *a: (torch.empty(1, device="meta"), 256, 2))
+    for deterministic in (False, True):
+        events.clear()
+        dq, dk, dv = interface.flash_attn_bwd(q, q, k, v, q, lse, causal=causal, deterministic=deterministic)
+        assert (dq.shape, dk.shape, dv.shape) == (q.shape, k.shape, v.shape)
+        if not taken:
+            assert events and all(e[0] in ("tile", "wait") for e in events)
+            continue
+        chunks = -(-hkv // sched.ds_chunkings(b, sq, skv, hq, hkv, 5120 << 20)[0][0])
+        assert events == [("launch_delta", "caller")] + chunks * [("launch_dkdv", "caller"), ("launch_dqds", "caller")]
+
+
+@needs_flydsl
+def test_sched_backward_scratch_chunks():
+    """The dS scratch of the Llama-3.1-8B training shape is 8.2 GiB: whole within a 10 GiB budget, two kv heads per
+    chunk on two streams within the default 5 GiB, one kv head at a time when not even two fit."""
+    from primus_turbo.flydsl.attention.gfx1250.sched import bwd
+
+    whole = bwd.ds_scratch_bytes(4, 8192, 8192, 32)
+    assert 8 << 30 < whole < 9 << 30
+    assert bwd.ds_chunkings(4, 8192, 8192, 32, 8, 10 << 30)[0] == (8, 1, whole)
+    assert bwd.ds_chunkings(4, 8192, 8192, 32, 8, 5120 << 20)[0] == (2, 2, whole // 2)
+    assert bwd.ds_chunkings(4, 8192, 8192, 32, 8, 1 << 30) == [(1, 1, whole // 8)]
+
+
+_SCHED_SHAPES = {
+    "gqa4": (2, 256, 256, 8, 2),
+    "mha": (1, 512, 512, 4, 4),
+    "sq_lt_skv": (1, 256, 512, 8, 2),
+    "gqa16_idle_rows": (1, 448, 448, 16, 1),  # the last kv block's rows past seqlen_kv
+    "three_kv_heads": (3, 640, 832, 12, 3),
+}
+
+
+@needs_gfx1250
+@pytest.mark.parametrize("shape", list(_SCHED_SHAPES.values()), ids=list(_SCHED_SHAPES))
+def test_sched_backward_matches_reference(monkeypatch, shape):
+    """The sched backward at every size (the size rule lifted): against the fp32 reference, bitwise the same when
+    repeated, and bitwise the same with one kv head per chunk as on one scratch."""
+    import primus_turbo.common.envs as envs
+    from primus_turbo.flydsl.attention.gfx1250 import interface
+
+    monkeypatch.setattr(interface, "SCHED_MIN_ITEMS_PER_CU", 0)
+    q, k, v, dout = _inputs(*shape)
+    first = _run(q, k, v, dout, True)
+    _check(first, _reference(q, k, v, dout, True))
+    envs.set_env("PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB", "0")
+    try:
+        chunked = _run(q, k, v, dout, True)
+    finally:
+        envs.set_env("PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB", None)
+    for name, a, b, c in zip(("out", "lse", "dq", "dk", "dv"), first, _run(q, k, v, dout, True), chunked):
+        assert torch.equal(a, b), f"{name} differs between two runs"
+        assert torch.equal(a, c), f"{name} differs between one scratch and one kv head per chunk"
 
 
 @needs_gfx1250

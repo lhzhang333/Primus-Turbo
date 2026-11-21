@@ -294,12 +294,13 @@ def _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, stream):
 # machine: its persistent workgroups (one per CU) run whole items, a kv block with all the q heads of its kv head,
 # so a smaller problem would leave CUs idle that the kernels below fill with one workgroup per tile.
 BWD_SCHED = True
+SCHED_MIN_ITEMS_PER_CU = 1  # kv blocks per CU from which the sched backward runs
 
 
 def _sched_ok(b, sq, skv, hq, hkv, causal, device):
     if not (BWD_SCHED and causal) or _sched.shape_unsupported_reason(b, sq, skv, hq, hkv) is not None:
         return False
-    return b * hkv * _sched.kv_blocks(skv) >= _num_cu(device)
+    return b * hkv * _sched.kv_blocks(skv) >= SCHED_MIN_ITEMS_PER_CU * _num_cu(device)
 
 
 def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, deterministic=False):
