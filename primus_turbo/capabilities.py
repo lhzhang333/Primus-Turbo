@@ -42,7 +42,7 @@ _FEATURES: Dict[str, Dict[str, Tuple[str, ...]]] = {
     "attention.flydsl.mha": {
         "gfx1250": (
             "primus_turbo.flydsl.attention.gfx1250.mha.interface",
-            "primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_impl",
+            "primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_mha_impl",
         ),
     },
     # Multi-head latent attention at the DeepSeek-V3 head dims.

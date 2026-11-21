@@ -101,7 +101,7 @@ def _unresolved_adapter(monkeypatch, import_interface, record_log=True):
     call resolves it again (under whatever flydsl the test fakes), importing the package
     through ``import_interface`` and, with ``record_log``, logging to a recorder."""
     from primus_turbo.pytorch.kernels.attention import (
-        attention_flydsl_gfx1250_impl as gfx1250_impl,
+        attention_flydsl_gfx1250_mha_impl as gfx1250_impl,
     )
 
     log = _LogRecorder()
@@ -307,7 +307,7 @@ def test_torch_compile_traces_the_custom_ops(monkeypatch, dynamic, first_call):
 
     if first_call:
         from primus_turbo.pytorch.kernels.attention import (
-            attention_flydsl_gfx1250_impl as gfx1250_impl,
+            attention_flydsl_gfx1250_mha_impl as gfx1250_impl,
         )
 
         monkeypatch.setattr(gfx1250_impl, "_INTERFACE", None)

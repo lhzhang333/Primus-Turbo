@@ -25,7 +25,7 @@ from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_varlen_backward_impl,
     attention_aiter_varlen_forward_impl,
 )
-from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_impl import (
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_mha_impl import (
     flash_attn_flydsl_gfx1250_backward_impl,
     flash_attn_flydsl_gfx1250_forward_impl,
     flydsl_gfx1250_unsupported_reason,
