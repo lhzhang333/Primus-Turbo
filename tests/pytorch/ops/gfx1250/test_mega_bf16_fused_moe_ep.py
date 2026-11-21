@@ -38,7 +38,7 @@ from primus_turbo.pytorch.ops.moe.fused_mega_moe import (  # noqa: E402
     fused_mega_moe_stage1,
     fused_mega_moe_stage2,
 )
-from tests.pytorch.ops.test_mega_bf16_gfx1250_fused_moe import (  # noqa: E402
+from tests.pytorch.ops.gfx1250.test_mega_bf16_fused_moe import (  # noqa: E402
     _reference,
     _snr,
 )

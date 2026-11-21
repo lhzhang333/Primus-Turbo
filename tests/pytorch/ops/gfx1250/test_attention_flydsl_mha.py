@@ -436,7 +436,7 @@ def test_setup_py_flydsl_requirement_agrees_with_the_gate():
 
     from primus_turbo.flydsl.attention.gfx1250.mha import flydsl_version as ver
 
-    setup_py = os.path.join(os.path.dirname(__file__), "..", "..", "..", "setup.py")
+    setup_py = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "setup.py")
     if not os.path.isfile(setup_py):
         pytest.skip("no setup.py next to the tests")
     with open(setup_py) as f:

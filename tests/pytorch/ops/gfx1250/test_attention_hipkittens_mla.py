@@ -26,7 +26,7 @@ from primus_turbo.pytorch.kernels.attention import (
     attention_hipkittens_gfx1250_mla_impl as hk,
 )
 from primus_turbo.pytorch.ops import flash_attn_func
-from tests.pytorch.ops.test_attention_flydsl_gfx1250_mla import (
+from tests.pytorch.ops.gfx1250.test_attention_flydsl_mla import (
     D_QK,
     D_V,
     MLA_SCALE,
@@ -44,7 +44,7 @@ from tests.pytorch.ops.test_attention_flydsl_gfx1250_mla import (
 from tests.pytorch.test_utils import compute_snr
 
 KERNEL_DIR = (
-    Path(__file__).resolve().parents[3] / "csrc" / "kernels" / "attention" / "hipkittens" / "gfx1250_mla"
+    Path(__file__).resolve().parents[4] / "csrc" / "kernels" / "attention" / "hipkittens" / "gfx1250_mla"
 )
 
 

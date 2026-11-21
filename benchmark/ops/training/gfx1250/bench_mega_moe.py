@@ -32,8 +32,8 @@ one EP4 process can hang its rendezvous.
 
 Usage::
 
-    python benchmark/ops/training/bench_mega_moe_gfx1250.py --num-processes 4
-    python benchmark/ops/training/bench_mega_moe_gfx1250.py --num-processes 4 --num-experts 128 --skew 1 -o out.csv
+    python benchmark/ops/training/gfx1250/bench_mega_moe.py --num-processes 4
+    python benchmark/ops/training/gfx1250/bench_mega_moe.py --num-processes 4 --num-experts 128 --skew 1 -o out.csv
 """
 
 import argparse
@@ -49,14 +49,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
-from config import gen_moe_test_cases, get_platform_info
 from tabulate import tabulate
 
-_HERE = os.path.dirname(__file__)
-sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))  # config.py
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..", "..")))
 
 import flydsl.compiler as flyc  # noqa: E402
 import flydsl.expr as fx  # noqa: E402
+from config import gen_moe_test_cases, get_platform_info  # noqa: E402
 
 # import primus_turbo.pytorch first to dodge the mega kernels' circular import
 import primus_turbo.pytorch  # noqa: E402,F401
@@ -676,7 +677,7 @@ def _worker(local_rank, world, args, case, port, queue):
 
 def main(args):
     if not is_gfx1250():
-        sys.exit("bench_mega_moe_gfx1250.py runs the gfx1250 kernels; use bench_mega_moe.py on gfx950")
+        sys.exit("gfx1250/bench_mega_moe.py runs the gfx1250 kernels; use bench_mega_moe.py on gfx950")
     world = args.num_processes
     _, gpu_name = get_platform_info()
     queue = mp.get_context("spawn").SimpleQueue()

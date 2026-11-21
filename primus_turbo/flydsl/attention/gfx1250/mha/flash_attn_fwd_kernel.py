@@ -96,7 +96,7 @@ ELEM_DTYPE = fx.BFloat16  # Q/K/V/P/O fragments
 # opaque inline asm: LLVM must see each dependency it covers, such as the LDS read after
 # a TDM write. The upstream kernel's notes report a rare failure under mode 2 (seq 8192,
 # non-causal); test_forward_repeats_bitwise_at_seq_8192 in
-# tests/pytorch/ops/test_attention_flydsl_gfx1250.py repeats that shape. False builds the
+# tests/pytorch/ops/gfx1250/test_attention_flydsl_mha.py repeats that shape. False builds the
 # kernels in mode 0.
 ENABLE_SCHED_MODE2 = True
 

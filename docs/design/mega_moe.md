@@ -231,7 +231,7 @@ Per-stage view (gemm_only / comm_only / fused / roofline for each of the six GEM
 whole step through `fused_mega_moe`):
 
 ```bash
-python benchmark/ops/training/bench_mega_moe_gfx1250.py --num-processes 4
+python benchmark/ops/training/gfx1250/bench_mega_moe.py --num-processes 4
 ```
 
 ## Implementation Map

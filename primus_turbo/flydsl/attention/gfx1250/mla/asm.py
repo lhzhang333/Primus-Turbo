@@ -57,7 +57,7 @@ for the waits, GCNHazardRecognizer for the wait states):
     load still in flight into one of them (the generators place ``s_wait_loadcnt`` where the kernel leaves one) nor
     the VALU-class instructions issued just before it: the v_nop rules hold across such an entry only when a
     va_vdst(0) wait stands before the block's first VALU-class instruction, or no WMMA / TRANS can be in flight
-    there (test_attention_flydsl_gfx1250_mla_codegen pins which regions rely on which).
+    there (test_attention_flydsl_mla_codegen pins which regions rely on which).
 
 The generators' common pieces are here too: ``vr`` (operand text of VGPRs), ``add_order`` and ``dag_ranks`` (the
 dependence graph their list schedulers rank nodes by)."""

@@ -6,7 +6,7 @@
 
 """The kwargs-mode shape keys of the FlyDSL bf16 grouped GEMM on gfx1250: the six MiniMax-M3 shapes.
 
-``test_grouped_gemm_flydsl_gfx1250_keys.py`` covers ``_STACK_KEYS``, the persistent-cluster group the
+``test_grouped_gemm_flydsl_keys.py`` covers ``_STACK_KEYS``, the persistent-cluster group the
 DeepSeek-V3 shapes resolve knob by knob. ``_KWARGS_KEYS`` is the other form: per (N, K, avg_m) the
 whole set of entry-point arguments measured at that shape, which the three public entry points fill
 in for a caller that passes no tuning argument -- as if it had passed them itself, so every gate of
@@ -42,7 +42,7 @@ from primus_turbo.flydsl.grouped_gemm.gfx1250.grouped_gemm_bf16_kernel import ( 
 
 
 def _have_gfx1250() -> bool:
-    """A gfx1250 device is visible; see the same helper in test_grouped_gemm_flydsl_gfx1250_keys.py."""
+    """A gfx1250 device is visible; see the same helper in test_grouped_gemm_flydsl_keys.py."""
     try:
         from primus_turbo.pytorch.core.utils import is_gfx1250
 
@@ -258,7 +258,7 @@ def _assert_matches(got: torch.Tensor, ref: torch.Tensor, dtype) -> None:
 
 
 def _ref(kind, a, b, offs):
-    """fp32-accumulated reference on the CPU (no device matmul; see test_grouped_gemm_flydsl_gfx1250_keys.py)."""
+    """fp32-accumulated reference on the CPU (no device matmul; see test_grouped_gemm_flydsl_keys.py)."""
     bounds = offs.cpu().tolist()
     a32, b32 = a.detach().float().cpu(), b.detach().float().cpu()
     out = []
