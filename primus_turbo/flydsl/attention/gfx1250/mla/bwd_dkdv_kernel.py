@@ -13,7 +13,7 @@
 
 """dK / dV of the gfx1250 MLA attention backward over 192-row kv blocks, plus the dS^T scratch (k_dkdv).
 
-The FlyDSL form of the HipKittens kernel k_dkdv96ds (csrc/kernels/attention/hipkittens/gfx1250_mla) with two of its
+The FlyDSL form of the HipKittens kernel k_dkdv96ds (csrc/kernels/attention/hipkittens/gfx1250/mla) with two of its
 96-row kv blocks per item and persistent workgroups: block 128 = 4 waves (one per SIMD), at most one workgroup per CU
 (grid = min(CUs, items)). An item is one 192-row kv block of one (batch, head) of the launch (the host launches the
 heads in chunks to bound the scratch): kv rows [192 bid, 192 bid + 192), wave w owning the 48 rows from 192 bid +

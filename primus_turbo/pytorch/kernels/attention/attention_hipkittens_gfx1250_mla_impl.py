@@ -8,7 +8,7 @@
 
 q / k head dim 192, v head dim 128, bf16, MHA, bottom-right causal; the tensors of the FlyDSL MLA kernels
 (``attention_flydsl_gfx1250_mla_impl``, which runs this backward when PRIMUS_TURBO_MLA_BWD_IMPL is ``hk``).
-The kernels are code objects built from ``csrc/kernels/attention/hipkittens/gfx1250_mla`` into
+The kernels are code objects built from ``csrc/kernels/attention/hipkittens/gfx1250/mla`` into
 ``primus_turbo/lib/hk_gfx1250_mla`` (see the README there), launched through the HIP runtime torch loaded:
   k_delta     NL = -log2(e) * lse and ND = -scale * delta, delta = rowsum(dO * O)
   k_dkdv96ds  dK, dV over 96-row kv blocks, then 64-row tail blocks; stores every bf16 dS^T tile it feeds the dK
@@ -40,7 +40,7 @@ _MLA_DQ_ROWS, _MLA_DQ_HEAD_ROWS = 384, 256  # k_dqds_c queries per workgroup, an
 _MLA_HEAD_GROUP = 32  # head-group target of the k_dkdv96ds / k_dqds_c grids
 _MLA_MAX_BH_S = 512 * 4096  # largest batch * heads * seqlen the kernels' index arithmetic is verified for
 # kernel: (workgroup size, packed arguments, sha256 of the code object), the signatures and pins of
-# csrc/.../gfx1250_mla/manifest.json (a test keeps them equal); only a code object with its pin is loaded:
+# csrc/.../gfx1250/mla/manifest.json (a test keeps them equal); only a code object with its pin is loaded:
 #   k_delta     DO O LSE NL ND, scale, S H
 #   k_dkdv96ds  Q K V DO NL ND DV DK DS, scale, Sq Skv Hq Hkv G nqt cshift causal B HG ds_mode
 #   k_dqds_c    DS K DQ, Sq Skv Hq Hkv G nkvt cshift causal q_off ntile HG

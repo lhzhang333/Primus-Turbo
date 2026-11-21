@@ -41,7 +41,7 @@ backward, and no scratch at least as large is tried again on that device.
 objects go to `primus_turbo/lib/hk_gfx1250_mla` and ship in the wheel. By hand:
 
 ```
-python csrc/kernels/attention/hipkittens/gfx1250_mla/hsaco.py [--check] [--force] [--strict] [--cxx PATH] [--bin-dir DIR]
+python csrc/kernels/attention/hipkittens/gfx1250/mla/hsaco.py [--check] [--force] [--strict] [--cxx PATH] [--bin-dir DIR]
 ```
 
 It builds into this checkout's `primus_turbo/lib/hk_gfx1250_mla`, which an in-place or editable build uses; for an

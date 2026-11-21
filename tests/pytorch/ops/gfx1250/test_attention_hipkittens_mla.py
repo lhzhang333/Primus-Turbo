@@ -5,7 +5,7 @@
 ###############################################################################
 
 """HipKittens kernels of the gfx1250 (MI455X) MLA attention backward: ``attention_hipkittens_gfx1250_mla_impl``,
-built from csrc/kernels/attention/hipkittens/gfx1250_mla.
+built from csrc/kernels/attention/hipkittens/gfx1250/mla.
 
 The setting, the gate, the routing, the launch plan and the build run on meta / CPU tensors with stand-in kernels.
 The numeric tests need a gfx1250 card and the built code objects; their fp32 reference runs on the CPU.
@@ -44,7 +44,7 @@ from tests.pytorch.ops.gfx1250.test_attention_flydsl_mla import (
 from tests.pytorch.test_utils import compute_snr
 
 KERNEL_DIR = (
-    Path(__file__).resolve().parents[4] / "csrc" / "kernels" / "attention" / "hipkittens" / "gfx1250_mla"
+    Path(__file__).resolve().parents[4] / "csrc" / "kernels" / "attention" / "hipkittens" / "gfx1250" / "mla"
 )
 
 
