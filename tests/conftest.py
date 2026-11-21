@@ -30,75 +30,20 @@ if _worker_id is not None:
     os.environ["HIP_VISIBLE_DEVICES"] = str(_gpu_id)
 
 
-# Suites that run on gfx1250 (MI455X). Everything else is skipped there -- see
-# pytest_collection_modifyitems. Paths are matched as suffixes of the test file path; an
-# optional "::<prefix>" narrows an entry to the test ids starting with that prefix.
-_GFX1250_ENABLED_TESTS = (
-    # FlyDSL intranode DeepEP (primus_turbo/flydsl/deep_ep); the C++ DeepEP is not loaded here.
-    "tests/pytorch/deep_ep/test_intranode.py",
-    # Source-only: the imports between the FlyDSL DeepEP modules, the same on every GPU.
-    "tests/pytorch/deep_ep/test_module_layering.py",
-    # bf16 grouped GEMM through the backend registry: Triton, plus the FlyDSL
-    # WMMA/TDM kernels in gfx1250/grouped_gemm_bf16_kernel.py.
-    "tests/pytorch/ops/test_grouped_gemm.py",
-    # Shape rules and ragged-K coverage for the same FlyDSL bf16 grouped GEMM. Separate
-    # from the suite above because most of it is host-only: it checks that the published
-    # shape gates and the entry points cannot disagree, which needs no GPU.
-    "tests/pytorch/ops/gfx1250/test_grouped_gemm_flydsl_shapes.py",
-    # The shape key table of the same kernel: which shapes get the tuned persistent-cluster
-    # stack, what the cluster and head_pipe gates refuse, and what a caller who switches the
-    # stack off is left with. Mostly host-only as well; its numeric cases are the DeepSeek-V3
-    # delivery shapes, which are the only shapes in this suite that take the keyed path.
-    "tests/pytorch/ops/gfx1250/test_grouped_gemm_flydsl_keys.py",
-    # The kwargs-mode shape keys of the same kernel (the MiniMax-M3 shapes): which calls get a key's
-    # whole argument set, and that the keyed result is bit-identical to the untuned one.
-    "tests/pytorch/ops/gfx1250/test_grouped_gemm_flydsl_kwargs_keys.py",
-    # beta = 1 on the same kernel's variable-K wgrad, into an fp32 main_grad (Muse Spark expert shapes).
-    "tests/pytorch/ops/gfx1250/test_grouped_gemm_flydsl_variable_k_accum.py",
-    # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250/mla).
-    "tests/pytorch/ops/gfx1250/test_attention_flydsl_mla.py",
-    # Its backward's launch plan: head chunks within the dS scratch budget, grids, bitwise equality across chunkings.
-    "tests/pytorch/ops/gfx1250/test_attention_flydsl_mla_bwd.py",
-    # The code its generators emit, pinned to what was validated on hardware (host-only: it runs on every GPU).
-    "tests/pytorch/ops/gfx1250/test_attention_flydsl_mla_codegen.py",
-    # HipKittens kernels of its backward (csrc/kernels/attention/hipkittens/gfx1250/mla).
-    "tests/pytorch/ops/gfx1250/test_attention_hipkittens_mla.py",
-    # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250/mha), bf16 head_dim 128.
-    "tests/pytorch/ops/gfx1250/test_attention_flydsl_mha.py",
-    # Sparse MLA (primus_turbo/flydsl/attention/gfx1250/sparse_mla); every backend it can pick
-    # runs here.
-    "tests/pytorch/ops/test_attention.py::test_sparse_mla_op",
-    "tests/pytorch/ops/gfx1250/test_attention_flydsl_sparse_mla.py",
-    # Buffer OOB, copy_warp and cross-XCD flag handoff of the BF16 Mega MoE EP path.
-    "tests/pytorch/ops/gfx1250/test_mega_bf16_prims.py",
-    # The BF16 Mega NT GEMM tile (gathered A, LDS-staged buffer-store epilogue).
-    "tests/pytorch/ops/gfx1250/test_mega_bf16_gemm.py",
-    # beta = 1 on the BF16 Mega variable-K wgrad (dW1 / dW2 straight into main_grad).
-    "tests/pytorch/ops/gfx1250/test_mega_bf16_variable_k_accum.py",
-    # The fused Mega dispatch + L1 GEMM, single GPU (EP1).
-    "tests/pytorch/ops/gfx1250/test_mega_bf16_dispatch_gemm.py",
-    # The fused Mega L2 GEMM + combine, single GPU (EP1).
-    "tests/pytorch/ops/gfx1250/test_mega_bf16_gemm_combine.py",
-    # The fused_mega_moe op (forward and backward) on the gfx1250 kernels, single GPU (EP1).
-    "tests/pytorch/ops/gfx1250/test_mega_bf16_fused_moe.py",
-    # The same op across every visible GPU (EP2+).
-    "tests/pytorch/ops/gfx1250/test_mega_bf16_fused_moe_ep.py",
-    # Host-only: the capability table Primus queries names modules that exist (the same on every GPU).
-    "tests/pytorch/core/test_capabilities.py",
-    # Host-only: a subprocess imports every primus_turbo.flydsl module and holds each launch
-    # declared at module level to the no-mutable-global rule. The rest of that file stays skipped here.
-    "tests/pytorch/ops/test_flydsl_autotune.py::test_no_module_level_launch_reads_a_mutable_global",
-)
-
-
 def _gfx1250_enabled(item) -> bool:
-    path = str(getattr(item, "path", item.fspath)).replace(os.sep, "/")
-    test_id = item.nodeid.split("::", 1)[-1]
-    for enabled in _GFX1250_ENABLED_TESTS:
-        suffix, _, prefix = enabled.partition("::")
-        if path.endswith(suffix) and test_id.startswith(prefix):
-            return True
-    return False
+    """Whether a test runs on gfx1250 (MI455X). Everything else is skipped there -- see
+    pytest_collection_modifyitems. A test opts in by where it is or by what it says:
+
+    - it is under a ``gfx1250/`` directory (``tests/pytorch/ops/gfx1250/``: the suites of the
+      gfx1250-only kernels), or
+    - it carries ``pytest.mark.gfx1250`` (a suite, or one test, in a file every architecture
+      shares: ``pytestmark = pytest.mark.gfx1250`` or ``@pytest.mark.gfx1250``).
+
+    So a new gfx1250 test needs no edit here.
+    """
+    # the node id's path is relative to the rootdir, so a checkout under some .../gfx1250/ enables nothing
+    path = "/" + item.nodeid.split("::", 1)[0].replace(os.sep, "/")
+    return "/gfx1250/" in path or item.get_closest_marker("gfx1250") is not None
 
 
 @pytest.fixture(autouse=True)
@@ -128,6 +73,9 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     config.addinivalue_line("markers", "multigpu: mark test as requiring multiple GPUs")
     config.addinivalue_line("markers", "deterministic: mark test as deterministic-only suite")
+    config.addinivalue_line(
+        "markers", "gfx1250: runs on gfx1250 (MI455X) too, where unmarked tests outside gfx1250/ are skipped"
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -145,11 +93,9 @@ def pytest_collection_modifyitems(config, items):
 
     if is_gfx1250:
         # The default on gfx1250 is still "skip": most ops have no port yet, and a
-        # blanket skip is honest about that. _GFX1250_ENABLED_TESTS is the opt-in list
-        # of suites that have been brought up and measured on the part, so a
-        # regression in one of those shows up as a failure instead of disappearing
-        # behind the skip. Match on a path suffix, not the bare file name -- there is
-        # a second test_grouped_gemm.py under tests/jax/.
+        # blanket skip is honest about that. The suites that have been brought up and
+        # measured on the part opt in (see _gfx1250_enabled), so a regression in one of
+        # those shows up as a failure instead of disappearing behind the skip.
         skip_gfx1250 = pytest.mark.skip(reason="Not yet supported on gfx1250")
         for item in items:
             if not _gfx1250_enabled(item):

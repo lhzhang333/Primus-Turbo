@@ -18,6 +18,8 @@ import primus_turbo
 from primus_turbo import capabilities
 from primus_turbo.common.arch import KNOWN_ARCHS, device_arch, normalize_arch
 
+pytestmark = pytest.mark.gfx1250
+
 _PKG_DIR = Path(primus_turbo.__file__).resolve().parent
 
 

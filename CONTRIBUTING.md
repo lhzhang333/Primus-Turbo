@@ -94,6 +94,41 @@ primus_turbo/flydsl/grouped_gemm/grouped_gemm_fp8_kernel.py      # concrete fp8 
 When adding a kernel: take `<op>` from the directory name, pick the **narrowest
 correct** `<dtype>` for that layer, and end with the matching `<role>`.
 
+### Architecture-specific kernels
+
+A kernel written for one GPU architecture says so with a **directory**, not in its file
+name. The directory is the gfx ID (`gfx950`, `gfx1250`); product names (`MI455X`) and
+other aliases (`w32`) are not used in paths.
+
+| Layer | Where the architecture goes | Example |
+|-------|-----------------------------|---------|
+| FlyDSL kernels | `primus_turbo/flydsl/<op>/<arch>/`, files named as above without the architecture | `flydsl/grouped_gemm/gfx1250/grouped_gemm_bf16_kernel.py` |
+| ... with several kernel families for one architecture | one more level, `<op>/<arch>/<variant>/` | `flydsl/attention/gfx1250/{mha,mla,sparse_mla}/` |
+| PyTorch frontend | no architecture directory; `<op>_<backend>_<arch>[_<variant>]_impl.py` | `attention_flydsl_gfx1250_mha_impl.py` |
+| C++ / HIP sources | `csrc/kernels/<op>/<backend>/<arch>/<variant>/` | `csrc/kernels/attention/hipkittens/gfx1250/mla/` |
+| Tests, benchmarks | `tests/pytorch/ops/<arch>/`, `benchmark/ops/training/<arch>/` | `tests/pytorch/ops/gfx1250/test_mega_bf16_gemm.py` |
+
+* **Mirror the counterpart.** A file in an architecture directory carries the name of the
+  same kernel for the other architecture (`grouped_gemm_bf16_kernel.py` in both places),
+  so the two can be compared side by side.
+* **Keep a launcher and the helpers it calls in one directory.** FlyDSL folds the source
+  of a plain Python helper into a kernel's disk-cache key only when the helper is in the
+  launcher's directory. A helper that has to be shared across directories must be made
+  part of the key by the package that uses it (hash its source into a module-level
+  constant the launchers read, as `flydsl/attention/gfx1250/mla/__init__.py` does);
+  otherwise an edit to it keeps serving kernels compiled before the edit.
+* **Tuning tables and selection logic** go in a `*_heuristic.py` next to the kernel.
+* **Names that are looked up at run time do not follow the directory rule**: FlyDSL kernel
+  names, `torch.library` op names (`primus_turbo::flash_attn_flydsl_gfx1250_forward`),
+  environment variables and build product directories keep the architecture in the name.
+* **Tests on gfx1250.** Tests are skipped on gfx1250 unless they opt in: everything under
+  a `gfx1250/` test directory runs there, and a test (or a whole file) elsewhere opts in
+  with `pytest.mark.gfx1250`. `tests/conftest.py` needs no edit.
+* **Tell other repositories through `primus_turbo.capabilities`.** Code outside
+  Primus-Turbo must not probe these directories or import these modules to find out
+  whether a feature is there; register the feature in `primus_turbo/capabilities.py`
+  (a test checks that every module the table names exists).
+
 
 ## 🎨 Code Style & Linting
 
