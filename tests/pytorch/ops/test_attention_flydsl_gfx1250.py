@@ -254,43 +254,65 @@ def test_dense_dispatcher_key_tells_apart_what_decides_eligibility():
 
 
 @needs_flydsl
-def test_forward_and_backward_route_to_the_gfx1250_kernels(monkeypatch):
-    """FlashAttnFunc on "gfx1250": the gfx1250 impls are called with contiguous BSHD tensors
-    and lse [B, Hq, Sq], and the gfx950 sbhd impls are never reached."""
+@pytest.mark.parametrize(
+    ("layout", "batch", "fold"),
+    [("sbhd", 2, True), ("sbhd", 1, False), ("bshd", 2, False), ("bhsd", 2, False)],
+    ids=["sbhd", "sbhd_b1", "bshd", "bhsd"],
+)
+def test_forward_and_backward_route_to_the_gfx1250_kernels(monkeypatch, layout, batch, fold):
+    """FlashAttnFunc on "gfx1250": the gfx1250 kernels' entries get contiguous tensors and lse [B, Hq, Sq] in the
+    kernels' layout, the gfx950 sbhd impls are never reached. Contiguous SBHD storage of batch > 1 is handed over as
+    [1, s, b * h, d] without a copy (the batch folded into the heads), any other byte order as contiguous BSHD; the
+    gradients come back shaped like q / k / v, in the storage order the kernels were given."""
+    from primus_turbo.pytorch.kernels.attention import attention_flydsl_gfx1250_impl as adapter
+
     monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: True)
     monkeypatch.setattr(flash_attn_interface, "is_gfx1250", lambda: True)
-    b, sq, skv, hq, hkv = 2, 128, 256, 4, 2
-    calls = []
+    monkeypatch.setattr(adapter, "_unavailable_reason", lambda: None)
+    b, sq, skv, hq, hkv = batch, 128, 256, 4, 2
+    kb, kh = (1, b) if fold else (b, 1)  # the kernels' batch, and their heads per head of the call
+    calls, base = [], {}
 
-    def fwd(q, k, v, softmax_scale=None, causal=True):
-        calls.append(("fwd", q.is_contiguous(), k.is_contiguous(), softmax_scale, causal))
-        return torch.zeros_like(q), torch.zeros(b, hq, sq)
+    def fwd(q, k, v, softmax_scale, causal):
+        calls.append(("fwd", tuple(q.shape), tuple(k.shape), tuple(v.shape), q.is_contiguous(), k.is_contiguous()))
+        calls.append(("copy", q.data_ptr() != base["q"], k.data_ptr() != base["k"]))
+        return torch.zeros_like(q), torch.zeros(kb, kh * hq, sq)
 
-    def bwd(dout, q, k, v, out, lse, softmax_scale=None, causal=True, deterministic=False):
-        calls.append(("bwd", tuple(lse.shape), tuple(out.shape), deterministic))
+    def bwd(dout, q, k, v, out, lse, softmax_scale, causal, deterministic):
+        calls.append(("bwd", tuple(dout.shape), dout.is_contiguous(), tuple(lse.shape), deterministic))
         return torch.ones_like(q), torch.ones_like(k), torch.ones_like(v)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("gfx950 FlyDSL impl reached on gfx1250")
 
-    monkeypatch.setattr(flash_attn_interface, "flash_attn_flydsl_gfx1250_forward_impl", fwd)
-    monkeypatch.setattr(flash_attn_interface, "flash_attn_flydsl_gfx1250_backward_impl", bwd)
+    monkeypatch.setattr(adapter, "_forward", fwd)
+    monkeypatch.setattr(adapter, "_backward", bwd)
+    monkeypatch.setattr(flash_attn_interface, "flydsl_gfx1250_unsupported_reason", lambda *a: None)
     monkeypatch.setattr(flash_attn_interface, "flash_attn_sbhd_flydsl_forward_impl", forbidden)
     monkeypatch.setattr(flash_attn_interface, "flash_attn_sbhd_flydsl_backward_impl", forbidden)
 
-    # sbhd bytes on purpose: the adapter must hand the kernels contiguous BSHD.
-    q = torch.randn(sq, b, hq, D, dtype=torch.bfloat16).permute(1, 0, 2, 3).requires_grad_()
-    k = torch.randn(skv, b, hkv, D, dtype=torch.bfloat16).permute(1, 0, 2, 3).requires_grad_()
-    v = torch.randn(skv, b, hkv, D, dtype=torch.bfloat16).permute(1, 0, 2, 3).requires_grad_()
+    def make(s, h):
+        if layout == "sbhd":
+            return torch.randn(s, b, h, D, dtype=torch.bfloat16).permute(1, 0, 2, 3)
+        if layout == "bhsd":
+            return torch.randn(b, h, s, D, dtype=torch.bfloat16).transpose(1, 2)
+        return torch.randn(b, s, h, D, dtype=torch.bfloat16)
+
+    q, k, v = (make(s, h).requires_grad_() for s, h in ((sq, hq), (skv, hkv), (skv, hkv)))
+    base.update(q=q.data_ptr(), k=k.data_ptr())
     GlobalBackendManager.set_attn_backend(BackendType.FLYDSL, PrecisionType.BF16_FP16_FP32)
     try:
-        out = flash_attn_func(q, k, v, causal=True)
+        out, lse = flash_attn_func(q, k, v, causal=True, return_lse=True)
         out.sum().backward()
     finally:
         GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
 
-    assert calls[0] == ("fwd", True, True, None, True)
-    assert calls[1] == ("bwd", (b, hq, sq), (b, sq, hq, D), False)  # flash_attn_func's default
+    assert calls[0] == ("fwd", (kb, sq, kh * hq, D), (kb, skv, kh * hkv, D), (kb, skv, kh * hkv, D), True, True)
+    # contiguous storage in the kernels' order is not copied: SBHD when it folds (and at batch 1), BSHD as is
+    assert calls[1] == ("copy", *2 * (layout == "bhsd",))
+    assert calls[2] == ("bwd", (kb, sq, kh * hq, D), True, (kb, kh * hq, sq), False)  # flash_attn_func's default
+    assert out.shape == (b, sq, hq, D) and lse.shape == (b, hq, sq)
+    assert q.grad.shape == (b, sq, hq, D) and torch.all(q.grad == 1)
     assert k.grad.shape == (b, skv, hkv, D) and torch.all(k.grad == 1)
 
 

@@ -9,8 +9,11 @@
 bf16, head_dim 128, GQA (Hq / Hkv of 1, 2, 4, 8 or 16), Sq a multiple of 64 and Skv of 32,
 q and k each at most 1 GiB, bottom-right causal or full attention, no dropout / bias / alibi /
 sink / sliding window; ``interface.unsupported_reason`` of the kernel package has the exact
-rules. The kernels address BSHD; any other byte order is made contiguous first. Mirrors the
-``attention_triton_impl`` layer -- dispatch and autograd wiring belong to the caller.
+rules. The kernels address BSHD. Contiguous SBHD storage (what Megatron passes) of batch > 1 is
+handed over without a copy, as [1, s, b * h, d]: a head's attention involves no other head, and
+q head b * Hq + h reads kv head (b * Hq + h) // (Hq / Hkv) = b * Hkv + h // (Hq / Hkv); any other
+byte order is made contiguous first. Mirrors the ``attention_triton_impl`` layer -- dispatch and
+autograd wiring belong to the caller.
 
 The kernels need a flydsl that satisfies ``FLYDSL_REQUIREMENT`` (``>=0.3.4.1,<0.3.5``, in
 ``primus_turbo/flydsl/attention/gfx1250/flydsl_version.py``). Under any other flydsl the gate
@@ -26,6 +29,10 @@ from typing import Optional
 import torch
 
 from primus_turbo.common.logger import logger
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_mla_impl import (
+    _from_kernel_layout,
+    _to_kernel_layout,
+)
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     _eager_custom_op,
 )
@@ -134,21 +141,32 @@ def _scale(softmax_scale: Optional[float], head_dim: int) -> float:
 
 
 def flash_attn_flydsl_gfx1250_forward_impl(q, k, v, softmax_scale=None, causal=True):
-    """Returns (out [b, sq, hq, d] contiguous, lse [b, hq, sq] fp32 natural log)."""
-    q, k, v = (t.contiguous() for t in (q, k, v))
-    return _forward(q, k, v, _scale(softmax_scale, q.shape[-1]), bool(causal))
+    """Returns (out [b, sq, hq, d], lse [b, hq, sq] fp32 natural log, saved).
+
+    ``saved`` is the kernel-layout (q, k, v, out, lse) the backward impl takes; out and lse are
+    views of its last two (out a [b, s, h, d] view of SBHD storage when the batch was folded
+    into the heads).
+    """
+    b, sq, hq, d = q.shape
+    # (b * hq is then a 16-bit dimension of the kernels' launch grids)
+    fold = b > 1 and b * hq < 1 << 16 and q.transpose(0, 1).is_contiguous()
+    qk, kk, vk = (_to_kernel_layout(t, fold) for t in (q, k, v))
+    out, lse = _forward(qk, kk, vk, _scale(softmax_scale, d), bool(causal))
+    return _from_kernel_layout(out, b), lse.view(b, hq, sq), (qk, kk, vk, out, lse)
 
 
 def flash_attn_flydsl_gfx1250_backward_impl(
     dout, q, k, v, out, lse, softmax_scale=None, causal=True, deterministic=False
 ):
-    """Returns (dq, dk, dv), contiguous [b, s, h, d]; dk/dv have k's head count.
+    """Returns (dq, dk, dv) shaped like the forward's q/k/v ([b, s, h, d]; dk/dv have k's head count).
 
-    q/k/v/out/lse are what the forward saw and returned; only dout may arrive strided. Unless
-    ``deterministic``, dq may be summed with fp32 atomics (not bitwise reproducible).
+    q/k/v/out/lse are the forward impl's ``saved``; dout is [b, sq, hq, d] in any byte order.
+    Unless ``deterministic``, dq may be summed with fp32 atomics (not bitwise reproducible).
     """
-    return _backward(
-        dout.contiguous(),
+    batch = dout.shape[0]
+    fold = q.shape[0] != batch  # the forward folded the batch into the heads
+    grads = _backward(
+        _to_kernel_layout(dout, fold),
         q,
         k,
         v,
@@ -158,3 +176,4 @@ def flash_attn_flydsl_gfx1250_backward_impl(
         bool(causal),
         bool(deterministic),
     )
+    return tuple(_from_kernel_layout(g, batch) for g in grads)

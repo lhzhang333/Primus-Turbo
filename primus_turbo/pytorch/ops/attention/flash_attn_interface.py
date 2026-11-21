@@ -215,13 +215,11 @@ class FlashAttnFunc(torch.autograd.Function):
                 reason = flydsl_gfx1250_unsupported_reason(q, k, v, causal)
                 if reason is not None:
                     raise ValueError(f"gfx1250 flydsl attention: {reason}")
-                # [b, s, h, d] in any byte order; the adapter makes q/k/v contiguous BSHD and the
-                # backward consumes exactly those tensors and lse [B, Hq, Sq].
-                q_c, k_c, v_c = (t.contiguous() for t in (q, k, v))
-                out, lse = flash_attn_flydsl_gfx1250_forward_impl(
-                    q_c, k_c, v_c, softmax_scale=softmax_scale, causal=causal
+                # [b, s, h, d] in any byte order; the backward consumes the adapter's kernel-layout
+                # tensors.
+                out, lse, saved = flash_attn_flydsl_gfx1250_forward_impl(
+                    q, k, v, softmax_scale=softmax_scale, causal=causal
                 )
-                saved = (q_c, k_c, v_c, out, lse)
             if is_grad_enabled and _any_requires_grad(q, k, v):
                 ctx.save_for_backward(*saved)
                 ctx.softmax_scale = softmax_scale
@@ -374,14 +372,9 @@ class FlashAttnFunc(torch.autograd.Function):
                     dout, *ctx.saved_tensors, softmax_scale=ctx.softmax_scale, causal=ctx.causal
                 )
             else:
-                q, k, v, out, lse = ctx.saved_tensors
                 dq, dk, dv = flash_attn_flydsl_gfx1250_backward_impl(
                     dout,
-                    q,
-                    k,
-                    v,
-                    out,
-                    lse,
+                    *ctx.saved_tensors,
                     softmax_scale=ctx.softmax_scale,
                     causal=ctx.causal,
                     deterministic=ctx.deterministic,
