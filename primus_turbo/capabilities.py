@@ -75,7 +75,7 @@ _FEATURES: Dict[str, Dict[str, Tuple[str, ...]]] = {
     # BF16 grouped-GEMM weight gradient that adds into an fp32 main_grad (beta = 1).
     "grouped_gemm.flydsl.bf16.wgrad_accum": {
         "gfx1250": (
-            "primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250"
+            "primus_turbo.flydsl.grouped_gemm.gfx1250.grouped_gemm_bf16_kernel"
             ":grouped_gemm_bf16_variable_k_accum_supported",
         ),
     },

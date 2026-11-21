@@ -60,7 +60,7 @@ import flydsl.expr as fx  # noqa: E402
 
 # import primus_turbo.pytorch first to dodge the mega kernels' circular import
 import primus_turbo.pytorch  # noqa: E402,F401
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (  # noqa: E402
+from primus_turbo.flydsl.grouped_gemm.gfx1250.grouped_gemm_bf16_kernel import (  # noqa: E402
     grouped_gemm_bf16_nn_flydsl_kernel,
     grouped_gemm_bf16_nt_flydsl_kernel,
 )

@@ -92,7 +92,7 @@ def _require_gfx1250(device: torch.device) -> None:
     arch = _gcn_arch(index)
     if "gfx1250" not in arch:
         raise RuntimeError(
-            f"grouped_gemm_bf16_kernel_gfx1250 is built for gfx1250 only -- it uses "
+            f"gfx1250.grouped_gemm_bf16_kernel is built for gfx1250 only -- it uses "
             f"wave32, WMMA and the TDM engine, none of which exist elsewhere -- but device "
             f"{index} reports gcnArchName={arch!r}. Use "
             f"primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel (gfx950) or dispatch "

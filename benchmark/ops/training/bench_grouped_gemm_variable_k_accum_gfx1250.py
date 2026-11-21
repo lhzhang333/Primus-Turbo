@@ -31,7 +31,7 @@ import torch
 from tabulate import tabulate
 
 import primus_turbo.pytorch  # noqa: F401
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+from primus_turbo.flydsl.grouped_gemm.gfx1250.grouped_gemm_bf16_kernel import (
     grouped_gemm_bf16_variable_k_accum_supported,
     grouped_gemm_bf16_variable_k_flydsl_kernel,
 )

@@ -402,7 +402,7 @@ def _gfx1250_grouped_gemm_shapes_ok(a: torch.Tensor, b: torch.Tensor, trans_b: b
     so a second copy of the rule would turn a Triton fallback into an
     ``AssertionError`` the moment the two drift.
     """
-    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+    from primus_turbo.flydsl.grouped_gemm.gfx1250.grouped_gemm_bf16_kernel import (
         grouped_gemm_bf16_nn_supported,
         grouped_gemm_bf16_nt_supported,
     )
@@ -431,7 +431,7 @@ class GroupedGEMMFlyDSLBackend(KernelBackend):
     count nor the per-expert run lengths have to land on the tile boundary.
 
     Two separate kernel modules back this: ``grouped_gemm_bf16_kernel`` (gfx950, MFMA /
-    wave64 / SRD) and ``grouped_gemm_bf16_kernel_gfx1250`` (gfx1250, WMMA / wave32 / TDM).
+    wave64 / SRD) and ``gfx1250.grouped_gemm_bf16_kernel`` (gfx1250, WMMA / wave32 / TDM).
     They share the entry-point names and the operand contract and nothing below that.
     """
 
@@ -480,7 +480,7 @@ class GroupedGEMMFlyDSLBackend(KernelBackend):
         **kwargs,
     ) -> torch.Tensor:
         if is_gfx1250():
-            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+            from primus_turbo.flydsl.grouped_gemm.gfx1250.grouped_gemm_bf16_kernel import (
                 grouped_gemm_bf16_nn_flydsl_kernel,
                 grouped_gemm_bf16_nt_flydsl_kernel,
             )
@@ -612,7 +612,7 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
             else GroupedGEMMVariableKFlyDSLBackend.MAX_G
         )
         if supported and gfx1250:
-            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+            from primus_turbo.flydsl.grouped_gemm.gfx1250.grouped_gemm_bf16_kernel import (
                 grouped_gemm_bf16_variable_k_supported,
             )
 
@@ -624,7 +624,7 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
             avg_m = max(1, a.shape[0] // max(group_lens.numel(), 1))
             supported &= grouped_gemm_bf16_variable_k_supported(lhs.shape[1], rhs.shape[1], avg_m)
             if supported and inplace_add_to_out:
-                from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+                from primus_turbo.flydsl.grouped_gemm.gfx1250.grouped_gemm_bf16_kernel import (
                     grouped_gemm_bf16_variable_k_accum_supported,
                 )
 
@@ -648,7 +648,7 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
         **kwargs,
     ) -> torch.Tensor:
         if is_gfx1250():
-            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+            from primus_turbo.flydsl.grouped_gemm.gfx1250.grouped_gemm_bf16_kernel import (
                 grouped_gemm_bf16_variable_k_flydsl_kernel,
             )
 

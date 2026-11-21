@@ -42,7 +42,7 @@ import torch
 from flydsl.expr import arith, const_expr, rocdl
 from flydsl.expr.typing import Constexpr, T
 
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+from primus_turbo.flydsl.grouped_gemm.gfx1250.grouped_gemm_bf16_kernel import (
     _as_ptr,
     _i32_table,
     _require_gfx1250,

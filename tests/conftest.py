@@ -39,7 +39,7 @@ _GFX1250_ENABLED_TESTS = (
     # Source-only: the imports between the FlyDSL DeepEP modules, the same on every GPU.
     "tests/pytorch/deep_ep/test_module_layering.py",
     # bf16 grouped GEMM through the backend registry: Triton, plus the FlyDSL
-    # WMMA/TDM kernels in grouped_gemm_bf16_kernel_gfx1250.py.
+    # WMMA/TDM kernels in gfx1250/grouped_gemm_bf16_kernel.py.
     "tests/pytorch/ops/test_grouped_gemm.py",
     # Shape rules and ragged-K coverage for the same FlyDSL bf16 grouped GEMM. Separate
     # from the suite above because most of it is host-only: it checks that the published

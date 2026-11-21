@@ -28,7 +28,7 @@ from tests.pytorch.test_utils import compute_snr, get_tolerances
 
 pytest.importorskip("flydsl", reason="the FlyDSL gfx1250 grouped GEMM lives behind flydsl")
 
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (  # noqa: E402
+from primus_turbo.flydsl.grouped_gemm.gfx1250.grouped_gemm_bf16_kernel import (  # noqa: E402
     WMMA_K_ENTRY,
     _pick_config,
     _pick_config_nn,
