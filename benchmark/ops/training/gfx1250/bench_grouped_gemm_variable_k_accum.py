@@ -20,8 +20,8 @@ and the per-step total for ``--layers`` x ``--micro-batches`` calls of each weig
 
 Usage::
 
-    python benchmark/ops/training/bench_grouped_gemm_variable_k_accum_gfx1250.py
-    python benchmark/ops/training/bench_grouped_gemm_variable_k_accum_gfx1250.py --layers 4 --micro-batches 2 -o out.csv
+    python benchmark/ops/training/gfx1250/bench_grouped_gemm_variable_k_accum.py
+    python benchmark/ops/training/gfx1250/bench_grouped_gemm_variable_k_accum.py --layers 4 --micro-batches 2 -o out.csv
 """
 
 import argparse

@@ -11,9 +11,9 @@ The kernels' inline asm is the product of two list schedulers and of a model of 
 any of them changes code that was validated on an MI455X. REGIONS pins that code. After a deliberate change:
 
   1. dump the regions before and after it and read the difference (attach it to the pull request):
-     ``python tests/pytorch/ops/test_attention_flydsl_gfx1250_mla_codegen.py --dump DIR`` in both trees, then
+     ``python tests/pytorch/ops/gfx1250/test_attention_flydsl_mla_codegen.py --dump DIR`` in both trees, then
      ``diff -r`` (as a script this file reads the generators of the tree it is in, whatever is installed);
-  2. run test_attention_flydsl_gfx1250_mla.py and test_attention_flydsl_gfx1250_mla_bwd.py on an MI455X, and time
+  2. run test_attention_flydsl_mla.py and test_attention_flydsl_mla_bwd.py on an MI455X, and time
      the kernels against the tree before the change;
   3. update REGIONS with the digests the same command prints.
 """
@@ -47,7 +47,7 @@ _PACKAGE = "primus_turbo.flydsl.gfx1250.attention.mla"
 
 
 def _module(name):
-    """asm, fwd_sched or bwd_dkdv_sched, imported on first use (test_attention_flydsl_gfx1250_mla checks that
+    """asm, fwd_sched or bwd_dkdv_sched, imported on first use (test_attention_flydsl_mla checks that
     collecting the tests imports no kernel module)."""
     return importlib.import_module(f"{_PACKAGE}.{name}")
 
@@ -439,7 +439,7 @@ def test_forward_tile_schedule_keeps_the_dependence_graph():
 def _use_this_tree():
     """As a script: the generators come from the tree this file is in, not from an installed primus_turbo. They
     use the standard library only, so their packages are stand-ins (no __init__ runs, nothing else is imported)."""
-    root = pathlib.Path(__file__).resolve().parents[3]
+    root = pathlib.Path(__file__).resolve().parents[4]
     parts = _PACKAGE.split(".")
     for n in range(1, len(parts) + 1):
         package = types.ModuleType(".".join(parts[:n]))

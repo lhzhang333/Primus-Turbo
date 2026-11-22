@@ -44,45 +44,45 @@ _GFX1250_ENABLED_TESTS = (
     # Shape rules and ragged-K coverage for the same FlyDSL bf16 grouped GEMM. Separate
     # from the suite above because most of it is host-only: it checks that the published
     # shape gates and the entry points cannot disagree, which needs no GPU.
-    "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_shapes.py",
+    "tests/pytorch/ops/gfx1250/test_grouped_gemm_flydsl_shapes.py",
     # The shape key table of the same kernel: which shapes get the tuned persistent-cluster
     # stack, what the cluster and head_pipe gates refuse, and what a caller who switches the
     # stack off is left with. Mostly host-only as well; its numeric cases are the DeepSeek-V3
     # delivery shapes, which are the only shapes in this suite that take the keyed path.
-    "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_keys.py",
+    "tests/pytorch/ops/gfx1250/test_grouped_gemm_flydsl_keys.py",
     # The kwargs-mode shape keys of the same kernel (the MiniMax-M3 shapes): which calls get a key's
     # whole argument set, and that the keyed result is bit-identical to the untuned one.
-    "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_kwargs_keys.py",
+    "tests/pytorch/ops/gfx1250/test_grouped_gemm_flydsl_kwargs_keys.py",
     # beta = 1 on the same kernel's variable-K wgrad, into an fp32 main_grad (Muse Spark expert shapes).
-    "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_variable_k_accum.py",
+    "tests/pytorch/ops/gfx1250/test_grouped_gemm_flydsl_variable_k_accum.py",
     # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/gfx1250/attention/mla).
-    "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
+    "tests/pytorch/ops/gfx1250/test_attention_flydsl_mla.py",
     # Its backward's launch plan: head chunks within the dS scratch budget, grids, bitwise equality across chunkings.
-    "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla_bwd.py",
+    "tests/pytorch/ops/gfx1250/test_attention_flydsl_mla_bwd.py",
     # The code its generators emit, pinned to what was validated on hardware (host-only: it runs on every GPU).
-    "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla_codegen.py",
+    "tests/pytorch/ops/gfx1250/test_attention_flydsl_mla_codegen.py",
     # HipKittens kernels of its backward (csrc/kernels/attention/hipkittens/gfx1250_mla).
-    "tests/pytorch/ops/test_attention_hipkittens_gfx1250_mla.py",
+    "tests/pytorch/ops/gfx1250/test_attention_hipkittens_mla.py",
     # Dense FlyDSL attention (primus_turbo/flydsl/gfx1250/attention/mha), bf16 head_dim 128.
-    "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
+    "tests/pytorch/ops/gfx1250/test_attention_flydsl_mha.py",
     # Sparse MLA (primus_turbo/flydsl/gfx1250/attention/sparse_mla); every backend it can pick
     # runs here.
     "tests/pytorch/ops/test_attention.py::test_sparse_mla_op",
-    "tests/pytorch/ops/test_attention_flydsl_gfx1250_sparse_mla.py",
+    "tests/pytorch/ops/gfx1250/test_attention_flydsl_sparse_mla.py",
     # Buffer OOB, copy_warp and cross-XCD flag handoff of the BF16 Mega MoE EP path.
-    "tests/pytorch/ops/test_mega_bf16_gfx1250_prims.py",
+    "tests/pytorch/ops/gfx1250/test_mega_bf16_prims.py",
     # The BF16 Mega NT GEMM tile (gathered A, LDS-staged buffer-store epilogue).
-    "tests/pytorch/ops/test_mega_bf16_gfx1250_gemm.py",
+    "tests/pytorch/ops/gfx1250/test_mega_bf16_gemm.py",
     # beta = 1 on the BF16 Mega variable-K wgrad (dW1 / dW2 straight into main_grad).
-    "tests/pytorch/ops/test_mega_bf16_gfx1250_variable_k_accum.py",
+    "tests/pytorch/ops/gfx1250/test_mega_bf16_variable_k_accum.py",
     # The fused Mega dispatch + L1 GEMM, single GPU (EP1).
-    "tests/pytorch/ops/test_mega_bf16_gfx1250_dispatch_gemm.py",
+    "tests/pytorch/ops/gfx1250/test_mega_bf16_dispatch_gemm.py",
     # The fused Mega L2 GEMM + combine, single GPU (EP1).
-    "tests/pytorch/ops/test_mega_bf16_gfx1250_gemm_combine.py",
+    "tests/pytorch/ops/gfx1250/test_mega_bf16_gemm_combine.py",
     # The fused_mega_moe op (forward and backward) on the gfx1250 kernels, single GPU (EP1).
-    "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe.py",
+    "tests/pytorch/ops/gfx1250/test_mega_bf16_fused_moe.py",
     # The same op across every visible GPU (EP2+).
-    "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe_ep.py",
+    "tests/pytorch/ops/gfx1250/test_mega_bf16_fused_moe_ep.py",
     # Host-only: the capability table Primus queries names modules that exist (the same on every GPU).
     "tests/pytorch/core/test_capabilities.py",
     # Host-only: a subprocess imports every primus_turbo.flydsl module and holds each launch

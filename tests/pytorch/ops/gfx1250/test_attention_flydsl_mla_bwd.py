@@ -10,8 +10,8 @@ PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB, else per head chunk, the chunks alternating 
 
 The launch and chunking tests use meta tensors and run anywhere. The numeric tests need a gfx1250 card and compare
 head chunkings with the whole scratch bitwise: every head's arithmetic is the same however the heads are chunked.
-test_attention_flydsl_gfx1250_mla checks the gradients against an fp32 reference, and
-test_attention_hipkittens_gfx1250_mla against the HipKittens kernels, bitwise.
+test_attention_flydsl_mla checks the gradients against an fp32 reference, and
+test_attention_hipkittens_mla against the HipKittens kernels, bitwise.
 """
 
 import contextlib

@@ -65,7 +65,7 @@ def _meta(b=1, sq=256, skv=256, h=2, hkv=None, d_qk=D_QK, d_v=D_V, dtype=torch.b
 @pytest.fixture(autouse=True)
 def _flydsl_backward(monkeypatch):
     """These tests cover the FlyDSL kernels: an exported PRIMUS_TURBO_MLA_BWD_IMPL=hk must not route the backward to
-    the HipKittens kernels (test_attention_hipkittens_gfx1250_mla covers those)."""
+    the HipKittens kernels (test_attention_hipkittens_mla covers those)."""
     monkeypatch.delenv("PRIMUS_TURBO_MLA_BWD_IMPL", raising=False)
     envs.reset_cache("PRIMUS_TURBO_MLA_BWD_IMPL")
 
@@ -158,7 +158,7 @@ def test_gate_accepts(monkeypatch, dims, kwargs, layout):
     [
         pytest.param({"dtype": torch.float16}, {}, id="fp16"),
         pytest.param({"d_v": 192}, {}, id="v_192"),
-        # Head dim 128 belongs to the other gfx1250 family (test_attention_flydsl_gfx1250.py); 64 to neither.
+        # Head dim 128 belongs to the other gfx1250 family (test_attention_flydsl_mha.py); 64 to neither.
         pytest.param({"d_qk": 64, "d_v": 64}, {}, id="head_dim_64"),
         pytest.param({"hkv": 1}, {}, id="gqa"),
         pytest.param({"sq": 96, "skv": 96}, {}, id="sq_not_multiple_of_64"),

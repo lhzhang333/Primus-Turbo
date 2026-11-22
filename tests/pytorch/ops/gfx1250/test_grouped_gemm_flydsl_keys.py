@@ -6,7 +6,7 @@
 
 """The shape key table of the FlyDSL bf16 grouped GEMM on gfx1250, and the six DeepSeek-V3 shapes.
 
-``test_grouped_gemm_flydsl_gfx1250_shapes.py`` covers the K rules -- which shapes the kernel may
+``test_grouped_gemm_flydsl_shapes.py`` covers the K rules -- which shapes the kernel may
 run at all. This file covers the layer above it: which shapes get the tuned persistent-cluster
 stack, and what a shape that misses it, or a caller that switches it off, is left with.
 

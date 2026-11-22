@@ -52,6 +52,6 @@ python benchmark/ops/training/bench_mega_moe.py --mode grouped_gemm_combine --mo
 Times the six GEMM stages of one forward + backward step, then the whole step through `fused_mega_moe`.
 
 ```bash
-python benchmark/ops/training/bench_mega_moe_gfx1250.py --num-processes 4
-python benchmark/ops/training/bench_mega_moe_gfx1250.py --num-processes 4 --num-experts 128 --skew 1 -o out.csv
+python benchmark/ops/training/gfx1250/bench_mega_moe.py --num-processes 4
+python benchmark/ops/training/gfx1250/bench_mega_moe.py --num-processes 4 --num-experts 128 --skew 1 -o out.csv
 ```

@@ -997,7 +997,7 @@ def test_no_launch_reads_a_mutable_global():
 # which is how the gfx1250 kernels came to read plain dicts unnoticed. So every flydsl module is
 # imported here and each of those launches is held to the same rule; in a fresh interpreter,
 # because some of these packages must not be imported into this one
-# (see test_attention_flydsl_gfx1250.py).
+# (see test_attention_flydsl_mha.py).
 _MODULE_LEVEL_SWEEP = """
 import gc
 import importlib

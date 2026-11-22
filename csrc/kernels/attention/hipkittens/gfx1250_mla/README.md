@@ -69,7 +69,7 @@ never fails the install.
 3. On an MI455X, `hsaco.py --check` must print `ok`, then run
 
    ```
-   pytest tests/pytorch/ops/test_attention_hipkittens_gfx1250_mla.py tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py
+   pytest tests/pytorch/ops/gfx1250/test_attention_hipkittens_mla.py tests/pytorch/ops/gfx1250/test_attention_flydsl_mla.py
    ```
 
 ## Performance

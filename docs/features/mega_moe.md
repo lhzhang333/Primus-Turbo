@@ -150,7 +150,7 @@ grouped GEMM.
 The outputs and gradients of the two paths agree to an SNR of 47 dB or more.
 
 - Source: [#582](https://github.com/AMD-AGI/Primus-Turbo/pull/582), Primus-Turbo `68821ec6`.
-- Per-stage times on MI455X: `python benchmark/ops/training/bench_mega_moe_gfx1250.py --num-processes 4`.
+- Per-stage times on MI455X: `python benchmark/ops/training/gfx1250/bench_mega_moe.py --num-processes 4`.
 
 Other benchmarks: [Benchmarks § MegaMoE](../../benchmark/README.md#megamoe).
 
@@ -217,4 +217,4 @@ Source: [#582](https://github.com/AMD-AGI/Primus-Turbo/pull/582), Primus-Turbo `
   `test_mega_moe_activation.py`, `test_mega_fp8_combine_autotune.py`, and the MI455X tests
   `test_mega_bf16_gfx1250_*.py`
 - Benchmarks: `benchmark/ops/training/bench_mega_moe.py` (MI355X),
-  `benchmark/ops/training/bench_mega_moe_gfx1250.py` (MI455X)
+  `benchmark/ops/training/gfx1250/bench_mega_moe.py` (MI455X)
