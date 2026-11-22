@@ -107,10 +107,10 @@ def check_submodules():
 
 
 # -------- gfx1250 MLA attention backward HipKittens code objects --------
-# csrc/kernels/attention/hipkittens/gfx1250_mla/hsaco.py builds them into primus_turbo/lib/hk_gfx1250_mla with
+# csrc/kernels/attention/hipkittens/gfx1250/mla/hsaco.py builds them into primus_turbo/lib/hk_gfx1250_mla with
 # the flags its manifest.json pins (not the extension's); output that is not the pinned bytes is dropped, and
 # the backward stays on FlyDSL. PRIMUS_TURBO_BUILD_HK_MLA=0 (or false, off, empty) skips the step.
-HK_MLA_HSACO = PROJECT_ROOT / "csrc" / "kernels" / "attention" / "hipkittens" / "gfx1250_mla" / "hsaco.py"
+HK_MLA_HSACO = PROJECT_ROOT / "csrc" / "kernels" / "attention" / "hipkittens" / "gfx1250" / "mla" / "hsaco.py"
 
 
 def build_hk_mla_hsaco(offload_arch_list):

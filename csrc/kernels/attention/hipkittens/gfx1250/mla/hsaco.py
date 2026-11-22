@@ -11,7 +11,7 @@ csrc extension's). The manifest pins every code object's sha256 for its ``toolch
 pinned bytes is installed, and one that is not (an older build) is removed. ``-cuid=<kernel>`` makes the build
 byte-identical in any directory.
 
-    python csrc/kernels/attention/hipkittens/gfx1250_mla/hsaco.py [--check] [--force] [--strict] [--cxx PATH]
+    python csrc/kernels/attention/hipkittens/gfx1250/mla/hsaco.py [--check] [--force] [--strict] [--cxx PATH]
 
 setup.py runs ``build()`` when GPU_ARCHS contains gfx1250. Standard library only: setup.py loads it by path.
 """
@@ -29,7 +29,7 @@ from typing import Optional
 
 HIP_DIR = Path(__file__).resolve().parent  # compile cwd: src/, include/
 MANIFEST_PATH = HIP_DIR / "manifest.json"
-BIN_DIR = HIP_DIR.parents[4] / "primus_turbo" / "lib" / "hk_gfx1250_mla"
+BIN_DIR = HIP_DIR.parents[5] / "primus_turbo" / "lib" / "hk_gfx1250_mla"
 CXX_ENV = "PRIMUS_TURBO_HK_CXX"
 
 

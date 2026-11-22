@@ -61,7 +61,7 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/gfx1250/test_attention_flydsl_mla_bwd.py",
     # The code its generators emit, pinned to what was validated on hardware (host-only: it runs on every GPU).
     "tests/pytorch/ops/gfx1250/test_attention_flydsl_mla_codegen.py",
-    # HipKittens kernels of its backward (csrc/kernels/attention/hipkittens/gfx1250_mla).
+    # HipKittens kernels of its backward (csrc/kernels/attention/hipkittens/gfx1250/mla).
     "tests/pytorch/ops/gfx1250/test_attention_hipkittens_mla.py",
     # Dense FlyDSL attention (primus_turbo/flydsl/gfx1250/attention/mha), bf16 head_dim 128.
     "tests/pytorch/ops/gfx1250/test_attention_flydsl_mha.py",

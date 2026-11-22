@@ -14,7 +14,7 @@
 """gfx1250 MLA backward dQ from a dS scratch: dQ = dS K, S and dP are not recomputed.
 
 dS is the scratch the dK / dV kernel writes (bf16, softmax scale included, packed causal), in the layout of
-``csrc/kernels/attention/hipkittens/gfx1250_mla/include/dslayout.h`` (version 2):
+``csrc/kernels/attention/hipkittens/gfx1250/mla/include/dslayout.h`` (version 2):
   * one region per (batch, q head) of the launch, bh = bat * HC + qh - H0, regions back to back,
     ``bwd_dkdv_items.ds_blocks_per_head`` blocks each;
   * inside a region the kv16 rows kt = 0 .. Skv / 16 - 1 in order; row kt holds the q pairs (32 queries)
