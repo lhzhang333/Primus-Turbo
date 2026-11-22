@@ -94,6 +94,42 @@ primus_turbo/flydsl/grouped_gemm/grouped_gemm_fp8_kernel.py      # concrete fp8 
 When adding a kernel: take `<op>` from the directory name, pick the **narrowest
 correct** `<dtype>` for that layer, and end with the matching `<role>`.
 
+### Architecture-specific kernels
+
+A kernel written for one GPU architecture stays **in the directory of its operation** and
+says which architecture it is for with a **tag in its name**: the gfx ID (`gfx950`,
+`gfx1250`) as a whole name segment, the way the C++ sources do (`*_gfx950.cu`, which the
+build filters by). Product names (`MI455X`) and other aliases (`w32`) are not used in paths.
+
+| What | Name | Example |
+|------|------|---------|
+| FlyDSL kernel file | `<op>_<dtype>_<role>_<arch>.py` | `flydsl/grouped_gemm/grouped_gemm_bf16_kernel_gfx1250.py` |
+| FlyDSL kernel package (several files) | `<op>/<arch>[_<variant>]/` | `flydsl/attention/gfx1250_mla/`, `flydsl/mega/gfx1250/` |
+| PyTorch frontend | `<op>_<backend>_<arch>[_<variant>]_impl.py` | `attention_flydsl_gfx1250_mla_impl.py` |
+| C++ / HIP sources | `<name>_<arch>.cu`, or a tagged directory | `hk_attn_fwd_d128_gfx950.cu`, `hipkittens/gfx1250_mla/` |
+| Tests, benchmarks | the tag anywhere in the file name | `test_mega_bf16_gfx1250_gemm.py` |
+
+* **Register it in the architecture's manifest.** `primus_turbo/arch/<arch>.py` lists the
+  kernel packages, the implementation modules and the features built on them. It is the
+  one place that says where an architecture's code is, and what
+  `primus_turbo.capabilities` answers from. `tools/check_arch_layout.py` (pre-commit)
+  fails when a tagged path under `primus_turbo/` or `csrc/` is not listed, when something
+  listed does not exist, or when the tag is not a whole name segment. An architecture
+  gets a manifest when someone needs one; gfx1250 has one.
+* **Keep a launcher and the helpers it calls in one directory.** FlyDSL folds the source
+  of a plain Python helper into a kernel's disk-cache key only when the helper is in the
+  launcher's directory. A helper that has to be shared across directories must be made
+  part of the key by the package that uses it (hash its source into a module-level
+  constant the launchers read, as `flydsl/attention/gfx1250_mla/__init__.py` does);
+  otherwise an edit to it keeps serving kernels compiled before the edit.
+* **Tuning tables and selection logic** go in a `*_heuristic_<arch>.py` next to the kernel.
+* **Tests on gfx1250.** Tests are skipped on gfx1250 unless they opt in: a test file whose
+  name carries the `gfx1250` tag runs there, and a test (or a whole file) without it opts
+  in with `pytest.mark.gfx1250`. `tests/conftest.py` needs no edit.
+* **Tell other repositories through `primus_turbo.capabilities`.** Code outside
+  Primus-Turbo must not probe directories or import internal modules to find out whether
+  a feature is there; add the feature to the manifest's `FEATURES`.
+
 
 ## 🎨 Code Style & Linting
 
