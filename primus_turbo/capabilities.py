@@ -16,15 +16,19 @@ or importing an internal module::
 
     python -m primus_turbo.capabilities --arch gfx1250 mega_moe.bf16   # prints True / False
 
-``_FEATURES`` maps a feature to the modules that implement it, per architecture. A feature
-is available when every one of those module files is in the installed package; nothing is
-imported to find out, so the query is cheap, needs no GPU and cannot fail on a kernel
-module's own import. ``tests/pytorch/core/test_capabilities.py`` checks on every
+``_FEATURES`` maps a feature to what implements it, per architecture: modules, and for a
+feature that needs build products, files. A feature is available when all of them are in
+the installed package. With ``arch`` given nothing is imported to find out, so the query
+is cheap, needs no GPU and cannot fail on a kernel module's own import; a launch script
+passes ``arch``. With ``arch`` left out the current device is asked, which imports torch
+and initializes its device runtime. ``tests/pytorch/core/test_capabilities.py`` checks on every
 architecture that each listed module file exists and defines the listed symbol, so whoever
 moves or renames one has to update the table.
 
 The table lists what callers ask about today, which is gfx1250 (MI455X). A feature that is
-not listed for an architecture answers False; add a row when a caller needs one.
+not listed for an architecture answers False, and so does a name this version does not
+know: to a caller written for a newer Primus-Turbo that is a feature this one does not
+have. ``features()`` gives the names it knows. Add a row when a caller needs one.
 """
 
 import argparse
@@ -36,7 +40,8 @@ from primus_turbo.common.arch import device_arch, normalize_arch
 
 _PKG_DIR = Path(__file__).resolve().parent
 
-# feature -> architecture -> modules ("<module>" or "<module>:<attribute>"), all required.
+# feature -> architecture -> what it needs, all required: "<module>", "<module>:<attribute>", or
+# "files:<glob relative to the package>" (build products; at least one file must match).
 _FEATURES: Dict[str, Dict[str, Tuple[str, ...]]] = {
     # Dense multi-head / grouped-query attention (flash_attn_func, backend FLYDSL).
     "attention.flydsl.mha": {
@@ -60,9 +65,13 @@ _FEATURES: Dict[str, Dict[str, Tuple[str, ...]]] = {
             "primus_turbo.flydsl.gfx1250.attention.sparse_mla.bwd_kernel",
         ),
     },
-    # HipKittens kernels of the MLA backward.
+    # HipKittens kernels of the MLA backward: the implementation and its code objects, which only a
+    # gfx1250 build produces (the implementation still checks each one's pin when it loads it).
     "attention.hipkittens.mla": {
-        "gfx1250": ("primus_turbo.pytorch.kernels.attention.attention_hipkittens_gfx1250_mla_impl",),
+        "gfx1250": (
+            "primus_turbo.pytorch.kernels.attention.attention_hipkittens_gfx1250_mla_impl",
+            "files:lib/hk_gfx1250_mla/*.hsaco",
+        ),
     },
     # BF16 MegaMoE (fused_mega_moe): dispatch + GEMM + combine in fused kernels.
     "mega_moe.bf16": {
@@ -86,9 +95,12 @@ _FEATURES: Dict[str, Dict[str, Tuple[str, ...]]] = {
 }
 
 
-def _module_file_exists(module: str) -> bool:
-    """Whether ``primus_turbo.<...>`` is a module or package file of this install. Not an import."""
-    parts = module.split(":", 1)[0].split(".")
+def _present(entry: str) -> bool:
+    """Whether a table entry is in this install: a ``primus_turbo.<...>`` module or package file, or
+    for ``files:<glob>`` at least one matching file. Not an import."""
+    if entry.startswith("files:"):
+        return any(_PKG_DIR.glob(entry[len("files:") :]))
+    parts = entry.split(":", 1)[0].split(".")
     if parts[0] != "primus_turbo":
         return False
     base = _PKG_DIR.joinpath(*parts[1:])
@@ -99,11 +111,11 @@ def has(feature: str, arch: Optional[str] = None) -> bool:
     """Whether ``feature`` is available for ``arch`` (default: the current device's architecture).
 
     False for a feature or an architecture the table does not list, and, with ``arch`` left
-    out, when there is no ROCm device to ask.
+    out, when there is no ROCm device to ask (that case imports torch; pass ``arch`` to avoid it).
     """
     arch = normalize_arch(arch) if arch else device_arch()
-    modules = _FEATURES.get(feature, {}).get(arch)
-    return bool(modules) and all(_module_file_exists(m) for m in modules)
+    needs = _FEATURES.get(feature, {}).get(arch)
+    return bool(needs) and all(_present(n) for n in needs)
 
 
 def features(arch: Optional[str] = None) -> Dict[str, bool]:

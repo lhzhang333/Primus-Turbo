@@ -6,10 +6,10 @@
 
 """GPU architecture names (``gfx942``, ``gfx950``, ``gfx1250``).
 
-An architecture is named by its gfx ID everywhere in Primus-Turbo: in directory names
-(``flydsl/<op>/<arch>/``), in file names and in the capability table. ROCm reports the ID
-with target features attached (``gfx1250:sramecc+:xnack-``); ``normalize_arch`` is the one
-place that strips them.
+An architecture is named by its gfx ID in Primus-Turbo: in directory names
+(``flydsl/<arch>/<op>/``), in file names and in the capability table. ROCm reports the ID
+with target features attached (``gfx1250:sramecc+:xnack-``); ``normalize_arch`` strips
+them, and new code should use it rather than splitting the name again.
 
 This module answers "which architecture is this device". It does not answer which target
 FlyDSL compiles for (``flydsl.runtime.device.get_rocm_arch``, which ``FLYDSL_GPU_ARCH``

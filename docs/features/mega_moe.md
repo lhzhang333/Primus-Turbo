@@ -215,6 +215,6 @@ Source: [#582](https://github.com/AMD-AGI/Primus-Turbo/pull/582), Primus-Turbo `
 - Design: [MegaMoE](../design/mega_moe.md)
 - Tests (`tests/pytorch/ops/`): `test_fused_mega_moe.py`, `test_fused_mega_moe_fp8.py`,
   `test_mega_moe_activation.py`, `test_mega_fp8_combine_autotune.py`, and the MI455X tests
-  `test_mega_bf16_gfx1250_*.py`
+  `gfx1250/test_mega_bf16_*.py`
 - Benchmarks: `benchmark/ops/training/bench_mega_moe.py` (MI355X),
   `benchmark/ops/training/gfx1250/bench_mega_moe.py` (MI455X)

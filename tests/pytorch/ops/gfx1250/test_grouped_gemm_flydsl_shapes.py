@@ -472,45 +472,54 @@ def _variable_k_call(groups, device="cpu"):
 
 
 def test_variable_k_group_cap_is_per_architecture(monkeypatch):
-    """Host-only: the gate reads shapes. Each cap is checked with a call that is fine otherwise."""
+    """Host-only: the gate reads shapes. Each cap is checked with a call that is fine otherwise, for the
+    plain call and for the one that adds into an fp32 ``out`` (gfx1250 only)."""
     from primus_turbo.pytorch.kernels.grouped_gemm import grouped_gemm_impl as impl
 
     backend = impl.GroupedGEMMVariableKFlyDSLBackend
 
-    def takes(groups, arch):
+    def takes(groups, arch, accumulate=False):
         monkeypatch.setattr(impl, "is_gfx950", lambda: arch == "gfx950")
         monkeypatch.setattr(impl, "is_gfx1250", lambda: arch == "gfx1250")
-        return backend.can_handle(*_variable_k_call(groups), True, False, False, None)
+        kwargs = {}
+        if accumulate:
+            kwargs = dict(inplace_add_to_out=True, out=torch.empty((groups, 512, 768), dtype=torch.float32))
+        return backend.can_handle(*_variable_k_call(groups), True, False, False, None, **kwargs)
 
     assert (backend.MAX_G, backend.MAX_G_GFX1250) == (64, 160)
     assert takes(64, "gfx950") and not takes(65, "gfx950")
     assert takes(160, "gfx1250") and not takes(161, "gfx1250")
+    assert takes(160, "gfx1250", accumulate=True) and not takes(161, "gfx1250", accumulate=True)
 
 
 @needs_gfx1250
+@pytest.mark.parametrize("accumulate", [False, True], ids=["plain", "accumulate"])
 @pytest.mark.parametrize("groups", [128, 160])  # MiniMax-M3's local experts on one GPU; the cap
-def test_variable_k_backend_above_64_groups_numeric(groups):
+def test_variable_k_backend_above_64_groups_numeric(groups, accumulate):
     from primus_turbo.pytorch.core.backend import BackendType
-    from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import grouped_gemm_variable_k_impl
+    from primus_turbo.pytorch.kernels.grouped_gemm import grouped_gemm_impl as impl
 
     a, b, lens, offs = _variable_k_call(groups, "cuda")
-    out = grouped_gemm_variable_k_impl(
-        a,
-        b,
-        lens,
-        offs,
-        trans_a=True,
-        trans_b=False,
-        trans_c=False,
-        num_cu=None,
-        default_backend=BackendType.FLYDSL.value,
-    )
     ref = torch.stack(
         [
             a[int(offs[g]) : int(offs[g + 1])].float().T @ b[int(offs[g]) : int(offs[g + 1])].float()
             for g in range(groups)
         ]
-    ).to(torch.bfloat16)
-    assert out.shape == ref.shape
-    assert compute_snr(ref, out) > 45.0
-    torch.testing.assert_close(out, ref, **get_tolerances(torch.bfloat16))
+    )
+    call = dict(trans_a=True, trans_b=False, trans_c=False, num_cu=None)
+    flydsl = BackendType.FLYDSL.value
+    if accumulate:  # out += A^T @ B into an fp32 buffer that already holds something
+        out = torch.full((groups, 512, 768), 0.5, dtype=torch.float32, device="cuda")
+        # the FlyDSL backend has to be the one that runs: a declining gate would fall through to another
+        assert impl.GroupedGEMMVariableKFlyDSLBackend.can_handle(
+            a, b, lens, offs, **call, inplace_add_to_out=True, out=out
+        )
+        impl.grouped_gemm_variable_k_accum_impl(a, b, lens, offs, **call, default_backend=flydsl, out=out)
+        assert compute_snr(ref + 0.5, out) > 45.0
+    else:
+        assert impl.GroupedGEMMVariableKFlyDSLBackend.can_handle(a, b, lens, offs, **call)
+        out = impl.grouped_gemm_variable_k_impl(a, b, lens, offs, **call, default_backend=flydsl)
+        ref = ref.to(torch.bfloat16)
+        assert out.shape == ref.shape
+        assert compute_snr(ref, out) > 45.0
+        torch.testing.assert_close(out, ref, **get_tolerances(torch.bfloat16))

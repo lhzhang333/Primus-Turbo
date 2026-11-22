@@ -97,8 +97,8 @@ correct** `<dtype>` for that layer, and end with the matching `<role>`.
 ### Architecture-specific kernels
 
 FlyDSL kernels written for one GPU architecture live in that architecture's **platform
-package**, `primus_turbo/flydsl/<arch>/`, laid out by operation like the
-architecture-neutral packages next to it. The directory is the gfx ID (`gfx1250`);
+package**, `primus_turbo/flydsl/<arch>/`, laid out by operation like the packages next
+to it (`flydsl/<op>/`, which hold the gfx950 kernels and the shared code). The directory is the gfx ID (`gfx1250`);
 product names (`MI455X`) and other aliases (`w32`) are not used in paths.
 
 | Layer | Where the architecture goes | Example |
@@ -109,19 +109,21 @@ product names (`MI455X`) and other aliases (`w32`) are not used in paths.
 | C++ / HIP sources | by operation and backend, then `<arch>/<variant>/` | `csrc/kernels/attention/hipkittens/gfx1250/mla/` |
 | Tests, benchmarks | `tests/pytorch/ops/<arch>/`, `benchmark/ops/training/<arch>/` | `tests/pytorch/ops/gfx1250/test_mega_bf16_gemm.py` |
 
-* **Mirror the neutral tree.** `flydsl/<arch>/<op>/<file>` carries the name the same
+* **Mirror the operation tree.** `flydsl/<arch>/<op>/<file>` carries the name the same
   kernel has at `flydsl/<op>/<file>` (`grouped_gemm_bf16_kernel.py` in both places), so
   the two can be compared side by side.
-* **The platform package is self-contained.** Code under `flydsl/<arch>/` may import the
-  architecture-neutral packages; nothing outside the implementation layer imports it, and
-  the implementation layer does so only after it has checked the device.
+* **The platform package is a leaf.** Code under `flydsl/<arch>/` may import the packages
+  next to it; only the implementation layer (`pytorch/kernels`) imports the platform
+  package, and it checks the device before it launches one of its kernels. Importing a
+  platform package must work on every architecture (CI runs on gfx942).
 * **Keep a launcher and the helpers it calls in one directory.** FlyDSL folds the source
   of a plain Python helper into a kernel's disk-cache key only when the helper is in the
   launcher's directory. A helper that has to be shared across directories must be made
   part of the key by the package that uses it (hash its source into a module-level
   constant the launchers read, as `flydsl/gfx1250/attention/mla/__init__.py` does);
   otherwise an edit to it keeps serving kernels compiled before the edit.
-* **Tuning tables and selection logic** go in a `*_heuristic.py` next to the kernel.
+* **Tuning tables and selection logic** belong in a `*_heuristic.py` next to the kernel
+  (new ones; the existing tables are still inside the kernel files).
 * **Names that are looked up at run time do not follow the directory rule**: FlyDSL kernel
   names, `torch.library` op names (`primus_turbo::flash_attn_flydsl_gfx1250_forward`),
   environment variables and build product directories keep the architecture in the name.
