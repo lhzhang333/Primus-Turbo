@@ -29,11 +29,17 @@ the HipKittens MLA forward generator.
   FINAL_A   the last tile's prefix, then out = bf16(O / d) and lse of the four q tiles into the staging slots
             (a block that ends before a diagonal tile 3)
 
-The math is the MLA forward's op for op (out / lse are bitwise its results on q / k zero-padded to 192 columns):
+The math is the MLA forward's op for op but for the rescale threshold (with RESC_THR = fp32(log2 e), the MLA value,
+out / lse are bitwise its results on q / k zero-padded to 192 columns):
 per q tile, S = Q K^T over 4 k-steps from
-+0, the mask (-inf), lm = the row max (any tree: max is exact), the rescale vote fma(lm, c, -m) > log2(e) over the
++0, the mask (-inf), lm = the row max (any tree: max is exact), the rescale vote fma(lm, c, -m) > RESC_THR over the
 wave, m' = max(m, c lm) if it fires, corr = exp2(m - m'), p = exp2(fma(s, c, -m')), FlyDSL's 3-ary sum tree,
 d = fma(corr, d, sum), O = O corr + bf16(p) V; c = scale log2(e).
+
+RESC_THR is 8 nats here (MLA: 1): m follows a row's max only when the max has grown by more than 8 nats, so p
+reaches e^8 and the O *= corr blocks run in the first tiles of a row only (with logits of standard deviation 5.5
+they ran in 40% of the tiles). The price: the row's largest p is no longer exactly 1.0 (exact in bf16), which costs
+0.6-1.8 dB of the output's SNR against an fp64 reference (53.2 dB against 53.9-55.0).
 
 The TILE regions are software-pipelined across tiles: the prefix of region t finishes tile t - 1 (the softmax of q
 tiles 2, 3, then the PV WMMAs of all four), the body reads tile t's K / V, runs QK of the four q tiles and the softmax
@@ -49,7 +55,7 @@ import re
 from primus_turbo.flydsl.attention.gfx1250_mla import asm as A
 from primus_turbo.flydsl.attention.gfx1250_mla.asm import add_order, vr
 
-LOG2E = 0x3FB8AA3B  # fp32(log2 e): the rescale threshold
+RESC_THR = 0x4138AA3B  # fp32(8 log2 e): the rescale vote fires 8 nats above m (MLA: log2 e, 1 nat)
 NEG_INF = 0xFF800000
 BIG_NEG = 0xF149F2CA  # fp32(-1e30): the initial m
 LN2 = 0x3F317218  # fp32(1 / log2 e)
@@ -559,7 +565,7 @@ def softmax_nodes(L, i, add, c_sgpr, resc=True):
     add(f"v_fma_f32 {vr(need)}, {vr(lm)}, {c}, -{vr(L.m[i])}", "VALU", f"dec{i}")
     add(f"v_mul_f32_e32 {vr(rmax)}, {c}, {vr(lm)}", "VALU", f"dec{i}")
     add(f"v_max_num_f32_e32 {vr(mfull)}, {vr(L.m[i])}, {vr(rmax)}", "VALU", f"dec{i}")
-    add(f"v_cmp_lt_f32_e64 {S_NEED[i]}, 0x{LOG2E:x}, {vr(need)}", "VALU", f"dec{i}")
+    add(f"v_cmp_lt_f32_e64 {S_NEED[i]}, 0x{RESC_THR:x}, {vr(need)}", "VALU", f"dec{i}")
     add(f"s_cmp_lg_u32 {S_NEED[i]}, 0", "SALU", f"dec{i}")
     add(f"s_cselect_b32 {S_ANY[i]}, -1, 0", "SALU", f"dec{i}")
     mn, corr = L.mn[i], L.corr[i]

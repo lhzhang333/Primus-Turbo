@@ -23,13 +23,13 @@ import pytest
 # sha256 of every region's asm text and constraint string
 REGIONS = {
     ("fwd", "INIT"): "f0fd455c835dedb75c886c15859da50e5c524845424fbe9105c6a9eacbb7b48c",
-    ("fwd", "INIT_C0"): "da9c4c9bac371c66c42e298a8f43a3f99423d614ea06f048272e54d58f83a969",
-    ("fwd", "TILE_CL"): "83e12f5c1f79441c5ce42d6ef766cf3cf894108298c96dfa6116f5d842602bfd",
-    ("fwd", "TILE_D0"): "ff1ddbaf26b51d37ede24d9c2345d9c8b813b8508f7f4fe5b6be54a6b3254f16",
-    ("fwd", "TILE_D1"): "ac50687279b2d76936c93d84bd410fadfd3cff861af797a7cad2cc2e1b066960",
-    ("fwd", "TILE_D2"): "4c402894bd4ed04097fa1520c0face9ecfa45e917b8f226d5a8cdf9e9993967e",
-    ("fwd", "TILE_D3F"): "1eeefcf807fffd72a4a9f30ffc6fba30adefb24c50994004d28c47589b203480",
-    ("fwd", "FINAL_A"): "87d4a494c84e3f70f5e5902055924499b972ca4aa5b0948102b0306e114b244d",
+    ("fwd", "INIT_C0"): "ecedb236f087d6e1fb2ad439dffeafd25905eb0f4efe20b42c40c74655dff639",
+    ("fwd", "TILE_CL"): "4ce3bb11b99fc7a9c76ee2e827594042015106f161474a59957ec189906cbf7f",
+    ("fwd", "TILE_D0"): "81248621ee71aa2ef579cb58ab1719befbf033dcd0e8a155b68f3eff96993988",
+    ("fwd", "TILE_D1"): "6a01f7a0eab1099b6e8727610431cfa0e2b4d4223c27c9227f4affe511af47a2",
+    ("fwd", "TILE_D2"): "28d53b6b888796cb5d128d112a1493b71e9657da25e8d90facc893d00b04550b",
+    ("fwd", "TILE_D3F"): "2fbb341a6cc72593dc55eb4076afd0203e060b529b64bcde43318987733c28a5",
+    ("fwd", "FINAL_A"): "aa17079c16501789b8da3ce367d9dbc4975f94b50310d44be16e5ab6f0426b1e",
     ("bwd_dkdv", "MAIN"): "426ce61bb0aacade520a94b4e9d305fc1f44d78cd24b647fe1f5948d2a674dc6",
 }
 _PACKAGE = "primus_turbo.flydsl.attention.gfx1250.sched"
