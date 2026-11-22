@@ -70,6 +70,8 @@ NQT_O = (
 )
 SEP_HH1 = True  # hh1's S / dP operands in tuples of their own (O1): loaded at the tile's start
 SEP_QT = True  # dK's Q^T operands in tuples of their own (QT)
+KH_MAJOR0 = SEP_HH1  # hh0's S / dP chains kh-major like hh1's: kh 0's softmax starts after 8 WMMAs, not 24
+PRE_SETS = 2  # NL / ND register sets; 2: tiles of stages 0, 1 load the next tile's at their start
 XK, XV = 272, 272  # LDS row strides (bytes) of Q / K and of dO / V rows (the TDM pads 16 B per row)
 STAGE_B = 16 * (XV + XK)  # one half of a ring stage (16 query rows)
 QOFF = 16 * XV  # the Q rows inside a half stage
@@ -222,8 +224,9 @@ class Layout:
         self.D = [take(8, 8) for _ in range(NDO_V)]
         self.P = [self.R0[2 * kh] for kh in range(NKV)]
         self.DS = [self.R0[2 * kh + 1] for kh in range(NKV)]
-        pre = [take(8, 8) for _ in range(4)]  # hh0 NL, hh0 ND, hh1 NL, hh1 ND
-        self.PRE = [pre[e // 2] + 4 * (e % 2) for e in range(8)]
+        # per set: hh0 NL, hh0 ND, hh1 NL, hh1 ND
+        pres = [[take(8, 8) for _ in range(4)] for _ in range(PRE_SETS)]
+        self.PRES = [[pre[e // 2] + 4 * (e % 2) for e in range(8)] for pre in pres]
         self.cc1, self.ccs = take(2, 2), take(2, 2)
         self.T = [take(1, 1) for _ in range(2 + NKV)]
         self.TD = take(1, 1)
@@ -288,6 +291,7 @@ QT_XDL_AFTER = 10
 # hh1's S / dP A operands of dt stream into the tuples hh0's dt releases, the late dt after hh1's first WMMAs: the
 # first position in hh1's WMMA stream at which the operands of dt have landed (hh1_order)
 HH1_AVAIL = (0, 0, 0, 0) if SEP_HH1 else (0, 6, 12, 18)
+PSET = tuple(s % PRE_SETS for s in range(DEPTH)) if PRE_SETS == 2 else (0,) * DEPTH  # a stage's NL / ND set
 SOFT_TAIL = 8  # dummy VALUs behind the softmax, before its one va_vdst(SOFT_TAIL) wait (step_nodes)
 DS_MAX = 56  # LDS loads in flight
 # issue model (4 waves per WGP): a WMMA occupies the XDL pipe 8 cycles; inside its window a VALU / TRANS issues only
@@ -674,7 +678,7 @@ def init_nl(L, ops):
     resource copies until the loop starts): they land under the K / V rows' wait, not at the tile's softmax."""
     out = ["s_wait_loadcnt 0x0"]
     out += [f"s_lshl_b32 {SG_TB}, {ops['qps']}, 7", f"s_add_co_i32 {SG_TB}, {ops['nl0']}, {SG_TB}"]
-    return out + nl_loads(L, dict(ops, nls=SG_TB))
+    return out + nl_loads(L, dict(ops, nls=SG_TB), PSET[0])
 
 
 def init_bar():
@@ -743,27 +747,28 @@ def sdp_loads(L, ops, hh, stage):
     return out
 
 
-def nl_loads(L, ops):
-    """The 8 buffer_load_b128 of a tile's NL / ND quads (constant offsets, soffset ops['nls'])."""
+def nl_loads(L, ops, pset=0):
+    """The 8 buffer_load_b128 of a tile's NL / ND quads into register set pset (constant offsets, soffset
+    ops['nls'])."""
     out = []
     for e in range(8):
         r = ops["rnl"] if (e % 4) // 2 == 0 else ops["rnd"]
         off = offset((e // 4) * 64 + (e % 2) * 16)
-        out.append(f"buffer_load_b128 {vr(L.PRE[e], 4)}, {ops['nlv']}, {r}, {ops['nls']} offen{off}")
+        out.append(f"buffer_load_b128 {vr(L.PRES[pset][e], 4)}, {ops['nlv']}, {r}, {ops['nls']} offen{off}")
     return out
 
 
 # --------------------------------------------------------------------------------------------------------------
 # one tile
 # --------------------------------------------------------------------------------------------------------------
-def softmax_unit(L, hh, kh, add, mask=None):
+def softmax_unit(L, hh, kh, add, mask=None, pset=0):
     """Node indices of the softmax / dS of (hh, kh), the FlyDSL backward's arithmetic: 4 element pairs into dwords
     4 hh + j of P[kh] / DS[kh]. mask: the VGPR holding dl - thr - 16 (hh - kh); element i is masked iff mask > i."""
     nodes = []
     s_, d_ = L.raw(hh, kh, 0), L.raw(hh, kh, 1)
     for j in range(4):
-        nl = L.PRE[hh * 4 + j // 2] + 2 * (j % 2)
-        nd = L.PRE[hh * 4 + 2 + j // 2] + 2 * (j % 2)
+        nl = L.PRES[pset][hh * 4 + j // 2] + 2 * (j % 2)
+        nd = L.PRES[pset][hh * 4 + 2 + j // 2] + 2 * (j % 2)
         s2, d2 = s_ + 2 * j, d_ + 2 * j
         nodes.append(add(f"v_pk_fma_f32 {vr(s2, 2)}, {vr(s2, 2)}, {vr(L.cc1, 2)}, {vr(nl, 2)}"))
         if mask is not None:
@@ -820,6 +825,10 @@ def step_nodes(L, ops, masked, stage, scal):
     # TDM of tile k + DEPTH - 1 into the stage tile k - 1 used (every wave's last reads of it preceded the previous
     # barrier); it issues before the tensorcnt wait below, which then retires tile k + 1
     tdm = [add(f"tensor_load_to_lds {ops['g0' + c]}, {ops['g1' + c]}") for c in "ab"[:NOPS]]
+    # NL / ND of tile k+1: into the other register set at the tile's start when the next stage uses the other set
+    pset, npset = PSET[stage], PSET[(stage + 1) % DEPTH]
+    early_nl = npset != pset
+    nl = [add(t) for t in nl_loads(L, ops, npset)] if early_nl else []
     # hh0's operands of LATE: their tuples were dK's last Q^T operands in O of the previous tile
     for key, text in sdp_loads(L, ops, 0, stage):
         if key[:2] in LATE:
@@ -841,8 +850,11 @@ def step_nodes(L, ops, masked, stage, scal):
                 stage_reads.append(add(hh1[("Q", dt, u)]))
                 if dt < NDT_V:
                     stage_reads.append(add(hh1[("D", dt, u)]))
+    if KH_MAJOR0:  # kh 0's chains first: its softmax runs under the later kh's WMMAs
+        for kind, kh, dt in hh1_order((0,) * NDT_QK):
+            w_sdp0.append(wmma_sdp(0, kind, kh, dt))
     for dt in range(NDT_QK):
-        for kind in ("S", "P") if dt < NDT_V else ("S",):
+        for kind in () if KH_MAJOR0 else (("S", "P") if dt < NDT_V else ("S",)):
             for kh in range(NKV):
                 w_sdp0.append(wmma_sdp(0, kind, kh, dt))
         for u in range(0 if SEP_HH1 else 2):
@@ -863,7 +875,7 @@ def step_nodes(L, ops, masked, stage, scal):
     # overwrite the constants it read) need no wait of their own: they go out right behind the softmax
     soft, units = [], {}
     for hh in range(2):
-        if hh:
+        if hh and not early_nl:
             split_d = add(f"v_mov_b32 {vr(L.TD)}, 0")
         for kh in range(NKV):
             mask = None
@@ -872,9 +884,9 @@ def step_nodes(L, ops, masked, stage, scal):
                 add(f"s_add_co_i32 {thr}, {ops['thr']}, {16 * (hh - kh)}")
                 add(f"v_subrev_nc_u32 {vr(L.T[hh])}, {thr}, {ops['dl']}")
                 mask = L.T[hh]
-            units[hh, kh] = softmax_unit(L, hh, kh, add, mask)
+            units[hh, kh] = softmax_unit(L, hh, kh, add, mask, pset)
             soft += units[hh, kh]
-            if (hh, kh) == (1, 0):
+            if (hh, kh) == (1, 0) and not early_nl:
                 split_w = add("s_wait_alu depctr_va_vdst(14)")
 
     def q_t_loads(d):
@@ -912,8 +924,10 @@ def step_nodes(L, ops, masked, stage, scal):
         for h in range(2):
             st = f"buffer_store_b128 {vr(L.DS[kh] + 4 * h, 4)}, {vd}, {ops['rds']}, {ops['ds' + str(kh)]} offen"
             ex.append(add(st + offset(h * DS_ST_B) + " th:TH_STORE_NT"))
-    # NL / ND of tile k+1 (PRE is dead after the softmax)
-    nl = [add(t) for t in nl_loads(L, ops)]
+    # NL / ND of tile k+1 into this tile's own set (dead after the softmax)
+    if not early_nl:
+        nl = [add(t) for t in nl_loads(L, ops, npset)]
+    late_nl = [] if early_nl else nl
     # the ring barrier after the last LDS read of stage k (tensorcnt TW: tile k+1 landed), dK (d outer), then the next
     # tile's hh0 operands into O as dK releases Q^T 0..9 (after the barrier wait)
     tw = add(f"s_wait_tensorcnt {hex(TW)}")
@@ -936,7 +950,7 @@ def step_nodes(L, ops, masked, stage, scal):
     # the dS^T stores (RAW on the bf16 converts) and the NL / ND loads (WAR on PRE) after the whole softmax: a memory
     # op with a hazard against core VALU waits for every in-flight VALU while WMMAs run (va_vdst 0), so one such wait
     # covers them all
-    for i in ex + nl:
+    for i in ex + late_nl:
         if nodes[i].kind in ("VM_ST", "VM_LD"):
             for j in soft:
                 add_order(nodes, j, i)
@@ -944,18 +958,18 @@ def step_nodes(L, ops, masked, stage, scal):
     for j in soft + [i for i in ex if nodes[i].kind == "VALU"]:
         add_order(nodes, j, tail_d[0])
     add_order(nodes, tail_d[-1], tail_w, 8)
-    for i in ex + nl[4:]:
+    for i in ex + late_nl[4:]:
         if nodes[i].kind in ("VM_ST", "VM_LD"):
             add_order(nodes, tail_w, i)
     # hh0's softmax, the dummy, hh1's first unit, the va_vdst(14) wait, hh0's NL / ND
     for (hh, _), unit in units.items():
-        if hh == 0:
+        if hh == 0 and not early_nl:
             for j in unit:
                 add_order(nodes, j, split_d)
-    for j in units[1, 0]:
+    for j in [] if early_nl else units[1, 0]:
         add_order(nodes, split_d, j)
         add_order(nodes, j, split_w)
-    for i in nl[:4]:
+    for i in late_nl[:4]:
         add_order(nodes, split_w, i)
     for i in nxt_reads:
         add_order(nodes, bw, i)

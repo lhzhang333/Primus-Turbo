@@ -30,7 +30,7 @@ REGIONS = {
     ("fwd", "TILE_D2"): "4c402894bd4ed04097fa1520c0face9ecfa45e917b8f226d5a8cdf9e9993967e",
     ("fwd", "TILE_D3F"): "1eeefcf807fffd72a4a9f30ffc6fba30adefb24c50994004d28c47589b203480",
     ("fwd", "FINAL_A"): "87d4a494c84e3f70f5e5902055924499b972ca4aa5b0948102b0306e114b244d",
-    ("bwd_dkdv", "MAIN"): "e6b87bf5f24a295901df10638f180e5cb7e1fe4b5bbbead6970eb6712a7acd59",
+    ("bwd_dkdv", "MAIN"): "426ce61bb0aacade520a94b4e9d305fc1f44d78cd24b647fe1f5948d2a674dc6",
 }
 _PACKAGE = "primus_turbo.flydsl.attention.gfx1250.sched"
 
