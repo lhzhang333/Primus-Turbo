@@ -15,11 +15,11 @@
 
 One operand's reduction rows come through a row-index table (TDM gather), so the
 wgrad can read the dispatched token buffer in pool order. Lives under
-``mega.gfx1250.bf16`` so the shared ``grouped_gemm_bf16_kernel_gfx1250`` stays free
+``mega.gfx1250.bf16`` so the shared ``gfx1250.grouped_gemm.grouped_gemm_bf16_kernel`` stays free
 of Mega-specific gather paths.
 
 Shared tile helpers and the dense / non-gather variable-K path stay in
-``primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250``.
+``primus_turbo.flydsl.gfx1250.grouped_gemm.grouped_gemm_bf16_kernel``.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 
 # Shared helpers / constants from the gfx1250 grouped GEMM (non-gather).
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+from primus_turbo.flydsl.gfx1250.grouped_gemm.grouped_gemm_bf16_kernel import (
     _F16,
     _GFX1250_LDS_BYTES,
     _TDM_TH_LOAD,

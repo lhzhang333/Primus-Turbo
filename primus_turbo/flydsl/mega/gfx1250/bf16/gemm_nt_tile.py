@@ -16,7 +16,7 @@
 
 One workgroup computes one ``tile_m x tile_n`` block of one 256-row pool block, the unit Mega
 schedules on. The pipeline is the shipped configuration of
-``grouped_gemm_bf16_kernel_gfx1250._launch_grouped_gemm_bf16_nt`` (TDM global -> LDS, two
+``gfx1250.grouped_gemm.grouped_gemm_bf16_kernel._launch_grouped_gemm_bf16_nt`` (TDM global -> LDS, two
 buffers, WMMA 16x16x32, ``split_bar`` with one deferred sub-step, a two-deep fragment ring),
 with two changes Mega needs:
 
@@ -63,7 +63,7 @@ from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+from primus_turbo.flydsl.gfx1250.grouped_gemm.grouped_gemm_bf16_kernel import (
     _WG_BARRIER,
     _as_ptr,
     _i32_table,

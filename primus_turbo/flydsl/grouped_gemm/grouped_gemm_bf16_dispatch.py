@@ -16,8 +16,8 @@
 Two implementations of the same three operators exist and they share nothing
 below the public signature:
 
-  ``grouped_gemm_bf16_kernel.py``          gfx950 / MI355X -- MFMA, wave64, SRD
-  ``grouped_gemm_bf16_kernel_gfx1250.py``  gfx1250 / MI455X -- WMMA, wave32, TDM
+  ``grouped_gemm/grouped_gemm_bf16_kernel.py``          gfx950 / MI355X -- MFMA, wave64, SRD
+  ``gfx1250/grouped_gemm/grouped_gemm_bf16_kernel.py``  gfx1250 / MI455X -- WMMA, wave32, TDM
 
 Why two files rather than ``if arch ==`` inside one
 ----------------------------------------------------
@@ -104,7 +104,7 @@ def grouped_gemm_bf16_arch(device: torch.device | int | None = None) -> str:
 def _impl(arch: str):
     """Import the module for ``arch`` -- lazily, so only one ever enters the graph."""
     if arch == "gfx1250":
-        from primus_turbo.flydsl.grouped_gemm import grouped_gemm_bf16_kernel_gfx1250 as mod
+        from primus_turbo.flydsl.gfx1250.grouped_gemm import grouped_gemm_bf16_kernel as mod
     else:
         from primus_turbo.flydsl.grouped_gemm import grouped_gemm_bf16_kernel as mod
     return mod
@@ -139,7 +139,7 @@ def grouped_gemm_bf16_nn(a: torch.Tensor, b: torch.Tensor, group_offs: torch.Ten
        falls back to materialising the transpose per call, which is a
        parameter-sized copy at ~1.07 TB/s. It warns once per shape rather than
        raising. A dispatcher should pre-check with
-       ``grouped_gemm_bf16_kernel_gfx1250.nn_native_unsupported_reason``.
+       ``gfx1250.grouped_gemm.grouped_gemm_bf16_kernel.nn_native_unsupported_reason``.
     """
     return _pick(a).grouped_gemm_bf16_nn_flydsl_kernel(a, b, group_offs, **kw)
 

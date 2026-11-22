@@ -44,9 +44,9 @@ IMPLS = ["tdm", "reg"]
 
 
 def _vk():
-    from primus_turbo.flydsl.grouped_gemm import grouped_gemm_bf16_kernel_gfx1250
+    from primus_turbo.flydsl.gfx1250.grouped_gemm import grouped_gemm_bf16_kernel
 
-    return grouped_gemm_bf16_kernel_gfx1250
+    return grouped_gemm_bf16_kernel
 
 
 def _routing(seed, num_experts=NUM_EXPERTS, tokens=TOKENS, topk=TOPK):

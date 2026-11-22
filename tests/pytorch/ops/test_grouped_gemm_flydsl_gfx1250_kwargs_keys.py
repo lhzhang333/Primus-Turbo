@@ -33,8 +33,8 @@ import torch
 
 pytest.importorskip("flydsl", reason="the FlyDSL gfx1250 grouped GEMM lives behind flydsl")
 
-from primus_turbo.flydsl.grouped_gemm import grouped_gemm_bf16_kernel_gfx1250 as gg  # noqa: E402
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (  # noqa: E402
+from primus_turbo.flydsl.gfx1250.grouped_gemm import grouped_gemm_bf16_kernel as gg  # noqa: E402
+from primus_turbo.flydsl.gfx1250.grouped_gemm.grouped_gemm_bf16_kernel import (  # noqa: E402
     grouped_gemm_bf16_nn_flydsl_kernel,
     grouped_gemm_bf16_nt_flydsl_kernel,
     grouped_gemm_bf16_variable_k_flydsl_kernel,
