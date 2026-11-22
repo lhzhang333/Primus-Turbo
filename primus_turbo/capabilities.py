@@ -17,9 +17,12 @@ or importing an internal module::
     python -m primus_turbo.capabilities --arch gfx1250 mega_moe.bf16   # prints True / False
 
 The answers come from the architecture manifests (``primus_turbo/arch/<arch>.py``): a feature
-is available when the files of the modules its manifest names are in the installed package.
-Nothing is imported to find out, so the query is cheap, needs no GPU and cannot fail on a
-kernel module's own import. A feature that no manifest lists for an architecture answers False.
+is available when what its manifest names (module files, and for a feature that needs build
+products, files) is in the installed package. With ``arch`` given nothing is imported to find
+out, so the query is cheap, needs no GPU and cannot fail on a kernel module's own import; a
+launch script passes ``arch``. With ``arch`` left out the current device is asked, which imports
+torch and initializes its device runtime. A feature that no manifest lists for an architecture
+answers False, and so does a name this version does not know.
 """
 
 import argparse

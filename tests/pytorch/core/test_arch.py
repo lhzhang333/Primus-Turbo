@@ -63,8 +63,9 @@ def test_every_listed_module_is_in_the_package():
     for feature, needs in gfx1250.FEATURES.items():
         assert needs, feature
         for need in needs:
-            assert need.partition(":")[0] in {**gfx1250.KERNELS, **gfx1250.IMPLS}, (feature, need)
-        assert arch.modules_of(feature, "gfx1250"), feature
+            if not need.startswith("files:"):  # build products: there only in a build for that architecture
+                assert need.partition(":")[0] in {**gfx1250.KERNELS, **gfx1250.IMPLS}, (feature, need)
+        assert arch.needs_of(feature, "gfx1250"), feature
 
 
 def test_the_tree_matches_the_manifests():
@@ -82,8 +83,28 @@ def test_has():
     assert not capabilities.has("no.such.feature", arch="gfx1250")
     table = capabilities.features("gfx1250")
     assert set(table) == set(gfx1250.FEATURES)
-    assert all(table.values())
+    # every feature whose modules are part of the source is there; one that also needs build products
+    # (the HipKittens code objects) is there exactly when they were built
+    for feature, answer in table.items():
+        files = [n for n in gfx1250.FEATURES[feature] if n.startswith("files:")]
+        assert answer == all(any(_PKG_DIR.glob(n[len("files:") :])) for n in files), feature
     assert capabilities.features("gfx000") == {}
+
+
+def test_a_feature_naming_something_unlisted_reads_false(monkeypatch):
+    monkeypatch.setitem(gfx1250.FEATURES, "attention.flydsl.mha", ("no.such.family",))
+    assert not capabilities.has("attention.flydsl.mha", arch="gfx1250")
+
+
+def test_what_older_primus_releases_probe_is_still_there():
+    """Primus releases that predate primus_turbo.capabilities look for two directories and import one
+    function from one module path. Whoever moves one of them switches a feature off there without an
+    error (keep an alias or a stub for a release)."""
+    flydsl = _PKG_DIR / "flydsl"
+    assert (flydsl / "attention" / "gfx1250").is_dir()
+    assert (flydsl / "mega" / "gfx1250").is_dir()
+    old = flydsl / "grouped_gemm" / "grouped_gemm_bf16_kernel_gfx1250.py"
+    assert old.is_file() and "grouped_gemm_bf16_variable_k_accum_supported" in old.read_text()
 
 
 def test_a_missing_module_reads_false(monkeypatch):
@@ -108,7 +129,7 @@ def test_cli(capsys):
     assert capsys.readouterr().out.split() == ["True", "False"]
     assert capabilities._main(["--arch", "gfx1250"]) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert lines == [f"{feature} True" for feature in sorted(gfx1250.FEATURES)]
+    assert lines == [f"{feature} {answer}" for feature, answer in capabilities.features("gfx1250").items()]
 
 
 def test_the_query_imports_neither_torch_nor_a_kernel():

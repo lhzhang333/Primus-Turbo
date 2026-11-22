@@ -56,7 +56,7 @@ slot in predictably. Read the name left-to-right: **operation → data type → 
 |-----------|--------|-------|
 | `<op>`    | `gemm`, `grouped_gemm`, `attention`, `rmsnorm`, `swiglu`, ... | The mathematical operation. **Always first**; matches the containing directory. |
 | `<dtype>` | see below | **Optional** — omit for dtype-agnostic files (e.g. `grouped_gemm_utils.py`). |
-| `<role>`  | `impl`, `kernel`, `utils`, `heuristic` | What the file *is*. **Always last**. |
+| `<role>`  | `impl`, `kernel`, `utils`, `heuristic` | What the file *is*. **Always last**, except that an architecture tag may follow it (see *Architecture-specific kernels*). |
 
 ### Two layers, two `<dtype>` vocabularies (intentional)
 
@@ -111,18 +111,21 @@ build filters by). Product names (`MI455X`) and other aliases (`w32`) are not us
 
 * **Register it in the architecture's manifest.** `primus_turbo/arch/<arch>.py` lists the
   kernel packages, the implementation modules and the features built on them. It is the
-  one place that says where an architecture's code is, and what
+  place that says where an architecture's code is, and what
   `primus_turbo.capabilities` answers from. `tools/check_arch_layout.py` (pre-commit)
   fails when a tagged path under `primus_turbo/` or `csrc/` is not listed, when something
-  listed does not exist, or when the tag is not a whole name segment. An architecture
-  gets a manifest when someone needs one; gfx1250 has one.
+  listed does not exist, or when the tag is not a whole name segment. The check sees
+  tagged paths only: tag what is specific to an architecture, or list it by hand (as the
+  FlyDSL DeepEP is). An architecture gets a manifest when someone needs one; gfx1250 has
+  one, and the older gfx950 kernels, which carry no tag, are not covered.
 * **Keep a launcher and the helpers it calls in one directory.** FlyDSL folds the source
   of a plain Python helper into a kernel's disk-cache key only when the helper is in the
   launcher's directory. A helper that has to be shared across directories must be made
   part of the key by the package that uses it (hash its source into a module-level
   constant the launchers read, as `flydsl/attention/gfx1250_mla/__init__.py` does);
   otherwise an edit to it keeps serving kernels compiled before the edit.
-* **Tuning tables and selection logic** go in a `*_heuristic_<arch>.py` next to the kernel.
+* **Tuning tables and selection logic** belong in a `*_heuristic_<arch>.py` next to the
+  kernel (new ones; the existing tables are still inside the kernel files).
 * **Tests on gfx1250.** Tests are skipped on gfx1250 unless they opt in: a test file whose
   name carries the `gfx1250` tag runs there, and a test (or a whole file) without it opts
   in with `pytest.mark.gfx1250`. `tests/conftest.py` needs no edit.

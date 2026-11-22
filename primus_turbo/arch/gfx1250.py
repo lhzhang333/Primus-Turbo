@@ -48,12 +48,15 @@ SOURCES = (
 
 # Features other code may ask for (primus_turbo.capabilities): the kernel families and
 # implementation modules each one needs, by their names above; "<name>:<symbol>" also names a
-# symbol the module must define.
+# symbol the module must define, and "files:<glob relative to primus_turbo/>" build products
+# of which at least one must be installed.
 FEATURES = {
     "attention.flydsl.mha": ("attention.mha", "attention.mha.flydsl"),
     "attention.flydsl.mla": ("attention.mla", "attention.mla.flydsl"),
     "attention.flydsl.sparse_mla": ("attention.sparse_mla",),
-    "attention.hipkittens.mla": ("attention.mla.hipkittens",),
+    # the implementation and its code objects, which only a gfx1250 build produces (the
+    # implementation still checks each one's pin when it loads it)
+    "attention.hipkittens.mla": ("attention.mla.hipkittens", "files:lib/hk_gfx1250_mla/*.hsaco"),
     "mega_moe.bf16": ("mega_moe", "mega_moe.bf16"),
     "grouped_gemm.flydsl.bf16.wgrad_accum": (
         "grouped_gemm.bf16:grouped_gemm_bf16_variable_k_accum_supported",

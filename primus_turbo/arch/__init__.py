@@ -7,8 +7,8 @@
 """GPU architectures: their names, and what Primus-Turbo has for each.
 
 An architecture is named by its gfx ID (``gfx942``, ``gfx950``, ``gfx1250``). ROCm reports the
-ID with target features attached (``gfx1250:sramecc+:xnack-``); ``normalize_arch`` is the one
-place that strips them.
+ID with target features attached (``gfx1250:sramecc+:xnack-``); ``normalize_arch`` strips them,
+and new code should use it rather than splitting the name again.
 
 **Manifests.** Architecture-specific code is not gathered in a directory of its own: a kernel
 stays in the directory of its operation and carries the architecture as a tag in its name
@@ -21,7 +21,8 @@ kernel packages, the implementation-layer modules and the features built on them
     know a path),
   * what ``tools/check_arch_layout.py`` (a pre-commit hook) holds the tree to: every path
     tagged with an architecture that has a manifest must be listed in it, and everything listed
-    must exist,
+    must exist (code that is specific to an architecture but carries no tag is invisible to the
+    check, so tag it or list it),
   * the one file to read, or to route reviews by, for an architecture.
 
 An architecture gets a manifest when someone needs one; gfx1250 (MI455X) has one today.
@@ -30,7 +31,9 @@ An architecture gets a manifest when someone needs one; gfx1250 (MI455X) has one
 FlyDSL compiles for (``flydsl.runtime.device.get_rocm_arch``, which ``FLYDSL_GPU_ARCH``
 overrides) or which architectures the C++ kernels were built for (``setup.py``).
 
-Importing this package imports neither torch nor a kernel module.
+Importing this package imports neither torch nor a kernel module, and neither does a query that
+names the architecture. A query that leaves it out asks the current device, which imports torch
+and initializes its device runtime: a launch script names the architecture.
 """
 
 import importlib
@@ -90,29 +93,44 @@ def module_file(module: str) -> Optional[Path]:
     return None
 
 
-def modules_of(feature: str, arch: Optional[str]) -> tuple:
-    """The modules (``"<module>"`` or ``"<module>:<symbol>"``) a feature needs on ``arch``, ``()``
-    when the architecture's manifest does not list the feature (or there is no manifest)."""
+def needs_of(feature: str, arch: Optional[str]) -> tuple:
+    """What a feature needs on ``arch``: modules (``"<module>"`` or ``"<module>:<symbol>"``) and, for
+    build products, ``"files:<glob relative to the package>"``. ``()`` when the architecture's
+    manifest does not list the feature (or there is no manifest)."""
     m = manifest(arch)
     if m is None:
         return ()
     out = []
-    for name in m.FEATURES.get(feature, ()):
-        name, _, symbol = name.partition(":")
-        module = m.KERNELS.get(name) or m.IMPLS[name]
+    for need in m.FEATURES.get(feature, ()):
+        if need.startswith("files:"):
+            out.append(need)
+            continue
+        name, _, symbol = need.partition(":")
+        # a name the manifest does not define stays as it is and is then simply not present
+        module = m.KERNELS.get(name) or m.IMPLS.get(name) or name
         out.append(f"{module}:{symbol}" if symbol else module)
     return tuple(out)
+
+
+def present(need: str) -> bool:
+    """Whether one entry of ``needs_of`` is in this install. Not an import."""
+    if need.startswith("files:"):
+        return any(_PKG_DIR.glob(need[len("files:") :]))
+    return module_file(need) is not None
 
 
 def has(feature: str, arch: Optional[str] = None) -> bool:
     """Whether ``feature`` is available for ``arch`` (default: the current device's architecture).
 
-    False for a feature or an architecture no manifest lists, and, with ``arch`` left out, when
-    there is no ROCm device to ask. Nothing is imported to answer: a feature is available when
-    the files of the modules its manifest names are in the installed package.
+    False for a feature or an architecture no manifest lists (to a caller written for a newer
+    Primus-Turbo, a name this version does not know is a feature it does not have; ``features``
+    gives the names it knows), and, with ``arch`` left out, when there is no ROCm device to ask.
+    With ``arch`` given nothing is imported to answer: a feature is available when what its
+    manifest names (module files, and for build products at least one matching file) is in the
+    installed package.
     """
-    modules = modules_of(feature, arch if arch else device_arch())
-    return bool(modules) and all(module_file(m) is not None for m in modules)
+    needs = needs_of(feature, arch if arch else device_arch())
+    return bool(needs) and all(present(n) for n in needs)
 
 
 def features(arch: Optional[str] = None) -> Dict[str, bool]:
