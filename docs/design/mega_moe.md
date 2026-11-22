@@ -254,10 +254,10 @@ python benchmark/ops/training/bench_mega_moe_gfx1250.py --num-processes 4
 | gfx950 MXFP8: dispatch prologue, combine CU autotune | `primus_turbo/flydsl/mega/fp8/dispatch_prologue.py`, `combine_autotune.py` |
 | gfx950 MXFP8: SwiGLU + MXFP8 quant fwd / bwd | `primus_turbo/flydsl/mega/fp8/swiglu_mxfp8_kernel.py` |
 | gfx950 MXFP8: symmetric buffer, barrier | `primus_turbo/flydsl/mega/fp8/symm_buffer.py`, `barrier.py` |
-| gfx1250: dispatch + GEMM, GEMM + combine | `primus_turbo/flydsl/mega/gfx1250/bf16/dispatch_gemm_kernel.py`, `gemm_combine_kernel.py` |
-| gfx1250: variable-K wgrad, `x` re-dispatch | `primus_turbo/flydsl/mega/gfx1250/bf16/variable_k.py`, `x_redispatch_kernel.py` |
-| gfx1250: dispatch prologue, cross-rank tiles, SwiGLU | `primus_turbo/flydsl/mega/gfx1250/dispatch_prologue_kernel.py`, `ep_intranode.py`, `swiglu_kernel.py` |
-| gfx1250: symmetric buffer, barrier | `primus_turbo/flydsl/mega/gfx1250/symm_buffer.py`, `barrier.py` |
+| gfx1250: dispatch + GEMM, GEMM + combine | `primus_turbo/flydsl/gfx1250/mega/bf16/dispatch_gemm_kernel.py`, `gemm_combine_kernel.py` |
+| gfx1250: variable-K wgrad, `x` re-dispatch | `primus_turbo/flydsl/gfx1250/mega/bf16/variable_k.py`, `x_redispatch_kernel.py` |
+| gfx1250: dispatch prologue, cross-rank tiles, SwiGLU | `primus_turbo/flydsl/gfx1250/mega/dispatch_prologue_kernel.py`, `ep_intranode.py`, `swiglu_kernel.py` |
+| gfx1250: symmetric buffer, barrier | `primus_turbo/flydsl/gfx1250/mega/symm_buffer.py`, `barrier.py` |
 | Activation spec (`GLUActivation`) | `primus_turbo/flydsl/utils/glu_activation.py` |
 
 ## Acknowledgements

@@ -15,7 +15,7 @@
 
 One operand's reduction rows come through a row-index table (TDM gather), so the
 wgrad can read the dispatched token buffer in pool order. Lives under
-``mega.gfx1250.bf16`` so the shared ``gfx1250.grouped_gemm.grouped_gemm_bf16_kernel`` stays free
+``gfx1250.mega.bf16`` so the shared ``gfx1250.grouped_gemm.grouped_gemm_bf16_kernel`` stays free
 of Mega-specific gather paths.
 
 Shared tile helpers and the dense / non-gather variable-K path stay in

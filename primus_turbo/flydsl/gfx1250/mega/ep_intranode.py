@@ -19,7 +19,7 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.utils.arith import ArithValue
 
-from primus_turbo.flydsl.mega.gfx1250.prims import (
+from primus_turbo.flydsl.gfx1250.mega.prims import (
     CPOL_DEVICE_STREAM,
     CPOL_SYSTEM_STREAM,
     WAVE,
@@ -34,8 +34,8 @@ from primus_turbo.flydsl.mega.gfx1250.prims import (
     st,
     wait_mem_all,
 )
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import BLOCK_M as POOL_BLOCK_M
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import SymBuffer, Workspace
+from primus_turbo.flydsl.gfx1250.mega.symm_buffer import BLOCK_M as POOL_BLOCK_M
+from primus_turbo.flydsl.gfx1250.mega.symm_buffer import SymBuffer, Workspace
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
     buffer_store,

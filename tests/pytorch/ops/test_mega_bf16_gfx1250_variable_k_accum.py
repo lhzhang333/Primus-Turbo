@@ -25,7 +25,7 @@ _POOL_BLOCK = 256
 
 
 def _vk():
-    from primus_turbo.flydsl.mega.gfx1250.bf16 import variable_k
+    from primus_turbo.flydsl.gfx1250.mega.bf16 import variable_k
 
     return variable_k
 

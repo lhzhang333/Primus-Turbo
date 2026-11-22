@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""The Mega MoE stages on the gfx1250 kernels (``primus_turbo.flydsl.mega.gfx1250.bf16``).
+"""The Mega MoE stages on the gfx1250 kernels (``primus_turbo.flydsl.gfx1250.mega.bf16``).
 
 Same contracts as the gfx950 stage1 / stage2 compositions. The GEMMs read the weights as stored:
 NT for the forward, NN (``b_nn``) for the dgrads. The wgrads run the gfx1250 variable-K kernel in
@@ -17,28 +17,28 @@ from typing import Optional
 
 import torch
 
-from primus_turbo.flydsl.mega.gfx1250.bf16.dispatch_gemm_kernel import (
+from primus_turbo.flydsl.gfx1250.mega.bf16.dispatch_gemm_kernel import (
     dispatch_gemm_nt_gfx1250,
 )
-from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import (
+from primus_turbo.flydsl.gfx1250.mega.bf16.gemm_combine_kernel import (
     gemm_combine_nt_gfx1250,
 )
-from primus_turbo.flydsl.mega.gfx1250.bf16.variable_k import (
+from primus_turbo.flydsl.gfx1250.mega.bf16.variable_k import (
     grouped_gemm_bf16_variable_k_accum_supported,
 )
-from primus_turbo.flydsl.mega.gfx1250.bf16.variable_k import (
+from primus_turbo.flydsl.gfx1250.mega.bf16.variable_k import (
     grouped_gemm_bf16_variable_k_flydsl_kernel as _variable_k,
 )
-from primus_turbo.flydsl.mega.gfx1250.bf16.x_redispatch_kernel import get_x_redispatch
-from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+from primus_turbo.flydsl.gfx1250.mega.bf16.x_redispatch_kernel import get_x_redispatch
+from primus_turbo.flydsl.gfx1250.mega.dispatch_prologue_kernel import (
     DispatchHandle,
     run_dispatch_prologue,
 )
-from primus_turbo.flydsl.mega.gfx1250.swiglu_kernel import (
+from primus_turbo.flydsl.gfx1250.mega.swiglu_kernel import (
     swiglu_backward_flydsl_kernel,
     swiglu_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.gfx1250.mega.symm_buffer import get_symm_buffer_for_mega_moe
 from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_bias_impl import (
     fc1_bias_backward,
     fc2_bias_backward,

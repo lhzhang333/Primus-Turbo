@@ -14,14 +14,14 @@
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 
-from primus_turbo.flydsl.mega.gfx1250.prims import (
+from primus_turbo.flydsl.gfx1250.mega.prims import (
     atomic_add,
     ld,
     memory_fence,
     read_clock,
     spin_timed_out,
 )
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import SymBuffer, Workspace
+from primus_turbo.flydsl.gfx1250.mega.symm_buffer import SymBuffer, Workspace
 
 # grid_sync counter: low bits count per-block arrivals, bit 25 is the phase flag. Requires num_blocks < 2^25.
 _PHASE_BIT = 25

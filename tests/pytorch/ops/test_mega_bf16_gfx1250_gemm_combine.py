@@ -54,10 +54,10 @@ def ep1_group():
     ],
 )
 def test_gemm_combine_nt_ep1(ep1_group, num_tokens, hidden, inter, num_experts, num_topk, num_empty):
-    from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import (
+    from primus_turbo.flydsl.gfx1250.mega.bf16.gemm_combine_kernel import (
         gemm_combine_nt_gfx1250,
     )
-    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+    from primus_turbo.flydsl.gfx1250.mega.dispatch_prologue_kernel import (
         run_dispatch_prologue,
     )
 
@@ -99,10 +99,10 @@ def test_gemm_combine_scheduling_is_bit_identical(ep1_group, b_nn):
     """``issue_first``, ``lds_cosched`` and ``wmma_b2b`` reorder each k-tile's loads and matrix ops, not any
     output's k-step sequence: every schedule gives the bits of the plain one, for the forward L2 (NT) and
     the backward's L1 dgrad against w1 (``b_nn``)."""
-    from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import (
+    from primus_turbo.flydsl.gfx1250.mega.bf16.gemm_combine_kernel import (
         gemm_combine_nt_gfx1250,
     )
-    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+    from primus_turbo.flydsl.gfx1250.mega.dispatch_prologue_kernel import (
         run_dispatch_prologue,
     )
 

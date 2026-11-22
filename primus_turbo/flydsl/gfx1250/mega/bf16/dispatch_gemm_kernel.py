@@ -41,7 +41,7 @@ from primus_turbo.flydsl.gfx1250.grouped_gemm.grouped_gemm_bf16_kernel import (
     _i32_table,
     _require_gfx1250,
 )
-from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
+from primus_turbo.flydsl.gfx1250.mega.bf16.gemm_nt_tile import (
     EB,
     GFX1250_LDS_BYTES,
     NUM_BUFFERS,
@@ -51,13 +51,13 @@ from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import (
     resolve_lds_cosched,
     tile_geometry,
 )
-from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import DispatchHandle
-from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (
+from primus_turbo.flydsl.gfx1250.mega.dispatch_prologue_kernel import DispatchHandle
+from primus_turbo.flydsl.gfx1250.mega.ep_intranode import (
     dispatch_bf16_tile,
     spin_until_flag_reaches,
 )
-from primus_turbo.flydsl.mega.gfx1250.prims import cast, ld, st
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
+from primus_turbo.flydsl.gfx1250.mega.prims import cast, ld, st
+from primus_turbo.flydsl.gfx1250.mega.symm_buffer import (
     BLOCK_M,
     TOKEN_DTYPE,
     Workspace,

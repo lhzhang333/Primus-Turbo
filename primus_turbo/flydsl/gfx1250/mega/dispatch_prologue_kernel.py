@@ -23,10 +23,10 @@ import torch
 from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
-from primus_turbo.flydsl.mega.gfx1250.barrier import grid_sync, xgmi_barrier
-from primus_turbo.flydsl.mega.gfx1250.ep_intranode import same_rank_order
-from primus_turbo.flydsl.mega.gfx1250.prims import atomic_add, ld, st
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (
+from primus_turbo.flydsl.gfx1250.mega.barrier import grid_sync, xgmi_barrier
+from primus_turbo.flydsl.gfx1250.mega.ep_intranode import same_rank_order
+from primus_turbo.flydsl.gfx1250.mega.prims import atomic_add, ld, st
+from primus_turbo.flydsl.gfx1250.mega.symm_buffer import (
     BLOCK_M,
     TOKEN_DTYPE,
     SymBuffer,

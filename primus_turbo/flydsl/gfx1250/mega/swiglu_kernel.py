@@ -30,7 +30,7 @@ from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
-from primus_turbo.flydsl.mega.gfx1250.prims import WAVE, ld, st
+from primus_turbo.flydsl.gfx1250.mega.prims import WAVE, ld, st
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,

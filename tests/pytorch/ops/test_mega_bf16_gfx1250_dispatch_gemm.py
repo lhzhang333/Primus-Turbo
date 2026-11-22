@@ -53,10 +53,10 @@ def ep1_group():
     ],
 )
 def test_dispatch_gemm_nt_ep1(ep1_group, num_tokens, hidden, inter, num_experts, num_topk, num_empty):
-    from primus_turbo.flydsl.mega.gfx1250.bf16.dispatch_gemm_kernel import (
+    from primus_turbo.flydsl.gfx1250.mega.bf16.dispatch_gemm_kernel import (
         dispatch_gemm_nt_gfx1250,
     )
-    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+    from primus_turbo.flydsl.gfx1250.mega.dispatch_prologue_kernel import (
         run_dispatch_prologue,
     )
 
@@ -93,10 +93,10 @@ def test_dispatch_gemm_scheduling_is_bit_identical(ep1_group, b_nn):
     """``issue_first``, ``lds_cosched`` and ``wmma_b2b`` reorder each k-tile's loads and matrix ops, not any
     output's k-step sequence: every schedule gives the bits of the plain one, for the forward L1 (NT) and
     the backward's dispatch of dy against w2 (``b_nn``)."""
-    from primus_turbo.flydsl.mega.gfx1250.bf16.dispatch_gemm_kernel import (
+    from primus_turbo.flydsl.gfx1250.mega.bf16.dispatch_gemm_kernel import (
         dispatch_gemm_nt_gfx1250,
     )
-    from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (
+    from primus_turbo.flydsl.gfx1250.mega.dispatch_prologue_kernel import (
         run_dispatch_prologue,
     )
 
@@ -129,7 +129,7 @@ def test_dispatch_gemm_scheduling_is_bit_identical(ep1_group, b_nn):
 )
 def test_lds_cosched_auto(tile_n, issue_first, requested, resolved):
     """-1, the default of dispatch_gemm and gemm_combine, turns lds_cosched on where it can run."""
-    from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import resolve_lds_cosched
+    from primus_turbo.flydsl.gfx1250.mega.bf16.gemm_nt_tile import resolve_lds_cosched
 
     assert resolve_lds_cosched(requested, issue_first, 256, tile_n, 4, 2) == resolved
 
@@ -137,7 +137,7 @@ def test_lds_cosched_auto(tile_n, issue_first, requested, resolved):
 @pytest.mark.parametrize("tile_n, issue_first", [(128, 1), (256, 0)])
 def test_lds_cosched_rejects_what_it_cannot_schedule(tile_n, issue_first):
     """An explicit lds_cosched=1 the tile cannot take raises, under python -O too."""
-    from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_nt_tile import resolve_lds_cosched
+    from primus_turbo.flydsl.gfx1250.mega.bf16.gemm_nt_tile import resolve_lds_cosched
 
     with pytest.raises(ValueError, match="lds_cosched=1"):
         resolve_lds_cosched(1, issue_first, 256, tile_n, 4, 2)

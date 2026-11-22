@@ -34,10 +34,10 @@ flyc = pytest.importorskip("flydsl.compiler")
 fx = pytest.importorskip("flydsl.expr")
 from flydsl.expr import arith, range_constexpr  # noqa: E402
 
-from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (  # noqa: E402
+from primus_turbo.flydsl.gfx1250.mega.ep_intranode import (  # noqa: E402
     spin_until_flag_reaches,
 )
-from primus_turbo.flydsl.mega.gfx1250.prims import (  # noqa: E402  # noqa: E402
+from primus_turbo.flydsl.gfx1250.mega.prims import (  # noqa: E402  # noqa: E402
     CPOL_DEVICE_STREAM,
     CPOL_SYSTEM_STREAM,
     atomic_add,
@@ -46,7 +46,7 @@ from primus_turbo.flydsl.mega.gfx1250.prims import (  # noqa: E402  # noqa: E402
     read_clock,
     wait_mem_all,
 )
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import SymBuffer  # noqa: E402
+from primus_turbo.flydsl.gfx1250.mega.symm_buffer import SymBuffer  # noqa: E402
 from primus_turbo.flydsl.utils.buffer_ops import (  # noqa: E402
     buffer_load,
     buffer_store,

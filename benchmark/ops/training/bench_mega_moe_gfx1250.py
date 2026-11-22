@@ -64,34 +64,34 @@ from primus_turbo.flydsl.gfx1250.grouped_gemm.grouped_gemm_bf16_kernel import ( 
     grouped_gemm_bf16_nn_flydsl_kernel,
     grouped_gemm_bf16_nt_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.gfx1250.bf16.dispatch_gemm_kernel import (  # noqa: E402
+from primus_turbo.flydsl.gfx1250.mega.bf16.dispatch_gemm_kernel import (  # noqa: E402
     dispatch_gemm_nt_gfx1250,
     dispatch_only_gfx1250,
 )
-from primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel import (  # noqa: E402
+from primus_turbo.flydsl.gfx1250.mega.bf16.gemm_combine_kernel import (  # noqa: E402
     gemm_combine_nt_gfx1250,
 )
-from primus_turbo.flydsl.mega.gfx1250.bf16.variable_k import (  # noqa: E402
+from primus_turbo.flydsl.gfx1250.mega.bf16.variable_k import (  # noqa: E402
     grouped_gemm_bf16_variable_k_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.gfx1250.bf16.x_redispatch_kernel import (  # noqa: E402
+from primus_turbo.flydsl.gfx1250.mega.bf16.x_redispatch_kernel import (  # noqa: E402
     get_x_redispatch,
 )
-from primus_turbo.flydsl.mega.gfx1250.dispatch_prologue_kernel import (  # noqa: E402
+from primus_turbo.flydsl.gfx1250.mega.dispatch_prologue_kernel import (  # noqa: E402
     run_dispatch_prologue,
 )
-from primus_turbo.flydsl.mega.gfx1250.ep_intranode import (  # noqa: E402
+from primus_turbo.flydsl.gfx1250.mega.ep_intranode import (  # noqa: E402
     _BLOCK_THREADS,
     _NUM_WARPS,
     combine_bf16_tile,
     topk_reduce_bf16_tile,
 )
-from primus_turbo.flydsl.mega.gfx1250.prims import WAVE  # noqa: E402
-from primus_turbo.flydsl.mega.gfx1250.swiglu_kernel import (  # noqa: E402
+from primus_turbo.flydsl.gfx1250.mega.prims import WAVE  # noqa: E402
+from primus_turbo.flydsl.gfx1250.mega.swiglu_kernel import (  # noqa: E402
     swiglu_backward_flydsl_kernel,
     swiglu_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.gfx1250.symm_buffer import (  # noqa: E402
+from primus_turbo.flydsl.gfx1250.mega.symm_buffer import (  # noqa: E402
     BLOCK_M,
     TOKEN_DTYPE,
     SymBuffer,

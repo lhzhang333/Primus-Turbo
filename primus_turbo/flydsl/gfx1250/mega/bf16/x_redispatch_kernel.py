@@ -29,8 +29,8 @@ import torch
 from flydsl.expr.typing import Constexpr
 
 from primus_turbo.flydsl.gfx1250.grouped_gemm.grouped_gemm_bf16_kernel import _as_ptr
-from primus_turbo.flydsl.mega.gfx1250.ep_intranode import spin_until_flag_reaches
-from primus_turbo.flydsl.mega.gfx1250.prims import ld, st
+from primus_turbo.flydsl.gfx1250.mega.ep_intranode import spin_until_flag_reaches
+from primus_turbo.flydsl.gfx1250.mega.prims import ld, st
 from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
 
 

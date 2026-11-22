@@ -67,8 +67,8 @@ _FEATURES: Dict[str, Dict[str, Tuple[str, ...]]] = {
     # BF16 MegaMoE (fused_mega_moe): dispatch + GEMM + combine in fused kernels.
     "mega_moe.bf16": {
         "gfx1250": (
-            "primus_turbo.flydsl.mega.gfx1250.bf16.dispatch_gemm_kernel",
-            "primus_turbo.flydsl.mega.gfx1250.bf16.gemm_combine_kernel",
+            "primus_turbo.flydsl.gfx1250.mega.bf16.dispatch_gemm_kernel",
+            "primus_turbo.flydsl.gfx1250.mega.bf16.gemm_combine_kernel",
             "primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_gfx1250_impl",
         ),
     },
