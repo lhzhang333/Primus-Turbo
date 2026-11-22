@@ -682,8 +682,8 @@ def _delta_inputs(b, s, h, special, seed=0):
 def test_hk_delta_matches_flydsl(dims, special):
     """k_delta's NL / ND bitwise equal the FlyDSL k_delta's, also for denormals, underflowing products, signed zeros
     and overflowing NL."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd as fly
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd_delta_kernel
+    from primus_turbo.flydsl.gfx1250.attention.mla import bwd as fly
+    from primus_turbo.flydsl.gfx1250.attention.mla import bwd_delta_kernel
 
     do, o, lse = _delta_inputs(*dims, special)
     b, s, h, _ = do.shape

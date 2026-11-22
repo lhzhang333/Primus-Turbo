@@ -33,7 +33,7 @@ _BUDGET = "PRIMUS_TURBO_MLA_BWD_DS_SCRATCH_MB"
 
 
 def _bwd():
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd
+    from primus_turbo.flydsl.gfx1250.attention.mla import bwd
 
     return bwd
 
@@ -139,8 +139,8 @@ def test_grids_cover_every_row_and_head(monkeypatch, dims, chunked):
     chunk, the item lists of k_dkdv's persistent workgroups hold every 192-row kv block of every (batch, head) of
     the chunk once, and k_dqds's tiles cover every query, over the same heads and batches."""
     bwd = _bwd()
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd_dkdv_items as items
-    from primus_turbo.flydsl.attention.gfx1250_mla.common import num_cus
+    from primus_turbo.flydsl.gfx1250.attention.mla import bwd_dkdv_items as items
+    from primus_turbo.flydsl.gfx1250.attention.mla.common import num_cus
 
     b, sq, skv, h = dims
     q, k, v, out, lse = _meta(b, sq, skv, h)
@@ -185,7 +185,7 @@ def test_grids_cover_every_row_and_head(monkeypatch, dims, chunked):
 )
 def test_item_lists_leave_no_workgroup_empty(b, sq, skv, hc, ncu):
     """Head counts that are no multiple of the 8 XCDs: every workgroup of the grid still gets an item."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd_dkdv_items as items
+    from primus_turbo.flydsl.gfx1250.attention.mla import bwd_dkdv_items as items
 
     lists = items.item_lists(b, sq, skv, hc, ncu)
     nblk = items.nblk_kv(skv)
@@ -197,8 +197,8 @@ def test_item_lists_leave_no_workgroup_empty(b, sq, skv, hc, ncu):
 
 def test_item_rows_of_the_last_block():
     """A wave whose kv rows pass seqlen_kv reads no K / V row and stores no dS^T block; one inside it does."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd_dkdv_items as items
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd_dkdv_sched
+    from primus_turbo.flydsl.gfx1250.attention.mla import bwd_dkdv_items as items
+    from primus_turbo.flydsl.gfx1250.attention.mla import bwd_dkdv_sched
 
     sq, skv, h = 320, 448, 2  # the last block: rows [384, 448) of 192, waves 2 and 3 past seqlen_kv
     rows = items.item_rows([1, 1], [0, 2], sq, skv, h, 0, h)
@@ -290,7 +290,7 @@ def test_scratch_is_the_last_allocation(monkeypatch):
     """The dS scratch is the backward's last allocation: when it fits, the row constants, the gradients and the
     item tables already did, so a scratch that fits never leaves the backward short of memory."""
     bwd = _bwd()
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd_dkdv_items as items
+    from primus_turbo.flydsl.gfx1250.attention.mla import bwd_dkdv_items as items
 
     b, sq, skv, h = 1, 384, 384, 2
     q, k, v, out, lse = _meta(b, sq, skv, h)
@@ -320,7 +320,7 @@ def test_scratch_is_the_last_allocation(monkeypatch):
 def test_item_tables_of_many_chunks_stay_cached(monkeypatch):
     """One head at a time over more heads than a cache counted in tables would hold: the second backward makes no
     table."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd_dkdv_items as items
+    from primus_turbo.flydsl.gfx1250.attention.mla import bwd_dkdv_items as items
 
     _set_budget(monkeypatch, 0)
     q, k, v, out, lse = _meta(1, 384, 384, 130)
@@ -336,7 +336,7 @@ def test_item_tables_of_many_chunks_stay_cached(monkeypatch):
 def test_item_table_cache_evicts_by_bytes_and_keeps_captured_tables():
     """The cache drops its least recently used tables once it is over its bytes, never the newest one, and never a
     table handed out while a CUDA graph was being captured: the graph keeps its address."""
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd_dkdv_items as items
+    from primus_turbo.flydsl.gfx1250.attention.mla import bwd_dkdv_items as items
 
     def entry(nbytes):
         return (torch.empty(nbytes // 4, dtype=torch.int32, device="meta"), 1, 2)
@@ -412,7 +412,7 @@ def _problem(b, sq, skv, h, seed=0):
         return torch.randn(b, s, h, d, device="cuda", generator=g).to(torch.bfloat16)
 
     q, k, v, do = r(sq, D_QK), r(skv, D_QK), r(skv, D_V), r(sq, D_V)
-    from primus_turbo.flydsl.attention.gfx1250_mla import fwd
+    from primus_turbo.flydsl.gfx1250.attention.mla import fwd
 
     out, lse = fwd.flash_attn_mla_fwd(q, k, v, MLA_SCALE, True)
     return do, q, k, v, out, lse
@@ -507,7 +507,7 @@ def test_chunked_backward_under_cuda_graphs(monkeypatch):
     eager bits, also after the cache dropped its item tables: the graph keeps their addresses, so the tables handed
     out during the capture stay."""
     bwd = _bwd()
-    from primus_turbo.flydsl.attention.gfx1250_mla import bwd_dkdv_items as items
+    from primus_turbo.flydsl.gfx1250.attention.mla import bwd_dkdv_items as items
 
     dims = (1, 1024, 1024, 40)
     monkeypatch.setattr(items, "_TABLES", items._TableCache(items.MAX_TABLE_BYTES))

@@ -313,7 +313,7 @@ def hk_mla_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True):
                 _mla_kernel(name)(grid, values, stream)
             return grads
         # Outside the except clauses: the failed allocations are released by now.
-        from primus_turbo.flydsl.attention.gfx1250_mla import bwd as flydsl_bwd
+        from primus_turbo.flydsl.gfx1250.attention.mla import bwd as flydsl_bwd
 
         why = flydsl_bwd.shape_unsupported_reason(q.shape[0], q.shape[1], k.shape[1], q.shape[2])
         if why is not None:

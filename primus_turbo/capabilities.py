@@ -41,23 +41,23 @@ _FEATURES: Dict[str, Dict[str, Tuple[str, ...]]] = {
     # Dense multi-head / grouped-query attention (flash_attn_func, backend FLYDSL).
     "attention.flydsl.mha": {
         "gfx1250": (
-            "primus_turbo.flydsl.attention.gfx1250.interface",
+            "primus_turbo.flydsl.gfx1250.attention.mha.interface",
             "primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_impl",
         ),
     },
     # Multi-head latent attention at the DeepSeek-V3 head dims.
     "attention.flydsl.mla": {
         "gfx1250": (
-            "primus_turbo.flydsl.attention.gfx1250_mla.fwd",
-            "primus_turbo.flydsl.attention.gfx1250_mla.bwd",
+            "primus_turbo.flydsl.gfx1250.attention.mla.fwd",
+            "primus_turbo.flydsl.gfx1250.attention.mla.bwd",
             "primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_mla_impl",
         ),
     },
     # Sparse MLA (DeepSeek-V4).
     "attention.flydsl.sparse_mla": {
         "gfx1250": (
-            "primus_turbo.flydsl.attention.gfx1250_sparse_mla.fwd_kernel",
-            "primus_turbo.flydsl.attention.gfx1250_sparse_mla.bwd_kernel",
+            "primus_turbo.flydsl.gfx1250.attention.sparse_mla.fwd_kernel",
+            "primus_turbo.flydsl.gfx1250.attention.sparse_mla.bwd_kernel",
         ),
     },
     # HipKittens kernels of the MLA backward.

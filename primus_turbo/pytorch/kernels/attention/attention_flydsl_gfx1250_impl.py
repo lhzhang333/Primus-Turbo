@@ -13,7 +13,7 @@ rules. The kernels address BSHD; any other byte order is made contiguous first. 
 ``attention_triton_impl`` layer -- dispatch and autograd wiring belong to the caller.
 
 The kernels need a flydsl that satisfies ``FLYDSL_REQUIREMENT`` (``>=0.3.4.1,<0.3.5``, in
-``primus_turbo/flydsl/attention/gfx1250/flydsl_version.py``). Under any other flydsl the gate
+``primus_turbo/flydsl/gfx1250/attention/mha/flydsl_version.py``). Under any other flydsl the gate
 declines every call before any kernel module is imported, and it also declines every call
 when the kernel package fails to import; either reason is logged once. A declined call goes
 to the dispatcher's fallback, which on gfx1250 tries AITER first, and AITER's CK backward
@@ -38,7 +38,7 @@ _INTERFACE = None
 
 def _import_interface():
     # Imported on first use: the package is wave32 WMMA code for gfx1250 only.
-    from primus_turbo.flydsl.attention.gfx1250 import interface
+    from primus_turbo.flydsl.gfx1250.attention.mha import interface
 
     return interface
 
@@ -47,7 +47,7 @@ def _load_interface():
     """The interface module, or why the kernels cannot be used (a str); never raises."""
     try:
         # A stdlib-only module: asking it imports no kernel code.
-        from primus_turbo.flydsl.attention.gfx1250.flydsl_version import (
+        from primus_turbo.flydsl.gfx1250.attention.mha.flydsl_version import (
             flydsl_unavailable_reason,
         )
 

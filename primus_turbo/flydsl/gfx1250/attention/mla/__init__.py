@@ -25,7 +25,7 @@ import pathlib
 NUM_XCD = 8  # XCDs of an MI455X: the hardware hands a launch's workgroups to them round robin
 
 _PKG = pathlib.Path(__file__).resolve().parent
-_UTILS = _PKG.parents[1] / "utils"
+_UTILS = _PKG.parents[2] / "utils"
 # FlyDSL's disk-cache key misses code reached via nested helpers or other directories; launchers read this.
 SOURCE_DIGEST = hashlib.sha256(
     b"".join(

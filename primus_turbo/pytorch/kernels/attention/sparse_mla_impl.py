@@ -22,14 +22,14 @@ from typing import Optional, Tuple
 
 import torch
 
-from primus_turbo.flydsl.attention.gfx1250_sparse_mla.bwd_kernel import (
-    sparse_mla_bwd_gfx1250,
-)
-from primus_turbo.flydsl.attention.gfx1250_sparse_mla.fwd_kernel import (
-    sparse_mla_fwd_gfx1250,
-)
 from primus_turbo.flydsl.attention.sparse_mla_bwd import sparse_mla_bwd_flydsl
 from primus_turbo.flydsl.attention.sparse_mla_fwd import sparse_mla_fwd_flydsl
+from primus_turbo.flydsl.gfx1250.attention.sparse_mla.bwd_kernel import (
+    sparse_mla_bwd_gfx1250,
+)
+from primus_turbo.flydsl.gfx1250.attention.sparse_mla.fwd_kernel import (
+    sparse_mla_fwd_gfx1250,
+)
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendChoice,

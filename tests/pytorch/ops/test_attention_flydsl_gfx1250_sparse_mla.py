@@ -21,7 +21,7 @@ import torch
 def test_sparse_mla_inverted_topk_chunks(n_tok, topk, num_kv, chunk):
     """Joint CSR inverse of the dkv gather: row pointers equal ``searchsorted(keys, arange(...))``
     and every chunk's slice equals the per-chunk inverse (rows, keys and stable entry order)."""
-    from primus_turbo.flydsl.attention.gfx1250_sparse_mla.bwd_kernel import (
+    from primus_turbo.flydsl.gfx1250.attention.sparse_mla.bwd_kernel import (
         _inverted_topk,
         _inverted_topk_chunks,
     )

@@ -55,7 +55,7 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_kwargs_keys.py",
     # beta = 1 on the same kernel's variable-K wgrad, into an fp32 main_grad (Muse Spark expert shapes).
     "tests/pytorch/ops/test_grouped_gemm_flydsl_gfx1250_variable_k_accum.py",
-    # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/attention/gfx1250_mla).
+    # FlyDSL attention at the DeepSeek-V3 MLA head dims (primus_turbo/flydsl/gfx1250/attention/mla).
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla.py",
     # Its backward's launch plan: head chunks within the dS scratch budget, grids, bitwise equality across chunkings.
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla_bwd.py",
@@ -63,9 +63,9 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_mla_codegen.py",
     # HipKittens kernels of its backward (csrc/kernels/attention/hipkittens/gfx1250_mla).
     "tests/pytorch/ops/test_attention_hipkittens_gfx1250_mla.py",
-    # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 128.
+    # Dense FlyDSL attention (primus_turbo/flydsl/gfx1250/attention/mha), bf16 head_dim 128.
     "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
-    # Sparse MLA (primus_turbo/flydsl/attention/gfx1250_sparse_mla); every backend it can pick
+    # Sparse MLA (primus_turbo/flydsl/gfx1250/attention/sparse_mla); every backend it can pick
     # runs here.
     "tests/pytorch/ops/test_attention.py::test_sparse_mla_op",
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_sparse_mla.py",

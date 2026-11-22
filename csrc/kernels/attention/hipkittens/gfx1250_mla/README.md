@@ -1,7 +1,7 @@
 # gfx1250 MLA attention backward on HipKittens kernels
 
 DeepSeek-V3 MLA attention (head dims qk 192 / v 128, bf16, MHA, bottom-right causal) backward on HIP kernels for
-gfx1250 (MI455X): a drop-in for the FlyDSL MLA backward (`primus_turbo/flydsl/attention/gfx1250_mla`) with the same
+gfx1250 (MI455X): a drop-in for the FlyDSL MLA backward (`primus_turbo/flydsl/gfx1250/attention/mla`) with the same
 tensors, whose gradients it reproduces bit for bit. The forward stays on FlyDSL. The Python side is
 `primus_turbo/pytorch/kernels/attention/attention_hipkittens_gfx1250_mla_impl.py` (`hk_mla_bwd`).
 
