@@ -30,6 +30,9 @@ if _worker_id is not None:
     os.environ["HIP_VISIBLE_DEVICES"] = str(_gpu_id)
 
 
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 def _gfx1250_enabled(item) -> bool:
     """Whether a test runs on gfx1250 (MI455X). Everything else is skipped there -- see
     pytest_collection_modifyitems. A test opts in by where it is or by what it says:
@@ -41,9 +44,10 @@ def _gfx1250_enabled(item) -> bool:
 
     So a new gfx1250 test needs no edit here.
     """
-    # the node id's path is relative to the rootdir, so a checkout under some .../gfx1250/ enables nothing
-    path = "/" + item.nodeid.split("::", 1)[0].replace(os.sep, "/")
-    return "/gfx1250/" in path or item.get_closest_marker("gfx1250") is not None
+    # Relative to this file's directory: not to the checkout (one under some .../gfx1250/ must enable
+    # nothing) and not to pytest's rootdir (--rootdir or -c elsewhere must not disable the suites).
+    path = os.path.relpath(str(getattr(item, "path", item.fspath)), _TESTS_DIR)
+    return "gfx1250" in path.split(os.sep)[:-1] or item.get_closest_marker("gfx1250") is not None
 
 
 @pytest.fixture(autouse=True)

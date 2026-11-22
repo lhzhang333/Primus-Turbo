@@ -68,6 +68,8 @@ def test_every_listed_module_is_in_the_package():
             assert arch in KNOWN_ARCHS, (feature, arch)
             assert modules, (feature, arch)
             for entry in modules:
+                if entry.startswith("files:"):  # build products: there only in a build for that architecture
+                    continue
                 module, _, symbol = entry.partition(":")
                 path = _module_path(module)
                 assert path.is_file(), f"{feature} / {arch}: no module {module}"
@@ -81,8 +83,28 @@ def test_has():
     assert not capabilities.has("no.such.feature", arch="gfx1250")
     table = capabilities.features("gfx1250")
     assert set(table) == set(capabilities._FEATURES)
-    assert all(table.values())
+    # every feature whose modules are part of the source is there; one that also needs build products
+    # (the HipKittens code objects) is there exactly when they were built
+    for feature, answer in table.items():
+        needs = capabilities._FEATURES[feature]["gfx1250"]
+        built = all(any(_PKG_DIR.glob(n[len("files:") :])) for n in needs if n.startswith("files:"))
+        assert answer == built, feature
     assert not any(capabilities.features("gfx000").values())
+
+
+def test_what_older_primus_releases_probe_is_still_there():
+    """Primus releases that predate this module look for two directories and import one function from
+    one module path. Whoever removes one of them switches a feature off there without an error."""
+    flydsl = _PKG_DIR / "flydsl"
+    assert (flydsl / "attention" / "gfx1250").is_dir()
+    assert (flydsl / "mega" / "gfx1250").is_dir()
+    old = flydsl / "grouped_gemm" / "grouped_gemm_bf16_kernel_gfx1250.py"
+    assert old.is_file()
+    # the module itself, or the alias that hands out the moved module
+    assert (
+        _defines(old, "grouped_gemm_bf16_variable_k_accum_supported")
+        or "sys.modules[__name__]" in old.read_text()
+    )
 
 
 def test_a_missing_module_reads_false(monkeypatch):
@@ -110,7 +132,7 @@ def test_cli(capsys):
     assert capsys.readouterr().out.split() == ["True", "False"]
     assert capabilities._main(["--arch", "gfx1250"]) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert lines == [f"{feature} True" for feature in sorted(capabilities._FEATURES)]
+    assert lines == [f"{feature} {answer}" for feature, answer in capabilities.features("gfx1250").items()]
 
 
 def test_the_query_imports_neither_torch_nor_a_kernel():

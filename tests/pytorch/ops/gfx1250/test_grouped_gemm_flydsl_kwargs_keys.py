@@ -22,7 +22,7 @@ Two groups:
   switched off -- every keyed value moves a schedule, never an address or an accumulation order --
   and the forward at 64 experts, where the key declines.
 
-Listed in ``tests/conftest.py``'s ``_GFX1250_ENABLED_TESTS``, without which it never runs on gfx1250.
+It runs on gfx1250 because it is under ``gfx1250/`` (``tests/conftest.py``); elsewhere it would be skipped there.
 """
 
 import inspect

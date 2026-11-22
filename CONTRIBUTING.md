@@ -117,7 +117,8 @@ other aliases (`w32`) are not used in paths.
   part of the key by the package that uses it (hash its source into a module-level
   constant the launchers read, as `flydsl/attention/gfx1250/mla/__init__.py` does);
   otherwise an edit to it keeps serving kernels compiled before the edit.
-* **Tuning tables and selection logic** go in a `*_heuristic.py` next to the kernel.
+* **Tuning tables and selection logic** belong in a `*_heuristic.py` next to the kernel
+  (new ones; the existing tables are still inside the kernel files).
 * **Names that are looked up at run time do not follow the directory rule**: FlyDSL kernel
   names, `torch.library` op names (`primus_turbo::flash_attn_flydsl_gfx1250_forward`),
   environment variables and build product directories keep the architecture in the name.

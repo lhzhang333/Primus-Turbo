@@ -21,8 +21,9 @@ Two groups:
   ``avg_m`` the key table is written for. These are the only shapes in the repository's test
   suite that take the keyed path, so without them the whole table is untested on hardware.
 
-``tests/conftest.py`` lists this file in ``_GFX1250_ENABLED_TESTS``; on gfx1250 every test outside
-that list is skipped, so an unlisted file never runs on the part it was written for.
+On gfx1250 ``tests/conftest.py`` runs what is under a ``gfx1250/`` directory or carries
+``pytest.mark.gfx1250`` and skips the rest, so this file has to stay in this directory to run on
+the part it was written for.
 """
 
 import inspect
