@@ -943,7 +943,7 @@ def _check(got, ref, min_db=40.0, skip=()):
     [
         ((4, 8192, 8192, 32, 8), True, False, ["delta", "dkdv_fused", "dq_cvt"]),
         ((1, 1024, 1024, 8, 2), True, False, ["delta", "dkdv_fused_sp", "redsp", "dq_cvt"]),
-        ((1, 512, 4096, 16, 16), True, False, ["delta", "dkdv_fused", "dq_cvt"]),
+        ((1, 512, 4096, 16, 16), True, False, ["delta", "dkdv_fused_sp", "redsp", "dq_cvt"]),
         ((4, 8192, 8192, 32, 8), False, False, None),
         ((1, 1024, 1088, 8, 2), True, False, None),
         ((4, 8192, 8192, 32, 8), True, True, None),
@@ -1133,9 +1133,7 @@ def test_d64_and_window_shapes_reach_every_kernel_variant(monkeypatch):
             interface.flash_attn_bwd(
                 q, q, k, v, q, lse, causal=True, deterministic=deterministic, window_left=wl
             )
-    every = {
-        "k_flash_attn_fwd",
-        "k_flash_attn_fwd_small_grid",
+    backward = {
         "delta",
         "dkdv",
         "dkdv_sp",
@@ -1147,7 +1145,9 @@ def test_d64_and_window_shapes_reach_every_kernel_variant(monkeypatch):
         "dkdv_fused_sp",
         "dq_cvt",
     }
-    assert plan == {"d64": every, "window": every}
+    # head dim 64 fills the machine with HD64; the windowed set also has head dim 128 (DEFAULT)
+    d64_fwd = {"k_flash_attn_fwd_hd64", "k_flash_attn_fwd_small_grid"}
+    assert plan == {"d64": backward | d64_fwd, "window": backward | d64_fwd | {"k_flash_attn_fwd"}}
 
 
 @needs_gfx1250

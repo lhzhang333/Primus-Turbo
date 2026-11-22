@@ -161,7 +161,10 @@ def flash_attn_fwd(q, k, v, softmax_scale=None, causal=True, window_left=-1):
     # An under-filled grid is bound by its heaviest workgroup's latency; the small-grid
     # tiling uses 64-row workgroups (BLOCK_M 64 instead of 256) to spread the work.
     grid = -(-sq * (hq // hkv) // _fwd.DEFAULT.block_m) * hkv * b
-    tiling = _fwd.SMALL_GRID if grid < _num_cu(q.device) else _fwd.DEFAULT
+    if grid < _num_cu(q.device):
+        tiling = _fwd.SMALL_GRID
+    else:
+        tiling = _fwd.HD64 if d == 64 else _fwd.DEFAULT
     return _fwd.flash_attn_fwd(
         q, k, v, tiling, softmax_scale=float(softmax_scale), causal=bool(causal), window_left=wl
     )
@@ -212,9 +215,15 @@ def _side_stream(device):
 # The fused backward (flash_attn_bwd_fused_kernel: dQ inside the dK/dV kernel, 5 GEMMs per unit
 # instead of 7) covers causal problems with Sq a multiple of 64 and Skv of 128. It adds dQ with
 # fp32 atomics, so dQ is not bitwise reproducible; deterministic=True keeps the two-kernel path.
-# Its split-K over the q loop aims at two dispatch waves of the 4-wave workgroups (one per CU).
-_FUSED_TARGET_WGS = 512
+# Its split-K over the q loop aims at four dispatch waves of the 4-wave workgroups (two per CU):
+# at S 4096, Hkv 16, D 64 (Muse Spark), 512 left the causal skew exposed (bwd -20 % at batch 1).
+_FUSED_TARGET_WGS = 1024
 _FUSED_NSP_CAP = 16
+# Under causal skew the longest workgroup (the q range a kv block can see) sets the tail: split until
+# no piece spans more than this many q rows, while the grid stays within twice the target (a grid
+# that already fills the machine several times over loses more to the fp32 partials than it gains).
+# Full causal at S 4096: 2 pieces; a 2047 window: none.
+_FUSED_MAX_Q_ROWS = 2048
 
 
 def _fused_ok(sq, skv, causal):
@@ -235,6 +244,13 @@ def _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, wl, stream):
     nblk = skv // _fused.W4_BKV
     nsp = 1
     while nblk * hkv * b * nsp < _FUSED_TARGET_WGS and nsp < _FUSED_NSP_CAP:
+        nsp *= 2
+    q_span = min(wl + 1, sq) if win else sq
+    while (
+        q_span // nsp > _FUSED_MAX_Q_ROWS
+        and nblk * hkv * b * nsp * 2 <= 2 * _FUSED_TARGET_WGS
+        and nsp < _FUSED_NSP_CAP
+    ):
         nsp *= 2
     dk = torch.empty((b, skv, hkv, d), device=k.device, dtype=k.dtype)
     dv = torch.empty_like(dk)
