@@ -54,7 +54,9 @@ def test_manifest_lookup():
 
 
 def test_every_listed_module_is_in_the_package():
-    """Not imported (a kernel package may refuse to import off its architecture): the file is there."""
+    """Not imported (a kernel package may refuse to import off its architecture): the file is there.
+    tools/check_arch_layout.py holds the whole tree to the manifest; this is the part of it that
+    also holds for an installed package."""
     for table in (gfx1250.KERNELS, gfx1250.IMPLS):
         for name, module in table.items():
             assert arch.module_file(module) is not None, f"{name}: no module {module}"
@@ -64,6 +66,15 @@ def test_every_listed_module_is_in_the_package():
             if not need.startswith("files:"):  # build products: there only in a build for that architecture
                 assert need.partition(":")[0] in {**gfx1250.KERNELS, **gfx1250.IMPLS}, (feature, need)
         assert arch.needs_of(feature, "gfx1250"), feature
+
+
+def test_the_tree_matches_the_manifests():
+    checker = _PKG_DIR.parent / "tools" / "check_arch_layout.py"
+    if not checker.is_file() or not (_PKG_DIR.parent / "csrc").is_dir():
+        # an installed package: tools/ is installed next to it, the sources the manifests list are not
+        pytest.skip("the package is not in a source tree")
+    run = subprocess.run([sys.executable, str(checker)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
 
 
 def test_has():
