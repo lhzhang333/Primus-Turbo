@@ -27,6 +27,9 @@ import pytest
 import torch
 import torch.distributed as dist
 
+# SymmetricMemory over IPC and fabric handles (UALink vpod) runs on gfx1250.
+pytestmark = pytest.mark.gfx1250
+
 N = 1 << 16
 
 

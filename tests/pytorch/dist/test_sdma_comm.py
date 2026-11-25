@@ -24,6 +24,9 @@ import pytest
 import torch
 import torch.distributed as dist
 
+# The SDMA put + signal collectives on SymmetricMemory run on gfx1250.
+pytestmark = pytest.mark.gfx1250
+
 ITERS = 5
 # elements per rank (per destination for all-to-all / reduce-scatter)
 NUMELS = [1, 1000, 1 << 18, 9 << 19]
